@@ -1,0 +1,21 @@
+# Core graph + state
+langgraph>=0.2.60
+pydantic>=2.7
+pydantic-settings>=2.3
+
+# LLM I/O (both providers via OpenAI-compatible HTTP)
+httpx>=0.27
+
+# Storage (each optional at runtime — graceful degradation)
+qdrant-client>=1.14
+fastembed>=0.3
+opensearch-py>=2.6
+langgraph-checkpoint-postgres>=2.0
+psycopg[binary]>=3.1
+
+# API
+fastapi>=0.111
+uvicorn>=0.30
+
+# Tests
+pytest>=8.0

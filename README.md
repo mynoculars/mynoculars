@@ -1,10 +1,10 @@
 # Agentic Research Agent — Reference Implementation (Core Build)
 
-A production-*style* (not production-*grade*) research agent built on LangGraph,
-designed as a learning vehicle and engineering showcase. Given a research
-question, it plans goals, retrieves evidence in parallel, iteratively deepens
-coverage, self-critiques its report, and remembers what it learned for future
-runs.
+A production-style (not production-grade) research agent built on LangGraph, 
+showcasing production-oriented architecture and engineering practices. Given 
+a  research  question,  it  plans  goals,  retrieves  evidenc e in parallel, 
+iteratively deepens coverage, self-critiques its report, and remembers what 
+it learned for future runs.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, and the self-critique loop from the
@@ -55,72 +55,172 @@ of this repo on purpose.
 
 ### Overall architecture
 
-```mermaid
-flowchart LR
-    CLI[CLI / FastAPI] --> G[LangGraph workflow]
-    G --> R[FallbackRouter]
-    R --> P[Qwen Cogito<br/>local llama-server]
-    R --> F[Gemini Flash<br/>fallback]
-    G --> T[Corpus tool]
-    T --> H[HybridRetriever]
-    H --> Q[(Qdrant<br/>dense)]
-    H --> O[(OpenSearch<br/>BM25)]
-    G --> M[SemanticMemory]
-    M --> QM[(Qdrant<br/>memory collection)]
-    G --> C[(Postgres<br/>checkpointer + runs)]
+```text
+            ┌────────────────────────────────────────────┐
+            │              CLI  /  FastAPI               │
+            └──────────────────────┬─────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                               LangGraph workflow                             │
+└──────┬────────────────────┬────────────────────┬────────────────────┬────────┘
+       │                    │                    │                    │
+       ▼                    ▼                    ▼                    ▼
+┌──────────────┐     ┌──────────────┐    ┌──────────────┐     ┌────────────────┐
+│FallbackRouter│     │ Corpus tool  │    │SemanticMemory│     │ Checkpointer   │
+└──┬────────┬──┘     └──────┬───────┘    └──────┬───────┘     │ + run history  │
+   │        │               ▼                   │             └──────┬─────────┘
+   ▼        ▼        ┌────────────────┐         ▼                    ▼
+┌───────┐ ┌──────┐   │HybridRetriever │    ┌──────────────┐    ┌──────────────┐
+│ Qwen  │ │Gemini│   └──┬──────────┬──┘    │Qdrant memory │    │   Postgres   │
+│Cogito │ │Flash │      │          │       │  collection  │    └──────────────┘
+│(local)│ │(fbk) │      ▼          ▼       └──────────────┘
+└───────┘ └──────┘  ┌───────┐ ┌──────────┐
+                    │Qdrant │ │OpenSearch│
+                    │dense  │ │ BM25     │
+                    └───────┘ └──────────┘
+
 ```
 
 ### Agent workflow
 
-```mermaid
-flowchart TD
-    S([START]) --> CL[classify]
-    CL --> MR[memory_retrieve]
-    MR --> GM[goal_manager]
-    GM -->|zero goals D-21| CP[compiler]
-    GM -->|goals| TE[task_expander]
-    TE -->|empty backlog D-1| CP
-    TE -->|Send xN| W[search_worker]
-    W --> MG[merger]
-    MG --> PC[progress_checker]
-    PC -->|recall or depth D-14| CP
-    PC -->|expand| GG[gap_generator]
-    GG -->|empty backlog D-1| CP
-    GG -->|Send xN| W
-    CP --> CR[critic]
-    CR -->|fail + budget D-22| CP
-    CR -->|fail exhausted E4 stub| TL[telemetry]
-    CR -->|pass| MW[memory_writer]
-    MW --> TL
-    TL --> E([END])
+```text
+                     [START]
+                        │
+                        ▼
+              ┌──────────────────┐
+              │     classify     │
+              └────────┬─────────┘
+                       ▼
+              ┌──────────────────┐
+              │ memory_retrieve  │
+              └────────┬─────────┘
+                       ▼
+              ┌──────────────────┐
+              │   goal_manager   │
+              └────────┬─────────┘
+                       │
+                       ▼
+        ┌────────────────────────────┐
+        │   goals present? (D-21)    │
+        └───────┬─────────────┬──────┘
+                │ no          │ yes
+                ▼             ▼
+        (ERROR report)   ┌──────────────────┐
+                │        │  task_expander   │
+                │        └────────┬─────────┘
+				│                 │
+                │                 ▼
+                │     ┌────────────────────────────┐
+                │     │    D-1: backlog check      │
+                │     └──────┬───────────────┬─────┘
+			 	│			 │ empty         │ tasks present
+				│			 ▼               ▼
+				│	  (EMPTY report)  ┌───────────────────┐
+				│		     │        │ search_worker ×N  │◄────────┐
+				│			 │		  └────────┬──────────┘         │
+				│			 │				   ▼                    │
+				│			 │		  ┌────────────────┐            │
+				│			 │		  │     merger     │            │
+				│			 │		  └────────┬───────┘            │
+				│◄───────────┘				   │                    │
+				│                              ▼                    │
+				│					  ┌──────────────────┐         L│
+				│					  │ progress_checker │         O│
+				│					  └────────┬─────────┘         O│
+				│							   ▼                   P│
+				│		┌─────────────────────────────────┐         │
+				│		│       convergence (D-14)        │         ▲
+				│		└──────┬──────────────────┬───────┘         │
+				│			   │ compile          │ expand          │
+				│			   │                  ▼                 │
+				│			   │        ┌────────────────┐          │
+				│			   │        │ gap_generator  │          │
+				│			   │        └───────┬────────┘          │
+				│			   │                ▼                   │
+				│			   │      ┌──────────────────┐  tasks   │
+				│			   │      │ D-1: backlog chk ├────►─────┘
+				│			   │      └────────┬─────────┘
+				│			   │               │ empty
+				│			   │               │
+				│			   └──────────────►┤
+				│							   │ 
+				│							   ▼
+				│					  ┌────────────────┐
+				│		┌────────────►│    compiler    │
+				│		│             └────────┬───────┘
+				│		│                      │
+				│		│                      ▼
+				│		│             ┌────────────────┐
+				└─────►(│)───────────►│     critic     │
+						│             └────────┬───────┘
+						│                      │  
+						│                      ▼
+						│      ┌─────────────────────────────────┐
+						└──────┤       D-22: critique check      │
+						FAIL,  └────────────┬──────────────┬─────┘
+						 budget             │ FAIL,        │ FAIL
+						 (revise)           │ exhausted    │
+								     		│ (E4 stub)    │
+											│              ▼
+											│    ┌───────────────┐
+											│    │ memory_writer │
+											│    └───────┬───────┘
+											│            │
+											▼            ▼
+									   ┌─────────────────────┐
+									   │      telemetry      │
+									   └───────────┬─────────┘
+												   │
+												   ▼
+											     [END]
+
+Legend: (C) error/empty reports join the main flow at critic (waved
+through, D-21) — every path reaches telemetry → [END]. "E4 stub" logs
+the escalation; the full design interrupts for a human there.
 ```
 
 ### Request flow (one worker, simplified)
 
-```mermaid
-sequenceDiagram
-    participant D as dispatch (Send)
-    participant W as search_worker
-    participant T as corpus tool
-    participant H as HybridRetriever
-    D->>W: WorkerPayload(task)
-    W->>T: tool(task)
-    T->>H: search(query)
-    H-->>T: fused hits (RRF)
-    T-->>W: [Evidence]
-    W-->>D: {evidence, completed_task_keys, counters}  %% reducer-backed only (D-15)
+```text
+ dispatch           search_worker        corpus tool      HybridRetriever
+    │                     │                   │                  │
+    │ Send(WorkerPayload) │                   │                  │
+    ├────────────────────►│                   │                  │
+    │                     │    tool(task)     │                  │
+    │                     ├──────────────────►│                  │
+    │                     │                   │  search(query)   │
+    │                     │                   ├─────────────────►│
+    │                     │                   │ fused hits (RRF) │
+    │                     │                   │◄─────────────────┤
+    │                     │    [Evidence]     │                  │
+    │                     │◄──────────────────┤                  │
+    │ {evidence, keys,    │                   │                  │
+    │  counters} ONLY —   │                   │                  │
+    │  D-15 whitelist     │                   │                  │
+    │◄────────────────────┤                   │                  │
+    │                     │                   │                  │
 ```
 
 ### Storage interactions
 
-```mermaid
-flowchart LR
-    ING[scripts/ingest_sample_data.py] --> O[(OpenSearch: corpus BM25)]
-    ING --> Q[(Qdrant: corpus dense)]
-    MW[memory_writer node] --> QM[(Qdrant: semantic memory)]
-    MRN[memory_retrieve node] --> QM
-    CK[graph checkpointer] --> P[(Postgres)]
-    RH[run history] --> P
+```text
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ ingest_sample_data.py    ├───────►│ OpenSearch: corpus BM25  │
+│                          │        └──────────────────────────┘
+│                          │        ┌──────────────────────────┐
+│                          ├───────►│ Qdrant: corpus dense     │
+└──────────────────────────┘        └──────────────────────────┘
+
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ memory_retrieve node     │◄───────┤ Qdrant: semantic memory  │
+│ memory_writer node       ├───────►│         collection       │
+└──────────────────────────┘        └──────────────────────────┘
+
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ graph checkpointer (D-8) ├───────►│         Postgres         │
+│ run-history rows         ├───────►│                          │
+└──────────────────────────┘        └──────────────────────────┘
 ```
 
 ## Design
