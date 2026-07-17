@@ -110,7 +110,16 @@ def build_progress_checker_node(settings: Settings):
         recall = (sum(g.covered for g in goals) / len(goals)) if goals else 1.0
         depth = state.iteration_depth + 1  # D-3: exactly one tick per cycle
         log_event(logger, "node.progress", recall=round(recall, 3), depth=depth)
-        return {"goals": goals, "recall_score": recall, "iteration_depth": depth}
+        update = {"goals": goals, "recall_score": recall, "iteration_depth": depth}
+        # D-23: at terminal non-convergence the CHECK raises the trigger
+        # (E2 if a contradiction blocks a goal, else E3). Routing reads it.
+        if (settings.hitl_enabled and depth >= settings.max_depth
+                and recall < settings.recall_target):
+            trigger = "E2" if any(g.contested for g in goals) else "E3"
+            update["escalation_trigger"] = trigger
+            log_event(logger, "escalation.raised", trigger=trigger,
+                      recall=round(recall, 3))
+        return update
 
     return progress_checker_node
 
@@ -120,11 +129,24 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings):
 
     def gap_generator_node(state: ResearchState) -> Dict[str, Any]:
         result = router.complete_json(templates.generate_gaps(
-            state.goals, state.evidence, state.iteration_depth, settings.max_fanout))
+            state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
+            guidance=state.human_guidance))
         tasks = cap_and_filter(result.get("tasks", []), state,
                                 depth=state.iteration_depth,
                                 max_fanout=settings.max_fanout)
         log_event(logger, "node.gaps", produced=len(tasks))
-        return {"pending_tasks": tasks, "counters": {"llm_calls": 1}}
+        update = {"pending_tasks": tasks, "human_guidance": "",
+                  "counters": {"llm_calls": 1}}
+        # D-23 (refined by test evidence): E3 originally guarded only the
+        # depth-exhaustion exit; a run can ALSO fail to converge by running
+        # out of producible tasks (the D-14 dispatch exit). Both are "cannot
+        # converge below target" — so the trigger is raised here too.
+        if (settings.hitl_enabled and not tasks
+                and state.recall_score < settings.recall_target):
+            trigger = "E2" if any(g.contested for g in state.goals) else "E3"
+            update["escalation_trigger"] = trigger
+            log_event(logger, "escalation.raised", trigger=trigger,
+                      reason="task_supply_exhausted")
+        return update
 
     return gap_generator_node

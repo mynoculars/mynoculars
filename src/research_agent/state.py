@@ -160,6 +160,15 @@ class ResearchState(BaseModel):
     iteration_depth: int = 0                  # D-3: checker increments
     recall_score: float = 0.0
 
+    # Human-in-the-loop escalation (D-23/D-28)
+    escalation_trigger: Optional[str] = None      # E1/E2/E3/E4; set by the
+    #   node whose check fired (routing fns are read-only and cannot set it)
+    escalation_history: Annotated[List[Dict[str, Any]], operator.add] = Field(
+        default_factory=list)  # appended in the RESUME update, never before
+    #   interrupt() — the D-28 idempotency invariant made concrete
+    human_guidance: str = ""                      # redirect payload for planners
+    abort_reason: Optional[str] = None            # human abort -> error report
+
     # Compile & critique (D-22)
     final_report: str = ""
     critique_notes: Annotated[List[str], operator.add] = Field(default_factory=list)

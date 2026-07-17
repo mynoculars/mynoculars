@@ -19,6 +19,8 @@ import json
 import sys
 import uuid
 
+from langgraph.types import Command
+
 from research_agent.config import get_settings
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import configure_logging, run_id_var
@@ -70,11 +72,24 @@ def main(argv=None) -> int:
     thread_id = args.thread_id or f"run-{uuid.uuid4().hex[:12]}"
     run_id_var.set(thread_id)  # correlate every log line to this run
 
-    result = app.invoke(
-        ResearchState(raw_query=args.query),
-        config={"configurable": {"thread_id": thread_id},
-                "recursion_limit": settings.recursion_limit},
-    )
+    config = {"configurable": {"thread_id": thread_id},
+              "recursion_limit": settings.recursion_limit}
+    result = app.invoke(ResearchState(raw_query=args.query), config=config)
+
+    # HITL loop (D-23): an interrupted run surfaces "__interrupt__" instead
+    # of finishing. Show the review payload, collect a decision, resume under
+    # the SAME thread_id (D-20). Blocking stdin IS the timeout policy for a
+    # CLI — the deferred operational decision, resolved per-interface.
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        print("\n=== HUMAN REVIEW REQUIRED ===")
+        print(json.dumps(payload, indent=2, default=str))
+        action = ""
+        while action not in ("approve", "redirect", "abort"):
+            action = input("action [approve/redirect/abort]: ").strip().lower()
+        guidance = input("guidance: ").strip() if action == "redirect" else ""
+        result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
+                            config=config)
 
     print(result["final_report"])
     print("\n--- telemetry ---")

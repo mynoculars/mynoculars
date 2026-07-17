@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     recall_target: float = Field(0.85, ge=0.0, le=1.0)   # D-4
     min_evidence_score: float = Field(0.0, ge=0.0)       # D-17: 0.0 = inert
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound
+    # D-23: human-in-the-loop escalation. Off by default — the graceful-
+    # degradation posture: shipping inert, enabled deliberately.
+    hitl_enabled: bool = False
     recursion_limit: int = Field(60, ge=10)   # D-8: invoke-time backstop
 
     # --- Memory decay (D-24, Python-side reranking in this core build) -----

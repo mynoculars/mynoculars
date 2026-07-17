@@ -1,16 +1,16 @@
 # Agentic Research Agent — Reference Implementation (Core Build)
 
-A production-style (not production-grade) research agent built on LangGraph, 
-showcasing production-oriented architecture and engineering practices. Given 
-a  research  question,  it  plans  goals,  retrieves  evidenc e in parallel, 
-iteratively deepens coverage, self-critiques its report, and remembers what 
-it learned for future runs.
+A production-style (not production-grade) research agent built on LangGraph,
+showcasing production-oriented architecture and engineering practices. Given
+a research question, it plans goals, retrieves evidence in parallel,
+iteratively deepens coverage, self-critiques its report, pauses for human
+review when it cannot converge, and remembers what it learned for future runs.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
-> semantic memory, LLM fallback routing, and the self-critique loop from the
-> accompanying design document (decisions D-1…D-24 subset). MCP tool
-> mediation and human-in-the-loop interrupts are deliberately deferred —
-> see [Limitations](#limitations).
+> semantic memory, LLM fallback routing, the self-critique loop, and
+> human-in-the-loop escalation from the accompanying design document
+> (decisions D-1…D-24 + D-28 subset). MCP tool mediation is deliberately
+> deferred — see [Limitations](#limitations).
 
 ## Overview
 
@@ -43,6 +43,11 @@ of this repo on purpose.
 - Cross-run semantic memory with volatility-aware staleness decay.
 - Primary→fallback LLM routing (local Qwen Cogito → Gemini Flash) with a
   quality threshold.
+- Human-in-the-loop escalation (`HITL_ENABLED=true`): the graph pauses via
+  LangGraph `interrupt()` on four triggers — E1 zero goals, E2 contested
+  goals, E3 cannot-converge, E4 critique exhausted — and resumes on
+  approve/redirect/abort under the same thread_id. CLI prompts on stdin;
+  the API returns `status: interrupted` plus a `/resume` endpoint.
 - Fully offline demo mode (`LLM_MODE=stub`) — the entire graph runs with zero
   services and zero API keys.
 
@@ -102,82 +107,87 @@ of this repo on purpose.
                        │
                        ▼
         ┌────────────────────────────┐
-        │   goals present? (D-21)    │
+        │ goals present? (D-21/E1*)  │
         └───────┬─────────────┬──────┘
                 │ no          │ yes
                 ▼             ▼
         (ERROR report)   ┌──────────────────┐
                 │        │  task_expander   │
                 │        └────────┬─────────┘
-				│                 │
+                │                 │
                 │                 ▼
                 │     ┌────────────────────────────┐
                 │     │    D-1: backlog check      │
                 │     └──────┬───────────────┬─────┘
-			 	│			 │ empty         │ tasks present
-				│			 ▼               ▼
-				│	  (EMPTY report)  ┌───────────────────┐
-				│		     │        │ search_worker ×N  │◄────────┐
-				│			 │		  └────────┬──────────┘         │
-				│			 │				   ▼                    │
-				│			 │		  ┌────────────────┐            │
-				│			 │		  │     merger     │            │
-				│			 │		  └────────┬───────┘            │
-				│◄───────────┘				   │                    │
-				│                              ▼                    │
-				│					  ┌──────────────────┐         L│
-				│					  │ progress_checker │         O│
-				│					  └────────┬─────────┘         O│
-				│							   ▼                   P│
-				│		┌─────────────────────────────────┐         │
-				│		│       convergence (D-14)        │         ▲
-				│		└──────┬──────────────────┬───────┘         │
-				│			   │ compile          │ expand          │
-				│			   │                  ▼                 │
-				│			   │        ┌────────────────┐          │
-				│			   │        │ gap_generator  │          │
-				│			   │        └───────┬────────┘          │
-				│			   │                ▼                   │
-				│			   │      ┌──────────────────┐  tasks   │
-				│			   │      │ D-1: backlog chk ├────►─────┘
-				│			   │      └────────┬─────────┘
-				│			   │               │ empty
-				│			   │               │
-				│			   └──────────────►┤
-				│							   │ 
-				│							   ▼
-				│					  ┌────────────────┐
-				│		┌────────────►│    compiler    │
-				│		│             └────────┬───────┘
-				│		│                      │
-				│		│                      ▼
-				│		│             ┌────────────────┐
-				└─────►(│)───────────►│     critic     │
-						│             └────────┬───────┘
-						│                      │  
-						│                      ▼
-						│      ┌─────────────────────────────────┐
-						└──────┤       D-22: critique check      │
-						FAIL,  └────────────┬──────────────┬─────┘
-						 budget             │ FAIL,        │ FAIL
-						 (revise)           │ exhausted    │
-								     		│ (E4 stub)    │
-											│              ▼
-											│    ┌───────────────┐
-											│    │ memory_writer │
-											│    └───────┬───────┘
-											│            │
-											▼            ▼
-									   ┌─────────────────────┐
-									   │      telemetry      │
-									   └───────────┬─────────┘
-												   │
-												   ▼
-											     [END]
+                │            │ empty         │ tasks present
+                │            ▼               ▼
+                │     (EMPTY report)  ┌───────────────────┐
+                │            │        │ search_worker ×N  │◄────────┐
+                │            │        └────────┬──────────┘         │
+                │            │                 ▼                    │
+                │            │        ┌────────────────┐            │
+                │            │        │     merger     │            │
+                │            │        └────────┬───────┘            │
+                │◄───────────┘                 │                    │
+                │                              ▼                    │
+                │                     ┌──────────────────┐         L│
+                │                     │ progress_checker │         O│
+                │                     └────────┬─────────┘         O│
+                │                              ▼                   P│
+                │       ┌─────────────────────────────────┐         │
+                │       │   convergence (D-14/E2-E3*)     │         ▲
+                │       └──────┬──────────────────┬───────┘         │
+                │              │ compile          │ expand          │
+                │              │                  ▼                 │
+                │              │        ┌────────────────┐          │
+                │              │        │ gap_generator  │          │
+                │              │        └───────┬────────┘          │
+                │              │                ▼                   │
+                │              │      ┌──────────────────┐  tasks   │
+                │              │      │D-1: backlog chk  ├────►─────┘
+                │              │      │     (E2-E3*)     │
+                │              │      └────────┬─────────┘
+                │              │               │ empty
+                │              │               │
+                │              └──────────────►┤
+                │                              │
+                │                              ▼
+                │                     ┌────────────────┐
+                │       ┌────────────►│    compiler    │
+                │       │             └────────┬───────┘
+                │       │                      │
+                │       │                      ▼
+                │       │             ┌────────────────┐
+                └───────┼────────────►│     critic     │
+                        │             └────────┬───────┘
+                        │                      │
+                        │                      ▼
+                        │      ┌─────────────────────────────────┐
+                        └──────┤       D-22: critique check      │
+                        FAIL,  └───────────┬───────────────┬─────┘
+                         budget            │ FAIL,         │ PASS
+                         (revise)          │ exhausted     │
+                                           │ (E4*)         │
+                                           │               ▼
+                                           │     ┌───────────────┐
+                                           │     │ memory_writer │
+                                           │     └───────┬───────┘
+                                           │             │
+                                           ▼             ▼
+                                      ┌─────────────────────┐
+                                      │      telemetry      │
+                                      └───────────┬─────────┘
+                                                  │
+                                                  ▼
+                                                [END]
 
-Legend: (C) error/empty reports join the main flow at critic (waved
-through, D-21) — every path reaches telemetry → [END]. "E4 stub" logs
-the escalation; the full design interrupts for a human there.
+Legend
+  Left rail — ERROR/EMPTY reports join the main flow at critic (waved
+  through, D-21): every path reaches telemetry → [END].
+  E1*/E2-E3*/E4* — with HITL_ENABLED=true the marked checks INTERRUPT the
+  run for human review (approve / redirect with guidance / abort) and
+  resume under the same thread_id; disabled, they log and continue (E4
+  ships the report marked unreviewed — never silently as good).
 ```
 
 ### Request flow (one worker, simplified)
@@ -334,8 +344,9 @@ uvicorn research_agent.api.server:app --reload
    counter, empty-backlog fallthrough, recursion-limit backstop.
 5. **Compile & critique**: the report is drafted, judged for faithfulness and
    completeness only, and rewritten against explicit notes up to
-   `MAX_REVISIONS`; exhaustion logs the E4 escalation stub and ships the report
-   marked unreviewed — never silently.
+   `MAX_REVISIONS`; exhaustion either interrupts for human review
+   (`HITL_ENABLED=true`: approve / redirect with guidance / abort) or logs
+   the E4 stub and ships the report marked unreviewed — never silently.
 6. **Persist & learn**: a *passed* report's fresh evidence enters semantic
    memory; telemetry aggregates node-recorded counters; a run-history row lands
    in Postgres when available.
@@ -357,6 +368,7 @@ Decision IDs reference the full architecture document that precedes this build.
 | D-21 | Zero goals → explicit error report | Diagnosable beats silent |
 | D-22 | Bounded critique, grounded rewrites, scoped to faithfulness | One judge per question; no blind retries |
 | D-24 | Memory decay = rerank by volatility class, never an age filter | One TTL is wrong for both stable and volatile facts |
+| D-23/D-28 | Escalation via `interrupt()`; nothing non-idempotent precedes the interrupt | The node re-executes on resume — history is appended in the resume update only |
 | — | Graceful degradation everywhere | First run must succeed on a bare laptop |
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
@@ -364,8 +376,6 @@ Decision IDs reference the full architecture document that precedes this build.
 
 - **MCP deferred**: tools are plain callables behind `tools/`; the calling
   pattern is MCP-shaped so the upgrade touches one module (design D-26).
-- **HITL deferred**: escalation triggers E1/E4 are log-line stubs, not
-  `interrupt()` pauses (design D-23/D-28).
 - **Contradiction detection is minimal**: the machinery (contested goals block
   coverage) is fully wired; the detector only honors explicit markers. A
   semantic detector slots into `merger` without wiring changes.
@@ -379,8 +389,7 @@ Decision IDs reference the full architecture document that precedes this build.
 
 ## Future Improvements
 
-In rough priority order: MCP tool mediation with typed workers → HITL
-interrupts for E1–E4 (checkpointer already in place) → server-side Qdrant
+In rough priority order: MCP tool mediation with typed workers → server-side Qdrant
 fusion/decay with payload indexes → semantic contradiction detection → memory
 supersession + GC job → judge-model quality scoring → token-usage telemetry
 from provider usage metadata.

@@ -36,6 +36,12 @@ def build_compiler_node(router: FallbackRouter):
     """Build the report compiler."""
 
     def compiler_node(state: ResearchState) -> Dict[str, Any]:
+        if state.abort_reason:
+            # Human abort (D-23): terminal, explicit, still reaches END.
+            report = (f"# Research Report — aborted by human reviewer\n\n"
+                      f"**Query:** {state.raw_query}\n\n"
+                      f"**Reason:** {state.abort_reason}\n")
+            return {"final_report": report}
         if state.planning_error:
             # D-21 path: an explicit, diagnosable error report beats silence.
             report = (f"# Research Report — planning failed\n\n"
@@ -54,8 +60,8 @@ def build_critic_node(router: FallbackRouter, settings: Settings):
     """Build the report critic (bounded self-critique loop, D-22)."""
 
     def critic_node(state: ResearchState) -> Dict[str, Any]:
-        if state.planning_error:
-            # Nothing to judge on the error-report path; wave it through so
+        if state.planning_error or state.abort_reason:
+            # Nothing to judge on the error/abort paths; wave them through so
             # the run still terminates at telemetry with a clear report.
             return {"critique_passed": True}
         result = router.complete_json(templates.critique(
@@ -71,11 +77,16 @@ def build_critic_node(router: FallbackRouter, settings: Settings):
         if not passed:
             update["critique_notes"] = notes  # accumulates via reducer
             if revision >= settings.max_revisions:
-                # E4 escalation stub: the full design interrupts for a human
-                # here (v3.1 D-23/D-28). Core build logs loudly and ships the
-                # report marked unreviewed — never silently, never as "good".
-                log_event(logger, "escalation.stub", level=logging.WARNING,
-                          trigger="E4", revisions=revision, notes=notes)
+                if settings.hitl_enabled:
+                    # D-23: raise E4 — the graph will interrupt for a human.
+                    update["escalation_trigger"] = "E4"
+                    log_event(logger, "escalation.raised", trigger="E4",
+                              revisions=revision)
+                else:
+                    # Stub path (HITL disabled): log loudly and ship the
+                    # report marked unreviewed — never silently as "good".
+                    log_event(logger, "escalation.stub", level=logging.WARNING,
+                              trigger="E4", revisions=revision, notes=notes)
         log_event(logger, "node.critique", passed=passed, revision=revision)
         return update
 

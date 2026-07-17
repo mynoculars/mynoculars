@@ -60,25 +60,33 @@ def build_memory_retrieve_node(memory: SemanticMemory) -> NodeFn:
     return memory_retrieve_node
 
 
-def build_goal_manager_node(router: FallbackRouter) -> NodeFn:
-    """Node: compose research goals, informed by any recalled memory."""
+def build_goal_manager_node(router: FallbackRouter, settings: Settings) -> NodeFn:
+    """Node: compose research goals, informed by memory and any human
+    redirect guidance (E1 escalation, D-23)."""
 
     def goal_manager_node(state: ResearchState) -> Dict[str, Any]:
         hints = [e.content[:150] for e in state.evidence if e.source == "memory"]
         result = router.complete_json(templates.compose_goals(
-            state.raw_query, state.classification.get("intent", "Unknown"), hints))
+            state.raw_query, state.classification.get("intent", "Unknown"), hints,
+            guidance=state.human_guidance))
         goals = [Goal(goal_id=g["goal_id"], description=g["description"])
                  for g in result.get("goals", [])]
         update: Dict[str, Any] = {"goals": goals,
+                                  "human_guidance": "",  # consumed; never reused stale
                                   "counters": {"llm_calls": 1,
                                                "composed_goals": float(len(goals))}}
         if not goals:
             # D-21: record, don't raise — routing sends this to the compiler
             # for an explicit error report. (Human escalation is the full
             # design's response; stubbed to a log line in this core build.)
-            log_event(logger, "escalation.stub", level=logging.WARNING,
-                      trigger="E1", reason="zero_goals")
             update["planning_error"] = "Goal composition produced zero goals."
+            if settings.hitl_enabled:
+                # D-23: the CHECK sets the trigger — routing functions are
+                # read-only in LangGraph and cannot write state.
+                update["escalation_trigger"] = "E1"
+            else:
+                log_event(logger, "escalation.stub", level=logging.WARNING,
+                          trigger="E1", reason="zero_goals")
         return update
 
     return goal_manager_node

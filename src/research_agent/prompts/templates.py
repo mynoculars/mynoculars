@@ -34,12 +34,18 @@ def classify(query: str) -> List[Message]:
             'JSON schema: {"intent": "<label>", "confidence": <0..1>}'}]
 
 
-def compose_goals(query: str, intent: str, memory_hints: List[str]) -> List[Message]:
-    """Goal composition. Schema: {"goals": [{"goal_id","description"}]}."""
+def compose_goals(query: str, intent: str, memory_hints: List[str],
+                  guidance: str = "") -> List[Message]:
+    """Goal composition. Schema: {"goals": [{"goal_id","description"}]}.
+
+    `guidance` carries a human redirect from an E1 escalation (D-23) —
+    injected verbatim so the reviewer's intent is not paraphrased away.
+    """
     hints = "\n".join(f"- {h}" for h in memory_hints) or "(none)"
+    steer = f"\nHuman reviewer guidance (follow it): {guidance}" if guidance else ""
     return [_SYSTEM, {"role": "user", "content":
             f"TASK=goals\nIntent: {intent}\nQuery: \"{query}\"\n"
-            f"Relevant facts from earlier research (may inform goals):\n{hints}\n"
+            f"Relevant facts from earlier research (may inform goals):\n{hints}{steer}\n"
             f"Compose 2-5 concrete research goals that together answer the query. "
             'JSON schema: {"goals": [{"goal_id": "g1", "description": "..."}]}'}]
 
@@ -55,14 +61,16 @@ def expand_tasks(goals: List[Goal], max_tasks: int) -> List[Message]:
 
 
 def generate_gaps(goals: List[Goal], evidence: List[Evidence], depth: int,
-                  max_tasks: int) -> List[Message]:
+                  max_tasks: int, guidance: str = "") -> List[Message]:
     """Gap analysis for uncovered goals. Same schema as expand_tasks."""
     uncovered = "\n".join(f"- {g.goal_id}: {g.description}"
                           for g in goals if not g.covered) or "(none)"
     have = "\n".join(f"- [{e.goal_id}] {e.content[:120]}" for e in evidence[-10:]) or "(none)"
+    steer = f"Human reviewer guidance (follow it): {guidance}\n" if guidance else ""
     return [_SYSTEM, {"role": "user", "content":
             f"TASK=gaps\nUncovered goals:\n{uncovered}\n"
             f"Evidence so far (tail):\n{have}\n"
+            f"{steer}"
             f"Iteration depth: {depth}. Produce at most {max_tasks} NEW search "
             f"queries that would cover the uncovered goals, highest value first. "
             'JSON schema: {"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>}]}'}]
