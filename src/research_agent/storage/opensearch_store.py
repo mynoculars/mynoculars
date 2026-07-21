@@ -29,14 +29,27 @@ logger = logging.getLogger(__name__)
 class OpenSearchStore:
     """Thin, failure-tolerant wrapper over opensearch-py."""
 
-    def __init__(self, url: str, index: str):
+    def __init__(self, url: str, index: str, username: str = "",
+                 password: str = "", use_ssl: bool = False,
+                 verify_certs: bool = False):
         """Connect lazily; mark unavailable instead of raising."""
         self.index = index
         self.available = False
         self._client = None
         try:
             from opensearchpy import OpenSearch
-            self._client = OpenSearch(hosts=[url], timeout=5)
+            kwargs = {"hosts": [url], "timeout": 5}
+            if use_ssl:
+                # verify_certs=False + self-signed cert -> opensearch-py emits a
+                # noisy InsecureRequestWarning per call; silence it deliberately.
+                kwargs["use_ssl"] = True
+                kwargs["verify_certs"] = verify_certs
+                if not verify_certs:
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            if username:
+                kwargs["http_auth"] = (username, password)
+            self._client = OpenSearch(**kwargs)
             self._client.info()  # liveness probe
             self.available = True
         except Exception as exc:  # noqa: BLE001

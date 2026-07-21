@@ -46,7 +46,12 @@ def build_app_and_settings():
 
     router = FallbackRouter.from_settings(settings)
     dense = QdrantStore(settings.qdrant_url, settings.corpus_index)
-    keyword = OpenSearchStore(settings.opensearch_url, settings.corpus_index)
+    keyword = OpenSearchStore(
+        settings.opensearch_url, settings.corpus_index,
+        username=settings.opensearch_username,
+        password=settings.opensearch_password,
+        use_ssl=settings.opensearch_use_ssl,
+        verify_certs=settings.opensearch_verify_certs)
     tool = make_corpus_tool(HybridRetriever(dense, keyword))
     memory = SemanticMemory(
         QdrantStore(settings.qdrant_url, settings.memory_collection),

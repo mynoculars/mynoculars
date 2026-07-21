@@ -29,7 +29,7 @@ def settings() -> Settings:
 @pytest.fixture
 def stub_router() -> FallbackRouter:
     """Router in stub mode: deterministic, no fallback."""
-    return FallbackRouter(StubClient(), None, quality_threshold=0.6)
+    return FallbackRouter([StubClient()], quality_threshold=0.6)
 
 
 @pytest.fixture

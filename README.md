@@ -286,6 +286,19 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
+#hf download Qwen/Qwen2.5-7B-Instruct-GGUF --include "qwen2.5-7b-instruct-q5_k_m*.gguf" --local-dir .
+
+# Download Cogito
+hf download bartowski/deepcogito_cogito-v1-preview-llama-8B-GGUF `
+  --include "deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf" `
+  --local-dir .
+
+#Bring up th LLM
+PS D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\llama-precompiled> .\llama-server.exe `
+>>   -m "D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf" `  
+
+#Test its Chat window on Browser by asking a general question
+http://127.0.0.1:8080/
 # 2. Configure
 copy .env.example .env        # defaults run fully offline (LLM_MODE=stub)
 

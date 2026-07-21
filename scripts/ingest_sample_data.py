@@ -34,7 +34,12 @@ def main() -> int:
     docs = [json.loads(line) for line in corpus_path.read_text().splitlines() if line.strip()]
     print(f"Loaded {len(docs)} sample documents")
 
-    keyword = OpenSearchStore(settings.opensearch_url, settings.corpus_index)
+    keyword = OpenSearchStore(
+        settings.opensearch_url, settings.corpus_index,
+        username=settings.opensearch_username,
+        password=settings.opensearch_password,
+        use_ssl=settings.opensearch_use_ssl,
+        verify_certs=settings.opensearch_verify_certs)
     n_kw = keyword.ingest(docs)
     print(f"OpenSearch: {'indexed ' + str(n_kw) if n_kw else 'SKIPPED (unreachable)'}")
 

@@ -137,12 +137,12 @@ class _Fine:
 
 
 def test_router_falls_back_on_primary_error():
-    router = FallbackRouter(_Boom(), _Fine(), quality_threshold=0.6)
+    router = FallbackRouter([_Boom(), _Fine()], quality_threshold=0.6)
     assert router.complete_json([{"role": "user", "content": "x"}]) == {"ok": True}
 
 
 def test_router_raises_when_no_fallback():
-    router = FallbackRouter(_Boom(), None, quality_threshold=0.6)
+    router = FallbackRouter([_Boom()], quality_threshold=0.6)
     with pytest.raises(RuntimeError):
         router.complete_json([{"role": "user", "content": "x"}])
 
@@ -186,3 +186,64 @@ def test_full_graph_runs_offline(graph, settings):
     assert tele["recall"] == 1.0             # fake tool covers both goals
     assert tele["critique_passed"] is True
     assert tele["iterations"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Fallback CHAIN (primary -> Mistral -> Gemini), N-provider router
+# ---------------------------------------------------------------------------
+
+
+class _Named:
+    """Stub provider: errors, low-quality, or good answer. `behavior` in
+    {"error","low","answer"}. On a TASK=quality scoring call it reports its
+    own quality so the router's gate can be exercised."""
+
+    def __init__(self, name, behavior):
+        self.name = name
+        self.behavior = behavior
+
+    def complete(self, messages, temperature=0.2):
+        import json
+        if messages and "TASK=quality" in messages[-1]["content"]:
+            return json.dumps({"score": 0.2 if self.behavior == "low" else 0.9})
+        if self.behavior == "error":
+            raise RuntimeError(f"{self.name} down")
+        return f"answer from {self.name}"
+
+    def complete_json(self, messages, temperature=0.0):
+        import json
+        return json.loads(self.complete(messages, temperature))
+
+
+def test_chain_steps_primary_to_mistral_to_gemini_on_error():
+    chain = FallbackRouter(
+        [_Named("primary", "error"), _Named("mistral", "error"),
+         _Named("gemini", "answer")], quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "answer from gemini"
+
+
+def test_chain_stops_at_first_good_provider():
+    chain = FallbackRouter(
+        [_Named("primary", "answer"), _Named("mistral", "answer"),
+         _Named("gemini", "answer")], quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "answer from primary"
+
+
+def test_chain_steps_on_low_quality_then_serves_next():
+    chain = FallbackRouter(
+        [_Named("primary", "low"), _Named("mistral", "answer")],
+        quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "answer from mistral"
+
+
+def test_chain_json_cascades_on_error():
+    import json
+
+    class _Json:
+        name = "j"
+        def complete(self, m, temperature=0.2): return json.dumps({"ok": True})
+        def complete_json(self, m, temperature=0.0): return {"ok": True}
+
+    chain = FallbackRouter([_Named("primary", "error"), _Json()],
+                           quality_threshold=0.6)
+    assert chain.complete_json([{"role": "user", "content": "x"}]) == {"ok": True}

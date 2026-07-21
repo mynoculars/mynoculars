@@ -1,27 +1,35 @@
 """
-llm/router.py — Primary-then-fallback model routing.
+llm/router.py — Chained provider fallback (primary → … → last).
 
 Purpose:
-    Every LLM call in the agent goes through FallbackRouter, which tries the
-    primary model (Qwen Cogito) and falls back to Gemini Flash when the call
-    fails or its quality is below threshold.
+    Every LLM call in the agent goes through FallbackRouter, which tries an
+    ORDERED CHAIN of providers and steps to the next one whenever a provider
+    is unavailable/errors OR returns below-threshold quality. Default chain:
+    local Qwen Cogito → Mistral → Gemini Flash.
 
 Responsibilities:
-    - Route complete()/complete_json() with automatic fallback.
-    - Decide WHEN to fall back (the policy lives here, nowhere else):
-        1. transport/HTTP error from the primary,
+    - Route complete()/complete_json() down the chain.
+    - Decide WHEN to step to the next provider (the policy lives here, nowhere
+      else), applying the SAME rule at every hop:
+        1. transport/HTTP error from the current provider,
         2. unparseable JSON when JSON was required,
         3. self-evaluated quality score below llm_quality_threshold
            (free-text answers only; see evaluation/quality.py).
-    - Log every fallback decision so runs are auditable.
+    - Log every hop so runs are auditable (which provider served, why we moved).
 
-Design decision (self-evaluated quality):
-    A model scoring its own answer is a weak but cheap signal — good enough
-    to catch obviously broken output from a small local model, which is the
-    actual failure mode this guards. Alternatives considered: a second-model
-    judge on every call (doubles cost/latency) or perplexity heuristics
-    (needs logprobs the compat endpoint may not return). Limitation stated
-    plainly: self-scores are optimistic; tune the threshold empirically.
+Design decisions:
+    - Generalized from a fixed primary/fallback pair to an N-provider list so
+      adding a fourth provider is a config change, not a code change. The chain
+      is just an ordered list of ChatClients; routing logic is identical at
+      every position.
+    - Same trigger (error OR low quality) at every hop, per requirement.
+      Quality is scored by the SAME provider that produced the answer — a weak
+      but cheap signal that catches broken output. A provider that errors on the
+      quality-scoring call is treated as "quality unknown → keep its answer"
+      rather than cascading further, so a flaky scorer can't burn the whole
+      chain (see _passes_quality).
+    - Stub mode builds a single-element chain with no downstream providers, so
+      deterministic tests never silently route elsewhere.
 """
 
 import logging
@@ -36,61 +44,136 @@ logger = logging.getLogger(__name__)
 
 
 class FallbackRouter:
-    """Primary/fallback orchestration over two ChatClients."""
+    """Ordered-chain orchestration over one or more ChatClients."""
 
-    def __init__(self, primary: ChatClient, fallback: Optional[ChatClient],
-                 quality_threshold: float):
-        """fallback may be None (e.g. stub mode) — then errors just raise."""
-        self.primary = primary
-        self.fallback = fallback
+    def __init__(self, providers: List[ChatClient], quality_threshold: float):
+        """`providers` is the fallback ORDER: index 0 is tried first, and each
+        subsequent provider is a fallback for the ones before it. Must be
+        non-empty. A single-element chain simply never falls back."""
+        if not providers:
+            raise ValueError("FallbackRouter needs at least one provider")
+        self.providers = providers
         self.quality_threshold = quality_threshold
 
     # -- factory ------------------------------------------------------------
 
     @classmethod
     def from_settings(cls, s: Settings) -> "FallbackRouter":
-        """Build the router the way cli/api do. Stub mode gets no fallback —
-        deterministic tests must never silently route elsewhere."""
+        """Build the router the way cli/api do.
+
+        Stub mode -> a single stub provider, no downstream (deterministic tests
+        must never silently route elsewhere).
+
+        Live mode -> the chain [primary, *fallbacks], skipping any fallback that
+        has no API key configured, so an unconfigured provider is simply absent
+        from the chain rather than a guaranteed error mid-run.
+        """
         if s.llm_mode == "stub":
-            return cls(StubClient(), None, s.llm_quality_threshold)
-        primary = OpenAICompatibleClient(
+            return cls([StubClient()], s.llm_quality_threshold)
+
+        chain: List[ChatClient] = [OpenAICompatibleClient(
             "primary", s.llm_primary_base_url, s.llm_primary_api_key,
-            s.llm_primary_model, s.llm_timeout_seconds)
-        fallback = OpenAICompatibleClient(
-            "fallback", s.llm_fallback_base_url, s.llm_fallback_api_key,
-            s.llm_fallback_model, s.llm_timeout_seconds)
-        return cls(primary, fallback, s.llm_quality_threshold)
+            s.llm_primary_model, s.llm_timeout_seconds)]
+
+        # Ordered fallbacks. Each is included only if it has an API key -- a
+        # provider you haven't configured is skipped, not a landmine.
+        for name, base, key, model in (
+            ("mistral", s.llm_mistral_base_url, s.llm_mistral_api_key, s.llm_mistral_model),
+            ("gemini", s.llm_fallback_base_url, s.llm_fallback_api_key, s.llm_fallback_model),
+        ):
+            if key:
+                chain.append(OpenAICompatibleClient(
+                    name, base, key, model, s.llm_timeout_seconds))
+
+        log_event(logger, "llm.chain_built", providers=[p.name for p in chain])
+        return cls(chain, s.llm_quality_threshold)
+
+    # -- internals ----------------------------------------------------------
+
+    def _passes_quality(self, provider: ChatClient, messages: List[Message],
+                        answer: str) -> bool:
+        """True if `answer` clears the quality gate (or can't be scored).
+
+        A scorer that itself errors returns 1.0 (see evaluation.quality), so a
+        flaky quality check keeps the answer rather than cascading -- the gate
+        exists to catch bad ANSWERS, not to punish a bad scoring call.
+        """
+        score = score_answer(provider, messages, answer)
+        if score < self.quality_threshold:
+            log_event(logger, "llm.quality_reject", provider=provider.name,
+                      score=score, threshold=self.quality_threshold)
+            return False
+        return True
 
     # -- routed calls -------------------------------------------------------
 
     def complete_json(self, messages: List[Message]) -> Dict[str, Any]:
-        """Structured call. Fallback on error or unparseable JSON.
+        """Structured call. Step down the chain on error/unparseable JSON.
 
-        Returns the parsed object; raises only if BOTH providers fail —
-        callers treat that as a node failure handled by graph-level policy.
+        No quality gate here: a successfully parsed JSON object either satisfies
+        the caller's schema or it doesn't, and the nodes validate their own
+        required keys. Returns the first provider's parsed object; raises the
+        LAST provider's error only if every provider in the chain fails.
         """
-        try:
-            return self.primary.complete_json(messages)
-        except Exception as exc:  # noqa: BLE001 — any primary failure routes over
-            if self.fallback is None:
-                raise
-            log_event(logger, "llm.fallback", reason=type(exc).__name__, mode="json")
-            return self.fallback.complete_json(messages)
+        last_exc: Optional[Exception] = None
+        for i, provider in enumerate(self.providers):
+            try:
+                result = provider.complete_json(messages)
+                if i > 0:
+                    log_event(logger, "llm.served_by_fallback",
+                              provider=provider.name, position=i, mode="json")
+                return result
+            except Exception as exc:  # noqa: BLE001 -- any failure steps to next
+                last_exc = exc
+                nxt = (self.providers[i + 1].name
+                       if i + 1 < len(self.providers) else None)
+                log_event(logger, "llm.fallback", from_provider=provider.name,
+                          to_provider=nxt, reason=type(exc).__name__, mode="json")
+        assert last_exc is not None
+        raise last_exc
 
     def complete(self, messages: List[Message]) -> str:
-        """Free-text call. Fallback on error OR low self-evaluated quality."""
-        try:
-            answer = self.primary.complete(messages)
-        except Exception as exc:  # noqa: BLE001
-            if self.fallback is None:
-                raise
-            log_event(logger, "llm.fallback", reason=type(exc).__name__, mode="text")
-            return self.fallback.complete(messages)
+        """Free-text call. Step down the chain on error OR low quality.
 
-        if self.fallback is not None:
-            quality = score_answer(self.primary, messages, answer)
-            if quality < self.quality_threshold:
-                log_event(logger, "llm.fallback", reason="low_quality",
-                          score=quality, threshold=self.quality_threshold)
-                return self.fallback.complete(messages)
-        return answer
+        Same trigger at every hop. Returns the first answer that both succeeds
+        and clears the quality gate; if none does, returns the LAST provider's
+        answer when it produced one (better a low-scored answer than nothing),
+        or raises if the entire chain errored.
+        """
+        last_exc: Optional[Exception] = None
+        last_answer: Optional[str] = None
+        last_name: str = ""
+
+        for i, provider in enumerate(self.providers):
+            # 1. availability / error
+            try:
+                answer = provider.complete(messages)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                nxt = (self.providers[i + 1].name
+                       if i + 1 < len(self.providers) else None)
+                log_event(logger, "llm.fallback", from_provider=provider.name,
+                          to_provider=nxt, reason=type(exc).__name__, mode="text")
+                continue
+
+            last_answer, last_name = answer, provider.name
+
+            # 2. quality gate -- only worth checking if a fallback remains
+            has_next = i + 1 < len(self.providers)
+            if has_next and not self._passes_quality(provider, messages, answer):
+                log_event(logger, "llm.fallback", from_provider=provider.name,
+                          to_provider=self.providers[i + 1].name,
+                          reason="low_quality", mode="text")
+                continue
+
+            if i > 0:
+                log_event(logger, "llm.served_by_fallback",
+                          provider=provider.name, position=i, mode="text")
+            return answer
+
+        # Chain exhausted. Prefer the last answer we got over raising.
+        if last_answer is not None:
+            log_event(logger, "llm.chain_exhausted_low_quality", provider=last_name)
+            return last_answer
+        assert last_exc is not None
+        raise last_exc

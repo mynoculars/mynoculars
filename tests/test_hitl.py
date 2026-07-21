@@ -65,7 +65,7 @@ class BrokenTool:
 
 def test_e1_interrupts_then_approve_ships_error_report(off_memory, fake_tool,
                                                        hitl_settings):
-    router = FallbackRouter(ZeroGoalsStub(), None, 0.6)
+    router = FallbackRouter([ZeroGoalsStub()], 0.6)
     graph = build_graph(router, fake_tool, off_memory, hitl_settings, MemorySaver())
     cfg = _cfg(hitl_settings, "hitl-e1")
 
@@ -84,7 +84,7 @@ def test_e1_interrupts_then_approve_ships_error_report(off_memory, fake_tool,
 
 
 def test_e1_abort_produces_abort_report(off_memory, fake_tool, hitl_settings):
-    router = FallbackRouter(ZeroGoalsStub(), None, 0.6)
+    router = FallbackRouter([ZeroGoalsStub()], 0.6)
     graph = build_graph(router, fake_tool, off_memory, hitl_settings, MemorySaver())
     cfg = _cfg(hitl_settings, "hitl-e1-abort")
 
@@ -123,7 +123,7 @@ def test_e3_interrupts_then_approve_ships_partial(off_memory, stub_router,
 
 
 def test_e4_approve_ships_without_memory(off_memory, fake_tool, hitl_settings):
-    router = FallbackRouter(RejectingCriticStub(), None, 0.6)
+    router = FallbackRouter([RejectingCriticStub()], 0.6)
     graph = build_graph(router, fake_tool, off_memory, hitl_settings, MemorySaver())
     cfg = _cfg(hitl_settings, "hitl-e4")
 
@@ -138,7 +138,7 @@ def test_e4_approve_ships_without_memory(off_memory, fake_tool, hitl_settings):
 
 def test_e4_redirect_rearms_one_cycle_then_reescalates(off_memory, fake_tool,
                                                        hitl_settings):
-    router = FallbackRouter(RejectingCriticStub(), None, 0.6)
+    router = FallbackRouter([RejectingCriticStub()], 0.6)
     graph = build_graph(router, fake_tool, off_memory, hitl_settings, MemorySaver())
     cfg = _cfg(hitl_settings, "hitl-e4-redirect")
 

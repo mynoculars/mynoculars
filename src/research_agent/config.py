@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     llm_primary_base_url: str = "http://127.0.0.1:8080/v1"
     llm_primary_api_key: str = "not-needed-for-local"
     llm_primary_model: str = "qwen-cogito"
+    # Fallback chain, in order: Mistral first, then Gemini. Each is included
+    # in the chain only if its API key is set (see FallbackRouter.from_settings).
+    llm_mistral_base_url: str = "https://api.mistral.ai/v1"
+    llm_mistral_api_key: str = ""
+    llm_mistral_model: str = "mistral-small-latest"
     llm_fallback_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = "gemini-2.0-flash"
@@ -53,6 +58,12 @@ class Settings(BaseSettings):
     postgres_dsn: str = "postgresql://agent:agent@localhost:5432/agent"
     qdrant_url: str = "http://localhost:6333"
     opensearch_url: str = "http://localhost:9200"
+    # OpenSearch auth/SSL (blank username = anonymous plain-HTTP, unchanged
+    # default). Set these when your cluster has the security plugin enabled.
+    opensearch_username: str = ""
+    opensearch_password: str = ""
+    opensearch_use_ssl: bool = False
+    opensearch_verify_certs: bool = False
     memory_collection: str = "agent_semantic_memory"
     corpus_index: str = "agent_corpus"
 

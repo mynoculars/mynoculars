@@ -34,7 +34,7 @@ class RejectingCriticStub(StubClient):
 
 def test_critique_exhaustion_terminates_and_skips_memory(
         fake_tool, off_memory, settings):
-    router = FallbackRouter(RejectingCriticStub(), None, quality_threshold=0.6)
+    router = FallbackRouter([RejectingCriticStub()], quality_threshold=0.6)
     graph = build_graph(router, fake_tool, off_memory, settings, MemorySaver())
 
     result = graph.invoke(
