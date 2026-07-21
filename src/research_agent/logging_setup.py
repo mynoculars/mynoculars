@@ -63,6 +63,10 @@ def configure_logging(level: str = "INFO") -> None:
     root.handlers[:] = [handler]
     root.setLevel(level.upper())
     root._agent_configured = True  # type: ignore[attr-defined]
+    
+    # Mutes the third-party stack traces while keeping your clean degradation log lines. Level 1 run
+    logging.getLogger("opensearch").setLevel(logging.ERROR)
+    logging.getLogger("qdrant_client").setLevel(logging.ERROR)
 
 
 def log_event(logger: logging.Logger, msg: str, level: int = logging.INFO, **fields: Any) -> None:

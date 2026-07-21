@@ -247,3 +247,33 @@ def test_chain_json_cascades_on_error():
     chain = FallbackRouter([_Named("primary", "error"), _Json()],
                            quality_threshold=0.6)
     assert chain.complete_json([{"role": "user", "content": "x"}]) == {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Debug tracer (--debug / DEBUG_TRACE)
+# ---------------------------------------------------------------------------
+
+
+def test_tracer_records_and_flushes(tmp_path):
+    from research_agent.tracing import Tracer
+    t = Tracer("run-test", log_dir=str(tmp_path))
+    t.record_llm("LOCAL PRIMARY (x)", "classify",
+                 [{"role": "user", "content": "hello"}], '{"ok":1}', 10, 3, 1.5)
+    t.record_retrieval("QDRANT (dense)", "redis vs memcached",
+                       [{"title": "doc", "similarity": 0.9}])
+    path = t.flush()
+    assert path is not None
+    text = open(path, encoding="utf-8").read()
+    assert "RETRIEVED FROM LOCAL PRIMARY (X)" in text
+    assert "node=classify" in text
+    assert "RETRIEVED FROM QDRANT (DENSE)" in text
+    assert "redis vs memcached" in text
+
+
+def test_null_tracer_is_noop(tmp_path):
+    from research_agent.tracing import NullTracer
+    t = NullTracer()
+    assert t.enabled is False
+    t.record_llm("x", None, [], "", None, None, 0.0)
+    t.record_retrieval("x", "q", [])
+    assert t.flush() is None

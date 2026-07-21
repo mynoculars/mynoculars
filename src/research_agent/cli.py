@@ -28,14 +28,19 @@ from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.orchestration.graph import build_graph
 from research_agent.retrieval.hybrid import HybridRetriever
 from research_agent.state import ResearchState
+from research_agent.tracing import NullTracer, Tracer
 from research_agent.storage.opensearch_store import OpenSearchStore
 from research_agent.storage.postgres import get_checkpointer, record_run
 from research_agent.storage.qdrant_store import QdrantStore
 from research_agent.tools.corpus_search import make_corpus_tool
 
 
-def build_app_and_settings():
+def build_app_and_settings(tracer=None):
     """Assemble the full application (shared by CLI and API).
+
+    Parameters:
+        tracer: optional Tracer for debug tracing (threaded into the LLM chain
+            and both retrieval stores). None -> no tracing overhead.
 
     Returns:
         (compiled_graph, settings) — every dependency wired from Settings,
@@ -43,18 +48,21 @@ def build_app_and_settings():
     """
     settings = get_settings()
     configure_logging(settings.log_level)
+    tracer = tracer or NullTracer()
 
-    router = FallbackRouter.from_settings(settings)
-    dense = QdrantStore(settings.qdrant_url, settings.corpus_index)
+    router = FallbackRouter.from_settings(settings, tracer=tracer)
+    dense = QdrantStore(settings.qdrant_url, settings.corpus_index, tracer=tracer)
     keyword = OpenSearchStore(
         settings.opensearch_url, settings.corpus_index,
         username=settings.opensearch_username,
         password=settings.opensearch_password,
         use_ssl=settings.opensearch_use_ssl,
-        verify_certs=settings.opensearch_verify_certs)
+        verify_certs=settings.opensearch_verify_certs,
+        tracer=tracer)
     tool = make_corpus_tool(HybridRetriever(dense, keyword))
     memory = SemanticMemory(
-        QdrantStore(settings.qdrant_url, settings.memory_collection),
+        QdrantStore(settings.qdrant_url, settings.memory_collection, tracer=tracer,
+                    trace_label="QDRANT (semantic memory)"),
         settings.memory_top_k,
         settings.decay_half_life_days_semi_stable,
         settings.decay_half_life_days_volatile,
@@ -71,11 +79,21 @@ def main(argv=None) -> int:
     parser.add_argument("--thread-id", default=None,
                         help="Run identity (fresh UUID per run by default; "
                              "reuse an old id to resume — design D-20)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Dump exact prompts, raw responses, provider, "
+                             "tokens/latency, and every retrieval engine's hits "
+                             "to logs/trace-<run_id>.txt (also enabled by "
+                             "DEBUG_TRACE=true in .env).")
     args = parser.parse_args(argv)
 
-    app, settings = build_app_and_settings()
     thread_id = args.thread_id or f"run-{uuid.uuid4().hex[:12]}"
     run_id_var.set(thread_id)  # correlate every log line to this run
+
+    settings_peek = get_settings()
+    trace_on = args.debug or settings_peek.debug_trace
+    tracer = Tracer(thread_id) if trace_on else NullTracer()
+
+    app, settings = build_app_and_settings(tracer=tracer)
 
     config = {"configurable": {"thread_id": thread_id},
               "recursion_limit": settings.recursion_limit}
@@ -95,6 +113,10 @@ def main(argv=None) -> int:
         guidance = input("guidance: ").strip() if action == "redirect" else ""
         result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
                             config=config)
+
+    trace_path = tracer.flush()
+    if trace_path:
+        print(f"[debug trace written to {trace_path}]")
 
     print(result["final_report"])
     print("\n--- telemetry ---")

@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     decay_half_life_days_semi_stable: float = 90.0
     decay_half_life_days_volatile: float = 14.0
 
+    # Debug tracing: when true (or --debug on the CLI), dump the exact prompt,
+    # raw response, provider, tokens and latency of every LLM call, plus every
+    # retrieval engine's hits, to logs/trace-<run_id>.txt. Off by default.
+    debug_trace: bool = False
+
     log_level: str = "INFO"
 
 

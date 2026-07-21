@@ -42,6 +42,7 @@ def build_classify_node(router: FallbackRouter) -> NodeFn:
     """Node: classify the query intent. Writes classification + counters."""
 
     def classify_node(state: ResearchState) -> Dict[str, Any]:
+        router.set_node("classify")
         result = router.complete_json(templates.classify(state.raw_query))
         log_event(logger, "node.classify", intent=result.get("intent"))
         return {"classification": result, "counters": {"llm_calls": 1}}
@@ -66,6 +67,7 @@ def build_goal_manager_node(router: FallbackRouter, settings: Settings) -> NodeF
 
     def goal_manager_node(state: ResearchState) -> Dict[str, Any]:
         hints = [e.content[:150] for e in state.evidence if e.source == "memory"]
+        router.set_node("goal_manager")
         result = router.complete_json(templates.compose_goals(
             state.raw_query, state.classification.get("intent", "Unknown"), hints,
             guidance=state.human_guidance))
@@ -97,6 +99,7 @@ def build_task_expander_node(router: FallbackRouter, settings: Settings) -> Node
     """Node: expand goals into the initial ranked, capped task backlog."""
 
     def task_expander_node(state: ResearchState) -> Dict[str, Any]:
+        router.set_node("task_expander")
         result = router.complete_json(
             templates.expand_tasks(state.goals, settings.max_fanout))
         tasks = cap_and_filter(result.get("tasks", []), state, depth=0,

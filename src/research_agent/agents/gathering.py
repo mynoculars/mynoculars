@@ -128,6 +128,7 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings):
     """Build the gap generator: new tasks for uncovered goals."""
 
     def gap_generator_node(state: ResearchState) -> Dict[str, Any]:
+        router.set_node("gap_generator")
         result = router.complete_json(templates.generate_gaps(
             state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
             guidance=state.human_guidance))

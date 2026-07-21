@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 class QdrantStore:
     """Thin, failure-tolerant wrapper over qdrant-client."""
 
-    def __init__(self, url: str, collection: str):
+    def __init__(self, url: str, collection: str, tracer: Any = None,
+                 trace_label: str = "QDRANT (dense)"):
         """Connect lazily; mark unavailable instead of raising."""
         self.collection = collection
         self.available = False
@@ -47,6 +48,8 @@ class QdrantStore:
         except Exception as exc:  # noqa: BLE001 — degrade, don't die
             log_event(logger, "qdrant.unavailable", level=logging.WARNING,
                       reason=type(exc).__name__)
+        self._tracer = tracer
+        self._label = trace_label
 
     # -- internals ----------------------------------------------------------
 
@@ -108,4 +111,6 @@ class QdrantStore:
             payload["similarity"] = float(h.score)
             payload["age_days"] = (now - float(payload.get("created_at", now))) / 86400.0
             out.append(payload)
+        if self._tracer is not None:
+            self._tracer.record_retrieval(self._label, query, out)
         return out

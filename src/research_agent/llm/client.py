@@ -26,7 +26,8 @@ Design decisions:
 import json
 import logging
 import re
-from typing import Any, Dict, List, Protocol
+import time
+from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
 
@@ -72,30 +73,51 @@ def _extract_json(text: str) -> Dict[str, Any]:
 class OpenAICompatibleClient:
     """Chat client for any /v1/chat/completions endpoint."""
 
-    def __init__(self, name: str, base_url: str, api_key: str, model: str, timeout: float = 60.0):
-        """Parameters map directly to Settings fields; see config.py."""
+    def __init__(self, name: str, base_url: str, api_key: str, model: str,
+                 timeout: float = 60.0, tracer: Any = None, display_label: str = ""):
+        """Parameters map directly to Settings fields; see config.py.
+
+        `tracer` (a Tracer, optional) receives the exact prompt/response/tokens/
+        latency for every call when debug tracing is on. `display_label` is the
+        human name shown in the trace banner (e.g. "GOOGLE GEMINI FLASH"); it
+        falls back to the model id. `_trace_node` is set by the router before
+        each call so the trace shows which graph node issued it."""
         self.name = name
         self._model = model
+        self._tracer = tracer
+        self._label = display_label or model
+        self._trace_node: Optional[str] = None
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=timeout,
         )
 
+    def set_trace_node(self, node: Optional[str]) -> None:
+        """Router sets the current node name so traces attribute each call."""
+        self._trace_node = node
+
     def complete(self, messages: List[Message], temperature: float = 0.2) -> str:
         """POST the transcript; return assistant text. Raises httpx errors
         upward — the router owns retry/fallback policy, not this class."""
+        started = time.perf_counter()
         resp = self._http.post(
             "/chat/completions",
             json={"model": self._model, "messages": messages, "temperature": temperature},
         )
         resp.raise_for_status()
         data = resp.json()
+        latency = time.perf_counter() - started
         text: str = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
+        pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
         log_event(logger, "llm.call", provider=self.name, model=self._model,
-                  prompt_tokens=usage.get("prompt_tokens"),
-                  completion_tokens=usage.get("completion_tokens"))
+                  label=self._label, node=self._trace_node,
+                  latency_s=round(latency, 3),
+                  prompt_tokens=pt, completion_tokens=ct)
+        if self._tracer is not None:
+            self._tracer.record_llm(self._label, self._trace_node, messages,
+                                    text, pt, ct, latency)
         return text
 
     def complete_json(self, messages: List[Message], temperature: float = 0.0) -> Dict[str, Any]:
@@ -113,6 +135,13 @@ class StubClient:
     """
 
     name = "stub"
+
+    def __init__(self, tracer: Any = None):
+        self._tracer = tracer
+        self._trace_node: Optional[str] = None
+
+    def set_trace_node(self, node: Optional[str]) -> None:
+        self._trace_node = node
 
     _CANNED: Dict[str, Dict[str, Any]] = {
         "classify": {"intent": "Comparison", "confidence": 0.9},
@@ -132,12 +161,19 @@ class StubClient:
     def complete(self, messages: List[Message], temperature: float = 0.2) -> str:
         """Return canned JSON (as text) for known tasks, else a fixed report."""
         last = messages[-1]["content"]
+        answer = None
         for tag, payload in self._CANNED.items():
             if f"TASK={tag}" in last:
-                return json.dumps(payload)
-        return ("# Research Report (stub mode)\n\n"
-                "This deterministic report proves the full graph executed "
-                "offline. Switch LLM_MODE=live for real model output.")
+                answer = json.dumps(payload)
+                break
+        if answer is None:
+            answer = ("# Research Report (stub mode)\n\n"
+                      "This deterministic report proves the full graph executed "
+                      "offline. Switch LLM_MODE=live for real model output.")
+        if self._tracer is not None:
+            self._tracer.record_llm("STUB (offline)", self._trace_node,
+                                    messages, answer, None, None, 0.0)
+        return answer
 
     def complete_json(self, messages: List[Message], temperature: float = 0.0) -> Dict[str, Any]:
         """Parse the canned reply."""

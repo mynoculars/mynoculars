@@ -49,6 +49,7 @@ def build_compiler_node(router: FallbackRouter):
                       f"**Problem:** {state.planning_error}\n\n"
                       f"No retrieval was attempted. Rephrase the query and retry.")
             return {"final_report": report}
+        router.set_node("compiler")
         report = router.complete(templates.compile_report(
             state.raw_query, state.goals, state.evidence, state.critique_notes))
         return {"final_report": report, "counters": {"llm_calls": 1}}
@@ -64,6 +65,7 @@ def build_critic_node(router: FallbackRouter, settings: Settings):
             # Nothing to judge on the error/abort paths; wave them through so
             # the run still terminates at telemetry with a clear report.
             return {"critique_passed": True}
+        router.set_node("critic")
         result = router.complete_json(templates.critique(
             state.raw_query, state.final_report, state.goals))
         passed = bool(result.get("passed", False))

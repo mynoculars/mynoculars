@@ -31,7 +31,8 @@ class OpenSearchStore:
 
     def __init__(self, url: str, index: str, username: str = "",
                  password: str = "", use_ssl: bool = False,
-                 verify_certs: bool = False):
+                 verify_certs: bool = False, tracer: Any = None,
+                 trace_label: str = "OPENSEARCH (BM25)"):
         """Connect lazily; mark unavailable instead of raising."""
         self.index = index
         self.available = False
@@ -55,6 +56,8 @@ class OpenSearchStore:
         except Exception as exc:  # noqa: BLE001
             log_event(logger, "opensearch.unavailable", level=logging.WARNING,
                       reason=type(exc).__name__)
+        self._tracer = tracer
+        self._label = trace_label
 
     def ensure_index(self) -> None:
         """Create the corpus index with a plain text mapping if missing."""
@@ -91,4 +94,6 @@ class OpenSearchStore:
             doc = dict(hit["_source"])
             doc["bm25_score"] = float(hit["_score"])
             out.append(doc)
+        if self._tracer is not None:
+            self._tracer.record_retrieval(self._label, query, out)
         return out

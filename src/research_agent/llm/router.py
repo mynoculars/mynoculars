@@ -36,6 +36,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from research_agent.config import Settings
+from research_agent.tracing import NullTracer, Tracer
 from research_agent.evaluation.quality import score_answer
 from research_agent.llm.client import ChatClient, Message, OpenAICompatibleClient, StubClient
 from research_agent.logging_setup import log_event
@@ -46,19 +47,30 @@ logger = logging.getLogger(__name__)
 class FallbackRouter:
     """Ordered-chain orchestration over one or more ChatClients."""
 
-    def __init__(self, providers: List[ChatClient], quality_threshold: float):
+    def __init__(self, providers: List[ChatClient], quality_threshold: float,
+                 tracer: Optional[Tracer] = None):
         """`providers` is the fallback ORDER: index 0 is tried first, and each
         subsequent provider is a fallback for the ones before it. Must be
-        non-empty. A single-element chain simply never falls back."""
+        non-empty. A single-element chain simply never falls back. `tracer`
+        (optional) is forwarded to the clients for debug tracing."""
         if not providers:
             raise ValueError("FallbackRouter needs at least one provider")
         self.providers = providers
         self.quality_threshold = quality_threshold
+        self.tracer = tracer or NullTracer()
+
+    def set_node(self, node: Optional[str]) -> None:
+        """Tag subsequent calls with the current graph node, so the trace and
+        the llm.call log line show WHICH node issued each call."""
+        for p in self.providers:
+            setter = getattr(p, "set_trace_node", None)
+            if setter:
+                setter(node)
 
     # -- factory ------------------------------------------------------------
 
     @classmethod
-    def from_settings(cls, s: Settings) -> "FallbackRouter":
+    def from_settings(cls, s: Settings, tracer: Optional[Tracer] = None) -> "FallbackRouter":
         """Build the router the way cli/api do.
 
         Stub mode -> a single stub provider, no downstream (deterministic tests
@@ -69,24 +81,26 @@ class FallbackRouter:
         from the chain rather than a guaranteed error mid-run.
         """
         if s.llm_mode == "stub":
-            return cls([StubClient()], s.llm_quality_threshold)
+            return cls([StubClient(tracer=tracer)], s.llm_quality_threshold, tracer)
 
         chain: List[ChatClient] = [OpenAICompatibleClient(
             "primary", s.llm_primary_base_url, s.llm_primary_api_key,
-            s.llm_primary_model, s.llm_timeout_seconds)]
+            s.llm_primary_model, s.llm_timeout_seconds, tracer,
+            display_label=f"LOCAL PRIMARY ({s.llm_primary_model})")]
 
-        # Ordered fallbacks. Each is included only if it has an API key -- a
-        # provider you haven't configured is skipped, not a landmine.
-        for name, base, key, model in (
-            ("mistral", s.llm_mistral_base_url, s.llm_mistral_api_key, s.llm_mistral_model),
-            ("gemini", s.llm_fallback_base_url, s.llm_fallback_api_key, s.llm_fallback_model),
+        for name, base, key, model, label in (
+            ("mistral", s.llm_mistral_base_url, s.llm_mistral_api_key,
+             s.llm_mistral_model, f"MISTRAL ({s.llm_mistral_model})"),
+            ("gemini", s.llm_fallback_base_url, s.llm_fallback_api_key,
+             s.llm_fallback_model, f"GOOGLE GEMINI ({s.llm_fallback_model})"),
         ):
             if key:
                 chain.append(OpenAICompatibleClient(
-                    name, base, key, model, s.llm_timeout_seconds))
+                    name, base, key, model, s.llm_timeout_seconds, tracer,
+                    display_label=label))
 
         log_event(logger, "llm.chain_built", providers=[p.name for p in chain])
-        return cls(chain, s.llm_quality_threshold)
+        return cls(chain, s.llm_quality_threshold, tracer)
 
     # -- internals ----------------------------------------------------------
 
