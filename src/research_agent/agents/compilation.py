@@ -32,7 +32,7 @@ from research_agent.state import ResearchState
 logger = logging.getLogger(__name__)
 
 
-def build_compiler_node(router: FallbackRouter):
+def build_compiler_node(router: FallbackRouter, debug: bool = False):
     """Build the report compiler."""
 
     def compiler_node(state: ResearchState) -> Dict[str, Any]:
@@ -74,6 +74,8 @@ def build_compiler_node(router: FallbackRouter):
         regardless of which of the three paths fired — see its
         short-circuit for how it avoids judging an error report.
         """
+        if debug:
+            log_event(logger, "node.enter", node="compiler")
         if state.abort_reason:
             # Human abort (D-23): terminal, explicit, still reaches END.
             report = (f"# Research Report — aborted by human reviewer\n\n"
@@ -95,7 +97,7 @@ def build_compiler_node(router: FallbackRouter):
     return compiler_node
 
 
-def build_critic_node(router: FallbackRouter, settings: Settings):
+def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = False):
     """Build the report critic (bounded self-critique loop, D-22)."""
 
     def critic_node(state: ResearchState) -> Dict[str, Any]:
@@ -137,6 +139,8 @@ def build_critic_node(router: FallbackRouter, settings: Settings):
         signal, rather than being critiqued against evidence that was
         never gathered.
         """
+        if debug:
+            log_event(logger, "node.enter", node="critic")
         if state.planning_error or state.abort_reason:
             return {"critique_passed": True}
         router.set_node("critic")
@@ -169,7 +173,7 @@ def build_critic_node(router: FallbackRouter, settings: Settings):
     return critic_node
 
 
-def build_memory_writer_node(memory: SemanticMemory):
+def build_memory_writer_node(memory: SemanticMemory, debug: bool = False):
     """Build the memory write-back node (runs only after a passed critique)."""
 
     def memory_writer_node(state: ResearchState) -> Dict[str, Any]:
@@ -190,13 +194,15 @@ def build_memory_writer_node(memory: SemanticMemory):
                 see memory/semantic_memory.py for the point structure)
         NEXT    graph.py routes unconditionally to telemetry.
         """
+        if debug:
+            log_event(logger, "node.enter", node="memory_writer")
         written = memory.store_run(state.raw_query, state.evidence)
         return {"counters": {"memory_writes": float(written)}}
 
     return memory_writer_node
 
 
-def build_telemetry_node():
+def build_telemetry_node(debug: bool = False):
     """Build the telemetry aggregator — pure aggregation, no invention."""
 
     def telemetry_node(state: ResearchState) -> Dict[str, Any]:
@@ -226,6 +232,8 @@ def build_telemetry_node():
         still counts as one). Read a debug trace (--debug) rather than
         this dict if you need the true call volume.
         """
+        if debug:
+            log_event(logger, "node.enter", node="telemetry")
         c = state.counters
         telemetry = {
             "intent": state.classification.get("intent"),

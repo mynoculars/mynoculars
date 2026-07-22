@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 ToolFn = Callable[[SearchTask], List[Evidence]]
 
 
-def build_search_worker(tool: ToolFn):
+def build_search_worker(tool: ToolFn, debug: bool = False):
     """Build the fanned-out worker node bound to a retrieval tool.
 
     The returned function receives WorkerPayload (not ResearchState — D-6)
@@ -112,6 +112,8 @@ def build_search_worker(tool: ToolFn):
         than risking a silent InvalidUpdateError under real concurrency.
         """
         task = payload.task
+        if debug:
+            log_event(logger, "node.enter", node="search_worker", task=task.key)
         try:
             evidence = tool(task)
             log_event(logger, "worker.done", task=task.key, items=len(evidence))
@@ -134,7 +136,7 @@ def build_search_worker(tool: ToolFn):
     return search_worker
 
 
-def build_merger_node():
+def build_merger_node(debug: bool = False):
     """Build the evidence merger / contradiction flagger."""
 
     def merger_node(state: ResearchState) -> Dict[str, Any]:
@@ -166,6 +168,11 @@ def build_merger_node():
         A future LLM-based detector slots in right here without touching
         any other file's wiring.
         """
+        if debug:
+            # merger_node makes no LLM or store call, so a --debug trace
+            # file never mentions it at all — this is exactly the "silent
+            # node" gap this flag exists to fill.
+            log_event(logger, "node.enter", node="merger")
         contested_goal_ids = {e.goal_id for e in state.evidence if e.contradicts}
         goals = [g.model_copy(update={"contested": g.goal_id in contested_goal_ids})
                  for g in state.goals]
@@ -178,7 +185,7 @@ def build_merger_node():
     return merger_node
 
 
-def build_progress_checker_node(settings: Settings):
+def build_progress_checker_node(settings: Settings, debug: bool = False):
     """Build the coverage/recall checker — the loop's clock (D-3)."""
 
     def progress_checker_node(state: ResearchState) -> Dict[str, Any]:
@@ -217,6 +224,8 @@ def build_progress_checker_node(settings: Settings):
         setting above the observed off-topic score floor is the single
         highest-value fix in this codebase; see PHASE2_PLAN.md item P2-01.
         """
+        if debug:
+            log_event(logger, "node.enter", node="progress_checker")
         goals = []
         for g in state.goals:
             has_quality_evidence = any(
@@ -242,7 +251,8 @@ def build_progress_checker_node(settings: Settings):
     return progress_checker_node
 
 
-def build_gap_generator_node(router: FallbackRouter, settings: Settings):
+def build_gap_generator_node(router: FallbackRouter, settings: Settings,
+                             debug: bool = False):
     """Build the gap generator: new tasks for uncovered goals."""
 
     def gap_generator_node(state: ResearchState) -> Dict[str, Any]:
@@ -288,6 +298,8 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings):
         below target," so both raise the same trigger codes.
         """
         router.set_node("gap_generator")
+        if debug:
+            log_event(logger, "node.enter", node="gap_generator")
         result = router.complete_json(templates.generate_gaps(
             state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
             guidance=state.human_guidance))

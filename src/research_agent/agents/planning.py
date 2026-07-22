@@ -62,8 +62,15 @@ logger = logging.getLogger(__name__)
 NodeFn = Callable[[ResearchState], Dict[str, Any]]
 
 
-def build_classify_node(router: FallbackRouter) -> NodeFn:
-    """Node: classify the query intent. Writes classification + counters."""
+def build_classify_node(router: FallbackRouter, debug: bool = False) -> NodeFn:
+    """Node: classify the query intent. Writes classification + counters.
+
+    `debug` (new): when True, logs one "node.enter" line the instant this
+    node starts running — see the module docstring's note on why this is
+    the simplest way to see EVERY node fire, including ones like merger_node
+    that never touch an LLM or a store and so never appear in a --debug
+    trace file.
+    """
 
     def classify_node(state: ResearchState) -> Dict[str, Any]:
         """First node the graph runs. No prior state to react to yet.
@@ -81,6 +88,8 @@ def build_classify_node(router: FallbackRouter) -> NodeFn:
         with. Nothing downstream reads `confidence` — only `intent` is
         consumed later.
         """
+        if debug:
+            log_event(logger, "node.enter", node="classify")
         router.set_node("classify")
         result = router.complete_json(templates.classify(state.raw_query))
         log_event(logger, "node.classify", intent=result.get("intent"))
@@ -89,7 +98,7 @@ def build_classify_node(router: FallbackRouter) -> NodeFn:
     return classify_node
 
 
-def build_memory_retrieve_node(memory: SemanticMemory) -> NodeFn:
+def build_memory_retrieve_node(memory: SemanticMemory, debug: bool = False) -> NodeFn:
     """Node: retrieve long-term memory as evidence (source='memory')."""
 
     def memory_retrieve_node(state: ResearchState) -> Dict[str, Any]:
@@ -117,6 +126,8 @@ def build_memory_retrieve_node(memory: SemanticMemory) -> NodeFn:
         there is no separate code path for "memory" evidence past this
         point. See the memory goal_id caveat in memory/semantic_memory.py.
         """
+        if debug:
+            log_event(logger, "node.enter", node="memory_retrieve")
         recalled = memory.retrieve(state.raw_query)
         return {"evidence": recalled,
                 "counters": {"memory_hits": float(len(recalled))}}
@@ -124,7 +135,8 @@ def build_memory_retrieve_node(memory: SemanticMemory) -> NodeFn:
     return memory_retrieve_node
 
 
-def build_goal_manager_node(router: FallbackRouter, settings: Settings) -> NodeFn:
+def build_goal_manager_node(router: FallbackRouter, settings: Settings,
+                            debug: bool = False) -> NodeFn:
     """Node: compose research goals, informed by memory and any human
     redirect guidance (E1 escalation, D-23)."""
 
@@ -161,6 +173,8 @@ def build_goal_manager_node(router: FallbackRouter, settings: Settings) -> NodeF
         try/except-as-data pattern (see gathering.py's search_worker).
         """
         hints = [e.content[:150] for e in state.evidence if e.source == "memory"]
+        if debug:
+            log_event(logger, "node.enter", node="goal_manager")
         router.set_node("goal_manager")
         result = router.complete_json(templates.compose_goals(
             state.raw_query, state.classification.get("intent", "Unknown"), hints,
@@ -189,7 +203,8 @@ def build_goal_manager_node(router: FallbackRouter, settings: Settings) -> NodeF
 
 
 
-def build_task_expander_node(router: FallbackRouter, settings: Settings) -> NodeFn:
+def build_task_expander_node(router: FallbackRouter, settings: Settings,
+                             debug: bool = False) -> NodeFn:
     """Node: expand goals into the initial ranked, capped task backlog."""
 
     def task_expander_node(state: ResearchState) -> Dict[str, Any]:
@@ -225,6 +240,8 @@ def build_task_expander_node(router: FallbackRouter, settings: Settings) -> Node
         run, same risk as goal_manager_node above.
         """
         router.set_node("task_expander")
+        if debug:
+            log_event(logger, "node.enter", node="task_expander")
         result = router.complete_json(
             templates.expand_tasks(state.goals, settings.max_fanout))
         tasks = cap_and_filter(result.get("tasks", []), state, depth=0,

@@ -95,6 +95,13 @@ def build_app_and_settings(tracer=None):
     # so every line below can hand `tracer` to a constructor unconditionally
     # without an `if tracer is not None` check at every call site.
     tracer = tracer or NullTracer()
+    # debug reuses tracer.enabled rather than being a second, separately-
+    # supplied flag: a real Tracer means --debug (or DEBUG_TRACE=true) was
+    # on, and that's exactly when we also want every node's "node.enter"
+    # line to fire. Deriving it here means graph.py and every agents/*.py
+    # builder gets one unambiguous boolean, with no risk of it drifting out
+    # of sync with whether tracing is actually on.
+    debug = tracer.enabled
 
     router = FallbackRouter.from_settings(settings, tracer=tracer)
     # Two SEPARATE QdrantStore instances get created in this function — one
@@ -119,7 +126,7 @@ def build_app_and_settings(tracer=None):
         settings.decay_half_life_days_volatile,
     )
     checkpointer, durable = get_checkpointer(settings.postgres_dsn)
-    app = build_graph(router, tool, memory, settings, checkpointer)
+    app = build_graph(router, tool, memory, settings, checkpointer, debug=debug)
     return app, settings
 
 
@@ -137,10 +144,12 @@ def main(argv=None) -> int:
                 this file, when this module is run directly as a script.
     """
     parser = argparse.ArgumentParser(description="Agentic research agent (core build)")
-    # parser.add_argument("query", ...) with no leading "--" makes this a
-    # POSITIONAL argument — the user must supply it directly, e.g.
-    # `python -m research_agent.cli "my question"`, with no flag name.
-    parser.add_argument("query", help="The research question")
+    # nargs="?" makes this positional argument OPTIONAL (default None) —
+    # needed so `--print-graph` can be used on its own, with no question,
+    # just to inspect the topology. The manual check a few lines below
+    # (`if args.query is None and not args.print_graph`) is what still
+    # enforces "a query is required for an actual run."
+    parser.add_argument("query", nargs="?", default=None, help="The research question")
     parser.add_argument("--thread-id", default=None,
                         help="Run identity (fresh UUID per run by default; "
                              "reuse an old id to resume — design D-20)")
@@ -153,11 +162,21 @@ def main(argv=None) -> int:
                              "tokens/latency, and every retrieval engine's hits "
                              "to logs/trace-<run_id>.txt (also enabled by "
                              "DEBUG_TRACE=true in .env).")
+    parser.add_argument("--print-graph", action="store_true",
+                        help="Print the graph's TOPOLOGY (13 node names and "
+                             "how they're wired) — not a run's output. This "
+                             "is static structure, unrelated to telemetry, "
+                             "which summarizes what happened during a run. "
+                             "Combine with a query to see it before running; "
+                             "omit the query to just inspect the wiring and "
+                             "exit without running anything.")
     # parser.parse_args(argv) reads sys.argv (the actual command-line
     # arguments) by default, or the `argv` list passed into this function —
     # the latter is what lets tests call main(["some", "query", "--debug"])
     # directly without needing to spawn a real subprocess.
     args = parser.parse_args(argv)
+    if args.query is None and not args.print_graph:
+        parser.error("query is required unless --print-graph is given alone")
 
     thread_id = args.thread_id or f"run-{uuid.uuid4().hex[:12]}"
     run_id_var.set(thread_id)  # correlate every log line to this run
@@ -173,6 +192,28 @@ def main(argv=None) -> int:
     tracer = Tracer(thread_id) if trace_on else NullTracer()
 
     app, settings = build_app_and_settings(tracer=tracer)
+
+    if args.print_graph:
+        # app.get_graph() is a LangGraph/LangChain introspection call — it
+        # walks the SAME compiled graph object we're about to (maybe) run,
+        # and returns its static topology: node names and edges, with no
+        # dependency on any particular query or run. This is why it is NOT
+        # the same thing as telemetry: telemetry is a dict of COUNTS
+        # summarizing what happened during one specific invoke() call
+        # (llm_calls, recall, etc — see agents/compilation.py::
+        # telemetry_node); this is the WIRING itself, unchanged run to run.
+        graph_repr = app.get_graph()
+        try:
+            # draw_ascii() needs the optional `grandalf` package (not in
+            # requirements.txt) — try it first since it's the most readable
+            # in a terminal, and fall back to Mermaid text (needs nothing
+            # extra) if that package isn't installed.
+            print(graph_repr.draw_ascii())
+        except ImportError:
+            print("[install 'grandalf' for ASCII art — falling back to Mermaid text]")
+            print(graph_repr.draw_mermaid())
+        if args.query is None:
+            return 0  # inspecting the wiring only — nothing to run
 
     config = {"configurable": {"thread_id": thread_id},
               "recursion_limit": settings.recursion_limit}

@@ -213,7 +213,7 @@ def route_after_critique(state: ResearchState, settings: Settings
 
 
 def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
-                settings: Settings, checkpointer: Any):
+                settings: Settings, checkpointer: Any, debug: bool = False):
     """Assemble and compile the workflow — the ONE function that turns 13
     independently-testable node functions into a single runnable graph.
 
@@ -232,6 +232,16 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
         memory: semantic memory (may be degraded/off).
         settings: graph bounds and thresholds.
         checkpointer: LangGraph checkpointer (Postgres or MemorySaver).
+        debug: when True, every node logs a "node.enter" line the instant
+            it starts running — including merger/progress_checker, which
+            make no LLM or store call and so never appear in a --debug
+            TRACE FILE (tracing.py's Tracer only ever records LLM calls and
+            store searches, never "a node ran"). This flag is a second,
+            independent signal from that one, threaded down from
+            cli.py::build_app_and_settings, where it is set to
+            tracer.enabled — so in practice both turn on together, but this
+            one reaches every node, not just the ones that touch an LLM or
+            a store.
     """
     # StateGraph(ResearchState) creates a new, empty graph builder whose
     # shared state will be validated against the ResearchState Pydantic
@@ -247,21 +257,21 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     # agents/planning.py's docstring that build_classify_node(router)
     # doesn't run classify_node itself; it returns the ready-to-call
     # classify_node function, already holding onto `router` via closure.
-    g.add_node("classify", build_classify_node(router))
-    g.add_node("memory_retrieve", build_memory_retrieve_node(memory))
-    g.add_node("goal_manager", build_goal_manager_node(router, settings))
-    g.add_node("task_expander", build_task_expander_node(router, settings))
-    g.add_node("search_worker", build_search_worker(tool))
-    g.add_node("merger", build_merger_node())
-    g.add_node("progress_checker", build_progress_checker_node(settings))
-    g.add_node("gap_generator", build_gap_generator_node(router, settings))
-    g.add_node("compiler", build_compiler_node(router))
-    g.add_node("critic", build_critic_node(router, settings))
-    g.add_node("memory_writer", build_memory_writer_node(memory))
-    g.add_node("telemetry", build_telemetry_node())
+    g.add_node("classify", build_classify_node(router, debug))
+    g.add_node("memory_retrieve", build_memory_retrieve_node(memory, debug))
+    g.add_node("goal_manager", build_goal_manager_node(router, settings, debug))
+    g.add_node("task_expander", build_task_expander_node(router, settings, debug))
+    g.add_node("search_worker", build_search_worker(tool, debug))
+    g.add_node("merger", build_merger_node(debug))
+    g.add_node("progress_checker", build_progress_checker_node(settings, debug))
+    g.add_node("gap_generator", build_gap_generator_node(router, settings, debug))
+    g.add_node("compiler", build_compiler_node(router, debug))
+    g.add_node("critic", build_critic_node(router, settings, debug))
+    g.add_node("memory_writer", build_memory_writer_node(memory, debug))
+    g.add_node("telemetry", build_telemetry_node(debug))
     # D-23/D-28: single parametrized escalation node. It returns Command
     # (goto inferred from its type hint), so no static edges are added.
-    g.add_node("human_escalation", build_escalation_node(settings))
+    g.add_node("human_escalation", build_escalation_node(settings, debug))
 
     # g.add_edge(from_node, to_node) wires a FIXED, unconditional edge:
     # whenever `from_node` finishes, always run `to_node` next, no decision

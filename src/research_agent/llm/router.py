@@ -129,13 +129,20 @@ class FallbackRouter:
         Live mode -> the chain [primary, *fallbacks], skipping any fallback that
         has no API key configured, so an unconfigured provider is simply absent
         from the chain rather than a guaranteed error mid-run.
+
+        Two DIFFERENT timeouts are used here, not one shared value: the
+        primary (local Cogito) gets settings.llm_primary_timeout_seconds,
+        every cloud fallback gets settings.llm_timeout_seconds. See
+        config.py's comment on those two fields for why they're split —
+        in short, a local model can need much longer than a cloud API
+        before a slow response is actually a problem worth failing over.
         """
         if s.llm_mode == "stub":
             return cls([StubClient(tracer=tracer)], s.llm_quality_threshold, tracer)
 
         chain: List[ChatClient] = [OpenAICompatibleClient(
             "primary", s.llm_primary_base_url, s.llm_primary_api_key,
-            s.llm_primary_model, s.llm_timeout_seconds, tracer,
+            s.llm_primary_model, s.llm_primary_timeout_seconds, tracer,
             display_label=f"LOCAL PRIMARY ({s.llm_primary_model})")]
 
         # See the module docstring for exactly what this tuple-of-tuples

@@ -98,7 +98,7 @@ def _payload_for(state: ResearchState) -> Dict[str, Any]:
     return base
 
 
-def build_escalation_node(settings):
+def build_escalation_node(settings, debug: bool = False):
     """Build the escalation node. `settings` reserved for future per-trigger
     policy (e.g. timeout) — deliberately unused today, keeping the signature
     stable across that change."""
@@ -147,6 +147,16 @@ def build_escalation_node(settings):
                 table below for exactly which node, per trigger and action.
         """
         trigger = state.escalation_trigger or "E?"
+        if debug:
+            # Logging here (before interrupt()) is safe — it's not a state
+            # write, so it doesn't threaten the D-28 idempotency invariant.
+            # But because this whole function re-executes from the top on
+            # resume (see the docstring above), this line WILL print twice
+            # for one escalation: once when the run pauses, once again when
+            # it resumes with the human's answer. That's expected, not a bug
+            # — it's the same re-execution behaviour the docstring describes,
+            # just made visible.
+            log_event(logger, "node.enter", node="human_escalation", trigger=trigger)
         answer = interrupt(_payload_for(state)) or {}
         action = str(answer.get("action", "abort")).lower()
         guidance = str(answer.get("guidance", ""))

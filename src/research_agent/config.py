@@ -103,7 +103,19 @@ class Settings(BaseSettings):
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = "gemini-2.0-flash"
     llm_quality_threshold: float = Field(0.6, ge=0.0, le=1.0)
-    llm_timeout_seconds: float = 60.0
+    # Two SEPARATE timeouts, not one shared value (this used to be a single
+    # llm_timeout_seconds applied to every provider identically — see
+    # PHASE2_PLAN.md / a live debug trace for why that was wrong in
+    # practice: a local llama-server-hosted model like Cogito can spend its
+    # first request of a session just loading the model into memory before
+    # it ever starts on your actual prompt, and its largest prompts (e.g.
+    # compiler's ~4500-token report-writing call) can genuinely need more
+    # wall-clock time than a fast cloud API ever would. Giving Cogito the
+    # SAME short timeout as Mistral/Gemini meant it was being given up on
+    # for being slow, not for being wrong — these two fields let it have
+    # more room while keeping the cloud fallbacks quick to fail over.
+    llm_primary_timeout_seconds: float = Field(120.0, gt=0.0)   # local Cogito
+    llm_timeout_seconds: float = Field(90.0, gt=0.0)            # Mistral, Gemini
 
     # --- Storage endpoints -------------------------------------------------
     postgres_dsn: str = "postgresql://agent:agent@localhost:5432/agent"

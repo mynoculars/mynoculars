@@ -71,6 +71,13 @@ logger = logging.getLogger(__name__)
 # {"role": "user", "content": "What is Redis?"}.
 Message = Dict[str, str]  # {"role": ..., "content": ...}
 
+# Chat-template end-of-turn markers some local models (llama.cpp / Llama-
+# family chat formats in particular) append after their actual answer —
+# confirmed by a live debug trace showing Cogito doing exactly this after
+# valid JSON. None of these strings can legally appear inside real JSON,
+# so removing them is always safe.
+_SENTINELS = ("<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>", "</s>")
+
 
 class ChatClient(Protocol):
     """The only surface the agent uses to talk to a model.
@@ -98,15 +105,34 @@ class ChatClient(Protocol):
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
-    """Parse JSON out of a model reply, tolerating ```json fences.
+    """Parse JSON out of a model reply, tolerating ```json fences AND
+    trailing chat-template sentinels.
 
     CALLED BY   OpenAICompatibleClient.complete_json and
                 StubClient.complete_json, immediately below — this is the
                 one place in the codebase that turns a raw string response
                 into an actual Python dict.
-    Why: small local models frequently wrap JSON in markdown fences even
-    when told not to. Stripping fences before parsing avoids a fallback
-    round-trip for a purely cosmetic failure.
+    Why fences: small local models frequently wrap JSON in markdown fences
+    even when told not to. Stripping fences before parsing avoids a
+    fallback round-trip for a purely cosmetic failure.
+
+    Why sentinels (added after a live trace confirmed this actually
+    happens): a llama.cpp-style local model can append its chat template's
+    end-of-turn marker right after the JSON, with no code fence around it
+    at all — e.g. `{"goals": [...]} <|im_end|>`. The fence regex alone
+    leaves that trailing text in place, json.loads then fails on it, and
+    every single structured call from that provider gets thrown away as
+    unparseable — even though the model answered correctly. _SENTINELS
+    below lists the common ones seen across llama.cpp/Llama-family chat
+    templates; stripping them is cheap and never touches genuinely valid
+    JSON, since none of these strings can legally appear inside one.
+
+    Belt-and-braces fallback: if the text STILL doesn't parse after both
+    cleanup steps (some other, unanticipated junk before/after), extract
+    the outermost {...} span and parse just that, rather than giving up
+    immediately. This can't turn bad JSON into good JSON — if there's
+    nothing shaped like an object in the text at all, it still raises,
+    exactly as before.
 
     r"^```(?:json)?\\s*|\\s*```$" is a regular expression with two
     alternatives joined by "|" (meaning "match either side"):
@@ -124,7 +150,21 @@ def _extract_json(text: str) -> Dict[str, Any]:
     fence markers sit on their own line inside a larger blob of text.
     """
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
-    obj = json.loads(cleaned)
+    for sentinel in _SENTINELS:
+        cleaned = cleaned.replace(sentinel, "")
+    cleaned = cleaned.strip()
+    try:
+        obj = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # str.find/.rfind locate the FIRST "{" and the LAST "}" in the
+        # cleaned text — a cheap approximation of "the outermost object
+        # span" that doesn't require a real parser. If either is missing,
+        # there's nothing object-shaped here at all, so re-raise the
+        # original error rather than manufacturing a confusing new one.
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        obj = json.loads(cleaned[start:end + 1])
     if not isinstance(obj, dict):
         raise ValueError("model returned JSON that is not an object")
     return obj
