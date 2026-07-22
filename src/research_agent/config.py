@@ -16,6 +16,42 @@ Design decision (why pydantic-settings):
     validation, silent typos) and dynaconf (more features than a reference
     implementation needs). Tradeoff: adds a small dependency; worth it for
     the fail-fast behavior.
+
+Python mechanics used in this file, if any of this is new to you:
+    BaseSettings (from pydantic_settings)
+        A special kind of Pydantic model (see state.py's module docstring
+        for what a Pydantic model is) whose fields are populated FROM THE
+        PROCESS ENVIRONMENT rather than from constructor arguments. Every
+        field declared below, e.g. "llm_mode: Literal[...] = 'stub'",
+        automatically reads the environment variable LLM_MODE (Pydantic
+        upper-cases the field name) if it's set, and falls back to the
+        written default ("stub") if it isn't. This is the ONLY place in the
+        entire codebase that reads os.environ, directly or indirectly —
+        every other file receives values through a Settings object, never
+        by reading the environment itself.
+    Literal["live", "stub"]
+        A type hint meaning "this field's value must be exactly one of
+        these strings" — see state.py's docstring for the same construct.
+        Here it restricts llm_mode so a typo like LLM_MODE=Live (capital L)
+        would be REJECTED at startup with a clear validation error, rather
+        than silently misbehaving later.
+    Field(0.6, ge=0.0, le=1.0)
+        Field() lets you attach VALIDATION RULES to a value, not just a
+        plain default. "0.6" is the default; ge/le mean "greater-or-equal"
+        and "less-or-equal" — so llm_quality_threshold is required to be a
+        number between 0.0 and 1.0 inclusive. Passing an out-of-range value
+        via the environment raises a clear error at startup instead of
+        misbehaving quietly deep inside the LLM router.
+    @lru_cache (from functools, stdlib — nothing pydantic-specific)
+        A decorator (see agents/gathering.py's module docstring for what a
+        decorator is) that makes a function remember its own return value:
+        the FIRST time get_settings() is called, it actually constructs a
+        new Settings() object (which reads the environment); every
+        subsequent call in the SAME process just returns that same cached
+        object instantly, without re-reading the environment. This is what
+        makes Settings effectively a "singleton" — one shared instance for
+        the whole running process — without writing any singleton
+        boilerplate by hand.
 """
 
 from functools import lru_cache
@@ -30,8 +66,23 @@ class Settings(BaseSettings):
 
     Every field maps 1:1 to an environment variable of the same (uppercased)
     name. See .env.example for documentation of each value.
+
+    Nothing in this class DOES anything by itself — it is a pure data
+    container. Every field below is read somewhere else in the codebase
+    (search the field name to find every call site); this class's only job
+    is to be the one place that decides where each value comes from and
+    what its default and valid range are.
     """
 
+    # SettingsConfigDict is BaseSettings' equivalent of a normal Pydantic
+    # model's ConfigDict (see state.py). env_file=".env" means: in addition
+    # to real environment variables, also read a ".env" file in the current
+    # working directory if one exists (handy for local development so you
+    # don't have to `export` a dozen variables by hand). extra="ignore"
+    # means an unrecognized environment variable (e.g. a typo like HITL=true
+    # instead of HITL_ENABLED=true) is SILENTLY DISCARDED rather than
+    # raising an error — worth knowing if a setting you set doesn't seem to
+    # take effect: check the exact field name below first.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- LLM providers -----------------------------------------------------
@@ -68,6 +119,8 @@ class Settings(BaseSettings):
     corpus_index: str = "agent_corpus"
 
     # --- Graph bounds (see design doc D-3/D-4/D-9/D-13/D-17/D-22) ----------
+    # ge=1 / ge=0 below means "must be greater-or-equal to 1 / 0" — same
+    # Field() validation mechanism explained in the module docstring above.
     max_fanout: int = Field(6, ge=1)          # D-13: producers cap task output
     max_depth: int = Field(3, ge=1)           # D-3: gather-loop bound
     recall_target: float = Field(0.85, ge=0.0, le=1.0)   # D-4
@@ -93,5 +146,16 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return the process-wide Settings singleton (cached after first load)."""
+    """Return the process-wide Settings singleton (cached after first load).
+
+    CALLED BY   cli.py::build_app_and_settings (and cli.py::main, once,
+                before the tracer is built), api/server.py at import time.
+                Every other module that needs a config value receives a
+                Settings OBJECT as a function/constructor argument (see
+                agents/planning.py's closure explanation) rather than
+                calling get_settings() itself — this function is the one
+                and only place Settings() gets constructed.
+    RETURNS     the same Settings instance on every call within one process
+                (see the @lru_cache explanation in the module docstring).
+    """
     return Settings()

@@ -25,6 +25,64 @@ Design decisions:
       transient retrieval failure does not permanently burn a query
       formulation: the gap generator may re-emit a failed key at a strictly
       greater depth.
+
+If you are new to Python, read this section before the code below — every
+concept it explains is used repeatedly in this file and in every node file
+that reads or writes ResearchState.
+
+    Pydantic "BaseModel"
+        A Pydantic model is a class whose job is to hold DATA with type
+        checking, not behaviour. You declare fields as class-level
+        annotations (name: type), and Pydantic automatically writes the
+        __init__ that accepts them as keyword arguments, validates their
+        types at construction time, and raises a clear error if you pass
+        the wrong type or a field is missing. Every class below (Goal,
+        SearchTask, Evidence, ResearchState, WorkerPayload) is one of these.
+        Constructing one looks like: Goal(goal_id="g1", description="...").
+
+    model_config = ConfigDict(extra="forbid")
+        A Pydantic-specific setting. By default Pydantic would silently
+        accept and store extra keyword arguments you didn't declare a field
+        for. "extra='forbid'" makes that an error instead — so a typo like
+        Goal(goal__id="g1") (double underscore) fails LOUDLY at the moment
+        you construct the object, instead of quietly creating a Goal with a
+        missing goal_id and a useless extra attribute nobody reads.
+
+    Enum (class Volatility(str, Enum): ...)
+        A fixed, named set of allowed values — like an enum in Java or C#.
+        Inheriting from BOTH str and Enum here means each member (e.g.
+        Volatility.STABLE) behaves as a real string ("stable") wherever a
+        string is expected (comparisons, JSON serialization, dict keys)
+        while still being restricted to only the three values defined below.
+
+    Optional[X]  (from the typing module)
+        Shorthand for "either a value of type X, or the special value
+        None". planning_error: Optional[str] = None means "this field holds
+        a string once something goes wrong, and starts out as None".
+
+    Field(default_factory=list)  /  Field(default_factory=dict)
+        You cannot write "goals: List[Goal] = []" directly as a class-level
+        default in Python — a single empty list object would then be SHARED
+        by every instance of the class, and mutating one instance's list
+        would corrupt every other instance's list too (a classic Python
+        footgun). default_factory=list tells Pydantic "call list() fresh,
+        once per new instance, to get its default" — so every ResearchState
+        gets its OWN empty list, not a shared one.
+
+    Annotated[SomeType, some_reducer_function]
+        This is the one piece of syntax in this file that has nothing to
+        do with plain Python and everything to do with LangGraph. Normally
+        a type hint is just documentation for humans and type checkers —
+        Python itself ignores it at runtime. LangGraph, however, actually
+        INSPECTS these Annotated[...] hints on StateGraph fields: whenever
+        two parallel nodes in the same "superstep" (see the reducer section
+        below) both try to write to the SAME field, LangGraph looks up the
+        function attached via Annotated and calls it as
+        merge_function(existing_value, new_value) to decide what the
+        combined value should be — instead of raising an error or silently
+        picking one write and discarding the other. A field with no
+        Annotated reducer can only ever be safely written by ONE node per
+        superstep; if two try, LangGraph raises InvalidUpdateError.
 """
 
 import operator
@@ -35,12 +93,28 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Reducers
+#
+# A "reducer" here is just a plain Python function with the shape
+# (existing_value, new_value) -> combined_value. LangGraph calls one of
+# these automatically whenever two nodes running in the same superstep both
+# write to the field it's attached to (via Annotated[...] below). None of
+# these functions are called directly anywhere else in the codebase — they
+# are registered as metadata on a type hint and invoked BY LangGraph.
 # ---------------------------------------------------------------------------
 
 
 def merge_key_sets(a: Set[str], b: Set[str]) -> Set[str]:
     """Set-union reducer for task dedup keys. Associative and commutative,
-    so parallel worker writes merge safely in any order."""
+    so parallel worker writes merge safely in any order.
+
+    CALLED BY   LangGraph itself, automatically, whenever more than one
+                search_worker instance returns a "completed_task_keys" key
+                in the same superstep (see agents/gathering.py). You will
+                not find a direct call to merge_key_sets anywhere else.
+    "|" below is Python's set-union operator: {1,2} | {2,3} == {1,2,3}.
+    "(a or set())" guards against a=None, which can happen on the very
+    first write when there is no existing value yet to merge with.
+    """
     return (a or set()) | (b or set())
 
 
@@ -51,6 +125,15 @@ def merge_failed_keys(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
     failure depth (D-16). Taking max is conservative — it never permits an
     earlier retry than any single worker observed — and keeps the reducer
     associative/commutative.
+
+    CALLED BY   LangGraph itself, when more than one search_worker instance
+                fails and returns a "failed_task_keys" entry in the same
+                superstep.
+    dict(a or {}) makes a SHALLOW COPY of the existing dict — this line does
+    NOT mutate the caller's dict `a` in place; it builds a new one to return.
+    ``for k, depth in (b or {}).items():`` iterates over the new dict's
+    (key, value) pairs — .items() is the standard way to loop over both a
+    dict's keys and values together in one go.
     """
     out = dict(a or {})
     for k, depth in (b or {}).items():
@@ -64,6 +147,13 @@ def merge_counters(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]
     Counters must contain MONOTONIC COUNTABLES ONLY (call counts, token
     counts, flags). Never durations: two parallel workers writing 150ms and
     200ms would 'merge' to 350ms of nothing. Durations belong in log lines.
+
+    CALLED BY   LangGraph itself, whenever more than one node in the same
+                superstep returns a "counters" key — this happens on nearly
+                every gather-loop cycle, since every parallel search_worker
+                instance reports its own "search_calls"/"search_failures".
+    out.get(k, 0) reads the current total for key k, defaulting to 0 if this
+    is the first time that counter name has ever been seen.
     """
     out = dict(a or {})
     for k, v in (b or {}).items():
@@ -73,11 +163,21 @@ def merge_counters(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]
 
 # ---------------------------------------------------------------------------
 # Domain entities
+#
+# These are plain data containers describing the "nouns" of a research run:
+# a Goal to accomplish, a SearchTask to execute, and a piece of Evidence
+# found along the way. None of them contain any logic — they are read and
+# written by the node functions in agents/*.py.
 # ---------------------------------------------------------------------------
 
 
 class Volatility(str, Enum):
-    """How quickly a remembered fact goes stale (D-24). Drives decay rate."""
+    """How quickly a remembered fact goes stale (D-24). Drives decay rate.
+
+    Because this inherits from both str and Enum, Volatility.STABLE both
+    IS the string "stable" (so it serializes to JSON cleanly and compares
+    equal to "stable") AND is restricted to only these three named values.
+    """
 
     STABLE = "stable"            # historical facts, established patterns
     SEMI_STABLE = "semi_stable"  # org structure, schema versions
@@ -85,7 +185,13 @@ class Volatility(str, Enum):
 
 
 class Goal(BaseModel):
-    """One research goal derived from the user query."""
+    """One research goal derived from the user query.
+
+    Produced by agents/planning.py::goal_manager_node (the model invents
+    these). Later mutated in place by two other nodes: merger_node sets
+    `contested`, progress_checker_node sets `covered` — see agents/
+    gathering.py for exactly how and when.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -99,7 +205,12 @@ class Goal(BaseModel):
 
 
 class SearchTask(BaseModel):
-    """One unit of retrieval work, produced by the expander or gap generator."""
+    """One unit of retrieval work, produced by the expander or gap generator.
+
+    Every SearchTask becomes exactly one parallel search_worker invocation
+    (see orchestration/graph.py::dispatch_tasks, which wraps each one in a
+    LangGraph `Send`).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -111,7 +222,14 @@ class SearchTask(BaseModel):
 
 
 class Evidence(BaseModel):
-    """One retrieved fact, from a live tool or from long-term memory."""
+    """One retrieved fact, from a live tool or from long-term memory.
+
+    Two producers create these: tools/corpus_search.py (source="corpus",
+    fresh retrieval this run) and memory/semantic_memory.py::retrieve
+    (source="memory", recalled from a past run). Every downstream node that
+    reads state.evidence treats both kinds identically — there is no
+    separate code path per source.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -130,33 +248,50 @@ class Evidence(BaseModel):
 
 
 class ResearchState(BaseModel):
-    """Shared state for the whole workflow.
+    """Shared state for the whole workflow — the ONE object every node
+    function receives as its argument and returns a partial update for.
 
     Concurrency rule (D-5): every field a fanned-out worker writes carries a
     reducer (the Annotated[...] fields below). Everything else is written by
     exactly one node per superstep and needs none.
+
+    HOW TO READ THIS CLASS: each field below is annotated with a comment
+    naming which phase/node writes it and, where relevant, which design
+    decision explains why. If you are trying to understand "who touches
+    this field and when", this class plus a text-search across agents/*.py
+    for the field name will answer it completely — there is no other place
+    state changes happen.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    # Inputs
+    # Inputs — set once, by the caller (cli.py or api/server.py), before the
+    # very first node runs. Nothing inside the graph ever changes raw_query.
     raw_query: str
     thread_note: str = ""
 
-    # Planning
+    # Planning — written by agents/planning.py's nodes, read by everything
+    # downstream.
     classification: Dict[str, Any] = Field(default_factory=dict)
     goals: List[Goal] = Field(default_factory=list)
     planning_error: Optional[str] = None      # D-21
 
-    # Work management
+    # Work management — the task backlog and its bookkeeping.
+    # pending_tasks has NO Annotated reducer: it is deliberately
+    # REPLACE-on-write (D-2) — the producer that wrote it is always
+    # rewriting the entire backlog from scratch, not adding to a shared one,
+    # so only a single writer per superstep is ever expected here.
     pending_tasks: List[SearchTask] = Field(default_factory=list)  # replace-on-write (D-2)
     completed_task_keys: Annotated[Set[str], merge_key_sets] = Field(default_factory=set)
     failed_task_keys: Annotated[Dict[str, int], merge_failed_keys] = Field(default_factory=dict)
 
-    # Results (parallel writers -> reducer-backed)
+    # Results — written in parallel by every fanned-out search_worker
+    # instance, hence the reducer. operator.add on two lists is just Python's
+    # list concatenation ([1,2] + [3,4] == [1,2,3,4]) used as the merge rule:
+    # every worker's evidence simply gets appended onto the combined list.
     evidence: Annotated[List[Evidence], operator.add] = Field(default_factory=list)
 
-    # Loop control
+    # Loop control — the gather loop's clock and its measured progress.
     iteration_depth: int = 0                  # D-3: checker increments
     recall_score: float = 0.0
 
@@ -175,7 +310,9 @@ class ResearchState(BaseModel):
     revision_count: int = 0
     critique_passed: bool = False
 
-    # Telemetry (D-12/D-19)
+    # Telemetry (D-12/D-19) — counters accumulate additively across the
+    # whole run; telemetry is the one-shot final summary built from them by
+    # agents/compilation.py::telemetry_node.
     counters: Annotated[Dict[str, float], merge_counters] = Field(default_factory=dict)
     telemetry: Dict[str, Any] = Field(default_factory=dict)
 
@@ -185,6 +322,11 @@ class WorkerPayload(BaseModel):
 
     Workers receive THIS, not the full ResearchState — and may return only
     reducer-backed ResearchState keys (enforced in orchestration/contracts.py).
+
+    Deliberately tiny: a worker cannot accidentally read (or leak) any part
+    of state it has no business touching, because it is never given the
+    rest of state in the first place. See orchestration/graph.py::
+    dispatch_tasks for exactly how each SearchTask becomes one of these.
     """
 
     model_config = ConfigDict(extra="forbid")

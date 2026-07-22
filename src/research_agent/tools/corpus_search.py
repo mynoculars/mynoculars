@@ -26,6 +26,16 @@ from research_agent.state import Evidence, SearchTask, Volatility
 def make_corpus_tool(retriever: HybridRetriever, top_k: int = 3):
     """Build the corpus-search tool bound to a retriever.
 
+    This is the same "closure" pattern used by every build_*_node function
+    in agents/*.py (see agents/planning.py's docstring for the full
+    explanation): make_corpus_tool takes `retriever` and `top_k`, defines
+    the actual corpus_search function INSIDE itself so it remembers both
+    values, and returns that inner function without calling it.
+
+    CALLED BY   cli.py::build_app_and_settings — once per run, wrapping
+                the same HybridRetriever every search_worker instance ends
+                up sharing.
+
     Parameters:
         retriever: the hybrid retriever over the ingested corpus.
         top_k: evidence items to return per task.
@@ -36,6 +46,23 @@ def make_corpus_tool(retriever: HybridRetriever, top_k: int = 3):
     """
 
     def corpus_search(task: SearchTask) -> List[Evidence]:
+        """The actual tool function every search_worker invocation calls.
+
+        CALLED BY   agents/gathering.py::search_worker — exactly once per
+                    SearchTask, wrapped in that worker's own try/except
+                    (see gathering.py's D-16 note: if this function raises,
+                    the WORKER is responsible for turning that into a
+                    "failed" record, not this function).
+        READS       task.query, task.goal_id, task.key — nothing from
+                    ResearchState directly; this function only ever sees
+                    the one SearchTask it was called with.
+        CALLS       retriever.search(...) (retrieval/hybrid.py) — the
+                    hybrid dense+BM25 search, already fused and ranked.
+        RETURNS     one Evidence object PER retrieved hit, each stamped
+                    with this task's identity (task_key, goal_id) so
+                    downstream nodes (merger, progress_checker) know which
+                    goal this evidence is supposed to help cover.
+        """
         hits = retriever.search(task.query, top_k=top_k)
         evidence: List[Evidence] = []
         for h in hits:
@@ -43,6 +70,10 @@ def make_corpus_tool(retriever: HybridRetriever, top_k: int = 3):
                 task_key=task.key,
                 goal_id=task.goal_id,
                 source="corpus",
+                # h.get("content", "")[:800] — see task_utils.py and
+                # templates.py for the same slicing idiom; this simply caps
+                # how much text from one hit gets carried into Evidence, so
+                # one enormous document can't dominate the compile prompt.
                 content=h.get("content", "")[:800],
                 # fused_score is unbounded-ish; squash into 0..1 for the
                 # coverage rule (D-17). Simple monotone squash is enough here.

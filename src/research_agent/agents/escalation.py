@@ -24,6 +24,37 @@ Termination note (design §6.9): a redirect can re-arm a loop (e.g. E4 ->
 compiler -> critic fails -> E4 again), but every such cycle requires a
 fresh human action — termination becomes human-bounded, which is the
 point of escalation, not a defect.
+
+Python mechanics used in this file, if any of this is new to you:
+    Literal["a", "b", "c"]   This is a TYPE HINT, not executable logic. It
+                             tells a type checker (and a human reader)
+                             "this value can only ever be one of these exact
+                             strings" — a lightweight enum. It changes
+                             nothing at runtime; Python does not enforce it.
+    interrupt(payload)       A special function from the langgraph library.
+                             Calling it does two very different things
+                             depending on whether the graph is running for
+                             the first time or being RESUMED:
+                               - first time: it pauses the ENTIRE graph run
+                                 right here, saves everything to the
+                                 checkpointer, and the whole invoke() call
+                                 that started this run returns immediately
+                                 to whoever called it (cli.py or the API).
+                               - on resume: LangGraph calls this SAME
+                                 function again from the top, but THIS time
+                                 interrupt() does not pause — it immediately
+                                 returns whatever the human supplied. See
+                                 the big warning inside human_escalation
+                                 below for why that matters so much.
+    Command(goto=..., update={...})
+                             Another langgraph type. Returning one from a
+                             node is how that node tells LangGraph "don't
+                             follow a normal edge — jump straight to the
+                             node named in `goto`, and merge `update` into
+                             state first." This is why human_escalation has
+                             no lines for it in graph.py's g.add_edge(...)
+                             calls — it decides its own destination in code
+                             instead of through the graph's wiring.
 """
 
 import logging
@@ -36,6 +67,9 @@ from research_agent.state import ResearchState
 
 logger = logging.getLogger(__name__)
 
+# See the Literal[...] note above — this just documents, for humans and type
+# checkers, the only four strings this node is ever allowed to return as a
+# destination via Command(goto=...).
 Destination = Literal["compiler", "gap_generator", "goal_manager", "telemetry"]
 
 
@@ -70,9 +104,49 @@ def build_escalation_node(settings):
     stable across that change."""
 
     def human_escalation(state: ResearchState) -> Command[Destination]:
+        """One node serving ALL FOUR escalation triggers. Reached from
+        four different places: goal_manager (E1), progress_checker or
+        gap_generator (E2/E3), critic (E4) — whichever node's check fired
+        set state.escalation_trigger before routing sent us here.
+
+        FIRST PASS (the graph just paused):
+          READS   state.escalation_trigger — which of the 4 checks fired.
+          CALLS   interrupt(_payload_for(state)) — this is a LangGraph
+                  primitive, not a normal function call: it serializes the
+                  payload to the checkpointer (Postgres, if reachable) and
+                  the WHOLE INVOKE CALL RETURNS immediately with
+                  "__interrupt__" in the result. Nothing after this line
+                  runs yet. The CLI (or API) shows the payload to a human
+                  and waits for approve/redirect/abort + optional guidance.
+
+        SECOND PASS (a human answered, cli.py called invoke again with
+        Command(resume=...) under the SAME thread_id):
+          ⚠ THE WHOLE FUNCTION RE-EXECUTES FROM ITS TOP — this is not a
+          resume-from-the-interrupted-line, it is a fresh call. That is
+          why `trigger` is read again above rather than cached, and why
+          nothing above the interrupt() line may have a side effect: it
+          would fire twice (once on pause, once on resume) if it did.
+          READS   the human's answer, now returned BY interrupt() instead
+                  of pausing: {"action": ..., "guidance": ...}.
+          WRITES  state.escalation_trigger = None   (clear it, or the same
+                      check would just re-raise it and loop forever)
+                  state.escalation_history += one entry  <- appended HERE,
+                      in this resume-path update, and NOWHERE before the
+                      interrupt() call — that placement is what makes
+                      re-execution safe: if it were written before the
+                      interrupt, the first (pausing) pass would already
+                      have written it, and the second (resuming) pass
+                      would write it AGAIN, double-counting one human
+                      decision as two.
+                  plus trigger-specific fields (planning_error cleared,
+                  human_guidance set, abort_reason set, or critique_notes
+                  seeded with "HUMAN REVIEWER: ...") depending on which of
+                  the 12 (trigger x action) combinations below fired.
+        NEXT    Command(goto=...) sends control directly to whichever node
+                should react to the human's decision — see the branch
+                table below for exactly which node, per trigger and action.
+        """
         trigger = state.escalation_trigger or "E?"
-        # D-28: first effectful statement. On resume this whole function
-        # re-executes; everything above this line is a pure read.
         answer = interrupt(_payload_for(state)) or {}
         action = str(answer.get("action", "abort")).lower()
         guidance = str(answer.get("guidance", ""))

@@ -17,6 +17,29 @@ Responsibilities:
       (D-17/D-18) + the iteration counter (D-3) — the loop's only clock.
     - gap_generator_node: new ranked/capped/filtered tasks for uncovered
       goals (same hygiene as the expander, shared code).
+
+Python mechanics used in this file, if any of this is new to you:
+    @validated_worker           A DECORATOR. Writing "@something" directly
+                                 above a function definition means: "take the
+                                 function I just wrote, pass it into
+                                 `something`, and replace my function with
+                                 whatever `something` returns." It does NOT
+                                 change search_worker's own code at all —
+                                 it wraps an extra safety check AROUND it.
+                                 See orchestration/contracts.py for what the
+                                 wrapper actually does.
+    ToolFn = Callable[...]       This just gives a NAME to a function
+                                 signature, purely for readability in type
+                                 hints below — it does not create any new
+                                 behaviour, it's a label like a typedef.
+    build_search_worker(tool)   This is a "closure" — a function that
+                                 builds and returns ANOTHER function
+                                 (search_worker), which remembers `tool`
+                                 even after build_search_worker has finished
+                                 running. That's how every node in this
+                                 codebase receives its dependencies without
+                                 global variables — see planning.py's module
+                                 docstring for the full explanation of why.
 """
 
 import logging
@@ -32,6 +55,10 @@ from research_agent.state import Evidence, ResearchState, SearchTask, WorkerPayl
 
 logger = logging.getLogger(__name__)
 
+# A type ALIAS, not a real class: "ToolFn" is just a short, readable name we
+# can use in type hints below instead of repeating the whole signature
+# "Callable[[SearchTask], List[Evidence]]" (= "a function that takes one
+# SearchTask argument and returns a list of Evidence") every time.
 ToolFn = Callable[[SearchTask], List[Evidence]]
 
 
@@ -44,8 +71,46 @@ def build_search_worker(tool: ToolFn):
     deterministic test failure.
     """
 
+    # The line below, "@validated_worker", is a DECORATOR (see the module
+    # docstring above if that word is new). In plain terms: Python takes the
+    # search_worker function defined right underneath, hands it to
+    # validated_worker() as an argument, and whatever validated_worker()
+    # returns becomes the NEW search_worker from this point on. The function
+    # body you read below is completely unaware this wrapping exists — the
+    # extra check happens outside it, in orchestration/contracts.py.
     @validated_worker
     def search_worker(payload: WorkerPayload) -> Dict[str, Any]:
+        """One instance of this runs PER TASK, all in the same LangGraph
+        superstep — this is the "map" half of the gather loop's map-reduce.
+
+        READS   payload.task ONLY (a single SearchTask) — deliberately NOT
+                the full ResearchState (D-6). A worker cannot see other
+                workers' tasks, other goals, or anything else in state; it
+                just executes the one query string it was handed.
+        CALLS   the injected retrieval tool (tools/corpus_search.py in
+                practice) — runs the hybrid dense+BM25 search and converts
+                hits into Evidence objects. No LLM call in this node.
+        WRITES  exactly ONE of the two outcomes below, never both:
+
+            SUCCESS -> state.evidence            += the Evidence list
+                       state.completed_task_keys  += {task.key}
+                       state.counters["search_calls"] += 1
+
+            FAILURE -> state.failed_task_keys[task.key] = task.depth
+                       state.counters["search_failures"] += 1
+                       (the task is NOT added to completed_task_keys — see
+                        the D-16 note below)
+
+        NEXT    ALL workers dispatched this cycle must land before anything
+                else runs — that join is LangGraph's superstep barrier, not
+                code in this file. Only once every worker has returned does
+                merger_node (below) execute.
+
+        Every returned dict is checked by @validated_worker (contracts.py)
+        against WORKER_WRITABLE_KEYS before LangGraph ever sees it. Return
+        any other key here and the run fails immediately and loudly, rather
+        than risking a silent InvalidUpdateError under real concurrency.
+        """
         task = payload.task
         try:
             evidence = tool(task)
@@ -73,12 +138,34 @@ def build_merger_node():
     """Build the evidence merger / contradiction flagger."""
 
     def merger_node(state: ResearchState) -> Dict[str, Any]:
-        # Minimal detection: honor explicit contradiction markers placed by
-        # tools (none in the sample corpus). The important part is wired
-        # regardless: any contradicted goal becomes contested, and contested
-        # goals are excluded from coverage in the checker — which drives the
-        # gap generator to seek adjudicating evidence (D-18). A semantic
-        # (LLM-based) detector slots in here later without touching wiring.
+        """The "reduce" half of the gather loop. Runs once all search_worker
+        instances from this cycle have landed (the superstep barrier — no
+        code here waits for that; LangGraph guarantees it).
+
+        READS   state.evidence (everything gathered so far, this run —
+                includes memory evidence from turn 1 and every prior
+                gather cycle's corpus evidence),
+                state.goals.
+        CALLS   nothing external — pure Python, no LLM, no store access.
+        WRITES  state.goals — same list, each Goal's `contested` flag
+                (re)computed: True if ANY evidence item tagged with that
+                goal_id carries an explicit e.contradicts marker.
+                state.counters["contradictions_flagged"] = count.
+        NEXT    graph.py routes unconditionally to progress_checker, which
+                is the node that actually ACTS on the contested flag (a
+                contested goal cannot be marked `covered`, however much
+                evidence points at it).
+
+        ⚠ Detection is minimal today: it only honors an explicit
+        e.contradicts marker placed by a tool, and no tool in this build
+        ever sets one — so contested_goal_ids is always empty in practice
+        and this node's real job never fires. The MACHINERY it feeds
+        (contested -> excluded from coverage -> gap generator seeks
+        adjudicating evidence, D-18) is fully wired and tested; only the
+        semantic judgement that would populate `contradicts` is missing.
+        A future LLM-based detector slots in right here without touching
+        any other file's wiring.
+        """
         contested_goal_ids = {e.goal_id for e in state.evidence if e.contradicts}
         goals = [g.model_copy(update={"contested": g.goal_id in contested_goal_ids})
                  for g in state.goals]
@@ -95,12 +182,43 @@ def build_progress_checker_node(settings: Settings):
     """Build the coverage/recall checker — the loop's clock (D-3)."""
 
     def progress_checker_node(state: ResearchState) -> Dict[str, Any]:
+        """The gather loop's ONLY clock. Runs right after merger, every
+        single cycle, whether this is the first pass or the fifth.
+
+        READS   state.goals (with merger's `contested` flags already set),
+                state.evidence, settings.min_evidence_score,
+                settings.max_depth, settings.recall_target,
+                settings.hitl_enabled, state.iteration_depth.
+        CALLS   nothing external — pure Python.
+        WRITES  state.goals — same list, each Goal's `covered` flag set:
+                    covered = (has >=1 evidence item scored at or above
+                               min_evidence_score for this goal_id)
+                              AND (not contested)
+                state.recall_score = covered_goals / total_goals
+                                     (1.0 if there are no goals at all)
+                state.iteration_depth += 1   <- the ONLY place this ticks,
+                                                exactly once per cycle
+                IF terminally short (hitl_enabled AND depth>=max_depth AND
+                recall<target): state.escalation_trigger = "E2" (a
+                contested goal is blocking) or "E3" (nothing contested,
+                just not enough found)
+        NEXT    graph.py's route_convergence reads recall_score, depth and
+                escalation_trigger to decide: human_escalation (if a
+                trigger fired) -> compiler (recall high enough, OR depth
+                budget spent) -> gap_generator (otherwise — go round again).
+
+        ⚠ settings.min_evidence_score defaults to 0.0, which makes the
+        `>= min_evidence_score` check true for every item ever returned,
+        including one scored exactly 0.0. Combined with the fact that dense
+        retrieval always returns its top-k nearest neighbours regardless of
+        actual relevance, recall effectively becomes "did ANY document come
+        back for this goal" rather than a real quality measure — which is
+        why E2/E3 essentially never fire while retrieval is up. Raising this
+        setting above the observed off-topic score floor is the single
+        highest-value fix in this codebase; see PHASE2_PLAN.md item P2-01.
+        """
         goals = []
         for g in state.goals:
-            # Coverage rule (§6.5): needs at least one evidence item for this
-            # goal at/above the quality gate, AND the goal must not be
-            # contested. min_evidence_score defaults to 0.0 (inert) until the
-            # score distribution is observed — graceful-degradation default.
             has_quality_evidence = any(
                 e.goal_id == g.goal_id and e.score >= settings.min_evidence_score
                 for e in state.evidence)
@@ -128,6 +246,47 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings):
     """Build the gap generator: new tasks for uncovered goals."""
 
     def gap_generator_node(state: ResearchState) -> Dict[str, Any]:
+        """The most agentic node in the whole graph: it looks at what was
+        actually found, decides what is still missing, and writes new
+        queries for the gap. This IS the gather loop — every trip round it
+        passes through here.
+
+        Only reached when progress_checker's route_convergence decided
+        recall is still below target and depth budget remains.
+
+        READS   state.goals (with `covered` flags from progress_checker),
+                the last 10 items of state.evidence,
+                state.iteration_depth, settings.max_fanout,
+                state.human_guidance — non-empty ONLY after an E2/E3
+                "redirect" from human_escalation.
+        CALLS   one LLM JSON call: "here's what's covered and what isn't,
+                write queries to close the gap" (templates.generate_gaps).
+        WRITES  state.pending_tasks = [SearchTask, ...]   (replaces the
+                    backlog wholesale, same as task_expander — D-2)
+                state.human_guidance = ""   (consumed)
+                state.counters["llm_calls"] += 1
+                IF the model produced NO usable tasks AND recall is still
+                below target: raises E2/E3 here too (see note below).
+        NEXT    graph.py's dispatch_tasks (the SAME routing function
+                task_expander uses): empty backlog -> compiler; otherwise
+                -> one parallel search_worker per new task, looping back
+                into the gather cycle.
+
+        Tasks pass through the same task_utils.cap_and_filter as
+        task_expander (D-13 cap / D-2 dedup / D-16 depth-gated retry), but
+        called with depth=state.iteration_depth rather than 0 — that depth
+        value is exactly what makes D-16's "retry only at a strictly
+        greater depth" rule meaningful for tasks that failed earlier.
+
+        WHY THIS NODE ALSO RAISES E2/E3 (progress_checker already does):
+        a run can fail to converge two different ways. progress_checker
+        catches "depth budget is spent" — but a run can ALSO run out of
+        NEW tasks to try (every candidate query already tried or already
+        failed) before depth is exhausted. That second failure mode only
+        becomes visible here, after cap_and_filter has actually filtered
+        the model's output down to nothing. Both are "cannot converge
+        below target," so both raise the same trigger codes.
+        """
         router.set_node("gap_generator")
         result = router.complete_json(templates.generate_gaps(
             state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
