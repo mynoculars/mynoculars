@@ -93,8 +93,8 @@ class OpenSearchStore:
         """
         if not self.available:
             return
-        if not self._client.indices.exists(self.index):
-            self._client.indices.create(self.index, body={
+        if not self._client.indices.exists(index=self.index):
+            self._client.indices.create(index=self.index, body={
                 "mappings": {"properties": {
                     "content": {"type": "text"},
                     "title": {"type": "text"},
@@ -121,14 +121,14 @@ class OpenSearchStore:
         # a brand-new random id per call. That asymmetry is a documented
         # difference between the two stores in this codebase.
         for i, doc in enumerate(docs):
-            self._client.index(self.index, body=doc, id=str(i))
+            self._client.index(index=self.index, body=doc, id=str(i))
         # indices.refresh(...) forces OpenSearch to make the just-indexed
         # documents immediately searchable. Without it, there can be a
         # short delay before new documents show up in search results — this
         # call trades a little bit of write performance for immediate
         # read-your-own-writes consistency, which matters for a one-shot
         # ingest script that's typically followed right away by a query.
-        self._client.indices.refresh(self.index)
+        self._client.indices.refresh(index=self.index)
         return len(docs)
 
     def search(self, query: str, top_k: int) -> List[Dict[str, Any]]:

@@ -9,6 +9,8 @@ no network, no real Postgres/Qdrant/OpenSearch.
 
 import json
 import logging
+import pathlib
+import sys
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
@@ -231,3 +233,50 @@ def test_e3_stub_logs_when_hitl_disabled(off_memory, stub_router, settings, capl
     stub_lines = [r for r in caplog.records if "escalation.stub" in r.message]
     assert stub_lines, "expected an escalation.stub WARNING when HITL is off"
     assert stub_lines[0].event_fields["trigger"] in ("E2", "E3")
+
+
+# ---------------------------------------------------------------------------
+# P2-03 follow-up — idempotent corpus ingest (scripts/ingest_sample_data.py
+# never actually used QdrantStore.upsert_texts's id_fn parameter, so every
+# re-run duplicated the dense-leg corpus even after P2-03 landed)
+# ---------------------------------------------------------------------------
+
+
+def _load_ingest_script():
+    """Import scripts/ingest_sample_data.py by file path — it's a script,
+    not a package member, so it can't be imported with a normal `import`
+    statement from tests/."""
+    import importlib.util
+
+    script_path = (pathlib.Path(__file__).parent.parent
+                  / "scripts" / "ingest_sample_data.py")
+    spec = importlib.util.spec_from_file_location("ingest_sample_data", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_content_id_is_deterministic_for_same_content():
+    mod = _load_ingest_script()
+    item = {"content": "Redis is an in-memory data store.", "title": "Redis"}
+    assert mod.content_id(item) == mod.content_id(dict(item))
+
+
+def test_content_id_differs_for_different_content():
+    mod = _load_ingest_script()
+    a = {"content": "Redis is an in-memory data store."}
+    b = {"content": "Cassandra is a distributed database."}
+    assert mod.content_id(a) != mod.content_id(b)
+
+
+def test_content_id_is_a_valid_qdrant_point_id_shape():
+    # Qdrant point ids must be an unsigned int or a UUID string — a raw
+    # hash digest would be rejected outright. uuid.uuid5(...) guarantees
+    # this shape; this test would fail loudly if that ever changed to a
+    # plain hexdigest by mistake.
+    import uuid as uuid_module
+
+    mod = _load_ingest_script()
+    result = mod.content_id({"content": "anything"})
+    parsed = uuid_module.UUID(result)  # raises ValueError if not a real UUID
+    assert str(parsed) == result
