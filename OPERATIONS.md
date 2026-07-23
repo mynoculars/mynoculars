@@ -1,18 +1,26 @@
 # OPERATIONS — How To Actually Run This Thing
 
-This is the missing manual. No architecture theory. Just: what to install, how to
-load data, how to run, in the exact order, with copy-paste commands and what you
-should see. If a step's output doesn't match, that's the diagnostic.
+This is the operations manual. No architecture theory. Just: what to install, 
+how toload data, how to run, in the exact order, with copy-paste commands and 
+what you should see. If a step's output doesn't match, that's the diagnostic.
 
-> **Note on this revision:** everything from "The One Thing Nobody Told You"
-> through "The 60-Second Is Everything Up? Check" is unchanged from the
-> previous version of this document, with two small factual corrections (the
-> test suite is **34** tests, not 28 — it grew since this doc was first
-> written) and one outdated bracketed note about OpenSearch SSL replaced with
-> a working fix, since that exact problem was hit and diagnosed live while
-> writing the new sections below. Everything from **Development & Debugging
-> Workflows** onward is new. All new command examples target **Windows
-> PowerShell** specifically, per how this environment actually runs.
+> **Note on this revision:** the test suite is now **57** tests (was 34/36
+> in earlier revisions of this document) — Tier 2 of `internal/
+> PHASE-2_PLAN.md` (producer validation, boundary-scoped telemetry, Postgres
+> lifecycle + API parity, config strictness) is closed, verified against
+> both the offline suite and multiple real live traces. Telemetry examples
+> throughout this document have been updated to the current field names
+> (`llm_node_calls`/`llm_provider_calls`/etc. — see **Understanding and
+> Interpreting the Debug Logs** below for what changed and why). A new
+> troubleshooting entry covers an `opensearch-py` 3.x compatibility break
+> hit live while re-testing ingest. Qdrant ingest is now genuinely
+> idempotent by default (previously the mechanism existed but nothing
+> called it) — see **Writing Your Own Test Corpus** below for the one
+> caveat that still applies to a collection that already has stale
+> duplicates in it from before this fix. Everything else — including all
+> of **Development & Debugging Workflows** — is otherwise unchanged from
+> the previous revision. All PowerShell-targeted command examples remain
+> PowerShell, per how this environment actually runs.
 
 ---
 
@@ -85,7 +93,14 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "iterations": 1,
   "evidence_items": 0,      <-- zero because no corpus is loaded yet
   "recall": 0.0,            <-- zero for the same reason
-  "llm_calls": 6,
+  "llm_node_calls": 6,
+  "llm_provider_calls": 6,  <-- stub mode: 1 attempt per node call, no fallbacks
+  "llm_fallback_hops": 0,
+  "llm_quality_calls": 0,
+  "retrieval_dense_calls": 2,     <-- workers RAN (2 tasks), retrieval attempted
+  "retrieval_keyword_calls": 2,
+  "retrieval_leg_unavailable": 4, <-- both legs down, both counted, both tasks
+  "producer_rejects": 0,
   "search_calls": 2,        <-- workers RAN, they just found nothing
   "search_failures": 0,
   "memory_hits": 0,
@@ -98,15 +113,18 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
 ```
 
 `search_calls: 2` with `evidence_items: 0` is the signature of L1: the workers
-executed, retrieval degraded to empty because the stores are down. **This is
-success for L1.** Now run the tests to confirm the logic:
+executed, retrieval degraded to empty because the stores are down.
+`retrieval_leg_unavailable: 4` is the newer, more direct way to see the same
+thing (P2-07) — 2 search calls × 2 unavailable legs each = 4, without having
+to infer it from zero evidence. **This is success for L1.** Now run the
+tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 36 passed
+# expect: 57 passed
 ```
 
-If L1 runs and 36 tests pass, your code is fine. Everything from here is about
+If L1 runs and 57 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -322,7 +340,14 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "iterations": 1,
   "evidence_items": 6,      <-- NOW the workers found real evidence
   "recall": 1.0,            <-- goals covered by retrieved facts
-  "llm_calls": 5,
+  "llm_node_calls": 5,
+  "llm_provider_calls": 5,
+  "llm_fallback_hops": 0,
+  "llm_quality_calls": 0,
+  "retrieval_dense_calls": 2,      <-- both legs actually answered now
+  "retrieval_keyword_calls": 2,
+  "retrieval_leg_unavailable": 0,  <-- neither leg was down for this run
+  "producer_rejects": 0,
   "search_calls": 2,
   "search_failures": 0,
   "memory_hits": 0,
@@ -482,7 +507,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 36 tests, all offline, ~0.3s
+python -m pytest tests/ -q   # 57 tests, all offline, ~0.6s
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -536,10 +561,17 @@ Rules that matter:
 - Then ask questions your new docs can answer and watch `recall` climb.
 
 To wipe and reload cleanly (Docker): `docker compose down -v && docker compose up -d`
-then re-ingest. Native: use `scripts/reset_stores.py` (see **Performing a Dry
-Run** below) rather than re-running ingest directly — Qdrant's ingest is not
-currently idempotent (re-running it duplicates points instead of overwriting;
-OpenSearch's re-running does correctly overwrite by id).
+then re-ingest. Native: `scripts/reset_stores.py` (see **Performing a Dry
+Run** below) is still the recommended path when you're changing the corpus's
+*shape* (adding/removing documents changes which ids exist). For an
+unchanged corpus, re-running `ingest_sample_data.py` directly is now safe on
+both legs — Qdrant's ingest was fixed to be idempotent (a deterministic
+`uuid5(content)` id, same as OpenSearch's long-standing `str(i)` behavior).
+**One caveat:** this fix is forward-looking only. If your Qdrant collection
+already has duplicate points from ingest runs before this fix landed,
+re-running ingest again won't clean those up — you'll need
+`reset_stores.py --yes` followed by one fresh ingest to get back to a clean
+count.
 
 ---
 
@@ -583,8 +615,8 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **36 tests**, fully offline — no services, no API keys, no
-network. It's split into three files, each testing a different layer:
+The suite is **57 tests**, fully offline — no services, no API keys, no
+network. It's split into four files, each testing a different layer:
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -595,8 +627,9 @@ python -m pytest tests/ -q
 tests/test_core.py              25 tests   the graph's everyday logic
 tests/test_hitl.py                8 tests   the human-in-the-loop path
 tests/test_integration_paths.py   3 tests   cross-cutting failure paths
+tests/test_tier2.py              21 tests   P2-06/07/08/09 + ingest-dedup fix
                                  --------
-                                  36 tests
+                                  57 tests
 ```
 
 **What each file is actually proving:**
@@ -617,6 +650,16 @@ tests/test_integration_paths.py   3 tests   cross-cutting failure paths
   exhaustion correctly skips `memory_writer`, a worker that raises is
   recorded as *failed*, not *completed* (D-16), and the stub client tolerates
   a model wrapping its JSON in markdown fences.
+- **`test_tier2.py`** — Tier 2's four items plus the P2-03 ingest-script
+  follow-up: producer-output rejection (P2-06, at both the `cap_and_filter`
+  and full-graph level), router- and retrieval-boundary telemetry counters
+  including a dedicated concurrency test proving the retrieval-side counters
+  are genuinely thread-safe under parallel `search_worker` dispatch (P2-07),
+  checkpointer lifecycle behavior (P2-08), config-typo warnings and
+  E2/E3 disabled-mode logging parity (P2-09), and `content_id()`'s
+  determinism for the Qdrant ingest fix. If you touch `llm/router.py`,
+  `retrieval/hybrid.py`, `agents/task_utils.py`, or `storage/postgres.py`,
+  run this file specifically.
 
 **Run just one file, or just one test:**
 
@@ -854,21 +897,27 @@ what a *healthy* line looks like for each node, and what to actually check.
 | `compiler` | one `llm.call` with `mode=text` — the only free-text call in the system; large `prompt_tokens` here is normal (it inlines all gathered evidence). **Watch for `llm.truncated_runaway_generation`** — a WARNING that fires if the model kept generating past its own answer (a fake follow-up conversation, a repeated turn); if you see it often, check your `llama-server`'s stop-token/chat-template config | `prompt_tokens` in the thousands is expected, not a problem; `llm.truncated_runaway_generation` appearing occasionally is handled gracefully — appearing on nearly every call across every node is a sign of a real server-config issue worth fixing at the source |
 | `critic` | `node.critique`, `"passed"` and `"revision"` | `"passed": true, "revision": 1` |
 | `memory_writer` | only reached if critique passed; `memory.stored`, `"count"` | `"count"` roughly matching this run's own fresh evidence |
-| `telemetry` | `run.telemetry` — the final summary; remember `llm_calls`/`search_calls` are **node-scoped counts**, not real provider-call counts (see below) | — |
+| `telemetry` | `run.telemetry` — the final summary; `llm_node_calls`/`search_calls` are still **node-scoped counts**, but `llm_provider_calls`/`llm_fallback_hops`/`llm_quality_calls`/`retrieval_dense_calls`/`retrieval_keyword_calls`/`retrieval_leg_unavailable` (P2-07) are real boundary-crossing counts now — see below | — |
 | `human_escalation` | only with `HITL_ENABLED=true` and a trigger fired; **fires twice** on one escalation (once pausing, once resuming) — expected, not a duplicate | one `escalation_history` entry recorded despite the two log lines |
 
-**One systematic gotcha with the final telemetry block:** `llm_calls` and
-`search_calls` count **node executions**, not actual provider traffic. A node
-that fell through the primary to Mistral still counts as one `llm_call`, even
-though two real network calls happened. If you need the true call volume,
-count `llm.call` lines in the log directly:
+**This used to be the single biggest gotcha in the telemetry block; as of
+P2-07 it mostly isn't anymore.** `llm_node_calls` and `search_calls` still
+count **node executions**, not actual provider traffic — a node that fell
+through the primary to Mistral still counts as one `llm_node_calls`, even
+though two real network calls happened. But you no longer have to count log
+lines by hand to see the real number: `llm_provider_calls` in the same
+telemetry block now IS the real provider-attempt count, and
+`llm_fallback_hops` is the real hop count. If you still want to
+cross-check against the raw log (or you're debugging something P2-07
+doesn't cover, like exact latencies):
 
 ```powershell
 (Select-String '"msg": "llm.call"' run.log).Count
 ```
 
-That will often be a noticeably higher number than `telemetry`'s `llm_calls`
-field — that gap is expected, not an error.
+`llm_provider_calls` in telemetry and this log-line count should now agree —
+if they don't, that's worth investigating as a real discrepancy, not an
+expected gap the way it used to be.
 
 ---
 
@@ -983,6 +1032,22 @@ or configured directly in `config/opensearch-security/internal_users.yml`
 under your OpenSearch install directory. Check there if `admin`/`admin`
 doesn't work.
 
+### `TypeError: IndicesClient.exists() takes 1 positional argument but 2 positional arguments ... were given` during ingest
+
+This is a client-library version issue, not a config problem. `opensearch-py`
+3.x made `indices.exists`/`.create`, `.index`, and `indices.refresh` require
+the index/document name as a **keyword** argument (`index=...`), where older
+versions of the library also accepted it positionally. If your installed
+`opensearch-py` is 3.x and you see this `TypeError` from
+`scripts/ingest_sample_data.py`, this has already been fixed in
+`storage/opensearch_store.py` (all four call sites now use `index=` — the
+`search()` call already did, which is why searches never showed this
+error, only ingest did). If you're on an older checkout without that fix,
+either update `storage/opensearch_store.py` to match, or pin
+`opensearch-py<3` in `requirements.txt` as a stopgap. Confirm the fix
+worked: `python scripts/ingest_sample_data.py` should print
+`OpenSearch: indexed 10` with no traceback.
+
 ### `worker.failed` with `"reason": "NotFoundError"` on every single search
 
 This means the Qdrant **collection itself doesn't exist** right now —
@@ -1054,3 +1119,4 @@ independent of this setting.
 $env:LLM_PRIMARY_TIMEOUT_SECONDS = "150"
 python -m research_agent.cli "your question" --debug
 ```
+</file_text>

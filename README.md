@@ -9,32 +9,41 @@ review when it cannot converge, and remembers what it learned for future runs.
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
 > human-in-the-loop escalation from the accompanying design document
-> (decisions D-1…D-24 + D-28 subset). MCP tool mediation is deliberately
-> deferred — see [Limitations](#limitations).
+> (decisions D-1…D-24, D-28, D-29 + proposed D-31/D-32). Tier 1 AND Tier 2
+> of `internal/PHASE-2_PLAN.md` are both closed as of this revision. MCP tool
+> mediation is deliberately deferred — see [Limitations](#limitations).
 >
 > **This revision is code-truth, updated after a round of live fixes.**
-> Every claim below was verified against the source, against a real debug
-> trace (`logs/trace-run-0d7d0448906a.txt`), and — for the fixes described
-> in [Recent Fixes](#recent-fixes) — against fresh live-mode debug traces
-> captured while diagnosing and closing them. Where the design document or
-> an earlier README said something the code does not do, the delta is
-> recorded in [Documentation Corrections](#documentation-corrections)
-> rather than quietly repeated.
+> Every claim below was verified against the source and against real
+> debug traces captured across several live runs while diagnosing and
+> closing Tier 2. Where the design document or an earlier README said
+> something the code does not do, the delta is recorded in
+> [Documentation Corrections](#documentation-corrections) rather than
+> quietly repeated.
 >
-> **The headline change since the last revision:** the escalation path has
-> now been confirmed live, end-to-end — a real run with
-> `HITL_ENABLED=true` reached `human_escalation` with trigger `E3`, paused
-> at the `action [approve/redirect/abort]:` prompt, and resumed correctly
-> on `approve`. **One honest caveat on HOW it fired:** in the run that
-> proved this, retrieval failed outright (`NotFoundError` — the Qdrant
-> corpus collection was empty after a `reset_stores.py --yes` with no
-> re-ingest), so `recall` hit `0.0` via the pre-existing D-16 failed-task
-> path, not via the specific P2-01 boundary-collision fix described below.
-> That fix (`>` instead of `>=` in the coverage check) is separately
-> unit-proven against the exact `score=0.5` artifact a real run produced —
-> see [Recent Fixes](#recent-fixes) — but has not yet been the thing that
-> triggered a live escalation on its own. Both are real, both are fixed;
-> this note just keeps the two pieces of evidence from being conflated.
+> **The headline change since the last revision: Tier 2 is closed, and
+> every item in it was verified against real, live traces — not just the
+> offline test suite.** `internal/PHASE-2_PLAN.md`'s four Tier 2 items (P2-06
+> producer validation, P2-07 boundary-scoped telemetry, P2-08 Postgres
+> lifecycle + API parity, P2-09 config strictness + `DECISIONS.md`) are
+> all done. P2-03's idempotent-ingest mechanism is now actually wired into
+> `scripts/ingest_sample_data.py` (previously the mechanism existed but no
+> caller used it — see [Recent Fixes](#recent-fixes)). One incidental fix
+> landed alongside this work, outside its original scope: an
+> `opensearch-py` 3.x compatibility break (`indices.exists`/`.create`/
+> `.index`/`indices.refresh` now require `index=` as a keyword argument,
+> not positional) surfaced during live ingest testing and is fixed in
+> `storage/opensearch_store.py`. Full suite: **57/57 tests passing**.
+>
+> The escalation path remains confirmed live, end-to-end, from the prior
+> revision — a real run with `HITL_ENABLED=true` reached
+> `human_escalation` with trigger `E3`, paused, and resumed correctly on
+> `approve`. **One honest caveat on HOW it fired, unchanged this
+> revision:** the run that proved this hit an outright retrieval failure
+> (`NotFoundError` — the Qdrant corpus collection was empty), so `recall`
+> hit `0.0` via the pre-existing D-16 failed-task path, not via the
+> specific P2-01 boundary-collision fix. That fix is separately
+> unit-proven; see [Recent Fixes](#recent-fixes).
 
 ## Overview
 
@@ -69,10 +78,13 @@ deliberately does not duplicate them:
 
 ## Recent Fixes
 
-Four of the fifteen items in `PHASE2_PLAN.md`'s Tier 1 have landed. Listed
-here first, ahead of the architecture walkthrough, because they change what
-several sections below used to say — if you've read an earlier revision of
-this README, this is the fastest way to see what moved.
+All five Tier 1 items and all four Tier 2 items in `internal/PHASE-2_PLAN.md` have
+landed, plus one incidental fix outside either tier's original scope.
+Listed here first, ahead of the architecture walkthrough, because they
+change what several sections below used to say — if you've read an
+earlier revision of this README, this is the fastest way to see what
+moved. Tier 1's table is unchanged from the prior revision (reproduced
+below for continuity); Tier 2's table follows it.
 
 | Item | What changed | Verified how |
 |---|---|---|
@@ -81,7 +93,21 @@ this README, this is the fastest way to see what moved.
 | **P2-02** — namespace memory `goal_id` | `memory/semantic_memory.py::retrieve` now tags every memory-sourced `Evidence` with `goal_id="memory::<original>"` instead of the bare original, so it can never satisfy a *current* run's goal by string collision | Constructed a fake memory hit tagged `goal_id="g3"` (simulating an unrelated earlier run) and confirmed the returned `Evidence.goal_id` (`"memory::g3"`) is provably `!= "g3"` |
 | separate, related fix — Cogito timeout | One shared `llm_timeout_seconds` (`60.0`, applied to every provider identically) split into `llm_primary_timeout_seconds` (`120.0`, Cogito only) and `llm_timeout_seconds` (`90.0`, now Mistral/Gemini only) | Confirmed live: two calls that previously timed out at exactly 60.0s now time out at exactly 120.0s (the local model genuinely needed more room for large prompts and, apparently, a cold-start model load on the session's first call) |
 | **P2-01 follow-up** — exact-boundary collision | Coverage check changed from `>=` to `>` in `agents/gathering.py::progress_checker_node`. Found live: with `RRF_SQUASH=30.0` and `RRF_K=60`, a rank-0 hit under SINGLE-LEG fusion (i.e. whenever OpenSearch is down) squashes to *exactly* `1/60 × 30 = 0.5` — a deterministic artifact of the fusion math, not a measure of relevance — and a `>=` comparison against `min_evidence_score=0.5` let that exact value through every time | Reconstructed the exact evidence shape a real run produced (`score=0.5` against a `0.5` threshold) and confirmed the goal is no longer marked covered. This closes the collision regardless of the threshold chosen — it does not replace actually fixing why OpenSearch is unreachable |
-| **New — free-text runaway-generation truncation** | New `_truncate_at_sentinel()` in `llm/client.py`, applied inside `OpenAICompatibleClient.complete()` (the free-text path `compiler_node` uses). P2-04's sentinel-stripping only ever covered the JSON-mode path (`_extract_json`) — the free-text path had zero cleanup. A real run showed the local model generating 94+ seconds and 3,151+ tokens past its actual answer, hallucinating an entire fake follow-up conversation (a fabricated `system` turn, the prompt regenerated, a duplicate report) that went straight into `final_report` verbatim | Reconstructed the exact runaway pattern from a real trace (clean report → `<\|im_end\|>` → fake turns → duplicate report) and confirmed only the clean report survives. **Confirmed firing live, repeatedly** — a later real run shows `llm.truncated_runaway_generation` on `goal_manager`, `task_expander`, both `gap_generator` calls, both `compiler` calls, and `critic`; the worst case kept 4,742 of 10,901 raw characters. The underlying cause is almost certainly the local `llama-server`'s stop-token/chat-template configuration, not fixed by this — this is a codebase-side safety net regardless of server config |
+| **New — free-text runaway-generation truncation** | New `_truncate_at_sentinel()` in `llm/client.py`, applied inside `OpenAICompatibleClient.complete()` (the free-text path `compiler_node` uses). P2-04's sentinel-stripping only ever covered the JSON-mode path (`_extract_json`) — the free-text path had zero cleanup. A real run showed the local model generating 94+ seconds and 3,151+ tokens past its actual answer, hallucinating an entire fake follow-up conversation (a fabricated `system` turn, the prompt regenerated, a duplicate report) that went straight into `final_report` verbatim | Reconstructed the exact runaway pattern from a real trace (clean report → `<\|im_end\|>` → fake turns → duplicate report) and confirmed only the clean report survives. **Confirmed firing live, repeatedly** — a later real run shows `llm.truncated_runaway_generation` on `goal_manager`, `task_expander`, both `gap_generator` calls, both `compiler` calls, and `critic`; the worst case kept 4,742 of 10,901 raw characters |
+
+### Tier 2 — closed this revision
+
+| Item | What changed | Verified how |
+|---|---|---|
+| **P2-06** — validate LLM producer output | New `RawTask` (`agents/task_utils.py`) and `RawGoal` (`agents/planning.py`) Pydantic models validate every raw goal/task dict *before* any key is indexed. A malformed entry is dropped and counted (`counters["producer_rejects"]`) instead of raising `KeyError` and aborting the whole run. `cap_and_filter`'s signature changed to `(tasks, rejected_count)` | Unit tests for the rejection/count behavior on malformed input; three separate live runs against a real model all show `producer_rejects: 0` — the well-formed path is provably unaffected |
+| **P2-07** — boundary-scoped telemetry (router half) | `llm/router.py::FallbackRouter` gained `drain_counters()` — a `threading`-free accumulator (single-threaded by nature; the router isn't shared across parallel workers the way retrieval is) tracking real attempts (`llm_provider_calls`), real fallback hops (`llm_fallback_hops`), and real self-scoring calls (`llm_quality_calls`). Every LLM-calling node merges these into its own returned counters. `llm_calls` renamed `llm_node_calls` (no alias — an honest rename) | Unit tests on the router directly; three live traces with different fallback/timeout/escalation shapes, every number in the final telemetry traced back by hand to a specific log line each time |
+| **P2-07** — boundary-scoped telemetry (retrieval half) | `retrieval/hybrid.py::HybridRetriever` gained `threading.local()`-backed counters (`retrieval_dense_calls`, `retrieval_keyword_calls`, `retrieval_leg_unavailable`), bumped as the *first* statement in `search()` so an attempt that raises partway through (e.g. a Qdrant `NotFoundError` on a missing collection) still counts as attempted. Exposed via an optional `drain_retrieval_counts` attribute on the `corpus_search` tool closure — deliberately not part of `ToolFn`'s return type, so no existing fake-tool test fixture needed to change shape | A dedicated concurrency test (`ThreadPoolExecutor`, 8 concurrent callers, each asserted to see only its own count — not a leaked or lost one); a live trace showing `retrieval_dense_calls: 6, retrieval_keyword_calls: 6` matching 6 real `search_worker` invocations exactly |
+| **P2-08** — Postgres lifecycle + API run-history parity | New `close_checkpointer()` in `storage/postgres.py` (reads the real `PostgresSaver.conn` attribute — verified against actual langgraph source, not guessed). `cli.py::build_app_and_settings` now returns a named `AppBundle(app, settings, durable, checkpointer)` instead of a bare 2-tuple that silently dropped `durable`. `api/server.py` surfaces `durable` in `/health`, closes the checkpointer on FastAPI shutdown, and calls `record_run` on completed `/research`/`/resume` calls | A live run shows `checkpointer.closed` logged on CLI exit against a real Postgres connection; `/health`'s `durable` field confirmed via a degraded-storage smoke test |
+| **P2-09** — config strictness + populated `DECISIONS.md` | `config.py::warn_on_likely_env_typos()` logs a WARNING for a fixed list of plausible env-key typos (`HITL` vs `HITL_ENABLED`, etc.) — chosen over `extra="forbid"` outright, which risked rejecting legitimate stray env vars. E2/E3's trigger condition in `agents/gathering.py` is now evaluated regardless of `hitl_enabled`, so an `escalation.stub` WARNING fires when HITL is off, matching E1/E4's existing parity. `DECISIONS.md` populated: D-1 through D-32, sourced only from code comments and this document's own decision citations — gaps (D-7/9/10/11) flagged as such, not invented | Unit tests for the typo warning firing/not-firing and for the E2/E3 stub-log parity; a live HITL-disabled run confirmed the `escalation.stub` line actually appears |
+| **Incidental — opensearch-py 3.x compatibility** | `storage/opensearch_store.py`'s `indices.exists`/`.create`/`.index`/`indices.refresh` calls passed the index/document name **positionally**; the installed `opensearch-py` 3.x client makes this a hard `TypeError` (`index=` must be a keyword). Fixed at all four call sites — `search()` already used the keyword form and was unaffected | Live: `python scripts/ingest_sample_data.py` failed with exactly this `TypeError` before the fix and completed cleanly (`OpenSearch: indexed 10`) after it |
+| **P2-03 follow-up — ingest script now actually idempotent** | `scripts/ingest_sample_data.py` was still calling `QdrantStore.upsert_texts(docs)` with no `id_fn` — the mechanism P2-03 added existed but nothing used it, so every re-ingest still duplicated the dense leg. New `content_id()` helper (`uuid.uuid5` of each document's content — deterministic, and a valid Qdrant point-id shape, unlike a raw hash digest) is now passed as `id_fn` | Three new unit tests (determinism, distinctness, valid-UUID shape); **your own Qdrant collection still has the ~20 duplicate points from ingest runs before this fix landed** — this only stops future re-ingests from adding more, it doesn't retroactively clean up what's already there (a `reset_stores.py --yes` + re-ingest gets you back to a clean 10) |
+
+**Full test suite: 57/57 passing** (36 from Tier 1 + 12 from Tier 2's four items + 6 from the P2-07 retrieval-side follow-up + 3 from the P2-03 ingest-script wiring).
 
 **A calibration caveat, stated plainly rather than buried:** `0.5` and
 `0.35` are starting points anchored to a real debug trace, not values
@@ -251,8 +277,8 @@ whose check fired**, never by the router that reads it.
                 │            │        └────────┬──────────┘         │
                 │            │                 ▼                    │
                 │            │        ┌────────────────┐            │
-                │            │        │     merger     │  contested │
-                │◄───────────┘        │  (D-18 flags)  │  goals     │
+                │◄───────────┘        │     merger     │  contested │
+                │                     │  (D-18 flags)  │  goals     │
                 │                     └────────┬───────┘            │
                 │                              ▼                    │
                 │                     ┌──────────────────┐         L│
@@ -391,10 +417,12 @@ cosine similarity; this is a documented, deliberate gap, not an oversight.
 
 ### Storage interactions
 
-Three stores, five distinct data flows. One writer path (Qdrant's
-`upsert_texts`) now has an OPTIONAL idempotent-id mechanism (P2-03) that
-nothing currently uses by default — see the note under Ingest identity below
-for exactly what that does and doesn't fix yet.
+Three stores, five distinct data flows. Qdrant's `upsert_texts` gained an
+optional idempotent-id mechanism under P2-03; as of this revision
+`scripts/ingest_sample_data.py` actually passes it — see the note under
+Ingest identity below for exactly what that does and doesn't fix (it's
+forward-looking only; it doesn't retroactively deduplicate a collection
+that already has stale duplicate points in it from before the fix).
 
 ```text
 ┌───────────────────────────┐         ┌────────────────────────────────────┐
@@ -407,9 +435,11 @@ for exactly what that does and doesn't fix yet.
 │                           │         ┌────────────────────────────────────┐
 │                           ├────────►│ Qdrant                             │
 │                           │         │ collection: agent_corpus           │
-└───────────────────────────┘         │ id = uuid4()   ── DUPLICATES ──    │
-                                      │ (still the DEFAULT behaviour — see │
-                                      │  Ingest identity note below)       │
+└───────────────────────────┘         │ id = uuid.uuid5(content) ── FIXED ─│
+                                      │ (P2-03 wired in — deterministic,   │
+                                      │  overwrites in place; see Ingest   │
+                                      │  identity note below for the id_fn │
+                                      │  mechanism this actually uses)     │
                                       │ vector: fastembed(content)         │
                                       │ payload: title, topic, content,    │
                                       │          created_at                │
@@ -458,7 +488,7 @@ LangGraph. Below it, us. Both halves are recreated automatically after a wipe �
 `PostgresSaver.setup()` rebuilds the top, `record_run`'s
 `CREATE TABLE IF NOT EXISTS` rebuilds the bottom.
 
-### Ingest identity — the divergence that bites (mechanism now exists to fix it; not yet wired in)
+### Ingest identity — fixed this revision, but check your existing collection
 
 ```text
                       sample_data/corpus.jsonl  (10 lines)
@@ -468,7 +498,9 @@ LangGraph. Below it, us. Both halves are recreated automatically after a wipe �
       ┌───────────────────┐                   ┌───────────────────┐
       │ OpenSearchStore   │                   │ QdrantStore       │
       │ .ingest()         │                   │ .upsert_texts()   │
-      │ _id = str(i)      │                   │ id = uuid4()      │
+      │ _id = str(i)      │                   │ id = uuid.uuid5(  │
+      │                   │                   │   NAMESPACE_URL,  │
+      │                   │                   │   content)   FIXED│
       └─────────┬─────────┘                   └─────────┬─────────┘
                 │                                       │
    run ingest 1 ▼                          run ingest 1 ▼
@@ -477,51 +509,66 @@ LangGraph. Below it, us. Both halves are recreated automatically after a wipe �
       └─────────┬─────────┘                   └─────────┬─────────┘
    run ingest 2 ▼                          run ingest 2 ▼
       ┌───────────────────┐                   ┌───────────────────┐
-      │  10 documents     │                   │  20 points        │
-      │  same ids ─►      │                   │  10 duplicates    │
-      │  overwritten      │                   └─────────┬─────────┘
-      └─────────┬─────────┘               run ingest 3  ▼
-   run ingest 3 ▼                            ┌───────────────────┐
-      ┌───────────────────┐                  │  30 points        │
-      │  10 documents     │                  │  20 duplicates    │
-      └─────────┬─────────┘                  └─────────┬─────────┘
-                │                                      │
+      │  10 documents     │                   │  10 points        │
+      │  same ids ─►      │                   │  same content ─►  │
+      │  overwritten      │                   │  SAME uuid5 id ─► │
+      └─────────┬─────────┘                   │  overwritten too  │
+   run ingest 3 ▼                             └─────────┬─────────┘
+      ┌───────────────────┐               run ingest 3 ▼
+      │  10 documents     │                  ┌───────────────────┐
+      └─────────┬─────────┘                  │  10 points, still │
+                │                            └─────────┬─────────┘
                 └──────────────────┬───────────────────┘
                                    ▼
-                 ┌──────────────────────────────────┐
-                 │ rrf_fuse() joins on `title`      │
-                 │ ── which silently COLLAPSES the  │
-                 │    duplicates, so the damage     │
-                 │    stays invisible until your    │
-                 │    corpus has repeated or        │
-                 │    missing titles                │
-                 └──────────────────────────────────┘
+                 ┌───────────────────────────────────┐
+                 │ rrf_fuse() joins on `title`       │
+                 │ ── still fragile for a corpus     │
+                 │    with repeated/missing titles,  │
+                 │    but no longer masking a growing│
+                 │    pile of duplicate points       │
+                 └───────────────────────────────────┘
 ```
 
-**P2-03 added the MECHANISM for idempotent ingest — `QdrantStore.upsert_texts`
-now accepts an optional `id_fn` parameter, and passing a deterministic,
-content-derived function makes re-ingesting the same content overwrite in
-place instead of duplicating.** But every existing caller in this codebase —
-`scripts/ingest_sample_data.py` and `memory_writer` alike — still calls
-`upsert_texts` **without** `id_fn`, which preserves the exact original
-`uuid4()`-per-call behavior. So as of this revision:
+**P2-03 added the MECHANISM for idempotent ingest** —
+`QdrantStore.upsert_texts` accepts an optional `id_fn` parameter, and
+passing a deterministic, content-derived function makes re-ingesting the
+same content overwrite in place instead of duplicating. **As of this
+revision, `scripts/ingest_sample_data.py` actually passes one** — a new
+`content_id(item)` helper computing `uuid.uuid5(uuid.NAMESPACE_URL,
+item["content"])`. `uuid5` was chosen deliberately over a raw content hash:
+Qdrant point ids must be an unsigned int or a UUID string, so a hex digest
+would be rejected outright, while `uuid5` gives a real, valid UUID that is
+still fully deterministic on its input.
 
-- **The corpus ingest duplication bug described above is still live in
-  practice.** The fix exists and is proven to work (see Recent Fixes), but
-  `scripts/ingest_sample_data.py` hasn't been updated to actually pass a
-  deterministic `id_fn` yet. That's a small, separate follow-up.
+- **The corpus ingest duplication bug described in earlier revisions is
+  now actually fixed in practice**, not just mechanism-available. Verified
+  live: `python scripts/ingest_sample_data.py` run twice in a row against
+  the same corpus reports `Qdrant: embedded 10` both times, not `10` then
+  `20`.
+- **⚠ This does not retroactively clean up a collection that already
+  accumulated duplicates before this fix landed.** If you ran the old
+  ingest script more than once against a real Qdrant instance, your
+  `agent_corpus` collection likely still has stale duplicate points sitting
+  in it (10 logical documents × however many times you ran ingest before
+  this fix). This fix only stops *future* re-ingests from adding more. To
+  get back to a clean state: `scripts/reset_stores.py --yes` (drops the
+  collection), then re-ingest.
 - **Memory's accumulation is unchanged, and deliberately so** —
-  `memory_writer` is meant to keep accumulating fresh evidence every passed
+  `memory_writer` still calls `upsert_texts` with no `id_fn`, and that's
+  intentional: it is meant to keep accumulating fresh evidence every passed
   run, not collapse repeats. Deduping memory is a larger, separate piece of
-  work tracked as `P2-15`, not something P2-03 was meant to touch.
+  work tracked as `P2-15`, not something P2-03 touches.
 
-**Do the chunks match between Qdrant and OpenSearch?** Still: the *units*
-match; the *identities* don't, for the reasons above. Neither store chunks
-anything — one JSONL line becomes exactly one OpenSearch document and
-exactly one Qdrant point, with byte-identical `content`. Only `content` is
-embedded, and only `content` is BM25-matched.
+**Do the chunks match between Qdrant and OpenSearch?** Yes, now on both axes.
+Neither store chunks anything — one JSONL line becomes exactly one
+OpenSearch document and exactly one Qdrant point, with byte-identical
+`content`. Only `content` is embedded, and only `content` is BM25-matched.
+Both stores now assign the SAME document the SAME id on every re-ingest —
+OpenSearch via `str(i)` (unchanged, always was idempotent), Qdrant via
+`uuid5(content)` (new this revision).
 
-The workaround remains `scripts/reset_stores.py` — see below.
+`scripts/reset_stores.py` remains the way back to a clean state for a
+collection with stale duplicates already in it — see below.
 
 ### LLM fallback chain
 
@@ -893,7 +940,7 @@ pass — including on a report whose Cassandra and DynamoDB sections were
 supported by no retrieved evidence whatsoever. Self-critique by the same
 model family is optimistic; that is what it costs. **This one is unrelated to
 P2-01/P2-02 and remains unfixed** — it's `P2-11` (judge-model quality
-scoring) in `PHASE2_PLAN.md`'s Tier 3, not something touched tonight.
+scoring) in `internal/PHASE-2_PLAN.md`'s Tier 3, not something touched tonight.
 
 Reproduced deterministically before the fix, no services required:
 `hitl_enabled=True`, stub LLM, and a tool returning one `score=0.0` item per
@@ -958,7 +1005,7 @@ Unchanged by tonight's fixes.
 | 2 | Namespace memory goal ids on retrieval | **Done** — `memory/semantic_memory.py::retrieve` |
 | 3 | Apply a similarity floor before hits become Evidence | **Done** — `retrieval/hybrid.py`, `min_similarity` |
 | 4 | Require at least one `source == "corpus"` item for coverage, or weight memory below fresh retrieval | Not done — still open, not part of tonight's scope |
-| 5 | Add an integration test asserting an interrupt for an out-of-corpus query | **Done** — two tests added to `tests/test_hitl.py`, both passing (36/36 total). **Live confirmation exists too**, though via the retrieval-failure path (D-16) rather than the low-relevance-evidence path these tests specifically target — see the status note at the top of this section |
+| 5 | Add an integration test asserting an interrupt for an out-of-corpus query | **Done** — two tests added to `tests/test_hitl.py`, both passing (57/57 total, current suite). **Live confirmation exists too**, though via the retrieval-failure path (D-16) rather than the low-relevance-evidence path these tests specifically target — see the status note at the top of this section |
 
 Items 1–3 were each individually sufficient to make E3 reachable for the
 documented query; all three are now in place together. Item 5 is what turns
@@ -967,34 +1014,57 @@ documented query; all three are now in place together. Item 5 is what turns
 ## Telemetry — read it honestly
 
 `telemetry_node` aggregates counters that nodes recorded. It invents nothing,
-exactly as D-12 requires. But the counters are **node-scoped, not
-boundary-scoped**, and that distinction will mislead you about cost:
+exactly as D-12 requires. **As of P2-07 (this revision), the counters are
+boundary-scoped, not just node-scoped** — the single biggest gap this
+section used to describe is now closed, on both the LLM side and the
+retrieval side:
 
-| Field | Counts | Does **not** count |
+| Field | Counts | Boundary |
 |---|---|---|
-| `llm_calls` | one per LLM-using **node execution** | fallback hops, self-scoring calls |
-| `search_calls` | one per **successful worker** | per-engine round trips |
-| `search_failures` | one per worker that raised | partial-leg failures |
-| `memory_hits` / `memory_writes` | items in / points out | |
-| `revision_cycles` | critic passes | |
+| `llm_node_calls` | one per LLM-using **node execution** — renamed from `llm_calls` for honesty; a node that fell through two fallback hops still counts as one | node |
+| `llm_provider_calls` | one per **real provider attempt**, win or lose — fallback hops now visible | `llm/router.py::FallbackRouter` |
+| `llm_fallback_hops` | one per actual hop to the next provider (error or low-quality) | same |
+| `llm_quality_calls` | one per self-scoring call (`compiler_node`'s free-text path only — the only path with a quality gate) | same |
+| `retrieval_dense_calls` / `retrieval_keyword_calls` | one pair per real `HybridRetriever.search()` attempt, bumped before either leg is even queried — so an attempt that raises partway through still counts | `retrieval/hybrid.py::HybridRetriever` |
+| `retrieval_leg_unavailable` | counts a store being unreachable at the moment of the call — **not** a leg that queried fine and legitimately returned nothing | same |
+| `producer_rejects` | malformed goal/task dicts the LLM returned, dropped by P2-06's validation instead of crashing the run | `agents/task_utils.py`, `agents/planning.py::goal_manager_node` |
+| `search_calls` | one per **successful worker** | node |
+| `search_failures` | one per worker that raised | node |
+| `memory_hits` / `memory_writes` | items in / points out | node |
+| `revision_cycles` | critic passes | node |
 
-In the original traced run `llm_calls` reported **5**, while the trace showed
-**9** recorded provider responses plus at least two untraced primary attempts
-that errored before returning a body. Read `llm_calls` as *"nodes that used
-an LLM"*, never as provider traffic or spend.
+A real live trace showed this working correctly under genuinely messy
+conditions — two provider timeouts, a low-quality rejection, and a 429 —
+in one run: `llm_node_calls: 8, llm_provider_calls: 11, llm_fallback_hops: 3,
+llm_quality_calls: 1`. Every one of those four numbers was verified by hand
+against the corresponding `llm.call`/`llm.fallback`/`llm.quality_reject` log
+lines in that same trace and matched exactly. A separate run with real
+corpus retrieval showed `retrieval_dense_calls: 6, retrieval_keyword_calls:
+6, retrieval_leg_unavailable: 0`, matching 6 real `search_worker`
+invocations, each with both legs answering (`"dense": 3, "keyword": 3` in
+every `retrieval.hybrid` log line that cycle).
 
-**The trace is still the honest view for LLM/store detail, but it's no
-longer the only signal.** `--debug` (or `DEBUG_TRACE=true`) records every LLM
-call and every retrieval call at the boundary it actually crosses, to
-`logs/trace-<run_id>.txt` — and, as of this revision, **also emits a
-`"node.enter"` line to stderr for every node**, including `merger` and
-`progress_checker`, which touch neither an LLM nor a store and so still
-never appear in the trace file itself. See
+**What this does NOT fix, and never claimed to:** `llm_node_calls` still
+counts node executions, not provider requests — that's the *point* of the
+rename, not a residual bug. If you need "how many nodes touched an LLM at
+all" that's still the right field; if you need real provider traffic or
+spend, use `llm_provider_calls` now, which didn't exist before this
+revision.
+
+**The trace is still the honest view for exact prompt/response detail, but
+it's no longer the only signal for volume.** `--debug` (or
+`DEBUG_TRACE=true`) records every LLM call and every retrieval call at the
+boundary it actually crosses, to `logs/trace-<run_id>.txt` — and, since a
+prior revision, **also emits a `"node.enter"` line to stderr for every
+node**, including `merger` and `progress_checker`, which touch neither an
+LLM nor a store and so still never appear in the trace file itself. See
 [Debugging a live run](#debugging-a-live-run) for exactly how to use both
 together. In one traced run, this combination revealed something telemetry
 alone never would: **OpenSearch never appeared at all**, because the keyword
 leg was down — the "hybrid" retriever was running single-legged, and nothing
-in the report or the telemetry said so.
+in the report or the (then node-scoped-only) telemetry said so.
+`retrieval_leg_unavailable` (this revision) now surfaces that same fact
+directly in the telemetry block itself, without needing the trace.
 
 ## Design
 
@@ -1039,19 +1109,19 @@ research-agent-dmp/
 │   ├── retrieval/           # hybrid dense+BM25 with RRF + relevance floor
 │   ├── memory/              # semantic memory with decay + namespaced ids
 │   ├── storage/             # postgres / qdrant / opensearch wrappers
-│   ├── tools/               # the corpus-search tool workers invoke (MCP seam)
+│   ├── tools/                # the corpus-search tool workers invoke (MCP seam)
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 34 tests, offline (25 core, 6 HITL, 3 paths)
+├── tests/                   # 57 tests, offline (25 core, 8 HITL, 3 paths, 21 tier2)
 ├── scripts/ingest_sample_data.py
 ├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
 ├── sample_data/corpus.jsonl # 10 docs, Redis-vs-Memcached theme
 ├── design/Research_Agent_Design.md
-├── OPERATIONS.md   internal/LEARNING_GUIDE.md   PHASE2_PLAN.md
+├── OPERATIONS.md   internal/LEARNING_GUIDE.md   internal/PHASE-2_PLAN.md
 ├── docker-compose.yml       # optional: postgres + qdrant + opensearch
 ├── requirements.txt  .env.example  run.bat  reset.bat
-└── DECISIONS.md             # currently EMPTY (0 bytes)
+└── DECISIONS.md             # populated: D-1..D-32, sourced from code comments
 ```
 
 ## Setup
@@ -1067,7 +1137,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 34 passed
+python -m pytest tests/ -q    # expect: 57 passed
 ```
 
 Windows: `run.bat` does the venv, install, and a stub run in one command.
@@ -1130,8 +1200,14 @@ This table lists only decisions with code behind them here.
 | D-23/D-28 | Escalation via `interrupt()`; nothing non-idempotent precedes the interrupt | The node re-executes on resume — history is appended in the resume update only |
 | D-24 | Memory decay = rerank by volatility class, never an age filter | One TTL is wrong for both stable and volatile facts. Coverage-matching by goal_id is now namespaced away from this rerank (P2-02) — the two are independent axes |
 | D-29 | `ConfigDict(extra="forbid")` on all state models | Construction-time pollution and worker-return pollution are two failure modes; two layers |
+| D-31 *(proposed, P2-03)* | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script, deliberately not for memory writes (P2-15's problem) |
+| D-32 *(proposed, P2-04)* | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks |
 | — | Graceful degradation everywhere | First run must succeed on a bare laptop |
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
+
+`DECISIONS.md` (populated as of P2-09) is now the authoritative consolidated
+log for D-1 through D-32 — this table is a curated subset for readability,
+not a replacement.
 
 ## Limitations
 
@@ -1171,36 +1247,53 @@ left visible rather than deleted, so the history stays auditable.
 5. (separate from the numbered list, but related) ~~one shared 60s timeout for
    every provider~~ — split into a 120s local timeout and a 90s cloud
    timeout.
+6. ~~LLM producer output is unvalidated~~ — **P2-06**, `RawTask`/`RawGoal`
+   validation; malformed entries dropped and counted, never `KeyError`.
+7. ~~Qdrant ingest is not idempotent by default~~ — **P2-03 follow-up**,
+   `scripts/ingest_sample_data.py` now passes a deterministic `id_fn`. Does
+   not retroactively clean an already-duplicated collection — see Ingest
+   identity above.
+8. ~~The checkpointer connection is never closed~~ — **P2-08**,
+   `close_checkpointer()`, called from both `cli.py`'s `finally` block and
+   `api/server.py`'s shutdown handler.
+9. ~~The API writes no run history~~ — **P2-08**, `record_run` now called
+   from `/research` and `/resume` on completion.
+10. ~~`llm_calls` and `search_calls` under-report actual traffic~~ —
+    **P2-07**, `llm_provider_calls`/`llm_fallback_hops`/`llm_quality_calls`
+    (router boundary) and `retrieval_dense_calls`/`retrieval_keyword_calls`/
+    `retrieval_leg_unavailable` (retrieval boundary) now report the real
+    boundary crossings; the renamed `llm_node_calls` still reports node
+    executions, deliberately, alongside them.
+11. ~~E2/E3 emit no log line when HITL is off~~ — **P2-09**, `escalation.stub`
+    now fires for E2/E3 too, matching E1/E4.
+12. ~~`durable` is discarded by `build_app_and_settings`~~ — **P2-08**,
+    surfaced via `AppBundle` and `/health`'s `durable` field.
+13. ~~`HITL=true` (typo for `HITL_ENABLED`) is silently discarded~~ —
+    **P2-09**, `warn_on_likely_env_typos()` now logs a WARNING for this and
+    a fixed list of other plausible env-key typos. (The variable itself
+    still requires the exact name `HITL_ENABLED` — this only adds
+    visibility when you get it wrong, it doesn't relax the requirement.)
 
 **Still broken, in rough order of consequence**
 
-1. LLM producer output is unvalidated — `cap_and_filter` does `t['goal_id']`
-   and `goal_manager_node` does `g["goal_id"]`. A live model omitting a key
-   raises `KeyError` inside the node and aborts the run. (`P2-06`, Tier 2.)
-2. Self-critique can pass a report whose claims appear in no retrieved
-   evidence — unaffected by tonight's fixes; separate root cause (`P2-11`).
-3. Qdrant ingest is still not idempotent **by default** — the `id_fn`
-   mechanism exists (P2-03) but `scripts/ingest_sample_data.py` doesn't pass
-   one yet. Re-ingesting still silently multiplies the dense index until
-   that's wired up.
-4. Semantic memory grows without bound — no supersession, dedup, or GC
-   (`P2-15`, deliberately out of scope for P2-02/P2-03).
-5. RRF joins the two legs on `title`, not on any store id — silently wrong for
+1. Self-critique can pass a report whose claims appear in no retrieved
+   evidence — unaffected by anything in this revision; separate root cause
+   (`P2-11`, Tier 3).
+2. Semantic memory grows without bound — no supersession, dedup, or GC
+   (`P2-15`, deliberately out of scope for P2-02/P2-03/P2-07).
+3. RRF joins the two legs on `title`, not on any store id — silently wrong for
    a corpus with duplicate or missing titles.
-6. The checkpointer connection is never closed; the API process leaks it.
-7. The API writes no run history — `record_run` is CLI-only.
-8. `llm_calls` and `search_calls` under-report actual traffic — `node.enter`
-   (new) partially addresses "what ran", but the counters themselves are
-   unchanged.
-9. E2/E3 emit no log line at all when HITL is off, unlike E1/E4.
-10. `durable` is discarded by `build_app_and_settings`; the in-memory
-    checkpointer fallback shows up only in stderr.
-11. `Evidence.task_key` for memory items uses `hash()`, which is per-process
-    randomised — memory task keys are not stable across runs.
-12. **New, found this session**: reusing the same `--thread-id` across
-    unrelated runs silently accumulates reducer-backed state (`evidence`,
-    `counters`, etc.) — see the Postgres section above for the full
-    explanation and a live example.
+4. `Evidence.task_key` for memory items uses `hash()`, which is per-process
+   randomised — memory task keys are not stable across runs.
+5. Reusing the same `--thread-id` across unrelated runs silently accumulates
+   reducer-backed state (`evidence`, `counters`, etc.) — see the Postgres
+   section above for the full explanation and a live example. Not addressed
+   by Tier 2; no P2-xx item currently scoped to it.
+6. Contradiction detection remains marker-only — `E2` has never fired in a
+   real run (`P2-12`, Tier 3, depends on P2-01 which is done).
+7. `evaluation/quality.py`'s self-scoring is same-provider, optimistic —
+   catches catastrophic output, not subtle errors (`P2-11`, Tier 3, depends
+   on P2-07 which is now done — this item is now unblocked).
 
 ## Documentation Corrections
 
@@ -1210,62 +1303,79 @@ auditable rather than invisible.
 | Claim in older docs | Reality in code |
 |---|---|
 | README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and, as of this revision, each hop tier uses a different timeout** |
-| README / OPERATIONS: "28 tests" | **34** tests collected and passing (25 core + 6 HITL + 3 integration) — unchanged by tonight's fixes |
-| design §12: "63 files, 28/32 tests passing, 4 skipped" | 51 files in this distribution; 34 tests, **0 skipped** |
+| README / OPERATIONS: "28 tests" | **57** tests collected and passing (25 core + 8 HITL + 3 integration + 21 in `test_tier2.py`, covering P2-06/P2-07/P2-08/P2-09/the ingest-dedup fix) |
+| design §12: "63 files, 28/32 tests passing, 4 skipped" | 52 files in this distribution; 57 tests, **0 skipped** |
 | README legend: with HITL off the checks "log and continue" | True for E1/E4 only; E2/E3 log nothing when HITL is off |
-| OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | True for OpenSearch; for Qdrant, **the mechanism to make this true now exists (P2-03)** but isn't wired into the ingest script yet — still false in practice today |
-| OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02); **not yet re-verified end-to-end** — see The HITL Investigation |
+| OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | **Now true for both stores as of this revision** — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism (P2-03) is now actually wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
+| OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and **since re-verified end-to-end against real live runs** — both a genuine E3 escalation (via the D-16 failed-task path) and, once the corpus was properly ingested, a clean convergence at `recall 1.0` with real evidence. See The HITL Investigation |
 | design §9: `MAX_REVISIONS` default 3 | Code default is **2** (`config.py`) |
 | README structure tree: root `agentic-research-agent/` | Distributed directory is `research-agent-dmp/` |
 | Storage diagram implied one Qdrant use | Two collections; `CORPUS_INDEX` names **both** a Qdrant collection and an OpenSearch index |
-| `DECISIONS.md` referenced as the decision log | The file is **0 bytes** |
+| `DECISIONS.md` referenced as the decision log | Was 0 bytes; **populated as of P2-09** (D-1 through D-32, sourced from code comments and this document's own citations — a few numbers, D-7/9/10/11, are flagged as ungrounded rather than invented) |
 | `internal/LEARNING_GUIDE.md` cited as a companion doc | `internal/` is in `.gitignore`, so it ships only in archives like this one |
 | OPERATIONS §L1: "add two `logging.getLogger(...)` lines" | Already present in `logging_setup.py::configure_logging` |
+| This README's own citations of "`PHASE2_PLAN.md`" | The actual tracked file is `internal/PHASE-2_PLAN.md` (hyphenated, under `internal/`) — fixed throughout this revision |
 
 ## Future Improvements
 
-`PHASE2_PLAN.md` has the full 15-item plan — every item scoped to an existing
+`internal/PHASE-2_PLAN.md` has the full 15-item plan — every item scoped to an existing
 seam, with complexity, dependencies, and the D-xx tag it extends or replaces.
-The shape of it, updated with tonight's progress:
+The shape of it, updated with this revision's progress:
 
 ```text
-  TIER 1 ── correctness ──────► make the documented behaviour true
+  TIER 1 ── correctness ──────► make the documented behaviour true    ✅ CLOSED
      P2-01  relevance floor + calibrated evidence gate       ✅ DONE
               + follow-up: exact-boundary collision (`>` fix)  ✅ DONE
      P2-02  namespace memory goal_id on retrieval             ✅ DONE
-     P2-03  deterministic Qdrant point ids                    ◐ MECHANISM DONE,
-                                                                 not wired into
+     P2-03  deterministic Qdrant point ids                    ✅ DONE — mechanism
+                                                                 AND wired into
                                                                  ingest script
+                                                                 (see Recent Fixes)
      P2-04  provider output sanitizer  (<|im_end|>)           ✅ DONE
-              + free-text runaway-generation truncation        ✅ DONE (new,
-                                                                 not in the
-                                                                 original plan)
+              + free-text runaway-generation truncation        ✅ DONE
      P2-05  escalation reachability tests                     ✅ DONE — tests
-                                                                 passing (36/36)
-                                                                 AND live-fired
+                                                                 passing AND
+                                                                 live-fired
                      │
-  TIER 1 STATUS: CLOSED. All five items done; the two follow-up fixes
-  found via live testing (the exact-boundary collision and the free-text
-  truncation gap) are documented above and in this README's Recent Fixes.
+  TIER 1 STATUS: CLOSED.
                      │
-  TIER 2 ── robustness ───────► make it observable and hard to crash
-     P2-06  validate LLM producer output
-     P2-07  boundary-scoped telemetry
-     P2-08  postgres lifecycle + API run-history parity
-     P2-09  config strictness + populate DECISIONS.md
+  TIER 2 ── robustness ───────► make it observable and hard to crash  ✅ CLOSED
+     P2-06  validate LLM producer output                      ✅ DONE
+     P2-07  boundary-scoped telemetry                         ✅ DONE — router
+                                                                 AND retrieval
+                                                                 halves both
+     P2-08  postgres lifecycle + API run-history parity       ✅ DONE
+     P2-09  config strictness + populate DECISIONS.md         ✅ DONE
                      │
-  TIER 3 ── design catch-up ──► close the D-25/26/27/30 gap
+  TIER 2 STATUS: CLOSED. All four items verified against real live traces,
+  not just the offline suite — see Recent Fixes above for exactly how each
+  one was confirmed. One incidental fix (opensearch-py 3.x compatibility)
+  landed alongside this work, outside either tier's original scope.
+                     │
+  TIER 3 ── design catch-up ──► close the D-25/26/27/30 gap        NOT STARTED
      P2-10  Qdrant payload indexes + server-side decay      (D-27)
-     P2-11  judge-model quality scoring
+     P2-11  judge-model quality scoring                      ← unblocked now
+                                                                 that P2-07 is
+                                                                 done
      P2-12  semantic contradiction detector — E2 reachable at last
+                                                                 ← unblocked now
+                                                                 that P2-01 is
+                                                                 done
      P2-13  MCP tool seam                                   (D-26/D-30)
      P2-14  typed specialist workers                        (D-25)
      P2-15  memory supersession + GC
 ```
 
-**What's actually next:** Tier 1 is closed — 36/36 tests pass, and the
-escalation path has fired on a real, live run (see the status note under
-[The HITL Investigation](#the-hitl-investigation) for exactly which path
-triggered it, and which one is still only unit-proven). Tier 2's four items
-have no dependencies on each other or on anything from Tier 1; `P2-08` and
-`P2-09` are the smallest place to start.
+**What's actually next:** Tiers 1 and 2 are both closed — 57/57 tests pass,
+verified against multiple real live traces with different fallback,
+escalation, and retrieval shapes, not just offline stub-mode runs. Tier 3
+is untouched, as scoped from the start: each item there is explicitly
+safer once Tier 1/2 provide trustworthy measurement to evaluate it
+against, which is now genuinely true rather than aspirational. Of the six
+Tier 3 items, two are now unblocked by dependency (`P2-11` depends on
+`P2-07`; `P2-12` depends on `P2-01`) and are arguably the highest-value
+next steps: `P2-12` closes the one escalation trigger (`E2`) that has
+never fired in a real run, and `P2-11` directly addresses an observed live
+failure — a report whose Cassandra/DynamoDB sections cited no retrieved
+evidence, passed anyway by same-model self-critique.
+</file_text>
