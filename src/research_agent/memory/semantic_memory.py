@@ -159,7 +159,21 @@ class SemanticMemory:
                 # tools/corpus_search.py). abs(hash(...)) % 10_000 turns
                 # arbitrary content text into a short numeric suffix.
                 task_key=f"memory-{abs(hash(h.get('content',''))) % 10_000}",
-                goal_id=h.get("goal_id", "memory"),
+                # P2-02: NAMESPACED, not the raw stored goal_id. Before this
+                # fix, a memory item's goal_id was whichever earlier run's
+                # goal it happened to be filed under — and since every
+                # run's goals are always named g1, g2, g3... an old,
+                # unrelated run's "g3" fact could silently satisfy THIS
+                # run's unrelated "g3" goal in agents/gathering.py's
+                # coverage check (e.goal_id == g.goal_id), just by string
+                # collision. Prefixing with "memory::" makes that equality
+                # impossible to ever accidentally satisfy — real goal ids
+                # are always bare "g1".."g5", never "memory::anything". The
+                # original goal_id is kept, not discarded, purely as a
+                # readable label (shown in the compiled report's evidence
+                # listing) — it just can no longer impersonate a CURRENT
+                # goal.
+                goal_id=f"memory::{h.get('goal_id', 'unknown')}",
                 source="memory",
                 content=h.get("content", ""),
                 score=min(1.0, final),

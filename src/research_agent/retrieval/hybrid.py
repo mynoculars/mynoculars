@@ -74,10 +74,21 @@ class HybridRetriever:
                 "tool" every parallel search_worker invokes.
     """
 
-    def __init__(self, dense: QdrantStore, keyword: OpenSearchStore):
-        """Both stores may be degraded; search() adapts per leg."""
+    def __init__(self, dense: QdrantStore, keyword: OpenSearchStore,
+                min_similarity: float = 0.0):
+        """Both stores may be degraded; search() adapts per leg.
+
+        min_similarity (P2-01): a floor applied to the DENSE leg's raw
+        cosine similarity score, BEFORE a hit ever enters RRF fusion or
+        becomes Evidence. Default 0.0 preserves the old behaviour (every
+        dense hit passes) for any caller that doesn't explicitly opt in.
+        Only the dense leg gets this floor — BM25 scores are corpus-
+        dependent and unbounded, so there's no principled fixed cutoff to
+        apply there the way there is for a 0..1 cosine similarity.
+        """
         self.dense = dense
         self.keyword = keyword
+        self.min_similarity = min_similarity
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Return fused results: dicts with content/title + 'fused_score'.
@@ -101,6 +112,19 @@ class HybridRetriever:
         """
         dense_hits = self.dense.search(query, top_k)
         kw_hits = self.keyword.search(query, top_k)
+
+        # P2-01: drop dense hits below the similarity floor BEFORE they can
+        # enter fusion or become Evidence at all. Without this, a dense
+        # index always returns its k nearest neighbours no matter how
+        # irrelevant the query — an out-of-domain question could never
+        # produce zero evidence. This is a NEW filter step, not a change
+        # to what dense.search() itself returns.
+        if self.min_similarity > 0.0:
+            dropped = sum(1 for h in dense_hits if h.get("similarity", 0.0) < self.min_similarity)
+            dense_hits = [h for h in dense_hits if h.get("similarity", 0.0) >= self.min_similarity]
+            if dropped:
+                log_event(logger, "retrieval.below_floor", query=query,
+                          dropped=dropped, floor=self.min_similarity)
 
         # by_id maps a computed "document identity" string to the FULL hit
         # dict (with every field the store returned) so we can look the

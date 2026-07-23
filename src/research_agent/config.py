@@ -136,7 +136,26 @@ class Settings(BaseSettings):
     max_fanout: int = Field(6, ge=1)          # D-13: producers cap task output
     max_depth: int = Field(3, ge=1)           # D-3: gather-loop bound
     recall_target: float = Field(0.85, ge=0.0, le=1.0)   # D-4
-    min_evidence_score: float = Field(0.0, ge=0.0)       # D-17: 0.0 = inert
+    # D-17: coverage gate. 0.0 was the ORIGINAL default, and it made this
+    # check inert — `score >= 0.0` is true for every item ever returned,
+    # including one scored exactly 0.0. Combined with the fact that a dense
+    # index always returns its top-k nearest neighbours regardless of actual
+    # relevance, recall degenerated to "did ANY document come back", which
+    # is why the HITL escalation paths (E2/E3) could never fire while
+    # retrieval was up. 0.5 is a starting point based on a real debug trace
+    # showing off-topic corpus hits landing at 0.48-0.50 after the
+    # RRF_SQUASH scaling in tools/corpus_search.py — NOT independently
+    # calibrated against every corpus. Tune against your own data.
+    min_evidence_score: float = Field(0.5, ge=0.0)
+    # P2-01, the other half of the same fix: a floor applied at RETRIEVAL
+    # time (retrieval/hybrid.py), before a hit ever becomes Evidence at
+    # all — as opposed to min_evidence_score above, which filters AFTER
+    # retrieval, at the coverage-checking step. Without this, a dense
+    # index still always returns its k nearest neighbours no matter how
+    # irrelevant, and min_evidence_score alone was the only gate; this
+    # adds a second, earlier one so an out-of-domain query can actually
+    # produce zero evidence rather than three confident wrong answers.
+    min_similarity: float = Field(0.35, ge=0.0, le=1.0)
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound
     # D-23: human-in-the-loop escalation. Off by default — the graceful-
     # degradation posture: shipping inert, enabled deliberately.

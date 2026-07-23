@@ -79,6 +79,49 @@ Message = Dict[str, str]  # {"role": ..., "content": ...}
 _SENTINELS = ("<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>", "</s>")
 
 
+def _truncate_at_sentinel(text: str) -> str:
+    """Cut a FREE-TEXT response off at the first chat-template sentinel.
+
+    CALLED BY   OpenAICompatibleClient.complete, below — the free-text
+                path used exclusively by agents/compilation.py::
+                compiler_node. This is a DIFFERENT defect from the one
+                _extract_json (above this in the file, used by
+                complete_json) already handled: that one strips a
+                sentinel that appears immediately after otherwise-valid
+                JSON. This one guards against something worse, confirmed
+                by a live run: a local model whose llama-server chat
+                template / stop-token configuration isn't halting
+                generation at its own end-of-turn can keep going,
+                hallucinating an entire extra fake conversation —
+                repeating the prompt, inventing a fictitious "system"
+                turn, even re-generating a second copy of its own answer
+                — all of which, with NO cleanup at all before this fix,
+                became the literal, user-facing final_report verbatim
+                (compiler_node has no JSON schema to validate against, so
+                nothing catches this the way a malformed JSON parse
+                would).
+
+    Unlike _extract_json's approach (remove the sentinel substring
+    wherever it occurs, keep everything else), this TRUNCATES — everything
+    from the first sentinel onward is either the sentinel itself or a
+    hallucinated continuation, never legitimate report content, so cutting
+    it off (not just deleting the marker) is the correct response here.
+
+    Returns the text unchanged if no sentinel is found — the overwhelming
+    majority of calls, where the model behaved.
+    """
+    earliest = len(text)
+    found_any = False
+    for sentinel in _SENTINELS:
+        idx = text.find(sentinel)
+        if idx != -1:
+            found_any = True
+            earliest = min(earliest, idx)
+    if not found_any:
+        return text
+    return text[:earliest].rstrip()
+
+
 class ChatClient(Protocol):
     """The only surface the agent uses to talk to a model.
 
@@ -242,16 +285,29 @@ class OpenAICompatibleClient:
         resp.raise_for_status()
         data = resp.json()
         latency = time.perf_counter() - started
-        text: str = data["choices"][0]["message"]["content"]
+        raw_text: str = data["choices"][0]["message"]["content"]
+        # See _truncate_at_sentinel's docstring above for exactly what
+        # this guards against: a model that keeps generating past its own
+        # end-of-turn, hallucinating an entire extra fake conversation.
+        # We trace the RAW text below (diagnostically useful — it shows
+        # you the runaway generation itself, which is what you'd want to
+        # see if you're debugging the underlying llama-server config
+        # issue) but RETURN the truncated version, since the raw text is
+        # never a legitimate answer past its first sentinel.
+        text = _truncate_at_sentinel(raw_text)
         usage = data.get("usage", {})
         pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        if text != raw_text:
+            log_event(logger, "llm.truncated_runaway_generation", level=logging.WARNING,
+                      provider=self.name, node=self._trace_node,
+                      raw_chars=len(raw_text), kept_chars=len(text))
         log_event(logger, "llm.call", provider=self.name, model=self._model,
                   label=self._label, node=self._trace_node,
                   latency_s=round(latency, 3),
                   prompt_tokens=pt, completion_tokens=ct)
         if self._tracer is not None:
             self._tracer.record_llm(self._label, self._trace_node, messages,
-                                    text, pt, ct, latency)
+                                    raw_text, pt, ct, latency)
         return text
 
     def complete_json(self, messages: List[Message], temperature: float = 0.0) -> Dict[str, Any]:

@@ -52,7 +52,7 @@ Python mechanics used in this file, if any of this is new to you:
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from research_agent.logging_setup import log_event
 
@@ -151,7 +151,8 @@ class QdrantStore:
 
     # -- public API ---------------------------------------------------------
 
-    def upsert_texts(self, items: List[Dict[str, Any]]) -> int:
+    def upsert_texts(self, items: List[Dict[str, Any]],
+                     id_fn: Optional[Callable[[Dict[str, Any]], str]] = None) -> int:
         """Store items: each dict needs 'content' plus arbitrary payload keys.
 
         CALLED BY   scripts/ingest_sample_data.py (loading the sample
@@ -161,11 +162,25 @@ class QdrantStore:
         READS       nothing from ResearchState — this class has no
                     knowledge of the graph; it only ever sees plain dicts.
         WRITES      new points into this instance's Qdrant collection —
-                    one per item in `items`, each with a brand-new random
-                    id (see the "id=str(uuid.uuid4())" line below — this is
-                    exactly why re-running ingest on the SAME corpus
-                    produces DUPLICATE points rather than overwriting the
-                    previous ones, a documented limitation of this build).
+                    one per item in `items`.
+
+        P2-03: id_fn is a NEW, OPTIONAL parameter. Every existing caller
+        (memory_writer, and anything not passing it explicitly) gets the
+        exact same uuid4()-per-call behaviour as before — nothing changes
+        for them, and memory is DELIBERATELY left on that default: memory
+        is meant to accumulate fresh evidence every passed run, not
+        collapse repeats (deduping memory writes is separate, larger work
+        — see PHASE2_PLAN.md P2-15 — not this fix).
+
+        The problem this solves, for whoever DOES pass id_fn: with a
+        random id every call, re-running corpus ingest on an UNCHANGED
+        corpus.jsonl doesn't overwrite the existing points, it silently
+        DUPLICATES them. Passing id_fn=lambda item: <stable hash of
+        item["content"]> makes the same input always produce the same
+        Qdrant point id, so re-ingesting the same content overwrites in
+        place instead of piling up — the same idempotent behaviour
+        OpenSearchStore.ingest already has via its deterministic str(i)
+        document ids.
 
         Returns number stored (0 when degraded).
         """
@@ -180,7 +195,11 @@ class QdrantStore:
         vectors = self._embed([i["content"] for i in items])
         points = [
             models.PointStruct(
-                id=str(uuid.uuid4()),
+                # id_fn(item) if the caller opted in, else the ORIGINAL
+                # uuid4() behaviour — this is the entire backward-
+                # compatibility guarantee: no id_fn passed means byte-for-
+                # byte the same behaviour as before this change.
+                id=id_fn(item) if id_fn else str(uuid.uuid4()),
                 vector=vec,
                 # {**item, "created_at": time.time()} — see the module
                 # docstring's dict-comprehension explanation. This builds a

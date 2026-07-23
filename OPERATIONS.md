@@ -4,6 +4,16 @@ This is the missing manual. No architecture theory. Just: what to install, how t
 load data, how to run, in the exact order, with copy-paste commands and what you
 should see. If a step's output doesn't match, that's the diagnostic.
 
+> **Note on this revision:** everything from "The One Thing Nobody Told You"
+> through "The 60-Second Is Everything Up? Check" is unchanged from the
+> previous version of this document, with two small factual corrections (the
+> test suite is **34** tests, not 28 — it grew since this doc was first
+> written) and one outdated bracketed note about OpenSearch SSL replaced with
+> a working fix, since that exact problem was hit and diagnosed live while
+> writing the new sections below. Everything from **Development & Debugging
+> Workflows** onward is new. All new command examples target **Windows
+> PowerShell** specifically, per how this environment actually runs.
+
 ---
 
 ## The One Thing Nobody Told You: There Are THREE Run Levels
@@ -93,10 +103,10 @@ success for L1.** Now run the tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 28 passed
+# expect: 36 passed
 ```
 
-If L1 runs and 28 tests pass, your code is fine. Everything from here is about
+If L1 runs and 36 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -257,10 +267,25 @@ MEMORY_COLLECTION=agent_semantic_memory
 ```
 
 If your native installs use different ports/credentials, change them HERE, not
-in code. (Native OpenSearch on Windows often ships with security ON → it needs
-HTTPS + a password. If ingest says `opensearch.unavailable`, that's why — tell
-me and I'll add auth support, ~10 lines. For now Docker OpenSearch runs with
-security off and Just Works.)
+in code.
+
+> **Fix, not a TODO anymore:** a native OpenSearch install on Windows with the
+> security plugin enabled runs its HTTP layer over **TLS by default** — even
+> on plain `http://localhost:9200`, the server is doing a TLS handshake and
+> will reject a plaintext request outright. If ingest (or any run) logs
+> `opensearch.unavailable` with `"reason": "ConnectionError"`, and the
+> OpenSearch server log itself shows `NotSslRecordException: not an SSL/TLS
+> record`, that's this. The support already exists in the codebase — set:
+> ```ini
+> OPENSEARCH_USE_SSL=true
+> OPENSEARCH_VERIFY_CERTS=false
+> ```
+> (`VERIFY_CERTS=false` because a default install uses OpenSearch's demo
+> self-signed certificate — the client already suppresses the resulting
+> warning). Confirm it worked by checking a `--debug` run: `retrieval.hybrid`
+> log lines should show `"keyword": 3` (or similar, non-zero) instead of
+> `"keyword": 0` — see **Understanding the Debug Logs** below for exactly
+> what that field means and where to find it.
 
 ### Step 2d — Run the ingest
 
@@ -312,7 +337,10 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
 doing its job.** The report text is still the stub placeholder (because
 `LLM_MODE=stub`), but the *retrieval, coverage, and memory* are all genuinely
 working now. Run it a second time and watch `memory_hits` become non-zero — the
-agent now remembers the first run.
+agent now remembers the first run. **One caution about "run it a second
+time":** see **Thread IDs — Usage, Lifecycle, and Reuse Considerations**
+below before you reuse the same `--thread-id` for a second, *different*
+question — it doesn't do what you'd expect.
 
 ---
 
@@ -393,6 +421,12 @@ curl http://127.0.0.1:8080/v1/models
 
 > **Note:** The values shown above are specific to the loaded **DeepCogito v1 Preview Llama 8B Q5_K_M** model and will differ for other models.
 
+> **New, see also:** if this local model times out on a tiny prompt like the
+> `classify` step, or on a large one like the final report, `LLM_MODE=live`'s
+> primary and fallback hops now use **separate, tunable timeouts** rather
+> than one shared value — see **Tuning the LLM Timeouts** under
+> **Troubleshooting Common Errors** below.
+
 
 
 
@@ -448,10 +482,12 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 28 tests, all offline, ~0.3s
+python -m pytest tests/ -q   # 36 tests, all offline, ~0.3s
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
-the graph logic is correct. Run this after any code change.
+the graph logic is correct. Run this after any code change. **See "Running and
+Interpreting the Test Suite" below for what each of the three test files
+actually verifies, and how to run just one of them.**
 
 **2. Test one query by hand (proves retrieval + flow):**
 Do L2 above. Change the question to something your corpus can answer:
@@ -500,8 +536,10 @@ Rules that matter:
 - Then ask questions your new docs can answer and watch `recall` climb.
 
 To wipe and reload cleanly (Docker): `docker compose down -v && docker compose up -d`
-then re-ingest. Native: delete the Qdrant collection and OpenSearch index, or
-just re-run ingest (it upserts by id, so re-running overwrites).
+then re-ingest. Native: use `scripts/reset_stores.py` (see **Performing a Dry
+Run** below) rather than re-running ingest directly — Qdrant's ingest is not
+currently idempotent (re-running it duplicates points instead of overwriting;
+OpenSearch's re-running does correctly overwrite by id).
 
 ---
 
@@ -530,3 +568,489 @@ python -m research_agent.cli "test"        # telemetry prints = graph OK
 
 The logs are the diagnostic. Degradation is silent by design in the *output*,
 but every degradation writes a log line. When confused: read stderr.
+
+---
+---
+
+# Development & Debugging Workflows
+
+Everything above gets the agent running. Everything below is about watching it
+run, understanding what a specific execution actually did, and knowing which
+knobs are safe to turn without surprising yourself. All commands here are
+**PowerShell**, matching how this environment is actually driven day to day.
+
+---
+
+## Running and Interpreting the Test Suite
+
+The suite is **36 tests**, fully offline — no services, no API keys, no
+network. It's split into three files, each testing a different layer:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m pytest tests/ -q
+```
+
+```text
+tests/test_core.py              25 tests   the graph's everyday logic
+tests/test_hitl.py                8 tests   the human-in-the-loop path
+tests/test_integration_paths.py   3 tests   cross-cutting failure paths
+                                 --------
+                                  36 tests
+```
+
+**What each file is actually proving:**
+
+- **`test_core.py`** — the bulk of the suite. Planning (goal composition,
+  task expansion), the gather loop (dispatch, merge, coverage, gap
+  generation), compile/critique, memory read/write, the dedup and depth-gate
+  rules (D-2/D-16), and the worker return-contract enforcement
+  (`orchestration/contracts.py`, D-15). If you change anything in `agents/`
+  or `state.py`, this is the file that will catch a regression first.
+- **`test_hitl.py`** — all four escalation triggers (E1–E4), each tested for
+  both `approve` and (where applicable) `redirect`/`abort`, plus the D-28
+  idempotency invariant: exactly one `escalation_history` entry per
+  escalation, even though the escalation node itself runs twice (once
+  pausing, once resuming). If you touch `agents/escalation.py` or the
+  routing functions in `orchestration/graph.py`, run this file specifically.
+- **`test_integration_paths.py`** — the smaller, cross-cutting checks: critic
+  exhaustion correctly skips `memory_writer`, a worker that raises is
+  recorded as *failed*, not *completed* (D-16), and the stub client tolerates
+  a model wrapping its JSON in markdown fences.
+
+**Run just one file, or just one test:**
+
+```powershell
+python -m pytest tests/test_hitl.py -q
+python -m pytest tests/test_hitl.py::test_e3_interrupts_then_approve_ships_partial -q
+python -m pytest tests/ -k "critique" -q       # anything with "critique" in its name
+```
+
+**Interpreting a failure.** Every test here runs entirely offline against
+`StubClient` and fake tools (see `tests/conftest.py`) — if a test fails, it is
+almost always a real regression in the graph's logic, not an environment
+problem, precisely *because* nothing here depends on a live service. Treat a
+failing test in this suite as a stop-and-look signal, not something to
+re-run and hope passes.
+
+**When to run it:** after any change to `src/research_agent/`, before you
+touch a live service. It takes under a second; there's no reason to skip it.
+
+**Before running it, if you've been doing manual live testing in the same
+shell: clear any HITL env var you set.** `Settings(_env_file=None, ...)`
+only skips reading a `.env` FILE — it does nothing to insulate against a
+real OS environment variable still sitting in your session. A leftover
+`$env:HITL_ENABLED = "true"` from an earlier manual test silently flips
+HITL on inside tests that specifically expect it off, and instead of a
+clear assertion failure you get a confusing `KeyError` on `state.telemetry`
+(an interrupted run never reaches `telemetry_node`, so it's stuck at its
+empty default). `tests/conftest.py`'s `settings` fixture now passes
+`hitl_enabled=False` explicitly as a hardening measure, so this specific
+failure can no longer happen — but clearing the variable first is still
+good practice, since other env vars (timeouts, corpus paths) aren't guarded
+the same way:
+
+```powershell
+Remove-Item Env:\HITL_ENABLED -ErrorAction SilentlyContinue
+python -m pytest tests\ -q
+```
+
+---
+
+## Using Debug Mode
+
+`--debug` (or setting `DEBUG_TRACE` for every run without the flag) turns on
+**two independent output streams** at once — knowing which is which is the
+whole trick to using this well.
+
+```powershell
+$env:DEBUG_TRACE = "true"          # turns it on for every run in this shell
+# or, per-run, without setting anything:
+python -m research_agent.cli "your question" --debug --thread-id demo1
+```
+
+| Stream | Where it goes | What it answers |
+|---|---|---|
+| `"node.enter"` + other JSON log lines | **stderr** — visible on screen by default | "What ran, in what order, and what happened at each step?" |
+| Exact prompt / raw response / retrieval hits | `logs\trace-<run_id>.txt` **only** — never printed to the console | "What exactly did one specific LLM call or retrieval call see and return?" |
+
+**Capture both streams separately, so you can search each on its own:**
+
+```powershell
+python -m research_agent.cli "your question" --debug --thread-id demo1 `
+    2> run.log 1> report.txt
+```
+
+That splits into: `report.txt` (the final report + telemetry — what you'd
+normally see on screen), `run.log` (every structured log line, including
+`node.enter`), and `logs\trace-demo1.txt` (the deep detail, written once at
+the very end of the run — see **Understanding the Debug Logs** below for what
+to actually look for in each).
+
+**One correction worth internalizing up front:** setting `DEBUG_TRACE=true`
+does **not** print prompts and raw responses to your screen. That detail only
+ever goes into the trace file. What *does* print live to your screen (via
+stderr) is the shorter JSON breadcrumb trail — provider names, node names,
+fallback decisions, timings. If you want the full prompt/response detail,
+open the trace file; it is never going to appear in your terminal directly.
+
+---
+
+## Performing a Dry Run
+
+Two different things in this codebase are legitimately called a "dry run,"
+and they answer different questions.
+
+### 1 — A dry run of the whole pipeline (Level 1, stub mode, no services)
+
+This is the safest possible way to check the graph itself is sound before you
+touch a live model or a live database — no cost, no network, no risk of
+mutating anything:
+
+```powershell
+$env:LLM_MODE = "stub"
+python -m research_agent.cli "test"
+```
+
+If this prints a telemetry block at all (even with `evidence_items: 0`), the
+graph, the config, and your Python environment are all fine. See **Level 1 —
+Skeleton** above for exactly what a healthy result looks like.
+
+### 2 — A dry run before resetting your stores
+
+`scripts/reset_stores.py` is destructive — it drops Qdrant collections, the
+OpenSearch index, and five Postgres tables. Before ever running it for real,
+preview exactly what it would touch:
+
+```powershell
+$env:PYTHONPATH = "src"
+python scripts/reset_stores.py --dry-run
+```
+
+This connects to each store (reporting which ones are actually reachable
+right now) and prints its plan, but **changes nothing** — confirmed by its own
+exit code convention: exit code `1` from `--dry-run` means "at least one
+store you asked about is unreachable," which is exactly what you want a
+preview to tell you, not an error to panic over.
+
+```powershell
+# once you've reviewed the plan and are ready:
+python scripts/reset_stores.py --yes
+
+# keep everything the agent has learned, reset only the corpus:
+python scripts/reset_stores.py --yes --keep-memory
+
+# one store at a time:
+python scripts/reset_stores.py --yes --qdrant
+```
+
+> **Before running this for real:** if you have a paused HITL run sitting on
+> an `action [approve/redirect/abort]:` prompt in another window, resolve it
+> first. Dropping the Postgres checkpoint tables destroys every resumable
+> thread, including that one — there is no way to get a paused run back once
+> its checkpoint is gone.
+
+---
+
+## Printing the LangGraph Topology
+
+`--print-graph` prints the compiled graph's **static wiring** — the 13 node
+names and how they're connected — completely independent of running any
+query. This is not telemetry (a summary of what *happened*); it's the shape
+of the graph itself, unchanged from run to run.
+
+```powershell
+# topology only, no query, exits after printing
+python -m research_agent.cli --print-graph
+
+# topology first, then a normal run
+python -m research_agent.cli "your question" --print-graph
+```
+
+It prints ASCII box-and-line art if the optional `grandalf` package is
+installed, or falls back automatically to Mermaid text (no extra install
+needed) if it isn't:
+
+```powershell
+pip install grandalf     # optional, for nicer terminal output
+```
+
+Solid arrows in the Mermaid output are the graph's fixed edges
+(`add_edge` in `orchestration/graph.py`); dotted arrows are the conditional
+ones (`add_conditional_edges`) — the four decision forks (after goal
+composition, after task dispatch, after convergence checking, after
+critique) are visible directly in the output as the dotted lines.
+
+---
+
+## Debugging a Workflow Execution
+
+The fastest way to actually understand what one run did is `node.enter`,
+combined with the trace file. Here is the full recipe:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m research_agent.cli "your question" --debug --thread-id debug-run-1 `
+    2> run.log 1> report.txt
+```
+
+**See every node that fired, in the exact order it ran:**
+
+```powershell
+Select-String '"msg": "node.enter"' run.log
+```
+
+This includes **`merger`** and **`progress_checker`**, which touch neither an
+LLM nor a store — before `--debug` gained per-node logging, these two nodes
+were invisible in any trace, and you could only *infer* they ran from the
+node before or after them. Now every one of the 13 nodes shows up here,
+including those two.
+
+**See exactly what one node's LLM call sent and received:**
+
+```powershell
+Get-Content logs\trace-debug-run-1.txt
+```
+
+Search that file for the node name you care about (e.g. `node=goal_manager`)
+to jump straight to its prompt and raw response.
+
+**A practical debugging loop, in order:**
+
+1. `Select-String '"msg": "node.enter"' run.log` — confirm the run reached
+   the node you're investigating at all, and see what ran immediately before
+   and after it.
+2. If that node calls an LLM or a store, open `logs\trace-<run_id>.txt` and
+   find its entry — see the exact prompt it sent and what came back.
+3. `Select-String '"msg": "llm.fallback"' run.log` — see whether the primary
+   model failed for that call, and why (`ReadTimeout`, `JSONDecodeError`,
+   etc. appear directly in the `reason` field).
+4. `Select-String '"msg": "retrieval.hybrid"' run.log` — for retrieval-heavy
+   debugging, see the `dense`/`keyword`/`fused` hit counts per query; a
+   `"keyword": 0` on every line usually means OpenSearch is down or
+   misconfigured (see **Troubleshooting Common Errors** below), not that
+   nothing matched.
+
+---
+
+## Understanding and Interpreting the Debug Logs — Node by Node
+
+Every log line is one JSON object. The `"msg"` field names the event;
+`"node"` (where present) names which of the 13 nodes it came from. Here is
+what a *healthy* line looks like for each node, and what to actually check.
+
+| Node | What to look for | A healthy example |
+|---|---|---|
+| `classify` | one `llm.call`, `node=classify`; watch `latency_s` | fast (well under a second to a few seconds) |
+| `memory_retrieve` | `memory.retrieved`, `count` — 0 on a fresh install, non-zero once you've run a passing query before | `"count": 5` |
+| `goal_manager` | one `llm.call`, `node=goal_manager`; if it falls to a fallback, `llm.fallback` fires first with a `reason` | `reason: "JSONDecodeError"` was Cogito's trailing chat-template token before P2-04 — should be rare now |
+| `task_expander` | `node.expand`, `"produced": N` — the number of search tasks actually dispatched | `"produced": 6` |
+| `search_worker` (×N) | one `node.enter` **per task**, all within milliseconds of each other — that's the parallel fan-out, not a bug | 6 entries within ~10ms |
+| — | `retrieval.hybrid` per search, `dense`/`keyword`/`fused` counts | `"dense": 3, "keyword": 3, "fused": 3` once OpenSearch is actually reachable |
+| — | `worker.done`, `"items": N` — confirms the task succeeded, not failed | `"items": 3` |
+| `merger` | `node.enter` only — no LLM, no store; this is the node that was invisible before node-level logging existed | — |
+| `progress_checker` | `node.progress`, `"recall"` and `"depth"` — this is the number that decides whether the loop continues | `"recall": 1.0, "depth": 1` means it converged on the first pass |
+| `gap_generator` | only reached if recall was below target; one `llm.call`, `node=gap_generator` | (absent entirely on a converged run — that's normal) |
+| `compiler` | one `llm.call` with `mode=text` — the only free-text call in the system; large `prompt_tokens` here is normal (it inlines all gathered evidence). **Watch for `llm.truncated_runaway_generation`** — a WARNING that fires if the model kept generating past its own answer (a fake follow-up conversation, a repeated turn); if you see it often, check your `llama-server`'s stop-token/chat-template config | `prompt_tokens` in the thousands is expected, not a problem; `llm.truncated_runaway_generation` appearing occasionally is handled gracefully — appearing on nearly every call across every node is a sign of a real server-config issue worth fixing at the source |
+| `critic` | `node.critique`, `"passed"` and `"revision"` | `"passed": true, "revision": 1` |
+| `memory_writer` | only reached if critique passed; `memory.stored`, `"count"` | `"count"` roughly matching this run's own fresh evidence |
+| `telemetry` | `run.telemetry` — the final summary; remember `llm_calls`/`search_calls` are **node-scoped counts**, not real provider-call counts (see below) | — |
+| `human_escalation` | only with `HITL_ENABLED=true` and a trigger fired; **fires twice** on one escalation (once pausing, once resuming) — expected, not a duplicate | one `escalation_history` entry recorded despite the two log lines |
+
+**One systematic gotcha with the final telemetry block:** `llm_calls` and
+`search_calls` count **node executions**, not actual provider traffic. A node
+that fell through the primary to Mistral still counts as one `llm_call`, even
+though two real network calls happened. If you need the true call volume,
+count `llm.call` lines in the log directly:
+
+```powershell
+(Select-String '"msg": "llm.call"' run.log).Count
+```
+
+That will often be a noticeably higher number than `telemetry`'s `llm_calls`
+field — that gap is expected, not an error.
+
+---
+
+## Thread IDs — Usage, Lifecycle, and Reuse Considerations
+
+`--thread-id` is the identity a run's checkpointed state lives under in
+Postgres (or in-memory, if Postgres is unreachable). Understanding its
+lifecycle matters more than it looks.
+
+### The default, if you don't set one
+
+```powershell
+python -m research_agent.cli "your question"
+```
+
+Generates a fresh id automatically (`run-<12 random hex characters>`) — you
+never need to think about this for a normal, one-shot run.
+
+### When you SHOULD reuse a thread-id
+
+**Exactly one case:** resuming a paused HITL escalation, in a **separate CLI
+invocation**, after the process that started it has already exited. Within
+one CLI invocation, the pause/resume loop happens automatically in the same
+process — you don't need to do anything with `--thread-id` yourself for
+that. Reusing it manually only matters if you closed the terminal and are
+coming back later:
+
+```powershell
+python -m research_agent.cli "your question" --thread-id my-paused-run
+# ... it pauses, you close the terminal ...
+# ... later, in a NEW terminal ...
+$env:PYTHONPATH = "src"
+python -m research_agent.cli "" --thread-id my-paused-run   # resumes where it left off
+```
+
+### When you should NOT reuse a thread-id — confirmed with real data
+
+Reusing the same `--thread-id` for a **second, unrelated question** does not
+give you a clean slate. Several of `ResearchState`'s fields (`evidence`,
+`counters`, `completed_task_keys`, `critique_notes`, `escalation_history`)
+are built to *merge* across invocations under the same thread-id, rather than
+reset — that's what makes HITL resume possible, but it has a side effect you
+need to know about: it applies to *every* invocation under that id, paused
+run or not.
+
+**This was confirmed directly, across four consecutive real runs under one
+reused thread-id**, all asking the same question:
+
+| Run | `evidence_items` | `memory_writes` | `revision_cycles` |
+|---|---|---|---|
+| 1 | (baseline) | 54 | 2 |
+| 2 | 46 | 54 | 2 |
+| 3 | 69 | 108 | 3 |
+| 4 | 92 | 180 | 4 |
+
+Every number climbs, run over run — each new run's real work is being added
+on top of everything the previous runs under that same id already
+accumulated, not replacing it. Harmless here because all four runs asked the
+same question. **It would not be harmless** if run 2 had asked something
+unrelated — its compiled report could silently include leftover evidence
+from run 1's completely different topic, with nothing in the output telling
+you that happened.
+
+**The practical rule:** use a fresh thread-id (or none at all — let it
+auto-generate) for every new, independent question. Only ever reuse one
+when you are deliberately resuming a run that is genuinely still paused.
+
+---
+
+## Troubleshooting Common Errors
+
+### `opensearch.unavailable` with `NotSslRecordException` in the OpenSearch log
+
+Covered in full under Step 2c above. Short version: your OpenSearch server
+is running its HTTP layer over TLS (the default for a security-plugin-enabled
+install) while the client is configured for plain HTTP. Fix:
+
+```ini
+OPENSEARCH_USE_SSL=true
+OPENSEARCH_VERIFY_CERTS=false
+```
+
+### `opensearch.unavailable` with `AuthenticationException` (a DIFFERENT problem than the one above)
+
+If you've already fixed the SSL issue above and now see `AuthenticationException`
+instead of `ConnectionError`, that's progress — TLS is negotiating correctly
+now, but the request is being rejected on credentials. Check the OpenSearch
+server's own log for the specific line:
+
+```text
+No 'Authorization' header, send 401 and 'WWW-Authenticate Basic'
+```
+
+This means the client sent **no credentials at all**, not wrong ones. Check
+`.env` for `OPENSEARCH_USERNAME` — the client code only attaches Basic Auth
+if that field is non-empty (`if username: kwargs["http_auth"] = (username,
+password)` in `storage/opensearch_store.py`); leave it blank and no
+`Authorization` header goes out, regardless of what `OPENSEARCH_PASSWORD` is
+set to. Fix:
+
+```ini
+OPENSEARCH_USERNAME=admin
+OPENSEARCH_PASSWORD=<your actual OpenSearch admin password>
+```
+
+**One thing worth knowing if you don't remember setting a password
+deliberately:** OpenSearch 2.12+ removed the old default `admin:admin`
+credential for security reasons. A native install requires an initial admin
+password to have been set explicitly — typically via an
+`OPENSEARCH_INITIAL_ADMIN_PASSWORD` environment variable at first startup,
+or configured directly in `config/opensearch-security/internal_users.yml`
+under your OpenSearch install directory. Check there if `admin`/`admin`
+doesn't work.
+
+### `worker.failed` with `"reason": "NotFoundError"` on every single search
+
+This means the Qdrant **collection itself doesn't exist** right now —
+Qdrant is reachable, but `agent_corpus` isn't there to query. Almost always
+caused by running `scripts/reset_stores.py --yes` (or its `.bat` equivalent)
+and not following it with a re-ingest:
+
+```powershell
+$env:PYTHONPATH = "src"
+python scripts/reset_stores.py --yes      # this DROPS the collection
+python scripts/ingest_sample_data.py      # this must run again afterward
+```
+
+Symptom in the logs is unambiguous: every `search_worker` fails with the
+same `NotFoundError`, `search_calls` in the final telemetry is `0`, and
+`recall` is `0.0` — not because retrieval found nothing relevant, but
+because it found nothing to search at all. This is easy to mistake for
+retrieval genuinely returning empty results (the L1 "skeleton" zeros); the
+tell is `search_failures` being non-zero rather than `evidence_items` simply
+being `0` with no failures recorded.
+
+### `"Deserializing unregistered type research_agent.state.Goal from checkpoint"` (WARNING, not an error)
+
+You'll see one of these per custom type (`Goal`, `Volatility`, `Evidence`,
+`SearchTask`) the first time each is checkpointed to Postgres in a given
+process. This is LangGraph's serializer telling you it reconstructed one of
+this project's own Pydantic models from checkpoint data without that type
+being on an explicit allowlist — currently harmless (it still works), but
+the message is a forward-looking one: a future LangGraph version (or setting
+`LANGGRAPH_STRICT_MSGPACK=true` yourself right now) would **block** this
+entirely, which would break `--thread-id` resume and HITL pause/resume
+outright, since the checkpointer would no longer be able to reconstruct your
+own state. Not yet fixed in this codebase; safe to ignore for now, but not
+indefinitely — do not set `LANGGRAPH_STRICT_MSGPACK=true` until this project
+explicitly allowlists its own four types.
+
+### HITL not pausing even with `HITL_ENABLED=true` set
+
+Check the exact variable name first. The setting is `HITL_ENABLED`, not
+`HITL` — and because config parsing silently ignores unrecognized keys, a
+typo here produces **no error, no warning, nothing** — HITL simply stays off:
+
+```powershell
+$env:HITL_ENABLED = "true"     # correct
+$env:HITL = "true"             # silently does NOTHING — common typo
+```
+
+### Tuning the LLM Timeouts
+
+The local primary model and the two cloud fallbacks (Mistral, Gemini) use
+**separate** timeout settings, not one shared value:
+
+```ini
+LLM_PRIMARY_TIMEOUT_SECONDS=120     # local Cogito — default 120s
+LLM_TIMEOUT_SECONDS=90              # Mistral + Gemini — default 90s
+```
+
+Raise `LLM_PRIMARY_TIMEOUT_SECONDS` if the local model is timing out on
+genuinely large prompts (the `compiler` node's prompt, which inlines all
+gathered evidence, is usually the biggest one — check `prompt_tokens` in a
+`--debug` trace for that node). **If a small, early prompt (e.g. `classify`)
+times out too, at the exact configured limit, every single run** — that is
+not a "needs more time" problem; it's a sign the local server itself may be
+spending that time on a one-time model load rather than on your actual
+question. Worth checking the model server's own startup behavior directly,
+independent of this setting.
+
+```powershell
+$env:LLM_PRIMARY_TIMEOUT_SECONDS = "150"
+python -m research_agent.cli "your question" --debug
+```

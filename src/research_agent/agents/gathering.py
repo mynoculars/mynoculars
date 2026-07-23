@@ -214,22 +214,36 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
                 trigger fired) -> compiler (recall high enough, OR depth
                 budget spent) -> gap_generator (otherwise — go round again).
 
-        ⚠ settings.min_evidence_score defaults to 0.0, which makes the
-        `>= min_evidence_score` check true for every item ever returned,
-        including one scored exactly 0.0. Combined with the fact that dense
-        retrieval always returns its top-k nearest neighbours regardless of
-        actual relevance, recall effectively becomes "did ANY document come
-        back for this goal" rather than a real quality measure — which is
-        why E2/E3 essentially never fire while retrieval is up. Raising this
-        setting above the observed off-topic score floor is the single
-        highest-value fix in this codebase; see PHASE2_PLAN.md item P2-01.
+        ⚠ P2-01 FOLLOW-UP (confirmed via a live run, not a stub): raising
+        min_evidence_score off 0.0 was necessary but not sufficient. With
+        RRF_SQUASH=30.0 and RRF_K=60 (tools/corpus_search.py,
+        retrieval/hybrid.py), a rank-0 hit under SINGLE-LEG fusion (i.e.
+        whenever OpenSearch is down and only the dense leg contributes)
+        squashes to EXACTLY 1/60 * 30 = 0.5 — not approximately, exactly,
+        for ANY query, regardless of actual relevance. A `>=` comparison
+        against a min_evidence_score of precisely 0.5 let that
+        mathematically-guaranteed boundary value through every time,
+        which is why a real end-to-end test still showed recall=1.0 on a
+        totally out-of-corpus query even after min_evidence_score was
+        raised. Strict `>` closes this specific collision regardless of
+        the exact threshold chosen. This does NOT replace the real fix for
+        the underlying cause — get BOTH retrieval legs actually
+        contributing (fix whatever is making OpenSearch unreachable) — it
+        only stops the coverage gate from being fooled by fusion-math
+        artifacts in the meantime.
         """
         if debug:
             log_event(logger, "node.enter", node="progress_checker")
         goals = []
         for g in state.goals:
+            # Strict `>`, not `>=` — see the docstring above. A score that
+            # lands EXACTLY on min_evidence_score is, under single-leg RRF
+            # fusion, indistinguishable from "ranked first among whatever
+            # came back," which carries no information about actual
+            # relevance. Requiring it to exceed the floor, not merely meet
+            # it, closes that specific loophole.
             has_quality_evidence = any(
-                e.goal_id == g.goal_id and e.score >= settings.min_evidence_score
+                e.goal_id == g.goal_id and e.score > settings.min_evidence_score
                 for e in state.evidence)
             covered = has_quality_evidence and not g.contested
             goals.append(g.model_copy(update={"covered": covered}))

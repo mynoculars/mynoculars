@@ -117,7 +117,9 @@ def build_app_and_settings(tracer=None):
         use_ssl=settings.opensearch_use_ssl,
         verify_certs=settings.opensearch_verify_certs,
         tracer=tracer)
-    tool = make_corpus_tool(HybridRetriever(dense, keyword))
+    # P2-01: settings.min_similarity is the retrieval-time floor on the
+    # dense leg — see retrieval/hybrid.py for what it filters and why.
+    tool = make_corpus_tool(HybridRetriever(dense, keyword, min_similarity=settings.min_similarity))
     memory = SemanticMemory(
         QdrantStore(settings.qdrant_url, settings.memory_collection, tracer=tracer,
                     trace_label="QDRANT (semantic memory)"),

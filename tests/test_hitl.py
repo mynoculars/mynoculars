@@ -18,9 +18,12 @@ from research_agent.config import Settings
 from research_agent.llm.client import StubClient
 from research_agent.llm.router import FallbackRouter
 from research_agent.orchestration.graph import build_graph
+from research_agent.retrieval.hybrid import HybridRetriever
 from research_agent.state import ResearchState
+from research_agent.state import Evidence, ResearchState, Volatility
 
 from tests.test_integration_paths import RejectingCriticStub
+
 
 
 @pytest.fixture
@@ -115,6 +118,63 @@ def test_e3_interrupts_then_approve_ships_partial(off_memory, stub_router,
     result = graph.invoke(_resume("approve"), config=cfg)
     assert result["final_report"]
     assert result["telemetry"]["recall"] == 0.0  # shipped partial, honestly
+
+class LowRelevanceTool:
+    """Retrieval tool that always returns evidence scored BELOW the
+    coverage floor — simulating exactly what corpus_search used to hand
+    back for an off-topic query before P2-01: a real hit, not a failure,
+    just not relevant enough to actually cover anything. This is the gap
+    BrokenTool (above) does NOT test — BrokenTool simulates retrieval
+    FAILING outright; this simulates retrieval SUCCEEDING with junk, which
+    is the specific pattern that silently produced recall=1.0 while
+    MIN_EVIDENCE_SCORE defaulted to 0.0.
+    """
+
+    def __call__(self, task):
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="fake",
+                         content=f"barely-related note about {task.query}",
+                         score=0.2, volatility=Volatility.SEMI_STABLE)]
+
+# complementary, narrower test — for the retrieval-time floor itself
+def test_e3_fires_on_low_relevance_evidence_not_just_tool_failure(
+        off_memory, stub_router, hitl_settings):
+    """P2-05. Before P2-01, every task here would score 0.2, and with
+    MIN_EVIDENCE_SCORE=0.0 the coverage predicate (e.score >= 0.0) was
+    TRUE anyway — every goal "covered", recall=1.0, no escalation, ever.
+    With the new default (0.5), a 0.2-scored item can't satisfy coverage,
+    recall stays below target, and E3 should fire.
+    """
+    graph = build_graph(stub_router, LowRelevanceTool(), off_memory,
+                        hitl_settings, MemorySaver())
+    cfg = _cfg(hitl_settings, "hitl-e3-low-relevance")
+
+    result = graph.invoke(ResearchState(raw_query="q"), config=cfg)
+    assert "__interrupt__" in result, (
+        "recall should be below target with only 0.2-scored evidence; "
+        "if this fails, min_evidence_score is inert again")
+    payload = result["__interrupt__"][0].value
+    assert payload["trigger"] == "E3"
+    assert payload["recall"] < hitl_settings.recall_target
+
+    result = graph.invoke(_resume("approve"), config=cfg)
+    assert result["final_report"]
+    
+def test_min_similarity_floor_drops_low_relevance_dense_hits():
+    """P2-01's other gate, tested in isolation from the graph. Without this,
+    only the coverage-check half of the fix (above) is covered."""
+    class FakeDense:
+        def search(self, query, top_k):
+            return [{"title": "on-topic", "content": "x", "similarity": 0.9},
+                   {"title": "off-topic", "content": "y", "similarity": 0.1}]
+
+    class FakeKeyword:
+        def search(self, query, top_k):
+            return []
+
+    retriever = HybridRetriever(FakeDense(), FakeKeyword(), min_similarity=0.35)
+    results = retriever.search("q", top_k=5)
+    assert len(results) == 1
+    assert results[0]["title"] == "on-topic"    
 
 
 # ---------------------------------------------------------------------------

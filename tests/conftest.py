@@ -19,9 +19,26 @@ from research_agent.storage.qdrant_store import QdrantStore
 
 @pytest.fixture
 def settings() -> Settings:
-    """Settings with tight bounds and no env-file surprises."""
+    """Settings with tight bounds and no env-file surprises.
+
+    hitl_enabled=False is passed EXPLICITLY here, not left to the field's
+    own default. Reason (found via a real failure, not theoretical):
+    Settings(_env_file=None, ...) only skips reading a .env FILE — it does
+    NOTHING to insulate against real OS environment variables, which
+    pydantic-settings always checks first regardless of _env_file. A
+    developer who ran `$env:HITL_ENABLED = "true"` earlier in the SAME
+    shell session (e.g. for manual live testing) and then ran pytest in
+    that same window would silently get hitl_enabled=True here too — and
+    tests that specifically exercise the HITL-OFF path (this fixture is
+    used by tests that expect NO interrupt) would instead pause via
+    interrupt() and never reach telemetry_node, producing a confusing
+    KeyError on state.telemetry (which stays at its default {} for an
+    interrupted run) instead of a clear assertion failure. Passing it
+    explicitly here makes that class of failure structurally impossible,
+    regardless of what's sitting in whoever's shell.
+    """
     return Settings(_env_file=None, llm_mode="stub", max_depth=2,
-                    max_fanout=4, max_revisions=2,
+                    max_fanout=4, max_revisions=2, hitl_enabled=False,
                     qdrant_url="http://127.0.0.1:1", postgres_dsn="postgresql://x:x@127.0.0.1:1/x",
                     opensearch_url="http://127.0.0.1:1")
 
