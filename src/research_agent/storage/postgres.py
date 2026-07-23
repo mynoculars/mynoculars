@@ -51,8 +51,49 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from research_agent.logging_setup import log_event
+from research_agent.state import Evidence, Goal, SearchTask, Volatility
 
 logger = logging.getLogger(__name__)
+
+# Every custom type that can appear ANYWHERE inside ResearchState and
+# therefore ever needs to be checkpointed to Postgres (or held by the
+# in-memory fallback). Passing the classes themselves here — rather than
+# string tuples like ("research_agent.state", "Goal") — is deliberate:
+# LangGraph's allowlist accepts either form, and passing the actual class
+# means this list can never silently drift out of sync with a future
+# rename of the module or the class itself (see build_checkpoint_serde
+# below for exactly how this gets used).
+_CHECKPOINTABLE_STATE_TYPES = (Goal, Volatility, Evidence, SearchTask)
+
+
+def _build_checkpoint_serde():
+    """Build the (de)serializer used by BOTH the Postgres saver and the
+    in-memory fallback, with this project's own state types explicitly
+    allowlisted.
+
+    CALLED BY   get_checkpointer, below — both branches (Postgres success
+                and the in-memory fallback) use the SAME serde, so a run
+                that starts durable and one that degrades to in-memory
+                behave identically with respect to this warning.
+    WHY THIS EXISTS: without an explicit allowlist, LangGraph's default
+    JsonPlusSerializer still round-trips our Goal/Volatility/Evidence/
+    SearchTask objects correctly (nothing was ever actually broken) — but
+    it does so via a "warn but allow" path, logging one WARNING per type
+    the first time each is deserialized in a process:
+        Deserializing unregistered type research_agent.state.Goal from
+        checkpoint. This will be blocked in a future version. Set
+        LANGGRAPH_STRICT_MSGPACK=true to block now, or add to
+        allowed_msgpack_modules to allow explicitly: [...]
+    That message is not cosmetic noise to silence — it is LangGraph telling
+    you plainly that this leniency is being phased out, and that a future
+    version (or LANGGRAPH_STRICT_MSGPACK=true set today) would BLOCK
+    deserialization entirely, which would break --thread-id resume and
+    HITL pause/resume outright: the checkpointer would no longer be able
+    to reconstruct this project's own state. Explicitly allowlisting our
+    four types here is the fix LangGraph's own warning is asking for.
+    """
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    return JsonPlusSerializer(allowed_msgpack_modules=list(_CHECKPOINTABLE_STATE_TYPES))
 
 # The SQL that creates this project's OWN table (as opposed to LangGraph's
 # checkpoint tables, which LangGraph creates itself — see the module
@@ -99,7 +140,10 @@ def get_checkpointer(dsn: str) -> Tuple[Any, bool]:
         # here since PostgresSaver manages its own transactions internally
         # once it has a connection to use.
         conn = psycopg.connect(dsn, autocommit=True)
-        saver = PostgresSaver(conn)
+        # serde=_build_checkpoint_serde() is the fix for the LangGraph
+        # "Deserializing unregistered type" warning — see that function's
+        # docstring above for exactly why this matters, not just how.
+        saver = PostgresSaver(conn, serde=_build_checkpoint_serde())
         # setup() creates the four checkpoint* tables (see the module
         # docstring) if they don't already exist — this is LangGraph's own
         # method, not custom code in this file.
@@ -114,7 +158,9 @@ def get_checkpointer(dsn: str) -> Tuple[Any, bool]:
         from langgraph.checkpoint.memory import MemorySaver
         log_event(logger, "checkpointer.memory_fallback",
                   level=logging.WARNING, reason=type(exc).__name__)
-        return MemorySaver(), False
+        # Same serde as the Postgres branch above — a degraded, in-memory
+        # run should be just as free of this warning as a durable one.
+        return MemorySaver(serde=_build_checkpoint_serde()), False
 
 
 def record_run(dsn: str, thread_id: str, query: str,
