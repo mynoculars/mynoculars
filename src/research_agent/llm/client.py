@@ -361,6 +361,11 @@ class StubClient:
         "gaps": {"tasks": []},
         "critique": {"passed": True, "score": 0.9, "notes": []},
         "quality": {"score": 0.9},
+        # P2-12: empty by default — stub mode has no way to judge real
+        # semantic conflict, so it deterministically reports nothing
+        # contested. Tests that want to exercise the contested/E2 path
+        # supply their own stub returning a non-empty list explicitly.
+        "contradictions": {"contested_goal_ids": []},
     }
 
     def complete(self, messages: List[Message], temperature: float = 0.2) -> str:

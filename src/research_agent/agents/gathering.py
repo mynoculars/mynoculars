@@ -148,8 +148,13 @@ def build_search_worker(tool: ToolFn, debug: bool = False):
     return search_worker
 
 
-def build_merger_node(debug: bool = False):
-    """Build the evidence merger / contradiction flagger."""
+def build_merger_node(router: FallbackRouter, settings: Settings, debug: bool = False):
+    """Build the evidence merger / contradiction flagger.
+
+    P2-12: now takes `router` and `settings`, the same closure shape
+    build_gap_generator_node already uses — needed because the detector
+    below is an LLM call, gated by settings.contradiction_detection_enabled.
+    """
 
     def merger_node(state: ResearchState) -> Dict[str, Any]:
         """The "reduce" half of the gather loop. Runs once all search_worker
@@ -159,40 +164,92 @@ def build_merger_node(debug: bool = False):
         READS   state.evidence (everything gathered so far, this run —
                 includes memory evidence from turn 1 and every prior
                 gather cycle's corpus evidence),
-                state.goals.
-        CALLS   nothing external — pure Python, no LLM, no store access.
+                state.goals, settings.contradiction_detection_enabled.
+        CALLS   ONE LLM JSON call (templates.detect_contradictions), but
+                ONLY when the gate is on AND at least one goal has 2+
+                evidence items — otherwise nothing external, pure Python,
+                exactly as before P2-12.
         WRITES  state.goals — same list, each Goal's `contested` flag
-                (re)computed: True if ANY evidence item tagged with that
-                goal_id carries an explicit e.contradicts marker.
-                state.counters["contradictions_flagged"] = count.
+                (re)computed from `contested_goal_ids` (see below).
+                state.counters["contradictions_flagged"] = count, plus
+                "llm_node_calls" and router-drained counters whenever the
+                LLM path actually ran.
         NEXT    graph.py routes unconditionally to progress_checker, which
                 is the node that actually ACTS on the contested flag (a
                 contested goal cannot be marked `covered`, however much
                 evidence points at it).
 
-        ⚠ Detection is minimal today: it only honors an explicit
-        e.contradicts marker placed by a tool, and no tool in this build
-        ever sets one — so contested_goal_ids is always empty in practice
-        and this node's real job never fires. The MACHINERY it feeds
-        (contested -> excluded from coverage -> gap generator seeks
-        adjudicating evidence, D-18) is fully wired and tested; only the
-        semantic judgement that would populate `contradicts` is missing.
-        A future LLM-based detector slots in right here without touching
-        any other file's wiring.
+        P2-12: two detection modes, chosen by settings.contradiction_detection_enabled.
+
+        GATE OFF (default — unchanged from pre-P2-12 behaviour): only
+        honors an explicit e.contradicts marker placed by a tool. No tool
+        in this build ever sets one, so contested_goal_ids is always empty
+        in this mode — this is the ORIGINAL, byte-for-byte-preserved
+        fallback path, not a regression.
+
+        GATE ON: an LLM pass over evidence grouped by goal_id
+        (templates.detect_contradictions), asking which goal_ids have
+        genuinely conflicting evidence. `contested_goal_ids` is read
+        DIRECTLY from the model's JSON response — this node does NOT write
+        onto individual Evidence.contradicts fields, because state.py's
+        `evidence` field is an append-only reducer (operator.add): returning
+        a rebuilt evidence list from this node would duplicate every item,
+        not update it in place. Tracking contested_goal_ids as a plain set
+        here is simpler and is the only thing progress_checker_node actually
+        reads (via g.contested) — Evidence.contradicts itself is read
+        nowhere else in this codebase once the gate is on.
+
+        A detector call that itself errors (bad JSON, provider failure) is
+        treated as "nothing contested" — the same fail-open posture
+        evaluation/quality.py's score_answer already uses — so a flaky
+        detector can never take the whole run down.
+
+        This is what makes E2 reachable in a real run for the first time
+        (see README Limitations — update once this is confirmed live, not
+        just once these unit tests pass).
         """
         if debug:
-            # merger_node makes no LLM or store call, so a --debug trace
-            # file never mentions it at all — this is exactly the "silent
+            # merger_node makes no store call ever, and makes no LLM call
+            # at all when the gate is off — a --debug trace file may still
+            # never mention it in that case. This is exactly the "silent
             # node" gap this flag exists to fill.
             log_event(logger, "node.enter", node="merger")
-        contested_goal_ids = {e.goal_id for e in state.evidence if e.contradicts}
+
+        contested_goal_ids: set = set()
+        counters: Dict[str, Any] = {}
+
+        if settings.contradiction_detection_enabled:
+            # Only worth the LLM call if at least one goal has 2+ evidence
+            # items — a single item cannot contradict itself, and
+            # templates.detect_contradictions already skips single-item
+            # goals when building its prompt; this early-exit just avoids
+            # paying for a call that would ask the model nothing useful.
+            multi_evidence_goal_ids = {
+                g.goal_id for g in state.goals
+                if sum(1 for e in state.evidence if e.goal_id == g.goal_id) >= 2
+            }
+            if multi_evidence_goal_ids:
+                router.set_node("merger")
+                try:
+                    result = router.complete_json(
+                        templates.detect_contradictions(state.goals, state.evidence))
+                    contested_goal_ids = set(result.get("contested_goal_ids", []))
+                except Exception as exc:  # noqa: BLE001 — fail open, never crash the run
+                    log_event(logger, "merger.contradiction_detection_failed",
+                              level=logging.WARNING, reason=type(exc).__name__)
+                counters = {"llm_node_calls": 1, **router.drain_counters()}
+        else:
+            # Original D-18 minimal detector, unchanged: honour an explicit
+            # marker if any tool ever sets one (none do in this build today).
+            contested_goal_ids = {e.goal_id for e in state.evidence if e.contradicts}
+
         goals = [g.model_copy(update={"contested": g.goal_id in contested_goal_ids})
                  for g in state.goals]
         n = len(contested_goal_ids)
         if n:
             log_event(logger, "merger.contested", goals=sorted(contested_goal_ids))
-        return {"goals": goals,
-                "counters": {"contradictions_flagged": float(n)}}
+        counters["contradictions_flagged"] = float(n)
+        return {"goals": goals, "counters": counters}
 
     return merger_node
 

@@ -262,7 +262,7 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     g.add_node("goal_manager", build_goal_manager_node(router, settings, debug))
     g.add_node("task_expander", build_task_expander_node(router, settings, debug))
     g.add_node("search_worker", build_search_worker(tool, debug))
-    g.add_node("merger", build_merger_node(debug))
+    g.add_node("merger", build_merger_node(router, settings, debug))  # P2-12
     g.add_node("progress_checker", build_progress_checker_node(settings, debug))
     g.add_node("gap_generator", build_gap_generator_node(router, settings, debug))
     g.add_node("compiler", build_compiler_node(router, debug))

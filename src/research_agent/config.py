@@ -167,6 +167,14 @@ class Settings(BaseSettings):
     # degradation posture: shipping inert, enabled deliberately.
     hitl_enabled: bool = False
     recursion_limit: int = Field(60, ge=10)   # D-8: invoke-time backstop
+    # D-18/P2-12: LLM-based contradiction detection in merger_node. Off by
+    # default — costs one extra LLM call per merger execution (i.e. once
+    # per gather cycle, up to max_depth times per run) whenever any goal
+    # has 2+ evidence items. When off, merger_node keeps the ORIGINAL
+    # marker-only behaviour (honours an explicit Evidence.contradicts, which
+    # no tool in this build sets — see agents/gathering.py). Turning this
+    # on is what makes E2 reachable in a real run for the first time.
+    contradiction_detection_enabled: bool = False
 
     # --- Memory decay (D-24, Python-side reranking in this core build) -----
     memory_top_k: int = Field(5, ge=1)
@@ -202,6 +210,7 @@ _KNOWN_ENV_TYPOS = {
     "REVISIONS": "MAX_REVISIONS",
     "DEBUG": "DEBUG_TRACE",
     "MEMORY_TOPK": "MEMORY_TOP_K",
+    "CONTRADICTION_DETECTION": "CONTRADICTION_DETECTION_ENABLED",
 }
 
 

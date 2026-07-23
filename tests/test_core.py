@@ -195,8 +195,12 @@ def test_full_graph_runs_offline(graph, settings):
 
 class _Named:
     """Stub provider: errors, low-quality, or good answer. `behavior` in
-    {"error","low","answer"}. On a TASK=quality scoring call it reports its
-    own quality so the router's gate can be exercised."""
+    {"error","low","answer"}. On a TASK=quality scoring call it reports the
+    fixed score baked into ITS OWN `behavior` — regardless of whose answer
+    it's actually asked to judge (P2-11: the router always passes the NEXT
+    provider in the chain as judge, never the answering provider itself, so
+    tests wire up whichever _Named instance should play judge with
+    behavior="low"/"answer" for that purpose)."""
 
     def __init__(self, name, behavior):
         self.name = name
@@ -230,10 +234,28 @@ def test_chain_stops_at_first_good_provider():
 
 
 def test_chain_steps_on_low_quality_then_serves_next():
+    # P2-11: the JUDGE is now the next provider in the chain (mistral), never
+    # the provider being judged (primary) — so it's mistral's `behavior`
+    # that must be "low" to reject primary's answer here, not primary's own.
+    # primary's own `behavior` ("answer") only governs the text IT returns,
+    # never its own quality score any more — confirming self-scoring is
+    # genuinely gone, not just relabeled.
+    chain = FallbackRouter(
+        [_Named("primary", "answer"), _Named("mistral", "low")],
+        quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "answer from mistral"
+
+
+def test_chain_ignores_providers_own_self_report_as_judge():
+    # P2-11 regression guard: if quality scoring were still self-scoring,
+    # primary reporting itself as "low" would cause a fallback hop even
+    # though the judge (mistral) would score it fine. Confirm primary's
+    # OWN low self-report is irrelevant now — only the judge's opinion
+    # (mistral, "answer" -> scores 0.9) decides, so primary's answer is kept.
     chain = FallbackRouter(
         [_Named("primary", "low"), _Named("mistral", "answer")],
         quality_threshold=0.6)
-    assert chain.complete([{"role": "user", "content": "x"}]) == "answer from mistral"
+    assert chain.complete([{"role": "user", "content": "x"}]) == "answer from primary"
 
 
 def test_chain_json_cascades_on_error():

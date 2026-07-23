@@ -3,22 +3,46 @@ evaluation/quality.py — Cheap answer-quality signal for fallback routing.
 
 Purpose:
     Give the FallbackRouter a 0..1 score for a free-text answer so it can
-    decide whether the primary model's output is good enough to keep.
+    decide whether the current provider's output is good enough to keep.
 
 Responsibilities:
-    - score_answer(): ask the SAME model to rate its own answer, parse the
-      score, and degrade gracefully (assume acceptable) when scoring itself
-      fails — a broken scorer must never take down a working answer path.
+    - score_answer(): ask a JUDGE model to rate an answer, parse the score,
+      and degrade gracefully (assume acceptable) when scoring itself fails
+      — a broken scorer must never take down a working answer path.
+
+History (P2-11):
+    This used to ask the SAME provider that wrote the answer to grade its
+    own work — cheap, but optimistic: a real run showed both the self-score
+    AND the critic pass a report whose Cassandra/DynamoDB sections cited no
+    retrieved evidence at all. The scorer is now always a DIFFERENT
+    provider — specifically the next one in FallbackRouter's chain (see
+    llm/router.py::FallbackRouter._passes_quality, the only caller, which
+    only invokes this when a next provider exists in the first place, so a
+    judge is always available whenever this runs). Still no new external
+    dependency — just a different existing provider doing the judging.
+
+    Follow-up (same P2-11 batch): a real run showed the judge itself can be
+    the one that's unavailable (Gemini rate-limited with a 429 right after
+    Mistral served the answer) — fail-open handled that correctly (the
+    answer was kept), but nothing distinguished "judge said 1.0" from
+    "judge couldn't be reached, defaulted to 1.0" in telemetry. The optional
+    `on_score_failed` callback below exists so llm/router.py can count that
+    case separately (`llm_quality_calls_failed`) without changing this
+    function's return type or its fail-open contract for any other caller.
 
 Limitation (stated, not hidden):
-    Self-evaluation is optimistic. It reliably catches catastrophic output
-    (empty, off-task, truncated) — which is the failure mode of a small
-    local model that this exists to guard — but will not catch subtle
-    factual errors. A second-model judge is the documented future upgrade.
+    A different LLM judging free text is still an LLM judgement, not
+    ground truth — it catches confidently-wrong or unsupported output far
+    more reliably than same-model self-scoring did, but it is not a
+    substitute for evidence-grounded verification. That remains the
+    critic's job (D-22, agents/compilation.py::critic_node) — the two stay
+    separate judges answering separate questions: this gate asks "is this
+    raw answer usable", the critic asks "is this compiled report faithful
+    and complete". One judge per question, per the router's own design note.
 """
 
 import logging
-from typing import List
+from typing import Callable, List, Optional
 
 from research_agent.llm.client import ChatClient, Message
 from research_agent.logging_setup import log_event
@@ -30,16 +54,22 @@ logger = logging.getLogger(__name__)
 # text at the very end varies per call. "TASK=quality" is the tag
 # llm/client.py::StubClient looks for, exactly like every other prompt in
 # prompts/templates.py.
+#
+# P2-11: reworded from "You wrote the answer below" (accurate when this was
+# self-scoring) to "Another model wrote the answer below" (accurate now that
+# `judge` is never the model that produced `answer`) — the wording is part
+# of the prompt a real model reads, so it needs to match reality.
 _SCORING_PROMPT = (
     "TASK=quality\n"
-    "You wrote the answer below for the preceding request. Rate how well it "
-    "answers the request on a 0.0-1.0 scale. Respond ONLY with JSON: "
+    "Another model wrote the answer below for the preceding request. Rate how "
+    "well it answers the request on a 0.0-1.0 scale. Respond ONLY with JSON: "
     '{"score": <float>}\n\nANSWER:\n'
 )
 
 
-def score_answer(client: ChatClient, request_messages: List[Message], answer: str) -> float:
-    """Return a 0..1 self-evaluated quality score for `answer`.
+def score_answer(judge: ChatClient, request_messages: List[Message], answer: str,
+                 on_score_failed: Optional[Callable[[], None]] = None) -> float:
+    """Return a 0..1 quality score for `answer`, as judged by `judge`.
 
     CALLED BY   llm/router.py::FallbackRouter._passes_quality, which in
                 turn is only called from complete() (never complete_json())
@@ -47,18 +77,27 @@ def score_answer(client: ChatClient, request_messages: List[Message], answer: st
                 the quality gate.
     READS       nothing from ResearchState — this is a standalone utility
                 function with no knowledge of the graph at all.
-    CALLS       client.complete_json(...) — note this asks the SAME client
-                that produced `answer` to now grade its own work, by
-                appending one more "user" message (the scoring prompt plus
-                the answer text) onto the ORIGINAL request transcript, so
-                the model sees the full context it was originally
-                responding to.
+    CALLS       judge.complete_json(...) — note `judge` is (P2-11) always a
+                DIFFERENT ChatClient than the one that produced `answer`:
+                the caller always passes the NEXT provider in the fallback
+                chain, never the answering one, by appending one more
+                "user" message (the scoring prompt plus the answer text)
+                onto the ORIGINAL request transcript, so the judge sees the
+                full context the answer was originally responding to.
     RETURNS     a float clamped to the [0, 1] range.
 
     Parameters:
-        client: the model that produced the answer (it also scores it).
+        judge: the model asked to grade the answer — never the model that
+            produced it (see module docstring's P2-11 history note).
         request_messages: the original request transcript, for context.
         answer: the produced answer text.
+        on_score_failed: optional zero-argument callback invoked ONLY on
+            the fail-open path below (judge errored / bad JSON / score
+            wasn't numeric) — never on a genuine low score. Lets a caller
+            (llm/router.py) count "couldn't be scored" separately from
+            "scored low" without this function's return type changing.
+            None (the default) means "don't bother" — every existing
+            caller that doesn't pass this keeps behaving identically.
 
     Returns:
         Parsed score clamped to [0, 1]; 1.0 if scoring itself errors
@@ -71,12 +110,12 @@ def score_answer(client: ChatClient, request_messages: List[Message], answer: st
         # one new scoring-prompt message.
         # answer[:4000] is a SLICE taking only the first 4000 characters of
         # `answer` — a cheap guard against sending an enormous answer back
-        # to the model just to be scored, which would cost tokens for very
+        # to the judge just to be scored, which would cost tokens for very
         # little benefit once the answer is already long enough to judge.
-        result = client.complete_json(
+        result = judge.complete_json(
             request_messages + [{"role": "user", "content": _SCORING_PROMPT + answer[:4000]}]
         )
-        # result.get("score", 1.0): read the "score" key if the model's
+        # result.get("score", 1.0): read the "score" key if the judge's
         # JSON included one, otherwise default to 1.0 (treat a missing
         # field the same as "couldn't be scored, assume it's fine").
         score = float(result.get("score", 1.0))
@@ -84,15 +123,17 @@ def score_answer(client: ChatClient, request_messages: List[Message], answer: st
         # min(1.0, score) caps the value at 1.0 from above; max(0.0, ...)
         # then floors THAT result at 0.0 from below. Net effect: whatever
         # `score` was, the returned value is guaranteed to sit inside
-        # [0.0, 1.0], even if the model returned something out of range
+        # [0.0, 1.0], even if the judge returned something out of range
         # like 1.5 or -3.
         return max(0.0, min(1.0, score))
     except Exception as exc:  # noqa: BLE001
-        # Anything going wrong here — the model erroring, the JSON not
+        # Anything going wrong here — the judge erroring, the JSON not
         # parsing, "score" being some non-numeric value that float() can't
         # convert — lands here. The module docstring's "Limitation" section
         # explains WHY this returns 1.0 (fail-open) rather than 0.0
         # (fail-closed): a broken scoring call should never be allowed to
         # accidentally reject a perfectly good answer.
         log_event(logger, "quality.score_failed", reason=type(exc).__name__)
+        if on_score_failed is not None:
+            on_score_failed()
         return 1.0

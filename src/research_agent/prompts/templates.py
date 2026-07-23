@@ -182,3 +182,44 @@ def critique(query: str, report: str, goals: List[Goal]) -> List[Message]:
             f"(b) does it address every goal. Do NOT judge whether more research "
             f"was needed — that is a different system's job. "
             'JSON schema: {"passed": <bool>, "score": <0..1>, "notes": ["..."]}'}]
+
+
+def detect_contradictions(goals: List[Goal], evidence: List[Evidence]) -> List[Message]:
+    """Contradiction detection over evidence grouped by goal (D-18, P2-12).
+
+    CALLED BY   agents/gathering.py::merger_node — ONLY when
+                settings.contradiction_detection_enabled is True AND at
+                least one goal currently has 2+ evidence items (a single
+                item cannot contradict itself — merger_node checks this
+                before ever calling this builder, so the "(none)" fallback
+                below is a defensive belt-and-braces case, not the expected
+                path).
+    RETURNS     a schema asking the model to name which goal_ids have
+                genuinely conflicting evidence — not merely different
+                angles on the same topic. merger_node reads
+                `contested_goal_ids` directly; it does NOT write this back
+                onto individual Evidence.contradicts fields (state.py's
+                `evidence` field is an append-only reducer —
+                operator.add — so rebuilding evidence items here would
+                duplicate them, not update them in place).
+    """
+    # Only include goals with 2+ evidence items — nothing to contradict
+    # with just zero or one item. Each block lists the goal, then every one
+    # of its evidence items truncated to 200 chars (same slicing idiom used
+    # throughout this file — see generate_gaps's evidence tail above — to
+    # keep the prompt bounded even with many long evidence items).
+    blocks = []
+    for g in goals:
+        items = [e for e in evidence if e.goal_id == g.goal_id]
+        if len(items) < 2:
+            continue
+        lines = "\n".join(f"  - {e.content[:200]}" for e in items)
+        blocks.append(f"- {g.goal_id}: {g.description}\n{lines}")
+    listing = "\n".join(blocks) or "(no goal currently has 2+ evidence items)"
+    return [_SYSTEM, {"role": "user", "content":
+            f"TASK=contradictions\nFor each goal below, its gathered evidence "
+            f"items are listed underneath it:\n{listing}\n"
+            f"Name ONLY the goal_ids where two or more items make genuinely "
+            f"conflicting factual claims — not just different aspects of the "
+            f"same topic. If nothing conflicts, return an empty list. "
+            'JSON schema: {"contested_goal_ids": ["g1", "..."]}'}]

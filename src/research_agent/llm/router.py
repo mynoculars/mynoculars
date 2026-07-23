@@ -13,7 +13,8 @@ Responsibilities:
       else), applying the SAME rule at every hop:
         1. transport/HTTP error from the current provider,
         2. unparseable JSON when JSON was required,
-        3. self-evaluated quality score below llm_quality_threshold
+        3. quality score (judged by the NEXT provider in the chain, never
+           the answering one — P2-11) below llm_quality_threshold
            (free-text answers only; see evaluation/quality.py).
     - Log every hop so runs are auditable (which provider served, why we moved).
 
@@ -23,10 +24,11 @@ Design decisions:
       is just an ordered list of ChatClients; routing logic is identical at
       every position.
     - Same trigger (error OR low quality) at every hop, per requirement.
-      Quality is scored by the SAME provider that produced the answer — a weak
-      but cheap signal that catches broken output. A provider that errors on the
+      Quality is judged by the NEXT provider in the chain (P2-11 — previously
+      the SAME provider that produced the answer, which a real run showed
+      passing a report with uncited sections). A judge that errors on the
       quality-scoring call is treated as "quality unknown → keep its answer"
-      rather than cascading further, so a flaky scorer can't burn the whole
+      rather than cascading further, so a flaky judge can't burn the whole
       chain (see _passes_quality).
     - Stub mode builds a single-element chain with no downstream providers, so
       deterministic tests never silently route elsewhere.
@@ -200,21 +202,38 @@ class FallbackRouter:
     # -- internals ----------------------------------------------------------
 
     def _passes_quality(self, provider: ChatClient, messages: List[Message],
-                        answer: str) -> bool:
+                        answer: str, judge: ChatClient) -> bool:
         """True if `answer` clears the quality gate (or can't be scored).
 
         CALLED BY   self.complete() below, ONLY when a further fallback
                     hop is available — see complete()'s docstring for why
                     it isn't worth checking on the last provider in the
-                    chain.
-        A scorer that itself errors returns 1.0 (see evaluation.quality), so a
-        flaky quality check keeps the answer rather than cascading -- the gate
-        exists to catch bad ANSWERS, not to punish a bad scoring call.
+                    chain. `judge` is always that NEXT provider (P2-11):
+                    the caller passes self.providers[i + 1], never
+                    `provider` itself — see evaluation/quality.py's module
+                    docstring for why self-scoring was replaced (a real run
+                    showed same-model self-scoring pass a report with
+                    uncited sections).
+        A judge that itself errors returns 1.0 (see evaluation.quality), so a
+        flaky judge keeps the answer rather than cascading -- the gate
+        exists to catch bad ANSWERS, not to punish a bad judging call.
+        `provider` is kept as a parameter purely for the log line below
+        (which provider's answer was rejected) — it is never passed to
+        score_answer itself any more.
+
+        P2-11 follow-up: a real run showed the judge itself can be
+        unreachable (Gemini 429'd right after Mistral answered, one hop
+        earlier in the same chain) — fail-open handled it correctly, but
+        telemetry couldn't tell "judge said 1.0" from "judge never
+        answered, defaulted to 1.0". The on_score_failed callback below
+        bumps llm_quality_calls_failed ONLY on that fail-open path — a
+        genuinely low score never touches this counter.
         """
-        score = score_answer(provider, messages, answer)
+        score = score_answer(judge, messages, answer,
+                             on_score_failed=lambda: self._bump("llm_quality_calls_failed"))
         if score < self.quality_threshold:
             log_event(logger, "llm.quality_reject", provider=provider.name,
-                      score=score, threshold=self.quality_threshold)
+                      judge=judge.name, score=score, threshold=self.quality_threshold)
             return False
         return True
 
@@ -318,8 +337,13 @@ class FallbackRouter:
             # in return; better to just accept whatever it produced.
             has_next = i + 1 < len(self.providers)
             if has_next:
-                self._bump("llm_quality_calls")  # P2-07: a real self-scoring call
-            if has_next and not self._passes_quality(provider, messages, answer):
+                self._bump("llm_quality_calls")  # P2-07: a real judging call
+            # P2-11: the judge is always the NEXT provider in the chain,
+            # never `provider` itself — self.providers[i + 1] is safe here
+            # precisely because this whole block is already gated on
+            # `has_next` (i + 1 < len(self.providers)).
+            if has_next and not self._passes_quality(provider, messages, answer,
+                                                      judge=self.providers[i + 1]):
                 self._bump("llm_fallback_hops")
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=self.providers[i + 1].name,
