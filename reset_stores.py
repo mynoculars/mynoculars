@@ -10,10 +10,16 @@ Purpose:
     before re-ingesting.
 
 Usage:
-    PYTHONPATH=src python scripts/reset_stores.py --dry-run
-    PYTHONPATH=src python scripts/reset_stores.py --yes
-    PYTHONPATH=src python scripts/reset_stores.py --yes --keep-memory
-    PYTHONPATH=src python scripts/reset_stores.py --yes --qdrant --opensearch
+    python reset_stores.py --dry-run
+    python reset_stores.py --yes
+    python reset_stores.py --yes --keep-memory
+    python reset_stores.py --yes --qdrant --opensearch
+
+    This file lives at the REPO ROOT, not under scripts/ (only
+    ingest_sample_data.py is there) -- a stale "scripts/reset_stores.py"
+    path lived in this docstring and in reset_stores.bat until a live run
+    surfaced it. No PYTHONPATH needed either: sys.path.insert(0, "src")
+    two lines below does that already, on every OS.
 
 Scope (endpoints and names always come from Settings / .env — never hardcoded):
     Qdrant      drop collection CORPUS_INDEX
@@ -101,13 +107,13 @@ def reset_opensearch(url: str, index: str, username: str, password: str,
         print(f"OpenSearch: UNREACHABLE ({type(exc).__name__}) — skipped")
         return False
 
-    if not client.indices.exists(index):
+    if not client.indices.exists(index=index):
         print(f"OpenSearch: index '{index}' absent — nothing to do")
         return True
     if dry_run:
         print(f"OpenSearch: WOULD DELETE index '{index}'")
         return True
-    client.indices.delete(index)
+    client.indices.delete(index=index)
     print(f"OpenSearch: deleted index '{index}'")
     return True
 

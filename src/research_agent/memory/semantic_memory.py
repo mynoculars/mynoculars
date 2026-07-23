@@ -92,7 +92,8 @@ class SemanticMemory:
     """
 
     def __init__(self, store: QdrantStore, top_k: int,
-                 half_life_semi: float, half_life_volatile: float):
+                 half_life_semi: float, half_life_volatile: float,
+                 server_side_decay: bool = False):
         """store may be degraded — retrieve() then returns [] and
         store_run() no-ops, i.e. the agent silently runs memory-off.
 
@@ -100,57 +101,95 @@ class SemanticMemory:
                     run, wrapping a QdrantStore already pointed at the
                     memory collection (a DIFFERENT collection name than the
                     corpus one — see storage/qdrant_store.py's docstring).
+
+        server_side_decay (P2-10, default False): when True, retrieve()
+        below asks the store to do fusion/decay server-side
+        (QdrantStore.search_with_decay) instead of over-fetching and
+        reranking in Python. The Python path (decay_factor(), just below
+        this class) is kept as the PARITY ORACLE either way — it is never
+        removed, and stays the default for anyone who hasn't opted in.
         """
         self.store = store
         self.top_k = top_k
         self.half_life_semi = half_life_semi
         self.half_life_volatile = half_life_volatile
+        self.server_side_decay = server_side_decay
 
     def retrieve(self, query: str) -> List[Evidence]:
-        """Similarity search reranked by similarity x decay.
+        """Similarity search reranked by similarity x decay — either in
+        Python (default) or server-side in Qdrant (P2-10, opt-in).
 
         CALLED BY   agents/planning.py::memory_retrieve_node — the second
                     node of every run, right after classify, and BEFORE any
                     goal has been composed (see that node's docstring for
                     why the ordering matters).
-        CALLS       self.store.search(...) — Qdrant similarity search,
-                    over-fetching 2x self.top_k candidates so there is room
-                    for the decay rerank below to actually change which
-                    items make the final cut, not just their order.
+        CALLS       EITHER self.store.search_with_decay(...) (P2-10, server-
+                    side formula — only when self.server_side_decay is
+                    True) OR self.store.search(...) (the original Python
+                    path, over-fetching 2x self.top_k candidates so there
+                    is room for the decay rerank below to actually change
+                    which items make the final cut, not just their order).
         RETURNS     up to self.top_k Evidence objects, tagged
                     source="memory", already decay-adjusted so the coverage
                     rule in agents/gathering.py needs no special case for
-                    memory-sourced evidence.
+                    memory-sourced evidence — identical contract whichever
+                    path computed the score.
 
         Returns Evidence with source='memory'; score already decay-adjusted
         so the coverage rule (D-17) needs no special-casing for memory.
+
+        P2-10: when self.server_side_decay is True, `scored` below is built
+        directly from search_with_decay's results — its "similarity" is
+        ALREADY the decay-adjusted final score (Qdrant computed vector
+        similarity x decay itself), so decay_factor() is deliberately NOT
+        called again here; doing so would double-apply decay. When False
+        (the default), this is byte-for-byte the original Python path:
+        decay_factor() (below this class, kept as the permanent PARITY
+        ORACLE — see its own docstring and the module header) computes the
+        multiplier explicitly, over 2x-over-fetched candidates.
         """
-        hits = self.store.search(query, top_k=self.top_k * 2)  # over-fetch, rerank, cut
-        scored = []
-        for h in hits:
-            # Volatility(h.get(...)) CONSTRUCTS an Enum member from its
-            # string value — e.g. Volatility("semi_stable") gives back
-            # Volatility.SEMI_STABLE. The .get(..., default) call supplies
-            # "semi_stable" as a fallback if this particular stored point
-            # somehow has no "volatility" key in its payload at all.
-            vol = Volatility(h.get("volatility", Volatility.SEMI_STABLE.value))
-            d = decay_factor(h["age_days"], vol, self.half_life_semi, self.half_life_volatile)
-            # Build a tuple of (combined_score, original_hit_dict,
-            # volatility) for each hit — a common Python pattern for
-            # "attach a computed sort key to each item before sorting",
-            # since Python's sort needs something to compare, and the raw
-            # hit dicts alone don't have an obvious ordering.
-            scored.append((h["similarity"] * d, h, vol))
-        # See the module docstring for exactly what this sort call does:
-        # order by the first tuple element (the combined score), best
-        # first.
-        scored.sort(key=lambda t: t[0], reverse=True)
+        if self.server_side_decay:
+            hits = self.store.search_with_decay(
+                query, top_k=self.top_k, decay_field="volatility",
+                half_lives={Volatility.STABLE.value: None,
+                           Volatility.SEMI_STABLE.value: self.half_life_semi,
+                           Volatility.VOLATILE.value: self.half_life_volatile})
+            scored = [
+                (h.get("similarity", 0.0), h,
+                 Volatility(h.get("volatility", Volatility.SEMI_STABLE.value)))
+                for h in hits
+            ]
+            # Already ranked best-first by Qdrant and already cut to
+            # top_k — no Python-side sort/slice needed on this path.
+        else:
+            hits = self.store.search(query, top_k=self.top_k * 2)  # over-fetch, rerank, cut
+            scored = []
+            for h in hits:
+                # Volatility(h.get(...)) CONSTRUCTS an Enum member from its
+                # string value — e.g. Volatility("semi_stable") gives back
+                # Volatility.SEMI_STABLE. The .get(..., default) call supplies
+                # "semi_stable" as a fallback if this particular stored point
+                # somehow has no "volatility" key in its payload at all.
+                vol = Volatility(h.get("volatility", Volatility.SEMI_STABLE.value))
+                d = decay_factor(h["age_days"], vol, self.half_life_semi, self.half_life_volatile)
+                # Build a tuple of (combined_score, original_hit_dict,
+                # volatility) for each hit — a common Python pattern for
+                # "attach a computed sort key to each item before sorting",
+                # since Python's sort needs something to compare, and the raw
+                # hit dicts alone don't have an obvious ordering.
+                scored.append((h["similarity"] * d, h, vol))
+            # See the module docstring for exactly what this sort call does:
+            # order by the first tuple element (the combined score), best
+            # first.
+            scored.sort(key=lambda t: t[0], reverse=True)
+            scored = scored[: self.top_k]
 
         out: List[Evidence] = []
-        # scored[: self.top_k] — see the module docstring's slice
-        # explanation. This loop unpacks each surviving (final, h, vol)
-        # tuple back into three separate names.
-        for final, h, vol in scored[: self.top_k]:
+        # scored is already at most self.top_k items on EITHER path above
+        # (server-side: Qdrant's `limit=top_k`; Python: the slice just
+        # above) — this loop unpacks each surviving (final, h, vol) tuple
+        # back into three separate names, same as before P2-10.
+        for final, h, vol in scored:
             out.append(Evidence(
                 # A synthetic task_key is invented here purely so this
                 # Evidence object has SOME unique-ish identifier, since

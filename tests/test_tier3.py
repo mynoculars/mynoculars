@@ -157,6 +157,44 @@ def test_router_never_bumps_llm_quality_calls_failed_on_a_genuine_score():
     assert drained.get("llm_quality_calls_failed", 0) == 0
 
 
+def test_telemetry_surfaces_llm_quality_calls_failed_end_to_end(settings):
+    """Regression guard for the exact gap a live run found: the counter
+    can be correctly bumped in state.counters (proven by the router-level
+    tests above) and STILL never appear in the printed/persisted telemetry,
+    because telemetry_node (agents/compilation.py) builds its output dict
+    by explicitly enumerating keys rather than passing state.counters
+    through wholesale. This drives a real graph run with StubClient as the
+    answering provider (so planning/goal composition succeeds normally,
+    same as every other full-graph test in this suite) and
+    _AlwaysErroringJudge as the NEXT provider in the chain — so it's only
+    ever consulted to SCORE the compiler's answer, never to produce one —
+    then asserts the key is actually present in state.telemetry, not just
+    in the raw counters dict some earlier test already checked."""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from research_agent.llm.client import StubClient
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.orchestration.graph import build_graph
+    from research_agent.state import Evidence, ResearchState, Volatility
+    from research_agent.storage.qdrant_store import QdrantStore
+
+    router = FallbackRouter([StubClient(), _AlwaysErroringJudge()], quality_threshold=0.6)
+
+    def fake_tool(task):
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="fake",
+                         content=f"fact about {task.query}", score=0.9,
+                         volatility=Volatility.SEMI_STABLE)]
+
+    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+                            settings.memory_top_k, 90.0, 14.0)
+
+    g = build_graph(router, fake_tool, memory, settings, MemorySaver())
+    result = g.invoke(ResearchState(raw_query="q"), config={"configurable": {"thread_id": "t"}})
+
+    assert "llm_quality_calls_failed" in result["telemetry"]
+    assert result["telemetry"]["llm_quality_calls_failed"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # P2-12 — semantic contradiction detector
 # ---------------------------------------------------------------------------
@@ -293,3 +331,312 @@ def test_gate_on_fails_open_when_detector_errors(caplog):
     goals_by_id = {g.goal_id: g for g in result["goals"]}
     assert goals_by_id["g1"].contested is False  # fails open -> nothing contested
     assert any("merger.contradiction_detection_failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# P2-10 — Qdrant payload indexes + server-side decay
+#
+# IMPORTANT LIMITATION, stated plainly: none of these tests run against a
+# real Qdrant server — this whole suite is offline by design (see
+# conftest.py's module docstring), and no live Qdrant was reachable in the
+# environment these were written in either. What IS verified here:
+#   1. The FormulaQuery/DecayParamsExpression/etc. objects construct
+#      without a Pydantic validation error against the ACTUAL installed
+#      qdrant-client version (not guessed, not copied from the design
+#      doc's Appendix C, which a prior external review is on record for
+#      having invented API symbols in).
+#   2. The exact shape of what gets sent (index field names/types, filter
+#      values, scale/midpoint numbers) matches what P2-10 was scoped to do.
+#   3. A NUMERIC PARITY check: if Qdrant evaluates an exp_decay formula
+#      per its documented semantics (output = midpoint ** (|x-target|/scale),
+#      i.e. exactly 0.5 at |x-target|==scale when midpoint=0.5), the value
+#      it would return is mathematically identical to decay_factor()'s
+#      Python output for the same age/half-life. This proves the FORMULA
+#      is correct; it does NOT prove Qdrant's server actually executes it
+#      this way — that step needs a live run against a real server (see
+#      PHASE2_TIER3_IMPLEMENTATION_PLAN.md's P2-10 risk note).
+# Before trusting this in production: run search_with_decay against a real
+# Qdrant (client 1.18.0 / server 1.17.1 confirmed compatible) and compare
+# its output to the Python path on the same corpus.
+# ---------------------------------------------------------------------------
+
+
+from unittest.mock import MagicMock
+
+from research_agent.memory.semantic_memory import decay_factor
+from research_agent.storage.qdrant_store import QdrantStore
+
+
+def _mock_store(collection="test_collection"):
+    """A QdrantStore with a real (degraded, unreachable) __init__ pass, then
+    forced "available" with a MagicMock in place of the real qdrant-client
+    connection — lets us test the Qdrant-API-CALLING code paths (something
+    no existing test in this suite does; every prior QdrantStore test only
+    ever exercised the degraded no-op path or a standalone helper function)
+    without a real server."""
+    store = QdrantStore("http://127.0.0.1:1", collection)
+    assert store.available is False  # sanity: really did fail to connect
+    store.available = True
+    store._client = MagicMock()
+    store._embedder = MagicMock()
+    # A fresh 3-float vector per call — NOT a fixed return_value, which
+    # would hand back the SAME (single-use) iterator object on every call
+    # and silently break the second of any two _embed() calls in one test.
+    store._embedder.embed = MagicMock(side_effect=lambda texts: [[0.1, 0.2, 0.3] for _ in texts])
+    # get_collections()... .collections defaults to an empty iterator on a
+    # MagicMock, so ensure_collection() always takes the "create it" path
+    # — fine for these tests, which only care about what's SENT, not the
+    # collection-exists check.
+    return store
+
+
+def test_ensure_payload_indexes_creates_the_two_required_indexes():
+    from qdrant_client import models
+
+    store = _mock_store()
+    store.ensure_payload_indexes()
+
+    calls = store._client.create_payload_index.call_args_list
+    assert len(calls) == 2
+    fields = {c.kwargs["field_name"]: c.kwargs["field_schema"] for c in calls}
+    assert fields["created_at_iso"] == models.PayloadSchemaType.DATETIME
+    assert fields["volatility"] == models.PayloadSchemaType.KEYWORD
+
+
+def test_ensure_payload_indexes_is_a_noop_when_degraded():
+    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    assert store.available is False
+    store.ensure_payload_indexes()  # must not raise
+
+
+def test_ensure_payload_indexes_fails_open_on_client_error(caplog):
+    import logging
+
+    store = _mock_store()
+    store._client.create_payload_index = MagicMock(side_effect=RuntimeError("qdrant is down"))
+    with caplog.at_level(logging.WARNING):
+        store.ensure_payload_indexes()  # must not raise
+    assert any("qdrant.index_creation_failed" in r.message for r in caplog.records)
+
+
+def test_ensure_collection_calls_ensure_payload_indexes_every_time():
+    """P2-10: unlike collection creation itself (only on first use),
+    payload-index creation must run on EVERY ensure_collection() call —
+    it's what guarantees the indexes exist even for a collection that
+    already existed from before P2-10 shipped."""
+    store = _mock_store()
+    store.ensure_collection()
+    store.ensure_collection()
+    assert store._client.create_payload_index.call_count == 4  # 2 indexes x 2 calls
+
+
+def test_upsert_texts_writes_both_created_at_and_created_at_iso():
+    store = _mock_store()
+    store.upsert_texts([{"content": "fact one"}])
+
+    upsert_call = store._client.upsert.call_args
+    points = upsert_call.kwargs.get("points") or upsert_call.args[-1]
+    payload = points[0].payload
+    assert "created_at" in payload and isinstance(payload["created_at"], float)
+    assert "created_at_iso" in payload
+    # Round-trips as a real ISO/RFC3339 instant — this is exactly the shape
+    # DatetimeKeyExpression needs; a malformed string here would silently
+    # never match server-side, not raise loudly, so this is worth checking.
+    import datetime as _dt
+    _dt.datetime.fromisoformat(payload["created_at_iso"])
+
+
+def test_search_with_decay_returns_empty_list_when_degraded():
+    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    assert store.available is False
+    out = store.search_with_decay("q", top_k=3, decay_field="volatility",
+                                  half_lives={"stable": None, "semi_stable": 90.0})
+    assert out == []
+
+
+def test_search_with_decay_builds_a_valid_formula_query_and_correct_scales():
+    """The real test of the P2-10 risk this item was flagged for: does the
+    FormulaQuery this method builds actually validate against the REAL
+    installed qdrant-client Pydantic models (not a hand-rolled dict that
+    only LOOKS right)? A ValidationError here would surface immediately —
+    this test doesn't even need to inspect the object's shape to prove
+    that much, though it does so anyway for the scale-math check below."""
+    from qdrant_client import models
+
+    store = _mock_store()
+    fake_point = MagicMock()
+    fake_point.payload = {"content": "x", "volatility": "semi_stable",
+                          "created_at": 1700000000.0,
+                          "created_at_iso": "2023-11-14T22:13:20+00:00"}
+    fake_point.score = 0.42
+    fake_response = MagicMock()
+    fake_response.points = [fake_point]
+    store._client.query_points = MagicMock(return_value=fake_response)
+
+    out = store.search_with_decay(
+        "q", top_k=3, decay_field="volatility",
+        half_lives={"stable": None, "semi_stable": 90.0, "volatile": 14.0})
+
+    # Constructed without error (no ValidationError raised above) AND
+    # produced a result in the expected shape.
+    assert out == [{
+        "content": "x", "volatility": "semi_stable",
+        "created_at": 1700000000.0, "created_at_iso": "2023-11-14T22:13:20+00:00",
+        "similarity": 0.42,
+        "age_days": out[0]["age_days"],  # computed from wall-clock "now"; not asserting an exact value
+    }]
+
+    call = store._client.query_points.call_args
+    formula = call.kwargs["query"]
+    assert isinstance(formula, models.FormulaQuery)
+    outer = formula.formula
+    assert isinstance(outer, models.MultExpression)
+    assert outer.mult[0] == "$score"
+    decay_sum = outer.mult[1]
+    assert isinstance(decay_sum, models.SumExpression)
+    assert len(decay_sum.sum) == 3  # one branch per half_lives entry
+
+    # Find the semi_stable branch and check its scale is EXACTLY
+    # half_life_days * 86400 seconds — the conversion this method's
+    # docstring promises.
+    semi_branch = next(
+        b for b in decay_sum.sum
+        if b.mult[0].must[0].match.value == "semi_stable")
+    exp_decay = semi_branch.mult[1]
+    assert isinstance(exp_decay, models.ExpDecayExpression)
+    assert exp_decay.exp_decay.scale == 90.0 * 86400.0
+    assert exp_decay.exp_decay.midpoint == 0.5
+    assert exp_decay.exp_decay.x.datetime_key == "created_at_iso"
+    assert exp_decay.exp_decay.target.datetime == "now"
+
+    # The "stable" branch (half_life=None) must be a flat 1.0 multiplier,
+    # not a decay expression — confirms the None-means-no-decay contract.
+    stable_branch = next(
+        b for b in decay_sum.sum
+        if b.mult[0].must[0].match.value == "stable")
+    assert stable_branch.mult[1] == 1.0
+
+
+def test_search_with_decay_prefetch_overfetches_by_the_given_multiplier():
+    from qdrant_client import models
+
+    store = _mock_store()
+    fake_response = MagicMock()
+    fake_response.points = []
+    store._client.query_points = MagicMock(return_value=fake_response)
+
+    store.search_with_decay("q", top_k=5, decay_field="volatility",
+                            half_lives={"stable": None}, overfetch=4)
+
+    call = store._client.query_points.call_args
+    prefetch = call.kwargs["prefetch"]
+    assert isinstance(prefetch, models.Prefetch)
+    assert prefetch.limit == 20  # top_k(5) * overfetch(4)
+    assert call.kwargs["limit"] == 5  # final cut is still just top_k
+
+
+# --- Numeric parity: server-side formula math vs. the Python parity oracle ---
+
+
+def _qdrant_exp_decay_semantics(age_days: float, half_life_days: float) -> float:
+    """Reimplements Qdrant's DOCUMENTED exp_decay semantics in pure Python:
+    output = midpoint ** (|x - target| / scale), which at midpoint=0.5 and
+    scale = half_life_days * 86400 seconds, with |x-target| = age in
+    seconds, reduces to exactly decay_factor()'s formula. This function
+    exists ONLY to make that equivalence an explicit, checkable claim — it
+    is not a substitute for confirming the real server computes it this
+    way (see this section's module-level note)."""
+    scale_seconds = half_life_days * 86400.0
+    age_seconds = age_days * 86400.0
+    return 0.5 ** (age_seconds / scale_seconds)
+
+
+def test_formula_math_matches_python_decay_factor_for_semi_stable():
+    from research_agent.state import Volatility
+
+    for age_days in (0.0, 1.0, 45.0, 90.0, 180.0, 365.0):
+        server_value = _qdrant_exp_decay_semantics(age_days, half_life_days=90.0)
+        python_value = decay_factor(age_days, Volatility.SEMI_STABLE,
+                                    half_life_semi=90.0, half_life_volatile=14.0)
+        assert abs(server_value - python_value) < 1e-9, (
+            f"mismatch at age_days={age_days}: server={server_value} python={python_value}")
+
+
+def test_formula_math_matches_python_decay_factor_for_volatile():
+    from research_agent.state import Volatility
+
+    for age_days in (0.0, 1.0, 7.0, 14.0, 28.0, 60.0):
+        server_value = _qdrant_exp_decay_semantics(age_days, half_life_days=14.0)
+        python_value = decay_factor(age_days, Volatility.VOLATILE,
+                                    half_life_semi=90.0, half_life_volatile=14.0)
+        assert abs(server_value - python_value) < 1e-9, (
+            f"mismatch at age_days={age_days}: server={server_value} python={python_value}")
+
+
+def test_formula_math_exp_decay_hits_exactly_midpoint_at_scale():
+    """Sanity check on the semantics claim itself: at age == half_life
+    (i.e. |x-target| == scale), exp_decay's documented output is EXACTLY
+    the midpoint (0.5 here) — same invariant decay_factor()'s own
+    docstring states ("exactly 0.5 when age == half_life")."""
+    assert abs(_qdrant_exp_decay_semantics(90.0, half_life_days=90.0) - 0.5) < 1e-12
+
+
+# --- SemanticMemory.retrieve: server-side gate on/off ---
+
+
+class _FakeDecayStore:
+    """Minimal fake satisfying exactly what SemanticMemory.retrieve calls
+    on `self.store` — .search() and/or .search_with_decay(), nothing else."""
+
+    def __init__(self, search_hits=None, decay_hits=None):
+        self._search_hits = search_hits or []
+        self._decay_hits = decay_hits or []
+        self.search_calls = 0
+        self.search_with_decay_calls = 0
+
+    def search(self, query, top_k):
+        self.search_calls += 1
+        return self._search_hits
+
+    def search_with_decay(self, query, top_k, decay_field, half_lives):
+        self.search_with_decay_calls += 1
+        return self._decay_hits
+
+
+def test_retrieve_gate_off_uses_the_python_path_unchanged():
+    from research_agent.memory.semantic_memory import SemanticMemory
+
+    store = _FakeDecayStore(search_hits=[
+        {"content": "c1", "goal_id": "g1", "volatility": "semi_stable",
+         "similarity": 0.9, "age_days": 10.0},
+    ])
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0,
+                        server_side_decay=False)
+    out = mem.retrieve("q")
+
+    assert store.search_calls == 1
+    assert store.search_with_decay_calls == 0
+    assert len(out) == 1
+    assert out[0].content == "c1"
+
+
+def test_retrieve_gate_on_uses_search_with_decay_and_skips_double_decay():
+    """The critical correctness check: on the server-side path, the hit's
+    "similarity" must be used AS THE FINAL SCORE directly — decay_factor()
+    must NOT be called again, or the item would be decayed twice."""
+    from research_agent.memory.semantic_memory import SemanticMemory
+
+    store = _FakeDecayStore(decay_hits=[
+        {"content": "c1", "goal_id": "g1", "volatility": "semi_stable",
+         "similarity": 0.42, "age_days": 999.0},  # age_days deliberately
+        # implausible for a fresh 0.42 score if decay were re-applied on
+        # top — catches an accidental double-decay immediately.
+    ])
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0,
+                        server_side_decay=True)
+    out = mem.retrieve("q")
+
+    assert store.search_with_decay_calls == 1
+    assert store.search_calls == 0
+    assert len(out) == 1
+    assert out[0].score == 0.42  # untouched — exactly what search_with_decay returned

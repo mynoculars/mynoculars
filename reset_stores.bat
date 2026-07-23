@@ -6,7 +6,7 @@ REM   reset.bat              preview only (dry run, nothing is deleted)
 REM   reset.bat --yes        delete, then re-ingest the sample corpus
 REM   reset.bat --yes --keep-memory   keep the semantic-memory collection
 REM
-REM Any arguments are passed straight through to scripts\reset_stores.py.
+REM Any arguments are passed straight through to reset_stores.py (repo root).
 
 setlocal
 
@@ -19,14 +19,14 @@ call .venv\Scripts\activate.bat
 set PYTHONPATH=src
 
 if "%~1"=="" (
-    python scripts\reset_stores.py --dry-run
+    python reset_stores.py --dry-run
     echo.
     echo Nothing was deleted. Re-run as:  reset.bat --yes
     endlocal
     exit /b 0
 )
 
-python scripts\reset_stores.py %*
+python reset_stores.py %*
 if errorlevel 1 (
     echo Reset reported an unreachable store. Fix it, then re-run.
     endlocal

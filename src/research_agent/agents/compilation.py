@@ -224,11 +224,11 @@ def build_telemetry_node(debug: bool = False):
         WRITES  state.telemetry = {intent, goals, iterations,
                     evidence_items, recall, llm_node_calls,
                     llm_provider_calls, llm_fallback_hops, llm_quality_calls,
-                    retrieval_dense_calls, retrieval_keyword_calls,
-                    retrieval_leg_unavailable, producer_rejects,
-                    search_calls, search_failures, memory_hits,
-                    memory_writes, revision_cycles, critique_passed,
-                    planning_error}
+                    llm_quality_calls_failed, retrieval_dense_calls,
+                    retrieval_keyword_calls, retrieval_leg_unavailable,
+                    producer_rejects, search_calls, search_failures,
+                    memory_hits, memory_writes, revision_cycles,
+                    critique_passed, planning_error}
         NEXT    graph.py routes unconditionally to END. cli.py then prints
                 state.final_report followed by this telemetry dict, and
                 persists a summary row to Postgres (CLI only — the API
@@ -244,8 +244,14 @@ def build_telemetry_node(debug: bool = False):
         every LLM-calling node's own counters — see planning.py/
         gathering.py/compilation.py's individual nodes) give the actual
         provider-request volume this dict couldn't previously show.
-        "llm_quality_calls" counts self-scoring calls (compiler_node's
-        free-text path only). "retrieval_dense_calls"/"retrieval_keyword_calls"
+        "llm_quality_calls" counts judge-scoring calls (compiler_node's
+        free-text path only — P2-11: the judge is always the NEXT provider
+        in the fallback chain, never the answering one). "llm_quality_calls_failed"
+        (P2-11 follow-up) is the subset of those where the judge itself
+        couldn't be reached/parsed — fail-open kept the answer either way,
+        but a nonzero count here means that many gate checks had no real
+        opinion behind them, which is worth knowing even though the run
+        still succeeded. "retrieval_dense_calls"/"retrieval_keyword_calls"
         (P2-07 follow-up) count actual HybridRetriever.search() attempts per
         leg — one pair per search_worker invocation that used the real
         corpus tool; a fake tool in tests contributes none, since it isn't
@@ -272,6 +278,7 @@ def build_telemetry_node(debug: bool = False):
             "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
             "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),
             "llm_quality_calls": int(c.get("llm_quality_calls", 0)),
+            "llm_quality_calls_failed": int(c.get("llm_quality_calls_failed", 0)),
             "retrieval_dense_calls": int(c.get("retrieval_dense_calls", 0)),
             "retrieval_keyword_calls": int(c.get("retrieval_keyword_calls", 0)),
             "retrieval_leg_unavailable": int(c.get("retrieval_leg_unavailable", 0)),

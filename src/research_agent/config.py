@@ -176,10 +176,21 @@ class Settings(BaseSettings):
     # on is what makes E2 reachable in a real run for the first time.
     contradiction_detection_enabled: bool = False
 
-    # --- Memory decay (D-24, Python-side reranking in this core build) -----
+    # --- Memory decay (D-24/D-27) -------------------------------------------
     memory_top_k: int = Field(5, ge=1)
     decay_half_life_days_semi_stable: float = 90.0
     decay_half_life_days_volatile: float = 14.0
+    # P2-10: server-side (Qdrant FormulaQuery) decay reranking instead of
+    # the Python over-fetch-then-rerank path. Off by default — requires
+    # points to carry the "created_at_iso" payload field, which only
+    # points written AFTER this shipped will have (see
+    # storage/qdrant_store.py::ensure_payload_indexes's docstring). Points
+    # from before this flag existed will simply never match the server-side
+    # formula's datetime filter; wipe and re-ingest (scripts/reset_stores.py)
+    # rather than trying to run mixed old/new points through this path.
+    # The Python decay_factor() path (memory/semantic_memory.py) remains
+    # the default AND the permanent parity oracle — never deleted.
+    memory_server_side_decay: bool = False
 
     # Debug tracing: when true (or --debug on the CLI), dump the exact prompt,
     # raw response, provider, tokens and latency of every LLM call, plus every
@@ -211,6 +222,7 @@ _KNOWN_ENV_TYPOS = {
     "DEBUG": "DEBUG_TRACE",
     "MEMORY_TOPK": "MEMORY_TOP_K",
     "CONTRADICTION_DETECTION": "CONTRADICTION_DETECTION_ENABLED",
+    "SERVER_SIDE_DECAY": "MEMORY_SERVER_SIDE_DECAY",
 }
 
 
