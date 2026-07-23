@@ -112,6 +112,38 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 """
 
 
+def close_checkpointer(checkpointer: Any) -> None:
+    """Close the underlying Postgres connection a checkpointer holds, if any
+    (P2-08).
+
+    CALLED BY   cli.py::main, in a `finally` block wrapping the whole run,
+                and api/server.py's FastAPI shutdown handler — the two
+                processes that ever construct a checkpointer via
+                get_checkpointer, below.
+    WHY THIS EXISTS: get_checkpointer's PostgresSaver branch opens a
+    psycopg connection that nothing in this codebase previously ever
+    closed — harmless for a single short CLI run that exits right after
+    (the OS reclaims it), but a real gap for a long-lived FastAPI process
+    that could rebuild the graph (and therefore a fresh connection) more
+    than once in its lifetime, and in general just bad practice for a
+    resource this codebase itself opened. A MemorySaver (the degraded
+    fallback) holds no connection at all, so this is a safe no-op for it.
+    getattr(checkpointer, "conn", None) is used rather than a type check
+    because PostgresSaver's connection attribute is an implementation
+    detail of the langgraph library, not part of its public contract —
+    this degrades to "do nothing" rather than raising if that attribute
+    name ever changes upstream.
+    """
+    conn = getattr(checkpointer, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+            log_event(logger, "checkpointer.closed")
+        except Exception as exc:  # noqa: BLE001 — closing is best-effort
+            log_event(logger, "checkpointer.close_failed", level=logging.WARNING,
+                      reason=type(exc).__name__)
+
+
 def get_checkpointer(dsn: str) -> Tuple[Any, bool]:
     """Return (checkpointer, durable_flag).
 

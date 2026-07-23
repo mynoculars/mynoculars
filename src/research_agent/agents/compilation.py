@@ -92,7 +92,12 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         router.set_node("compiler")
         report = router.complete(templates.compile_report(
             state.raw_query, state.goals, state.evidence, state.critique_notes))
-        return {"final_report": report, "counters": {"llm_calls": 1}}
+        # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
+        # complete() (not complete_json) is the only free-text path, so this
+        # is the one node whose drained counters can include
+        # llm_quality_calls (the self-scoring gate only runs on free text).
+        counters = {"llm_node_calls": 1, **router.drain_counters()}
+        return {"final_report": report, "counters": counters}
 
     return compiler_node
 
@@ -152,7 +157,8 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         update: Dict[str, Any] = {
             "critique_passed": passed,
             "revision_count": revision,
-            "counters": {"llm_calls": 1, "revision_cycles": 1},
+            "counters": {"llm_node_calls": 1, "revision_cycles": 1,
+                        **router.drain_counters()},
         }
         if not passed:
             update["critique_notes"] = notes  # accumulates via reducer
@@ -216,21 +222,32 @@ def build_telemetry_node(debug: bool = False):
                 to all run), state.critique_passed, state.planning_error.
         CALLS   nothing external — pure aggregation.
         WRITES  state.telemetry = {intent, goals, iterations,
-                    evidence_items, recall, llm_calls, search_calls,
-                    search_failures, memory_hits, memory_writes,
-                    revision_cycles, critique_passed, planning_error}
+                    evidence_items, recall, llm_node_calls,
+                    llm_provider_calls, llm_fallback_hops, llm_quality_calls,
+                    producer_rejects, search_calls, search_failures,
+                    memory_hits, memory_writes, revision_cycles,
+                    critique_passed, planning_error}
         NEXT    graph.py routes unconditionally to END. cli.py then prints
                 state.final_report followed by this telemetry dict, and
                 persists a summary row to Postgres (CLI only — the API
                 path never calls record_run).
 
         D-12: this function ONLY adds up numbers other nodes already
-        recorded in state.counters — it never invents a figure. That said,
-        those counters are NODE-scoped, not call-scoped: llm_calls counts
-        how many NODES made an LLM call, not how many provider requests
-        actually went out (a node that fell through two fallback hops
-        still counts as one). Read a debug trace (--debug) rather than
-        this dict if you need the true call volume.
+        recorded in state.counters — it never invents a figure.
+        P2-07: "llm_calls" is renamed "llm_node_calls" for honesty — it
+        counts NODE executions that made an LLM call, not provider
+        requests (a node that fell through two fallback hops still counts
+        as one node-level call). The new "llm_provider_calls" and
+        "llm_fallback_hops" (from llm/router.py's boundary, drained into
+        every LLM-calling node's own counters — see planning.py/
+        gathering.py/compilation.py's individual nodes) give the actual
+        provider-request volume this dict couldn't previously show.
+        "llm_quality_calls" counts self-scoring calls (compiler_node's
+        free-text path only). "producer_rejects" (P2-06) counts malformed
+        goal/task items the LLM returned that were dropped rather than
+        crashing the run. Read a debug trace (--debug) for full per-call
+        detail (exact prompts/latencies) beyond what these aggregate counts
+        show.
         """
         if debug:
             log_event(logger, "node.enter", node="telemetry")
@@ -241,7 +258,11 @@ def build_telemetry_node(debug: bool = False):
             "iterations": state.iteration_depth,
             "evidence_items": len(state.evidence),
             "recall": round(state.recall_score, 3),
-            "llm_calls": int(c.get("llm_calls", 0)),
+            "llm_node_calls": int(c.get("llm_node_calls", 0)),
+            "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
+            "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),
+            "llm_quality_calls": int(c.get("llm_quality_calls", 0)),
+            "producer_rejects": int(c.get("producer_rejects", 0)),
             "search_calls": int(c.get("search_calls", 0)),
             "search_failures": int(c.get("search_failures", 0)),
             "memory_hits": int(c.get("memory_hits", 0)),

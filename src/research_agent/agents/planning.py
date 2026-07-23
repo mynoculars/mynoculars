@@ -45,6 +45,8 @@ an inner function before returning it.
 import logging
 from typing import Any, Callable, Dict
 
+from pydantic import BaseModel, Field, ValidationError
+
 from research_agent.agents.task_utils import cap_and_filter
 from research_agent.config import Settings
 from research_agent.llm.router import FallbackRouter
@@ -52,6 +54,18 @@ from research_agent.logging_setup import log_event
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
 from research_agent.state import Goal, ResearchState, SearchTask
+
+
+class RawGoal(BaseModel):
+    """P2-06: the shape goal_manager_node's LLM call is REQUIRED to return
+    per goal, validated before g["goal_id"]/g["description"] are ever
+    indexed. Same rationale as task_utils.py::RawTask — a missing or empty
+    key used to raise KeyError and abort the whole run; now it is dropped
+    and counted instead.
+    """
+
+    goal_id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +107,13 @@ def build_classify_node(router: FallbackRouter, debug: bool = False) -> NodeFn:
         router.set_node("classify")
         result = router.complete_json(templates.classify(state.raw_query))
         log_event(logger, "node.classify", intent=result.get("intent"))
-        return {"classification": result, "counters": {"llm_calls": 1}}
+        # P2-07: renamed from "llm_calls" — this counts NODE executions
+        # that made an LLM call, not provider requests. router.drain_counters()
+        # folds in the honest, provider-level counts (attempts, fallback
+        # hops, quality-scoring calls) THIS call actually made underneath —
+        # see llm/router.py::FallbackRouter.drain_counters.
+        counters = {"llm_node_calls": 1, **router.drain_counters()}
+        return {"classification": result, "counters": counters}
 
     return classify_node
 
@@ -179,12 +199,31 @@ def build_goal_manager_node(router: FallbackRouter, settings: Settings,
         result = router.complete_json(templates.compose_goals(
             state.raw_query, state.classification.get("intent", "Unknown"), hints,
             guidance=state.human_guidance))
-        goals = [Goal(goal_id=g["goal_id"], description=g["description"])
-                 for g in result.get("goals", [])]
+        # P2-06: validate each raw goal dict via RawGoal before indexing it.
+        # A malformed entry (missing/empty goal_id or description) is
+        # dropped and counted, not a KeyError that aborts the run — zero
+        # SURVIVING goals still falls through to the existing, already-
+        # legal D-21 "zero goals" path below, exactly as if the model had
+        # returned an empty list outright.
+        goals: list = []
+        producer_rejects = 0
+        for g in result.get("goals", []):
+            try:
+                raw = RawGoal.model_validate(g)
+            except ValidationError as exc:
+                producer_rejects += 1
+                log_event(logger, "producer.reject", level=logging.WARNING,
+                          node="goal_manager", errors=str(exc.errors()))
+                continue
+            goals.append(Goal(goal_id=raw.goal_id, description=raw.description))
+        counters: Dict[str, float] = {"llm_node_calls": 1,
+                                      "composed_goals": float(len(goals)),
+                                      **router.drain_counters()}
+        if producer_rejects:
+            counters["producer_rejects"] = float(producer_rejects)
         update: Dict[str, Any] = {"goals": goals,
                                   "human_guidance": "",  # consumed; never reused stale
-                                  "counters": {"llm_calls": 1,
-                                               "composed_goals": float(len(goals))}}
+                                  "counters": counters}
         if not goals:
             # D-21: record, don't raise — routing sends this to the compiler
             # for an explicit error report. (Human escalation is the full
@@ -244,10 +283,15 @@ def build_task_expander_node(router: FallbackRouter, settings: Settings,
             log_event(logger, "node.enter", node="task_expander")
         result = router.complete_json(
             templates.expand_tasks(state.goals, settings.max_fanout))
-        tasks = cap_and_filter(result.get("tasks", []), state, depth=0,
-                                max_fanout=settings.max_fanout)
-        log_event(logger, "node.expand", produced=len(tasks))
+        # P2-06: cap_and_filter now also validates each raw item and
+        # returns how many it rejected, alongside the survivors.
+        tasks, rejected = cap_and_filter(result.get("tasks", []), state, depth=0,
+                                         max_fanout=settings.max_fanout)
+        log_event(logger, "node.expand", produced=len(tasks), rejected=rejected)
         # D-2: replace-on-write — this IS the whole backlog for next dispatch.
-        return {"pending_tasks": tasks, "counters": {"llm_calls": 1}}
+        counters = {"llm_node_calls": 1, **router.drain_counters()}
+        if rejected:
+            counters["producer_rejects"] = float(rejected)
+        return {"pending_tasks": tasks, "counters": counters}
 
     return task_expander_node

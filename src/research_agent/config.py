@@ -54,11 +54,17 @@ Python mechanics used in this file, if any of this is new to you:
         boilerplate by hand.
 """
 
+import logging
+import os
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from research_agent.logging_setup import log_event
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -175,6 +181,51 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
 
+# P2-09: known-typo list. Each key here is a plausible mistyped env var name
+# someone might set, mapped to the CORRECT field-backed name they probably
+# meant. Settings.model_config uses extra="ignore" (see above), so any of
+# these left-hand names would previously be silently discarded with NO
+# indication the intended setting never took effect — e.g. HITL=true in
+# .env does nothing; HITL_ENABLED=true is the real field. This is a fixed,
+# reviewed list (not fuzzy matching) — deliberately conservative: it only
+# warns on names someone plausibly typed, never blocks a genuinely unknown
+# environment variable a shell might have set for unrelated reasons.
+_KNOWN_ENV_TYPOS = {
+    "HITL": "HITL_ENABLED",
+    "LLM_TIMEOUT": "LLM_TIMEOUT_SECONDS",
+    "LLM_PRIMARY_TIMEOUT": "LLM_PRIMARY_TIMEOUT_SECONDS",
+    "MIN_EVIDENCE": "MIN_EVIDENCE_SCORE",
+    "MIN_SIM": "MIN_SIMILARITY",
+    "RECALL": "RECALL_TARGET",
+    "FANOUT": "MAX_FANOUT",
+    "DEPTH": "MAX_DEPTH",
+    "REVISIONS": "MAX_REVISIONS",
+    "DEBUG": "DEBUG_TRACE",
+    "MEMORY_TOPK": "MEMORY_TOP_K",
+}
+
+
+def warn_on_likely_env_typos() -> None:
+    """Log a WARNING for every real environment variable matching a known
+    typo pattern (P2-09).
+
+    CALLED BY   get_settings(), below, once per process (immediately after
+                Settings() is constructed) — this never blocks startup,
+                it only makes a previously-silent misconfiguration visible
+                in the log the first time it happens.
+    READS       os.environ directly — the one exception to config.py's own
+                rule that this is the only place the process environment
+                is read (see the module docstring); Settings itself never
+                sees these keys at all, precisely because they don't match
+                any declared field, which is the whole problem being
+                flagged here.
+    """
+    for wrong, right in _KNOWN_ENV_TYPOS.items():
+        if wrong in os.environ and right not in os.environ:
+            log_event(logger, "config.likely_typo", level=logging.WARNING,
+                      set_key=wrong, probably_meant=right)
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Return the process-wide Settings singleton (cached after first load).
@@ -189,4 +240,5 @@ def get_settings() -> Settings:
     RETURNS     the same Settings instance on every call within one process
                 (see the @lru_cache explanation in the module docstring).
     """
+    warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     return Settings()

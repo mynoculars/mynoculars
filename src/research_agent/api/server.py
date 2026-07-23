@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from research_agent.cli import build_app_and_settings
 from research_agent.logging_setup import run_id_var
 from research_agent.state import ResearchState
+from research_agent.storage.postgres import close_checkpointer, record_run
 
 app = FastAPI(title="Agentic Research Agent (core build)")
 
@@ -52,7 +53,21 @@ app = FastAPI(title="Agentic Research Agent (core build)")
 # shared across every request the process ever serves. _graph is a
 # compiled LangGraph app (already bound to its checkpointer); _settings is
 # the process-wide config singleton (see config.py::get_settings).
-_graph, _settings = build_app_and_settings()
+# P2-08: build_app_and_settings now returns an AppBundle (not a bare
+# 2-tuple) — _durable and _checkpointer were previously unreachable from
+# this file at all, which is what made both the /health gap and the
+# leaked-connection-on-shutdown gap possible.
+_bundle = build_app_and_settings()
+_graph, _settings, _durable, _checkpointer = _bundle
+
+
+@app.on_event("shutdown")
+def _close_checkpointer_on_shutdown() -> None:
+    """P2-08: close whatever connection get_checkpointer opened at import
+    time. Harmless no-op for the degraded MemorySaver case (nothing to
+    close); closes the leaked-until-now Postgres connection otherwise.
+    """
+    close_checkpointer(_checkpointer)
 
 
 class ResearchRequest(BaseModel):
@@ -76,7 +91,7 @@ class ResearchRequest(BaseModel):
 def health() -> dict:
     """Liveness probe — proves the process is up and the graph was built.
 
-    READS   _settings.llm_mode (module-level singleton, see above).
+    READS   _settings.llm_mode, _durable (module-level, see above).
     CALLS   nothing external — no store or LLM reachability is checked
             here. A 200 from this endpoint means "the FastAPI app started
             successfully," not "Postgres/Qdrant/OpenSearch are reachable."
@@ -84,9 +99,14 @@ def health() -> dict:
             at build_app_and_settings() time, and degrades silently if
             unreachable — see storage/qdrant_store.py and
             storage/opensearch_store.py for that behaviour.
-    RETURNS {"status": "ok", "llm_mode": "stub"|"live"}
+    RETURNS {"status": "ok", "llm_mode": "stub"|"live", "durable": bool}
+            P2-08: `durable` is new — False means checkpointing degraded to
+            an in-memory MemorySaver at startup (Postgres was unreachable),
+            so any paused (interrupted) run will NOT survive a process
+            restart. Previously this was visible only in a startup log
+            line; a caller polling /health had no way to see it at all.
     """
-    return {"status": "ok", "llm_mode": _settings.llm_mode}
+    return {"status": "ok", "llm_mode": _settings.llm_mode, "durable": _durable}
 
 
 def _config(thread_id: str) -> dict:
@@ -111,7 +131,17 @@ def _respond(thread_id: str, result: dict) -> dict:
             called interrupt() during this invoke (see
             agents/escalation.py::human_escalation) — its presence is the
             ONLY signal this function uses to decide which shape to return;
-            there is no separate flag anywhere else to check.
+            there is no separate flag anywhere else to check. result also
+            carries every other ResearchState field flattened at the top
+            level — including "raw_query" — which is how this function gets
+            the original query text on the /resume path below, where the
+            request body itself (ResumeRequest) never carries one.
+    CALLS   storage/postgres.py::record_run — ONLY on the "done" branch
+            (P2-08). Previously NOTHING in this file ever called
+            record_run, so API-driven runs produced no agent_runs row at
+            all, unlike every CLI run (cli.py::main calls it unconditionally
+            after printing the report) — a real asymmetry between the two
+            interfaces this closes.
     RETURNS
       paused    {"thread_id", "status": "interrupted",
                  "review": <the payload human_escalation built for a
@@ -131,9 +161,12 @@ def _respond(thread_id: str, result: dict) -> dict:
     if "__interrupt__" in result:
         return {"thread_id": thread_id, "status": "interrupted",
                 "review": result["__interrupt__"][0].value}
+    telemetry = result["telemetry"]
+    record_run(_settings.postgres_dsn, thread_id, result.get("raw_query", ""),
+              telemetry.get("recall", 0.0), telemetry)
     return {"thread_id": thread_id, "status": "done",
             "report": result["final_report"],
-            "telemetry": result["telemetry"]}
+            "telemetry": telemetry}
 
 
 class ResumeRequest(BaseModel):

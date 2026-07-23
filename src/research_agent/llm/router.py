@@ -94,6 +94,40 @@ class FallbackRouter:
         self.providers = providers
         self.quality_threshold = quality_threshold
         self.tracer = tracer or NullTracer()
+        # P2-07: boundary-scoped telemetry. This router is the ONE place
+        # that actually knows how many real provider requests, fallback
+        # hops, and quality-scoring calls happened underneath a single
+        # node's complete()/complete_json() call — node-level counters
+        # (agents/*.py's "llm_node_calls") only ever counted NODE
+        # executions, invisible to fallback hops and self-scoring calls
+        # made entirely inside this class. Accumulated here, then drained
+        # by each calling node into its own returned counters dict (see
+        # drain_counters below) — never written to ResearchState directly,
+        # since this class has no knowledge of the graph at all.
+        self._counters: Dict[str, float] = {}
+
+    def _bump(self, key: str, amount: float = 1.0) -> None:
+        """Internal: add `amount` to one accumulated counter."""
+        self._counters[key] = self._counters.get(key, 0.0) + amount
+
+    def drain_counters(self) -> Dict[str, float]:
+        """Return everything accumulated since the last drain, and reset.
+
+        CALLED BY   every agents/*.py node right after its router.complete()
+                    or router.complete_json() call, to fold these
+                    provider-level counts into the SAME counters dict the
+                    node already returns (state.counters is reducer-backed
+                    via merge_counters, so adding these keys needs no state
+                    change — see state.py).
+        WHY DRAIN, NOT PEEK: each node call should only ever report the
+        provider activity ITS OWN call caused, never a stale total left
+        over from an earlier node in the same run — draining (read + reset
+        in one step) makes that structurally guaranteed rather than
+        something every call site has to remember to do correctly.
+        """
+        drained = self._counters
+        self._counters = {}
+        return drained
 
     def set_node(self, node: Optional[str]) -> None:
         """Tag subsequent calls with the current graph node, so the trace and
@@ -210,6 +244,7 @@ class FallbackRouter:
         # both the position `i` (0, 1, 2...) and the `provider` object on
         # each pass, in the fixed order the chain was built in.
         for i, provider in enumerate(self.providers):
+            self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 result = provider.complete_json(messages)
                 if i > 0:
@@ -225,6 +260,8 @@ class FallbackRouter:
                 last_exc = exc
                 nxt = (self.providers[i + 1].name
                        if i + 1 < len(self.providers) else None)
+                if nxt is not None:
+                    self._bump("llm_fallback_hops")  # P2-07: a real hop, not the last dead end
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=nxt, reason=type(exc).__name__, mode="json")
         # If we reach this line, every provider in the loop above raised.
@@ -258,12 +295,15 @@ class FallbackRouter:
 
         for i, provider in enumerate(self.providers):
             # 1. availability / error
+            self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 answer = provider.complete(messages)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 nxt = (self.providers[i + 1].name
                        if i + 1 < len(self.providers) else None)
+                if nxt is not None:
+                    self._bump("llm_fallback_hops")
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=nxt, reason=type(exc).__name__, mode="text")
                 continue  # move on to the next provider in the loop
@@ -277,7 +317,10 @@ class FallbackRouter:
             # so scoring its answer would only ever discard it for nothing
             # in return; better to just accept whatever it produced.
             has_next = i + 1 < len(self.providers)
+            if has_next:
+                self._bump("llm_quality_calls")  # P2-07: a real self-scoring call
             if has_next and not self._passes_quality(provider, messages, answer):
+                self._bump("llm_fallback_hops")
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=self.providers[i + 1].name,
                           reason="low_quality", mode="text")

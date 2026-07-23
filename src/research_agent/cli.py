@@ -42,23 +42,42 @@ Python mechanics used in this file, if any of this is new to you:
 
 import argparse
 import json
+import logging
 import sys
 import uuid
+from typing import NamedTuple
 
 from langgraph.types import Command
 
 from research_agent.config import get_settings
 from research_agent.llm.router import FallbackRouter
-from research_agent.logging_setup import configure_logging, run_id_var
+from research_agent.logging_setup import configure_logging, log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.orchestration.graph import build_graph
 from research_agent.retrieval.hybrid import HybridRetriever
 from research_agent.state import ResearchState
 from research_agent.tracing import NullTracer, Tracer
 from research_agent.storage.opensearch_store import OpenSearchStore
-from research_agent.storage.postgres import get_checkpointer, record_run
+from research_agent.storage.postgres import close_checkpointer, get_checkpointer, record_run
 from research_agent.storage.qdrant_store import QdrantStore
 from research_agent.tools.corpus_search import make_corpus_tool
+
+
+class AppBundle(NamedTuple):
+    """Everything build_app_and_settings assembles (P2-08).
+
+    Replaces the old bare (app, settings) 2-tuple with named fields so
+    `durable` and `checkpointer` are no longer silently dropped by callers
+    who only unpack the first two — the exact gap this item exists to
+    close (`durable` was previously computed inside build_app_and_settings
+    and never returned at all; see get_checkpointer in storage/postgres.py
+    for what durable=False actually means operationally).
+    """
+
+    app: object
+    settings: object
+    durable: bool
+    checkpointer: object
 
 
 def build_app_and_settings(tracer=None):
@@ -85,8 +104,13 @@ def build_app_and_settings(tracer=None):
             and both retrieval stores). None -> no tracing overhead.
 
     Returns:
-        (compiled_graph, settings) — every dependency wired from Settings,
-        with graceful degradation applied by each storage module.
+        AppBundle(app, settings, durable, checkpointer) — every dependency
+        wired from Settings, with graceful degradation applied by each
+        storage module. P2-08: `durable` and `checkpointer` are now part of
+        the return value (previously `durable` was computed here and
+        silently discarded, and `checkpointer` wasn't returned at all,
+        making close_checkpointer's cleanup unreachable from either
+        caller).
     """
     settings = get_settings()
     configure_logging(settings.log_level)
@@ -128,8 +152,17 @@ def build_app_and_settings(tracer=None):
         settings.decay_half_life_days_volatile,
     )
     checkpointer, durable = get_checkpointer(settings.postgres_dsn)
+    if not durable:
+        # P2-08: previously this was visible only as a WARNING log line
+        # from get_checkpointer itself (checkpointer.memory_fallback) — a
+        # caller that doesn't read logs had no way to know. Surfacing it
+        # here too means both cli.py and api/server.py can act on it
+        # (print a banner, put it in /health) without re-deriving it.
+        log_event(logging.getLogger(__name__), "app.degraded_checkpointing",
+                  level=logging.WARNING)
     app = build_graph(router, tool, memory, settings, checkpointer, debug=debug)
-    return app, settings
+    return AppBundle(app=app, settings=settings, durable=durable,
+                     checkpointer=checkpointer)
 
 
 def main(argv=None) -> int:
@@ -193,8 +226,25 @@ def main(argv=None) -> int:
     trace_on = args.debug or settings_peek.debug_trace
     tracer = Tracer(thread_id) if trace_on else NullTracer()
 
-    app, settings = build_app_and_settings(tracer=tracer)
+    bundle = build_app_and_settings(tracer=tracer)
+    app, settings = bundle.app, bundle.settings
+    if not bundle.durable:
+        print("[warning: Postgres unreachable — running with an in-memory "
+              "checkpointer; a process restart loses any paused/resumable run]")
 
+    try:
+        return _run(app, settings, args, thread_id, tracer)
+    finally:
+        # P2-08: close whatever connection get_checkpointer opened, even if
+        # _run raised — a CLI process is short-lived, but leaving this to
+        # the OS was never a design decision, just an oversight this item
+        # closes.
+        close_checkpointer(bundle.checkpointer)
+
+
+def _run(app, settings, args, thread_id, tracer) -> int:
+    """The actual run, factored out of main() so P2-08's finally/close
+    wraps it cleanly without one giant try block."""
     if args.print_graph:
         # app.get_graph() is a LangGraph/LangChain introspection call — it
         # walks the SAME compiled graph object we're about to (maybe) run,

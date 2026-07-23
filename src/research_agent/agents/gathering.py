@@ -254,12 +254,26 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         update = {"goals": goals, "recall_score": recall, "iteration_depth": depth}
         # D-23: at terminal non-convergence the CHECK raises the trigger
         # (E2 if a contradiction blocks a goal, else E3). Routing reads it.
-        if (settings.hitl_enabled and depth >= settings.max_depth
-                and recall < settings.recall_target):
+        # P2-09: the non-convergence CONDITION is evaluated regardless of
+        # hitl_enabled now — previously E2/E3 emitted nothing at all when
+        # HITL was off, unlike E1 (goal_manager_node) and E4 (critic_node),
+        # which both already log an "escalation.stub" WARNING in their
+        # disabled-mode branch. That asymmetry made a terminally-stuck run
+        # look identical to a converged one in the logs whenever HITL
+        # happened to be off — this restores parity across all four
+        # triggers without changing any actual routing behaviour (only
+        # settings.hitl_enabled still decides whether escalation_trigger is
+        # ever SET, which is the only thing route_convergence reads).
+        if depth >= settings.max_depth and recall < settings.recall_target:
             trigger = "E2" if any(g.contested for g in goals) else "E3"
-            update["escalation_trigger"] = trigger
-            log_event(logger, "escalation.raised", trigger=trigger,
-                      recall=round(recall, 3))
+            if settings.hitl_enabled:
+                update["escalation_trigger"] = trigger
+                log_event(logger, "escalation.raised", trigger=trigger,
+                          recall=round(recall, 3))
+            else:
+                log_event(logger, "escalation.stub", level=logging.WARNING,
+                          trigger=trigger, recall=round(recall, 3),
+                          reason="depth_exhausted")
         return update
 
     return progress_checker_node
@@ -317,22 +331,30 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         result = router.complete_json(templates.generate_gaps(
             state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
             guidance=state.human_guidance))
-        tasks = cap_and_filter(result.get("tasks", []), state,
-                                depth=state.iteration_depth,
-                                max_fanout=settings.max_fanout)
-        log_event(logger, "node.gaps", produced=len(tasks))
-        update = {"pending_tasks": tasks, "human_guidance": "",
-                  "counters": {"llm_calls": 1}}
+        # P2-06: same validated cap_and_filter seam task_expander_node uses.
+        tasks, rejected = cap_and_filter(result.get("tasks", []), state,
+                                         depth=state.iteration_depth,
+                                         max_fanout=settings.max_fanout)
+        log_event(logger, "node.gaps", produced=len(tasks), rejected=rejected)
+        counters = {"llm_node_calls": 1, **router.drain_counters()}
+        if rejected:
+            counters["producer_rejects"] = float(rejected)
+        update = {"pending_tasks": tasks, "human_guidance": "", "counters": counters}
         # D-23 (refined by test evidence): E3 originally guarded only the
         # depth-exhaustion exit; a run can ALSO fail to converge by running
         # out of producible tasks (the D-14 dispatch exit). Both are "cannot
         # converge below target" — so the trigger is raised here too.
-        if (settings.hitl_enabled and not tasks
-                and state.recall_score < settings.recall_target):
+        # P2-09: same disabled-mode logging parity as progress_checker_node
+        # above — see that node's comment for why this branch exists.
+        if not tasks and state.recall_score < settings.recall_target:
             trigger = "E2" if any(g.contested for g in state.goals) else "E3"
-            update["escalation_trigger"] = trigger
-            log_event(logger, "escalation.raised", trigger=trigger,
-                      reason="task_supply_exhausted")
+            if settings.hitl_enabled:
+                update["escalation_trigger"] = trigger
+                log_event(logger, "escalation.raised", trigger=trigger,
+                          reason="task_supply_exhausted")
+            else:
+                log_event(logger, "escalation.stub", level=logging.WARNING,
+                          trigger=trigger, reason="task_supply_exhausted")
         return update
 
     return gap_generator_node
