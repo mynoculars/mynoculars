@@ -116,21 +116,33 @@ def build_search_worker(tool: ToolFn, debug: bool = False):
             log_event(logger, "node.enter", node="search_worker", task=task.key)
         try:
             evidence = tool(task)
+            # P2-07 follow-up: drain retrieval-side boundary counts if this
+            # tool exposes them (the real corpus_search does; test fakes
+            # generally don't — see tools/corpus_search.py for exactly why
+            # this is an optional, duck-typed capability rather than part
+            # of ToolFn's required contract).
+            retrieval_counts = getattr(tool, "drain_retrieval_counts", lambda: {})()
             log_event(logger, "worker.done", task=task.key, items=len(evidence))
             return {
                 "evidence": evidence,
                 "completed_task_keys": {task.key},
-                "counters": {"search_calls": 1},
+                "counters": {"search_calls": 1, **retrieval_counts},
             }
         except Exception as exc:  # noqa: BLE001 — failure is data, not a crash
             # D-16: failed, NOT completed. Re-emission allowed at depth >
             # task.depth, so a transient backend error costs one cycle of
             # delay, not permanent loss of this query formulation.
+            # P2-07 follow-up: drain here too — _bump_retrieval_counts runs
+            # as the FIRST line of HybridRetriever.search(), so an attempt
+            # that raised partway through (e.g. a Qdrant NotFoundError on a
+            # collection that was never ingested) still counted as an
+            # attempted retrieval call, not a silent zero.
+            retrieval_counts = getattr(tool, "drain_retrieval_counts", lambda: {})()
             log_event(logger, "worker.failed", level=logging.WARNING,
                       task=task.key, reason=type(exc).__name__)
             return {
                 "failed_task_keys": {task.key: task.depth},
-                "counters": {"search_failures": 1},
+                "counters": {"search_failures": 1, **retrieval_counts},
             }
 
     return search_worker

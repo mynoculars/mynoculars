@@ -20,8 +20,10 @@ from research_agent.config import warn_on_likely_env_typos
 from research_agent.llm.client import StubClient
 from research_agent.llm.router import FallbackRouter
 from research_agent.orchestration.graph import build_graph
+from research_agent.retrieval.hybrid import HybridRetriever
 from research_agent.state import ResearchState, SearchTask
 from research_agent.storage.postgres import close_checkpointer
+from research_agent.tools.corpus_search import make_corpus_tool
 
 # ---------------------------------------------------------------------------
 # P2-06 — producer output validation
@@ -280,3 +282,118 @@ def test_content_id_is_a_valid_qdrant_point_id_shape():
     result = mod.content_id({"content": "anything"})
     parsed = uuid_module.UUID(result)  # raises ValueError if not a real UUID
     assert str(parsed) == result
+
+
+# ---------------------------------------------------------------------------
+# P2-07 follow-up — retrieval-side boundary telemetry (retrieval_dense_calls,
+# retrieval_keyword_calls, retrieval_leg_unavailable). The router-side half
+# of P2-07 shipped earlier; this fills in the gap flagged at the time: the
+# ToolFn seam (tools/corpus_search.py) had no way to surface per-call
+# retrieval counts without either widening ToolFn's return type (breaking
+# every existing fake-tool fixture) or risking a race condition on shared
+# mutable state under LangGraph's parallel search_worker dispatch. Solved
+# via threading.local() + an optional, duck-typed drain_retrieval_counts
+# attribute on the tool closure.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLeg:
+    """Minimal fake store: only .search() and .available — enough to drive
+    HybridRetriever without touching real Qdrant/OpenSearch."""
+
+    def __init__(self, hits=None, available=True):
+        self._hits = hits or []
+        self.available = available
+
+    def search(self, query, top_k):
+        return list(self._hits)
+
+
+def test_hybrid_retriever_drain_counts_tracks_calls_and_resets():
+    retriever = HybridRetriever(_FakeLeg(), _FakeLeg(), min_similarity=0.0)
+    retriever.search("q", top_k=3)
+    retriever.search("q2", top_k=3)
+    counts = retriever.drain_counts()
+    assert counts["retrieval_dense_calls"] == 2
+    assert counts["retrieval_keyword_calls"] == 2
+    assert counts["retrieval_leg_unavailable"] == 0
+    # Draining resets — nothing left for a second call on the same thread.
+    assert retriever.drain_counts() == {}
+
+
+def test_hybrid_retriever_counts_unavailable_legs_not_empty_results():
+    # dense unavailable, keyword available but legitimately returns nothing
+    # — these are two DIFFERENT situations and must be counted differently.
+    retriever = HybridRetriever(_FakeLeg(available=False),
+                                _FakeLeg(hits=[], available=True),
+                                min_similarity=0.0)
+    retriever.search("obscure query", top_k=3)
+    counts = retriever.drain_counts()
+    assert counts["retrieval_leg_unavailable"] == 1  # only dense, not keyword
+
+
+def test_hybrid_retriever_counts_are_thread_local():
+    """Direct verification of the thread-safety claim: N threads, each
+    doing exactly one search()+drain() pair, must each see ONLY their own
+    call — never another thread's count leaking in, and never losing their
+    own to a race."""
+    import concurrent.futures
+
+    retriever = HybridRetriever(_FakeLeg(), _FakeLeg(), min_similarity=0.0)
+
+    def one_call_and_drain():
+        retriever.search("q", top_k=3)
+        return retriever.drain_counts()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: one_call_and_drain(), range(8)))
+
+    for counts in results:
+        assert counts["retrieval_dense_calls"] == 1
+        assert counts["retrieval_keyword_calls"] == 1
+
+
+def test_corpus_search_tool_exposes_drain_retrieval_counts():
+    retriever = HybridRetriever(_FakeLeg(hits=[{"content": "x", "title": "t"}]),
+                                _FakeLeg(), min_similarity=0.0)
+    tool = make_corpus_tool(retriever, top_k=3)
+    task = SearchTask(key="g1::x", query="x", goal_id="g1")
+    tool(task)
+    assert hasattr(tool, "drain_retrieval_counts")
+    counts = tool.drain_retrieval_counts()
+    assert counts["retrieval_dense_calls"] == 1
+    assert counts["retrieval_keyword_calls"] == 1
+
+
+def test_fake_tool_fixture_has_no_retrieval_counts_attribute(fake_tool):
+    # conftest.py's fake_tool is a plain function, not backed by
+    # HybridRetriever — search_worker must not assume every ToolFn has
+    # drain_retrieval_counts (see agents/gathering.py's getattr guard).
+    assert not hasattr(fake_tool, "drain_retrieval_counts")
+
+
+def test_full_graph_with_real_corpus_tool_reports_retrieval_counters(
+        off_memory, stub_router, settings):
+    """End-to-end: wiring the REAL HybridRetriever + make_corpus_tool
+    (instead of the fake_tool fixture) through the whole graph, telemetry
+    should report actual retrieval_dense_calls/retrieval_keyword_calls —
+    the fixture-based e2e tests elsewhere in this suite never exercise
+    this path, since fake_tool bypasses HybridRetriever entirely."""
+    retriever = HybridRetriever(
+        _FakeLeg(hits=[{"content": "fact one", "title": "doc1"}]),
+        _FakeLeg(hits=[{"content": "fact one", "title": "doc1"}]),
+        min_similarity=0.0)
+    tool = make_corpus_tool(retriever, top_k=3)
+    graph = build_graph(stub_router, tool, off_memory, settings, MemorySaver())
+
+    result = graph.invoke(
+        ResearchState(raw_query="q"),
+        config={"configurable": {"thread_id": "test-p207-retrieval"},
+                "recursion_limit": settings.recursion_limit})
+
+    tele = result["telemetry"]
+    # Stub composes 2 goals -> 2 tasks -> 2 search_worker calls, each one
+    # real HybridRetriever.search() call (one dense + one keyword attempt).
+    assert tele["retrieval_dense_calls"] == 2
+    assert tele["retrieval_keyword_calls"] == 2
+    assert tele["retrieval_leg_unavailable"] == 0

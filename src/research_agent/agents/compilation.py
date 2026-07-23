@@ -224,9 +224,11 @@ def build_telemetry_node(debug: bool = False):
         WRITES  state.telemetry = {intent, goals, iterations,
                     evidence_items, recall, llm_node_calls,
                     llm_provider_calls, llm_fallback_hops, llm_quality_calls,
-                    producer_rejects, search_calls, search_failures,
-                    memory_hits, memory_writes, revision_cycles,
-                    critique_passed, planning_error}
+                    retrieval_dense_calls, retrieval_keyword_calls,
+                    retrieval_leg_unavailable, producer_rejects,
+                    search_calls, search_failures, memory_hits,
+                    memory_writes, revision_cycles, critique_passed,
+                    planning_error}
         NEXT    graph.py routes unconditionally to END. cli.py then prints
                 state.final_report followed by this telemetry dict, and
                 persists a summary row to Postgres (CLI only — the API
@@ -243,7 +245,15 @@ def build_telemetry_node(debug: bool = False):
         gathering.py/compilation.py's individual nodes) give the actual
         provider-request volume this dict couldn't previously show.
         "llm_quality_calls" counts self-scoring calls (compiler_node's
-        free-text path only). "producer_rejects" (P2-06) counts malformed
+        free-text path only). "retrieval_dense_calls"/"retrieval_keyword_calls"
+        (P2-07 follow-up) count actual HybridRetriever.search() attempts per
+        leg — one pair per search_worker invocation that used the real
+        corpus tool; a fake tool in tests contributes none, since it isn't
+        really doing retrieval. "retrieval_leg_unavailable" counts DEGRADED
+        legs specifically (a store that was unreachable when checked), not
+        legs that legitimately returned zero hits — see
+        retrieval/hybrid.py::HybridRetriever._bump_retrieval_counts for
+        that distinction. "producer_rejects" (P2-06) counts malformed
         goal/task items the LLM returned that were dropped rather than
         crashing the run. Read a debug trace (--debug) for full per-call
         detail (exact prompts/latencies) beyond what these aggregate counts
@@ -262,6 +272,9 @@ def build_telemetry_node(debug: bool = False):
             "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
             "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),
             "llm_quality_calls": int(c.get("llm_quality_calls", 0)),
+            "retrieval_dense_calls": int(c.get("retrieval_dense_calls", 0)),
+            "retrieval_keyword_calls": int(c.get("retrieval_keyword_calls", 0)),
+            "retrieval_leg_unavailable": int(c.get("retrieval_leg_unavailable", 0)),
             "producer_rejects": int(c.get("producer_rejects", 0)),
             "search_calls": int(c.get("search_calls", 0)),
             "search_failures": int(c.get("search_failures", 0)),

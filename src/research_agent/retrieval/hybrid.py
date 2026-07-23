@@ -22,6 +22,7 @@ Design decision (Python-side fusion in the core build):
 """
 
 import logging
+import threading
 from typing import Any, Dict, List
 
 from research_agent.logging_setup import log_event
@@ -85,10 +86,80 @@ class HybridRetriever:
         Only the dense leg gets this floor — BM25 scores are corpus-
         dependent and unbounded, so there's no principled fixed cutoff to
         apply there the way there is for a 0..1 cosine similarity.
+
+        P2-07 follow-up (retrieval-side boundary telemetry): self._counts
+        is a threading.local(), not a plain dict — a single HybridRetriever
+        instance is shared across every parallel search_worker invocation
+        this run (see cli.py::build_app_and_settings, which constructs one
+        HybridRetriever and wraps it once in make_corpus_tool), and
+        LangGraph dispatches those workers as N simultaneous invocations
+        (design doc, orchestration/graph.py's module docstring). A plain
+        shared dict here would race under real concurrency: two workers'
+        counts could clobber each other between one worker's bump and its
+        own drain. threading.local() gives each worker's OS thread its own
+        private counts, so drain_counts() (below) only ever reads back what
+        THIS call's own thread wrote, no lock required.
         """
         self.dense = dense
         self.keyword = keyword
         self.min_similarity = min_similarity
+        self._counts = threading.local()
+
+    def _bump_retrieval_counts(self) -> None:
+        """Record one retrieval attempt, BEFORE calling either leg (P2-07
+        follow-up). Bumping first — not after a successful return — means
+        an attempt that raises partway through (e.g. the QdrantStore
+        NotFoundError seen in live testing when a collection doesn't exist
+        yet) is still counted as an attempted call, the same "attempts,
+        win or lose" philosophy llm/router.py's llm_provider_calls uses.
+
+        CALLED BY   search(), below, as its very first statement.
+        WRITES      this thread's private counts dict (see __init__'s
+                    threading.local() note) — never state.counters
+                    directly; this class has no knowledge of the graph.
+        """
+        # (0 if available else 1) for each leg: retrieval_leg_unavailable
+        # counts DEGRADED legs, not empty result sets — a leg can be fully
+        # available and legitimately return zero hits for an obscure query;
+        # that is not degradation and must not be conflated with it.
+        # getattr(..., "available", True): QdrantStore/OpenSearchStore both
+        # always set self.available in __init__, but minimal test fakes
+        # (e.g. test_hitl.py's FakeDense/FakeKeyword, which only implement
+        # .search()) predate this attribute and don't set it — defaulting
+        # to True (assume available) rather than raising AttributeError
+        # keeps this a purely additive change, not a rewrite of those
+        # existing Phase 1 test fixtures.
+        unavailable = ((0 if getattr(self.dense, "available", True) else 1)
+                      + (0 if getattr(self.keyword, "available", True) else 1))
+        counts: Dict[str, float] = getattr(self._counts, "data", {})
+        counts["retrieval_dense_calls"] = counts.get("retrieval_dense_calls", 0) + 1
+        counts["retrieval_keyword_calls"] = counts.get("retrieval_keyword_calls", 0) + 1
+        counts["retrieval_leg_unavailable"] = (
+            counts.get("retrieval_leg_unavailable", 0) + unavailable)
+        self._counts.data = counts
+
+    def drain_counts(self) -> Dict[str, float]:
+        """Return this thread's accumulated retrieval counts, and reset them.
+
+        CALLED BY   tools/corpus_search.py::make_corpus_tool's returned
+                    corpus_search function, which exposes this as
+                    corpus_search.drain_retrieval_counts — a bound method
+                    reference, so calling it from a DIFFERENT thread than
+                    the one that just called search() still correctly
+                    reads that OTHER thread's own counts, since
+                    threading.local() keys storage by the calling thread,
+                    not by which thread originally constructed the object.
+                    In practice search_worker (agents/gathering.py) always
+                    calls tool(task) and drains on the SAME thread, back to
+                    back, so this is a non-issue here — noted for
+                    completeness.
+        Same drain-not-peek reasoning as FallbackRouter.drain_counters
+        (llm/router.py): resets so a later call on the same thread never
+        double-reports an earlier call's counts.
+        """
+        data = getattr(self._counts, "data", {})
+        self._counts.data = {}
+        return data
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Return fused results: dicts with content/title + 'fused_score'.
@@ -110,6 +181,7 @@ class HybridRetriever:
         hybrid; one leg up -> that leg's ranking passes through RRF alone
         (order-preserving); none -> [].
         """
+        self._bump_retrieval_counts()
         dense_hits = self.dense.search(query, top_k)
         kw_hits = self.keyword.search(query, top_k)
 

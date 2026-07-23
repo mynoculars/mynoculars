@@ -82,6 +82,21 @@ def make_corpus_tool(retriever: HybridRetriever, top_k: int = 3):
             ))
         return evidence
 
+    # P2-07 follow-up (retrieval-side boundary telemetry): a plain
+    # attribute assignment on the returned closure, exposing
+    # HybridRetriever.drain_counts under a tool-facing name. Deliberately
+    # NOT part of ToolFn's return type — that would force every existing
+    # ToolFn implementation in this codebase and every test fixture
+    # (fake_tool, BrokenTool, LowRelevanceTool, broken_tool — see
+    # tests/conftest.py, tests/test_hitl.py, tests/test_integration_paths.py)
+    # to change shape for a telemetry-only concern. agents/gathering.py's
+    # search_worker reads this via getattr(tool, "drain_retrieval_counts",
+    # None) — the same optional-capability pattern llm/router.py's
+    # set_node already uses for set_trace_node — so a fake tool with no
+    # such attribute simply contributes no retrieval_* counters, which is
+    # correct: a fake isn't really doing retrieval.
+    corpus_search.drain_retrieval_counts = retriever.drain_counts
+
     return corpus_search
 
 
