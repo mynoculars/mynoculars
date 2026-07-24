@@ -63,7 +63,15 @@ class OpenSearchStore:
             # conditionally adding keys, then unpack it all at once into
             # the actual OpenSearch(...) constructor call below — see the
             # module docstring's **kwargs explanation.
-            kwargs = {"hosts": [url], "timeout": 5}
+            # pool_maxsize=20: default urllib3 pool is small (often 1),
+            # which under concurrent search_worker fan-out (D-13,
+            # settings.max_fanout, default 6) causes real, harmless-but-
+            # noisy "Connection pool is full, discarding connection"
+            # warnings -- each discarded connection still WORKS, just
+            # forces a fresh TCP+TLS handshake next time instead of
+            # reuse. 20 covers max_fanout's default with real headroom
+            # for a future higher setting, at negligible memory cost.
+            kwargs = {"hosts": [url], "timeout": 5, "pool_maxsize": 20}
             if use_ssl:
                 # verify_certs=False + self-signed cert -> opensearch-py emits a
                 # noisy InsecureRequestWarning per call; silence it deliberately.

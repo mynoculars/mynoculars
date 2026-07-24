@@ -1218,21 +1218,10 @@ left visible rather than deleted, so the history stays auditable.
 
 **Deferred by design**
 
-- **MCP deferred**: tools are plain callables behind `tools/`; the calling
-  pattern is MCP-shaped so the upgrade touches one module (design D-26/D-30).
 - **Contradiction detection is minimal**: the machinery (contested goals block
   coverage) is fully wired; the detector only honors explicit markers, which no
   tool sets. Consequence: **E2 has never fired in a real run** — every observed
   escalation would be E3.
-- **Server-side hybrid fusion deferred**: RRF + decay run in Python here for
-  readability; the design (D-27) moves both into Qdrant `FormulaQuery`, with
-  payload indexes this build does not create.
-- **Memory simplifications**: no supersession links, no per-item volatility
-  classification (items default `semi_stable`), no garbage collection job.
-  Deliberately unaffected by P2-02/P2-03 — see the notes under those items.
-- **Self-evaluated quality is optimistic**: catches broken output, not subtle
-  errors; a judge model is the upgrade (`P2-11`).
-- **Single tool, single worker type**: typed specialists (D-25) arrive with MCP.
 
 **Fixed since the last revision** (kept here, not deleted, for auditability)
 
@@ -1273,27 +1262,69 @@ left visible rather than deleted, so the history stays auditable.
     a fixed list of other plausible env-key typos. (The variable itself
     still requires the exact name `HITL_ENABLED` — this only adds
     visibility when you get it wrong, it doesn't relax the requirement.)
+14. ~~MCP deferred~~ — **P2-13**, `tools/mcp_client.py` (stdio transport,
+    D-30 constraints) + `scripts/mcp_corpus_server.py` (real server
+    wrapping the existing corpus tool). Off by default
+    (`MCP_ENABLED=false`) — see new "Still broken" item below, this is
+    NOT yet usable under real concurrent load.
+15. ~~Single tool, single worker type~~ — **P2-14**, `SearchTask.tool_hint`
+    (D-25) routes a task to a named specialist (`"mcp"` today, the only
+    one this build has) instead of the default corpus worker.
+    `cap_and_filter` validates the hint against what's actually wired in;
+    inert with `MCP_ENABLED=false`.
+16. ~~Server-side hybrid fusion deferred~~ — **P2-10**,
+    `storage/qdrant_store.py::search_with_decay` (Qdrant `FormulaQuery` +
+    payload indexes), gated by `MEMORY_SERVER_SIDE_DECAY` (off by
+    default). Python path kept permanently as parity oracle.
+17. ~~Memory simplifications (no supersession, no GC)~~ — **P2-15**,
+    content-hash dedup (`content_id`, exact-match upsert-in-place) +
+    `scripts/gc_memory.py` (decay-threshold GC, `--dry-run`/`--yes`
+    gated). No per-item volatility classification still applies
+    (unchanged).
+18. ~~Self-evaluated quality is optimistic~~ — **P2-11**,
+    `evaluation/quality.py::score_answer` — the NEXT provider in the
+    fallback chain judges, never the answering provider itself.
+19. ~~`Connection pool is full, discarding connection` warning under
+    concurrent corpus search~~ — `storage/opensearch_store.py` now sets
+    `pool_maxsize=20` (was relying on the client library's small
+    default). Harmless before this fix (each discarded connection still
+    worked, just paid a fresh TCP+TLS handshake); now avoided.
 
 **Still broken, in rough order of consequence**
 
 1. Self-critique can pass a report whose claims appear in no retrieved
    evidence — unaffected by anything in this revision; separate root cause
    (`P2-11`, Tier 3).
-2. Semantic memory grows without bound — no supersession, dedup, or GC
-   (`P2-15`, deliberately out of scope for P2-02/P2-03/P2-07).
-3. RRF joins the two legs on `title`, not on any store id — silently wrong for
+2. RRF joins the two legs on `title`, not on any store id — silently wrong for
    a corpus with duplicate or missing titles.
-4. `Evidence.task_key` for memory items uses `hash()`, which is per-process
+3. `Evidence.task_key` for memory items uses `hash()`, which is per-process
    randomised — memory task keys are not stable across runs.
-5. Reusing the same `--thread-id` across unrelated runs silently accumulates
+4. Reusing the same `--thread-id` across unrelated runs silently accumulates
    reducer-backed state (`evidence`, `counters`, etc.) — see the Postgres
    section above for the full explanation and a live example. Not addressed
    by Tier 2; no P2-xx item currently scoped to it.
-6. Contradiction detection remains marker-only — `E2` has never fired in a
+5. Contradiction detection remains marker-only — `E2` has never fired in a
    real run (`P2-12`, Tier 3, depends on P2-01 which is done).
-7. `evaluation/quality.py`'s self-scoring is same-provider, optimistic —
-   catches catastrophic output, not subtle errors (`P2-11`, Tier 3, depends
-   on P2-07 which is now done — this item is now unblocked).
+6. **MCP corpus server serializes under concurrent load** (`P2-13`, Tier 3):
+   `scripts/mcp_corpus_server.py`'s tool handler is synchronous; FastMCP
+   calls it directly on its single event loop with no thread offload
+   (confirmed by reading `func_metadata.py::call_fn_with_arg_validation` —
+   `fn(**args)` called inline, not via `asyncio.to_thread`). Result: one
+   real MCP request blocks the whole server for its full duration (~13s+
+   for a real Qdrant/OpenSearch round trip), so `MAX_FANOUT` concurrent
+   requests fully serialize instead of running in parallel — confirmed
+   live: 6 concurrent calls that take 14.4s total called DIRECTLY (no
+   MCP) took 100+ seconds through MCP, with two additional real
+   concurrency bugs (a `MCPBridge.start()` race and a
+   `_get_corpus_tool()` thundering-herd race, both since fixed) found and
+   fixed along the way but NOT the cause of this specific slowdown. Not
+   a correctness bug — every request eventually completes correctly, just
+   slowly. Fix (not yet done): make `mcp_corpus_server.py::search`
+   `async def` and wrap the blocking call in `asyncio.to_thread(...)`.
+   `MCP_ENABLED=false` (default) is unaffected; P2-14's tool_hint routing
+   is fully built and tested, just not practically usable at real
+   concurrency until this is fixed.
+
 
 ## Documentation Corrections
 

@@ -385,7 +385,10 @@ cd D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\llama-precompiled
 # START TEST: -c 8192
 .\llama-server.exe -m ..\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf -ngl 999 -c 8192 --chat-template chatml --port 8080 > ..\logs\llama-server_cogito.log 2>&1
 
-#DIAGNOSTICS
+# Stable on 8 GB VRAM: -c 1536, typically ~28 GPU layers (~4 layers remain in RAM)
+.\llama-server.exe -m ..\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf -ngl 28 -c 1536 --chat-template chatml --port 8080 > ..\logs\llama-server_cogito.log 2>&1
+
+# DIAGNOSTICS
 curl http://127.0.0.1:8080/v1/models
 
 # THIS WILL MOST PROBABLY OOM
@@ -587,6 +590,20 @@ echo $PYTHONPATH          # must print: src
 curl http://localhost:6333/collections     # Qdrant: JSON response = up
 curl http://localhost:9200                 # OpenSearch: JSON response = up
 
+```PowerShell
+cd D:\work\softwares\PostgreSQL\pgsql\bin
+
+.\psql.exe -h localhost -U postgres
+
+# In the resultant PostGres prompt (postgres=#)type
+SELECT version()
+
+SELECT NOW()
+
+# To exit PostGres proplt and return to parent PostGres prompt, simply type exit
+exit
+
+```
 # 3. Is the corpus loaded?
 #    Re-run ingest; "indexed 10 / embedded 10" = yes, "SKIPPED" = engine down
 
@@ -1119,4 +1136,41 @@ independent of this setting.
 $env:LLM_PRIMARY_TIMEOUT_SECONDS = "150"
 python -m research_agent.cli "your question" --debug
 ```
+
+### `Connection pool is full, discarding connection: localhost` (WARNING, fixed)
+
+Seen under real concurrent corpus search (`MAX_FANOUT` search_workers all
+hitting OpenSearch at once). Harmless before the fix below — the request
+still succeeded, urllib3 just couldn't cache the connection for reuse
+(pool size 1), forcing a fresh TCP+TLS handshake instead. Fixed:
+`storage/opensearch_store.py` now passes `pool_maxsize=20` to the
+`OpenSearch(...)` client, covering `MAX_FANOUT`'s default (6) with
+headroom. If you still see this warning after updating, you've likely
+raised `MAX_FANOUT` above 20 — bump `pool_maxsize` to match.
+
+### MCP tool (`MCP_ENABLED=true`) is slow / times out under concurrent load — KNOWN, UNRESOLVED
+
+Root cause confirmed (not a mystery, just not yet fixed): FastMCP calls a
+synchronous tool handler directly on its single event loop, with no
+thread offload (`mcp/server/fastmcp/utilities/func_metadata.py::
+call_fn_with_arg_validation` — `fn(**args)`, not `asyncio.to_thread(fn,
+**args)`). `scripts/mcp_corpus_server.py`'s `search()` does real, blocking
+Qdrant/OpenSearch I/O (~13s+ per call), so one in-flight request blocks
+the ENTIRE server — `MAX_FANOUT` concurrent search_worker calls fully
+serialize instead of running in parallel. Confirmed live: the same 6
+concurrent searches that complete in 14.4s total called directly (no
+MCP) took 100+ seconds through MCP, all still eventually succeeding
+(not a correctness bug — see the real end-to-end trace evidence in
+`README.md`'s Limitations section, item 6).
+
+**Not fixed yet.** `MCP_ENABLED=false` (the default) is completely
+unaffected — the corpus tool and P2-14's tool_hint routing mechanism
+both work correctly and are fully tested; this only bites you if you
+turn MCP on AND hit it with real concurrent load. If you need this
+working now: lower `MAX_FANOUT` to reduce how many requests pile up
+concurrently, and raise `MCP_CALL_TIMEOUT_SECONDS` well above 30 (e.g.
+120+) so a queued request doesn't time out before its turn. The real
+fix — making `mcp_corpus_server.py::search` `async def` with the
+blocking call wrapped in `asyncio.to_thread(...)` — is scoped but not
+implemented.
 </file_text>
