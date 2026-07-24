@@ -640,3 +640,373 @@ def test_retrieve_gate_on_uses_search_with_decay_and_skips_double_decay():
     assert store.search_calls == 0
     assert len(out) == 1
     assert out[0].score == 0.42  # untouched — exactly what search_with_decay returned
+
+
+# ---------------------------------------------------------------------------
+# P2-15 — content-identity dedup for memory writes + scroll_all/delete_points
+#
+# Scope note, stated plainly (matches PHASE2_TIER3_IMPLEMENTATION_PLAN.md's
+# P2-15 risk callout): identity here is EXACT content-hash only. There is no
+# separate Evidence.superseded_by field — "supersession" is achieved simply
+# by upsert-by-id overwriting the same point in place (see
+# memory/semantic_memory.py::store_run's docstring for the full reasoning).
+# Near-duplicate/paraphrased-fact detection remains explicitly out of scope.
+# ---------------------------------------------------------------------------
+
+
+from research_agent.storage.qdrant_store import content_id as _content_id
+
+
+class _FakeUpsertStore:
+    """Minimal fake exposing only what store_run actually calls:
+    .upsert_texts(items, id_fn=...) and (P2-15 follow-up)
+    .existing_point_ids(ids). Records every upsert_texts call so tests can
+    inspect exactly what id_fn was passed and what it produces.
+    `preexisting_ids` lets a test simulate "these ids already exist in
+    Qdrant" for the new/overwritten split -- empty by default (everything
+    looks new), matching a store_run call against a brand-new memory
+    collection."""
+
+    def __init__(self, preexisting_ids=None):
+        self.calls = []
+        self._preexisting_ids = set(preexisting_ids or [])
+
+    def upsert_texts(self, items, id_fn=None):
+        self.calls.append((items, id_fn))
+        return len(items)
+
+    def existing_point_ids(self, ids):
+        return {i for i in ids if i in self._preexisting_ids}
+
+
+def _one_evidence(content, goal_id="g1"):
+    from research_agent.state import Evidence, Volatility
+
+    return [Evidence(task_key="t1", goal_id=goal_id, source="corpus", content=content,
+                     score=0.9, volatility=Volatility.SEMI_STABLE)]
+
+
+def test_store_run_passes_a_content_based_id_fn():
+    from research_agent.memory.semantic_memory import SemanticMemory
+
+    store = _FakeUpsertStore()
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    mem.store_run("q", _one_evidence("Redis is fast"))
+
+    assert len(store.calls) == 1
+    items, id_fn = store.calls[0]
+    assert id_fn is not None
+    assert id_fn(items[0]) == _content_id("Redis is fast")
+
+
+def test_store_run_id_fn_collapses_identical_content_across_two_separate_calls():
+    """The actual bug this closes: a fact re-discovered from the corpus on
+    two different runs used to get two different random ids (two separate
+    points, accumulating forever). Same content -> same id, regardless of
+    which query or goal it was filed under either time."""
+    from research_agent.memory.semantic_memory import SemanticMemory
+
+    store = _FakeUpsertStore()
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    mem.store_run("first query", _one_evidence("same fact", goal_id="g1"))
+    mem.store_run("second query, different run", _one_evidence("same fact", goal_id="g7"))
+
+    (items1, id_fn1), (items2, id_fn2) = store.calls
+    assert id_fn1(items1[0]) == id_fn2(items2[0])
+
+
+def test_store_run_id_fn_differs_for_different_content():
+    from research_agent.memory.semantic_memory import SemanticMemory
+
+    store = _FakeUpsertStore()
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    mem.store_run("q", _one_evidence("fact A"))
+    mem.store_run("q", _one_evidence("fact B"))
+
+    (items1, id_fn1), (items2, id_fn2) = store.calls
+    assert id_fn1(items1[0]) != id_fn2(items2[0])
+
+
+def test_store_run_logs_all_items_as_new_when_nothing_preexisted(caplog):
+    import logging as _logging
+
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.storage.qdrant_store import content_id
+
+    store = _FakeUpsertStore()  # empty preexisting_ids -> everything is new
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    with caplog.at_level(_logging.INFO):
+        mem.store_run("q", _one_evidence("brand new fact"))
+
+    stored_lines = [r for r in caplog.records if r.message == "memory.stored"]
+    assert len(stored_lines) == 1
+    assert stored_lines[0].event_fields["new"] == 1
+    assert stored_lines[0].event_fields["overwritten"] == 0
+    assert stored_lines[0].event_fields["count"] == 1
+
+
+def test_store_run_logs_overwritten_when_the_id_already_existed(caplog):
+    import logging as _logging
+
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.storage.qdrant_store import content_id
+
+    already_there = content_id("known fact")
+    store = _FakeUpsertStore(preexisting_ids={already_there})
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    with caplog.at_level(_logging.INFO):
+        mem.store_run("q", _one_evidence("known fact"))
+
+    stored_lines = [r for r in caplog.records if r.message == "memory.stored"]
+    assert stored_lines[0].event_fields["new"] == 0
+    assert stored_lines[0].event_fields["overwritten"] == 1
+
+
+def test_store_run_splits_a_mixed_batch_correctly(caplog):
+    import logging as _logging
+
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.state import Evidence, Volatility
+    from research_agent.storage.qdrant_store import content_id
+
+    already_there = content_id("old fact")
+    store = _FakeUpsertStore(preexisting_ids={already_there})
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    evidence = [
+        Evidence(task_key="t1", goal_id="g1", source="corpus", content="old fact",
+                 score=0.9, volatility=Volatility.SEMI_STABLE),
+        Evidence(task_key="t2", goal_id="g1", source="corpus", content="brand new fact",
+                 score=0.9, volatility=Volatility.SEMI_STABLE),
+    ]
+    with caplog.at_level(_logging.INFO):
+        mem.store_run("q", evidence)
+
+    stored_lines = [r for r in caplog.records if r.message == "memory.stored"]
+    assert stored_lines[0].event_fields["new"] == 1
+    assert stored_lines[0].event_fields["overwritten"] == 1
+    assert stored_lines[0].event_fields["count"] == 2
+
+
+def test_existing_point_ids_returns_only_the_ids_qdrant_actually_has():
+    class _Rec:
+        def __init__(self, id_):
+            self.id = id_
+
+    store = _mock_store()
+    store._client.retrieve = MagicMock(return_value=[_Rec("id1"), _Rec("id3")])
+
+    result = store.existing_point_ids(["id1", "id2", "id3"])
+
+    assert result == {"id1", "id3"}
+    call = store._client.retrieve.call_args
+    assert call.args[0] == "test_collection"
+    assert call.kwargs["ids"] == ["id1", "id2", "id3"]
+    assert call.kwargs["with_payload"] is False
+    assert call.kwargs["with_vectors"] is False
+
+
+def test_existing_point_ids_returns_empty_set_when_degraded():
+    from research_agent.storage.qdrant_store import QdrantStore
+
+    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    assert store.available is False
+    assert store.existing_point_ids(["id1"]) == set()
+
+
+def test_existing_point_ids_fails_open_on_client_error(caplog):
+    import logging as _logging
+
+    store = _mock_store()
+    store._client.retrieve = MagicMock(side_effect=RuntimeError("qdrant is down"))
+    with caplog.at_level(_logging.WARNING):
+        result = store.existing_point_ids(["id1"])
+
+    assert result == set()
+    assert any("qdrant.existing_point_ids_failed" in r.message for r in caplog.records)
+
+
+def test_content_id_still_filters_memory_sourced_evidence_before_dedup_even_applies():
+    """Regression guard: the PRE-EXISTING `fresh = [... if e.source !=
+    "memory"]` filter must still run before id_fn is ever considered —
+    P2-15 must not change what counts as "fresh" in the first place, only
+    how fresh items get their point id."""
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.state import Evidence, Volatility
+
+    store = _FakeUpsertStore()
+    mem = SemanticMemory(store, top_k=5, half_life_semi=90.0, half_life_volatile=14.0)
+    evidence = [
+        Evidence(task_key="t1", goal_id="g1", source="corpus", content="fresh fact",
+                 score=0.9, volatility=Volatility.SEMI_STABLE),
+        Evidence(task_key="t2", goal_id="g1", source="memory", content="recalled fact",
+                 score=0.9, volatility=Volatility.SEMI_STABLE),
+    ]
+    mem.store_run("q", evidence)
+
+    items, _ = store.calls[0]
+    assert len(items) == 1
+    assert items[0]["content"] == "fresh fact"
+
+
+# --- scroll_all / delete_points ---
+
+
+def test_scroll_all_follows_pagination_until_offset_is_none():
+    store = _mock_store()
+    r1, r2, r3 = MagicMock(), MagicMock(), MagicMock()
+    r1.id, r1.payload = "id1", {"content": "a"}
+    r2.id, r2.payload = "id2", {"content": "b"}
+    r3.id, r3.payload = "id3", {"content": "c"}
+    store._client.scroll = MagicMock(side_effect=[([r1, r2], "page2token"), ([r3], None)])
+
+    out = store.scroll_all(batch_size=2)
+
+    assert out == [
+        {"id": "id1", "content": "a"},
+        {"id": "id2", "content": "b"},
+        {"id": "id3", "content": "c"},
+    ]
+    assert store._client.scroll.call_count == 2
+
+
+def test_scroll_all_returns_empty_list_when_degraded():
+    from research_agent.storage.qdrant_store import QdrantStore
+
+    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    assert store.available is False
+    assert store.scroll_all() == []
+
+
+def test_delete_points_calls_client_delete_with_the_given_ids():
+    store = _mock_store()
+    n = store.delete_points(["id1", "id2"])
+
+    assert n == 2
+    call = store._client.delete.call_args
+    assert call.args[0] == "test_collection"
+    assert call.kwargs["points_selector"] == ["id1", "id2"]
+
+
+def test_delete_points_is_a_noop_on_empty_list_or_when_degraded():
+    from research_agent.storage.qdrant_store import QdrantStore
+
+    degraded = QdrantStore("http://127.0.0.1:1", "test_collection")
+    assert degraded.delete_points(["id1"]) == 0  # degraded -> no client call possible
+
+    store = _mock_store()
+    assert store.delete_points([]) == 0
+    assert store._client.delete.called is False
+
+
+def test_delete_points_fails_open_on_client_error(caplog):
+    import logging as _logging
+
+    store = _mock_store()
+    store._client.delete = MagicMock(side_effect=RuntimeError("qdrant is down"))
+    with caplog.at_level(_logging.WARNING):
+        n = store.delete_points(["id1"])
+
+    assert n == 0
+    assert any("qdrant.delete_points_failed" in r.message for r in caplog.records)
+
+
+# --- scripts/gc_memory.py::find_gc_candidates ---
+#
+# gc_memory.py is a standalone operational script (like reset_stores.py,
+# which has no pytest coverage of its own at all) -- but unlike
+# reset_stores.py, its actual decision logic (find_gc_candidates) is a
+# pure function worth testing directly, so it's loaded by file path here,
+# the same way tests/test_tier2.py used to load ingest_sample_data.py
+# before content_id moved into the regular package.
+
+
+def _load_gc_script():
+    import importlib.util
+    import pathlib
+
+    script_path = (pathlib.Path(__file__).parent.parent
+                  / "scripts" / "gc_memory.py")
+    spec = importlib.util.spec_from_file_location("gc_memory", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_find_gc_candidates_flags_old_volatile_points():
+    import time as _time
+
+    gc_memory = _load_gc_script()
+    store = _mock_store()
+    now = _time.time()
+    old_volatile = MagicMock(id="old_volatile",
+                             payload={"content": "stale fact", "volatility": "volatile",
+                                     "created_at": now - 200 * 86400.0})
+    store._client.scroll = MagicMock(return_value=([old_volatile], None))
+
+    candidates = gc_memory.find_gc_candidates(
+        store, half_life_semi=90.0, half_life_volatile=14.0, threshold=0.05, now=now)
+
+    assert len(candidates) == 1
+    assert candidates[0][0] == "old_volatile"
+
+
+def test_find_gc_candidates_spares_fresh_points():
+    import time as _time
+
+    gc_memory = _load_gc_script()
+    store = _mock_store()
+    now = _time.time()
+    fresh = MagicMock(id="fresh_volatile",
+                      payload={"content": "new fact", "volatility": "volatile",
+                              "created_at": now - 1 * 86400.0})
+    store._client.scroll = MagicMock(return_value=([fresh], None))
+
+    candidates = gc_memory.find_gc_candidates(
+        store, half_life_semi=90.0, half_life_volatile=14.0, threshold=0.05, now=now)
+
+    assert candidates == []
+
+
+def test_find_gc_candidates_never_flags_stable_points_regardless_of_age():
+    """D-24's own reasoning: stable facts don't fade at all -- decay_factor
+    returns exactly 1.0 for Volatility.STABLE regardless of age (see that
+    function's docstring), so no threshold ever catches one."""
+    import time as _time
+
+    gc_memory = _load_gc_script()
+    store = _mock_store()
+    now = _time.time()
+    ancient_stable = MagicMock(id="old_stable",
+                               payload={"content": "old but stable", "volatility": "stable",
+                                       "created_at": now - 5000 * 86400.0})
+    store._client.scroll = MagicMock(return_value=([ancient_stable], None))
+
+    candidates = gc_memory.find_gc_candidates(
+        store, half_life_semi=90.0, half_life_volatile=14.0, threshold=0.05, now=now)
+
+    assert candidates == []
+
+
+def test_find_gc_candidates_defaults_missing_volatility_to_semi_stable():
+    """Consistency with SemanticMemory.retrieve's own fallback for the
+    same payload gap -- not a second, different guess."""
+    import time as _time
+
+    gc_memory = _load_gc_script()
+    store = _mock_store()
+    now = _time.time()
+    # No "volatility" key at all in the payload. 500 days at the default
+    # 90-day semi_stable half-life decays to 0.5**(500/90) ~= 0.011, well
+    # past the 0.05 threshold (200 days, tried first, only decays to
+    # ~0.214 -- still well ABOVE threshold, which is exactly why this
+    # needed a real number check rather than an assumed one).
+    untagged = MagicMock(id="untagged",
+                         payload={"content": "no volatility tag",
+                                 "created_at": now - 500 * 86400.0})
+    store._client.scroll = MagicMock(return_value=([untagged], None))
+
+    candidates = gc_memory.find_gc_candidates(
+        store, half_life_semi=90.0, half_life_volatile=14.0, threshold=0.05, now=now)
+
+    assert len(candidates) == 1
+    assert candidates[0][0] == "untagged"

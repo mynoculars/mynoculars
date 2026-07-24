@@ -285,7 +285,13 @@ def test_tracer_records_and_flushes(tmp_path):
                        [{"title": "doc", "similarity": 0.9}])
     path = t.flush()
     assert path is not None
-    text = open(path, encoding="utf-8").read()
+    # ResourceWarning fix: the file object from a bare open(...).read() is
+    # only closed whenever the garbage collector gets around to it -- a
+    # `with` block closes it deterministically the moment this line ends.
+    # This only became visible once filterwarnings=always (pytest.ini) 
+    # stopped Python's default "once per location" dedup from hiding it.
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
     assert "RETRIEVED FROM LOCAL PRIMARY (X)" in text
     assert "node=classify" in text
     assert "RETRIEVED FROM QDRANT (DENSE)" in text

@@ -9,8 +9,6 @@ no network, no real Postgres/Qdrant/OpenSearch.
 
 import json
 import logging
-import pathlib
-import sys
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
@@ -241,34 +239,28 @@ def test_e3_stub_logs_when_hitl_disabled(off_memory, stub_router, settings, capl
 # P2-03 follow-up — idempotent corpus ingest (scripts/ingest_sample_data.py
 # never actually used QdrantStore.upsert_texts's id_fn parameter, so every
 # re-run duplicated the dense-leg corpus even after P2-03 landed)
+#
+# P2-15 promoted content_id() out of scripts/ingest_sample_data.py (where it
+# used to be a script-local function taking a dict) into
+# research_agent.storage.qdrant_store (a plain string -> string function,
+# reused unchanged by memory/semantic_memory.py::store_run's own dedup) --
+# so these tests no longer need the by-file-path importlib loading trick
+# the script-local version required; it's a normal package import now.
 # ---------------------------------------------------------------------------
 
 
-def _load_ingest_script():
-    """Import scripts/ingest_sample_data.py by file path — it's a script,
-    not a package member, so it can't be imported with a normal `import`
-    statement from tests/."""
-    import importlib.util
-
-    script_path = (pathlib.Path(__file__).parent.parent
-                  / "scripts" / "ingest_sample_data.py")
-    spec = importlib.util.spec_from_file_location("ingest_sample_data", script_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_content_id_is_deterministic_for_same_content():
-    mod = _load_ingest_script()
-    item = {"content": "Redis is an in-memory data store.", "title": "Redis"}
-    assert mod.content_id(item) == mod.content_id(dict(item))
+    from research_agent.storage.qdrant_store import content_id
+
+    assert content_id("Redis is an in-memory data store.") == \
+        content_id("Redis is an in-memory data store.")
 
 
 def test_content_id_differs_for_different_content():
-    mod = _load_ingest_script()
-    a = {"content": "Redis is an in-memory data store."}
-    b = {"content": "Cassandra is a distributed database."}
-    assert mod.content_id(a) != mod.content_id(b)
+    from research_agent.storage.qdrant_store import content_id
+
+    assert content_id("Redis is an in-memory data store.") != \
+        content_id("Cassandra is a distributed database.")
 
 
 def test_content_id_is_a_valid_qdrant_point_id_shape():
@@ -278,8 +270,9 @@ def test_content_id_is_a_valid_qdrant_point_id_shape():
     # plain hexdigest by mistake.
     import uuid as uuid_module
 
-    mod = _load_ingest_script()
-    result = mod.content_id({"content": "anything"})
+    from research_agent.storage.qdrant_store import content_id
+
+    result = content_id("anything")
     parsed = uuid_module.UUID(result)  # raises ValueError if not a real UUID
     assert str(parsed) == result
 

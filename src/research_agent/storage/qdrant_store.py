@@ -60,6 +60,42 @@ from research_agent.logging_setup import log_event
 logger = logging.getLogger(__name__)
 
 
+def content_id(content: str) -> str:
+    """Deterministic Qdrant point id derived from raw text content.
+
+    CALLED BY   scripts/ingest_sample_data.py (as id_fn=lambda item:
+                content_id(item["content"]), P2-03) and
+                memory/semantic_memory.py::SemanticMemory.store_run (same
+                wrapper shape, P2-15). ONE canonical identity scheme for
+                BOTH callers -- there used to be a second, duplicate
+                uuid5-based content_id(item) defined locally inside
+                ingest_sample_data.py; P2-15 needed the identical scheme
+                for memory, so this promotes it here instead of writing a
+                second copy (the two collections -- corpus vs memory --
+                never share a point-id namespace anyway, since Qdrant
+                scopes ids per collection, so reusing the exact same
+                function for both is safe as well as simpler).
+
+    uuid.uuid5(NAMESPACE_URL, content) is deterministic: the SAME string
+    always produces the SAME UUID, and it's a valid Qdrant point id (Qdrant
+    only accepts unsigned ints or UUID strings, never an arbitrary string)
+    -- unlike a raw hash digest, which Qdrant would reject outright.
+
+    Content is the ONLY input, deliberately -- this is an exact-match
+    identity scheme, not fuzzy/semantic deduplication. Two evidence items
+    with byte-identical text collapse to one point (their payload's
+    goal_id/source_query is simply whichever store_run call happened most
+    recently -- those fields are diagnostic metadata only, never used to
+    filter retrieval, so overwriting them on a repeat is harmless). Two
+    items that are semantically the same fact but WORDED differently
+    (e.g. paraphrased by a different LLM provider on a different run) get
+    DIFFERENT ids and remain separate points -- catching that case would
+    need semantic/fuzzy matching, an open problem explicitly out of scope
+    here (see PHASE2_TIER3_IMPLEMENTATION_PLAN.md's P2-15 risk note).
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, content))
+
+
 class QdrantStore:
     """Thin, failure-tolerant wrapper over qdrant-client."""
 
@@ -228,13 +264,11 @@ class QdrantStore:
         WRITES      new points into this instance's Qdrant collection —
                     one per item in `items`.
 
-        P2-03: id_fn is a NEW, OPTIONAL parameter. Every existing caller
-        (memory_writer, and anything not passing it explicitly) gets the
-        exact same uuid4()-per-call behaviour as before — nothing changes
-        for them, and memory is DELIBERATELY left on that default: memory
-        is meant to accumulate fresh evidence every passed run, not
-        collapse repeats (deduping memory writes is separate, larger work
-        — see PHASE2_PLAN.md P2-15 — not this fix).
+        P2-03: id_fn is a NEW, OPTIONAL parameter -- callers that don't
+        pass it get the exact same uuid4()-per-call behaviour as before,
+        nothing changes for them. memory/semantic_memory.py::store_run now
+        DOES pass id_fn (P2-15, storage/qdrant_store.py::content_id) --
+        see that method's docstring for what changed and why.
 
         The problem this solves, for whoever DOES pass id_fn: with a
         random id every call, re-running corpus ingest on an UNCHANGED
@@ -444,3 +478,104 @@ class QdrantStore:
         if self._tracer is not None:
             self._tracer.record_retrieval(self._label, query, out)
         return out
+
+    def scroll_all(self, batch_size: int = 256) -> List[Dict[str, Any]]:
+        """Return every point in this collection as {"id": ..., **payload}.
+
+        CALLED BY   scripts/gc_memory.py (P2-15) -- a batch job needs to
+                    see EVERY point to decide what's decayed past keeping,
+                    unlike search()/search_with_decay() above, which only
+                    ever look at the top-k candidates for one query.
+        READS       nothing from ResearchState -- same contract as every
+                    other method here.
+        RETURNS     a flat list of payload dicts, each with its Qdrant
+                    point id folded in under the "id" key (payloads
+                    otherwise never carry their own id -- callers that
+                    need to act on specific points, like gc_memory.py
+                    deciding what to pass to delete_points(), need it
+                    surfaced explicitly). [] when degraded or empty.
+
+        WHY PAGINATED, NOT ONE CALL: Qdrant's scroll() API is itself
+        paginated (this is Qdrant's own design, not a choice made here) --
+        each call returns at most `batch_size` records plus a
+        next_page_offset token, or None once there's nothing left. The
+        while loop below just follows that token until it runs out, same
+        idea as following a "next page" link, one page at a time.
+        """
+        if not self.available:
+            return []
+        self.ensure_collection()
+        out: List[Dict[str, Any]] = []
+        offset = None
+        while True:
+            records, offset = self._client.scroll(
+                self.collection, limit=batch_size, offset=offset,
+                with_payload=True, with_vectors=False)
+            for r in records:
+                out.append({"id": r.id, **(r.payload or {})})
+            if offset is None:
+                break
+        return out
+
+    def delete_points(self, ids: List[str]) -> int:
+        """Delete the given point ids. Returns how many were REQUESTED
+        (Qdrant's delete response doesn't confirm a count back, only that
+        the operation completed -- see the try/except below for what
+        happens if it doesn't).
+
+        CALLED BY   scripts/gc_memory.py (P2-15), only after its own
+                    --yes gate -- this method itself has no confirmation
+                    logic of its own; that responsibility stays in the
+                    CALLING script, matching reset_stores.py's existing
+                    --dry-run/--yes convention rather than duplicating a
+                    second confirmation mechanism inside the storage layer.
+        WRITES      removes points from this collection. Nothing else.
+
+        Fails open (returns 0, logs a warning) rather than raising --
+        matches this class's overall graceful-degradation posture: a
+        failed cleanup attempt should not crash whatever called it.
+        """
+        if not self.available or not ids:
+            return 0
+        try:
+            self._client.delete(self.collection, points_selector=ids)
+            return len(ids)
+        except Exception as exc:  # noqa: BLE001 -- degrade, don't die
+            log_event(logger, "qdrant.delete_points_failed", level=logging.WARNING,
+                      collection=self.collection, reason=type(exc).__name__)
+            return 0
+
+    def existing_point_ids(self, ids: List[str]) -> set:
+        """Return the subset of `ids` that already exist in this collection.
+
+        CALLED BY   memory/semantic_memory.py::SemanticMemory.store_run
+                    (P2-15 follow-up) -- BEFORE calling upsert_texts, so it
+                    can log how many of this run's fresh items are brand
+                    new points versus overwrites of an already-known fact
+                    (content_id makes that distinction meaningful -- see
+                    that function's docstring).
+        READS       nothing from ResearchState -- plain id list in,
+                    matching id set out.
+        CALLS       self._client.retrieve(..., with_payload=False,
+                    with_vectors=False) -- the cheapest possible query
+                    that still tells us existence: neither the payload
+                    nor the vector is needed, only WHICH of the requested
+                    ids Qdrant actually has (retrieve() only returns
+                    records that exist; ids not found are simply absent
+                    from the result, never an error).
+
+        Fails open (returns an empty set, logs a warning) rather than
+        raising -- if this check can't run, store_run's own upsert_texts
+        call still proceeds unaffected; the only cost is a less accurate
+        "new vs overwritten" log line, never a broken write.
+        """
+        if not self.available or not ids:
+            return set()
+        try:
+            records = self._client.retrieve(
+                self.collection, ids=ids, with_payload=False, with_vectors=False)
+            return {r.id for r in records}
+        except Exception as exc:  # noqa: BLE001 -- degrade, don't die
+            log_event(logger, "qdrant.existing_point_ids_failed", level=logging.WARNING,
+                      collection=self.collection, reason=type(exc).__name__)
+            return set()

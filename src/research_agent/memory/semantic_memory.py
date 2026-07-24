@@ -18,8 +18,16 @@ Design decisions:
     - Why decay is a RERANK, never a filter: a stable fact from a year ago
       must remain retrievable; only volatile facts should fade fast. One
       TTL for both is wrong at both ends — hence per-volatility half-lives.
-    - Deferred (documented): supersession links, server-side decay via
-      Qdrant FormulaQuery (D-27), per-item volatility classification —
+    - Server-side decay via Qdrant FormulaQuery (D-27) is now IMPLEMENTED
+      (P2-10, storage/qdrant_store.py::search_with_decay) -- gated by
+      settings.memory_server_side_decay, off by default; the Python path
+      below remains the permanent parity oracle either way.
+    - Content-identity dedup for memory writes (P2-15) is now IMPLEMENTED
+      too -- see store_run's docstring for exactly what "supersession"
+      ended up meaning once an EXACT-content-hash identity scheme was
+      chosen (deliberately, not fuzzy/semantic matching -- see
+      storage/qdrant_store.py::content_id's docstring for why).
+    - Still deferred (documented): per-item volatility classification —
       items currently inherit SEMI_STABLE unless the tool says otherwise.
 
 Python mechanics used in this file, if any of this is new to you:
@@ -47,7 +55,7 @@ from typing import List
 
 from research_agent.logging_setup import log_event
 from research_agent.state import Evidence, Volatility
-from research_agent.storage.qdrant_store import QdrantStore
+from research_agent.storage.qdrant_store import QdrantStore, content_id
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +249,47 @@ class SemanticMemory:
         memory as if it were new, which would otherwise let the exact same
         fact accumulate duplicate points every single run it gets recalled
         in.
+
+        P2-15: id_fn=lambda item: content_id(item["content"]) makes this
+        write IDEMPOTENT on exact-duplicate content, the same way P2-03
+        already made corpus ingest idempotent. Before this, EVERY passed
+        run wrote a fresh, randomly-id'd point for each of its fresh
+        evidence items -- so a fact independently re-discovered from the
+        CORPUS (source="corpus", never filtered by the `fresh` check
+        above, since that check only catches facts recalled FROM memory,
+        not facts re-found fresh from the corpus every time) accumulated
+        one duplicate point per run it kept getting rediscovered in,
+        forever, with no cap. Passing id_fn here means the SAME content
+        string now overwrites its own prior point in place instead --
+        which, as a side effect, also REFRESHES that point's created_at/
+        created_at_iso to the current instant (upsert-by-id fully replaces
+        the payload, it doesn't merge), so a fact that keeps getting
+        reaffirmed run after run naturally reads as "recently confirmed"
+        rather than aging out under decay -- this IS what "supersession"
+        ends up meaning once identity is exact-content-hash: the old
+        point isn't archived-and-linked, it simply becomes the new one
+        (same id, replaced payload). A genuinely DIFFERENT wording of the
+        same underlying fact (e.g. paraphrased by a different provider on
+        a different run) gets a different id and remains a SEPARATE
+        point -- catching that case would need semantic/fuzzy matching,
+        deliberately out of scope here (see content_id's own docstring).
+        Garbage-collecting points that have decayed near zero regardless
+        of exact-duplicate status is a separate concern -- see
+        scripts/gc_memory.py.
+
+        P2-15 follow-up: the "memory.stored" log line used to report only
+        a single `count` -- how many items were WRITTEN, which after the
+        id_fn change above conflates two very different outcomes: a
+        brand-new fact landing in memory for the first time, versus an
+        already-known fact simply refreshing its timestamp. Both count as
+        "written" from upsert_texts's point of view (same code path
+        either way), but they mean different things operationally -- a
+        run where every single item was "new" is discovering a lot of
+        fresh material; a run where everything was "overwritten" is
+        mostly just reaffirming what memory already knew. This computes
+        that split BEFORE calling upsert_texts (existing_point_ids checks
+        which of this batch's computed ids Qdrant already has), and logs
+        both numbers instead of one.
         """
         fresh = [e for e in evidence if e.source != "memory"]
         items = [{
@@ -249,6 +298,17 @@ class SemanticMemory:
             "volatility": e.volatility.value,
             "source_query": query,
         } for e in fresh]
-        written = self.store.upsert_texts(items)
-        log_event(logger, "memory.stored", count=written)
+        ids = [content_id(item["content"]) for item in items]
+        # existing_point_ids fails open (empty set) if it can't run for any
+        # reason -- worst case, every item is counted as "new" below, which
+        # is never WRONG about what got written, only imprecise about the
+        # new/overwritten split. The actual upsert_texts call just below is
+        # entirely unaffected either way.
+        already_existed = self.store.existing_point_ids(ids)
+        overwritten = sum(1 for i in ids if i in already_existed)
+        new = len(items) - overwritten
+
+        written = self.store.upsert_texts(
+            items, id_fn=lambda item: content_id(item["content"]))
+        log_event(logger, "memory.stored", count=written, new=new, overwritten=overwritten)
         return written
