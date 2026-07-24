@@ -418,13 +418,18 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         router.set_node("gap_generator")
         if debug:
             log_event(logger, "node.enter", node="gap_generator")
+        # P2-14 (D-25): same reasoning as task_expander_node's identical
+        # line -- settings.mcp_enabled IS the "is mcp available" signal,
+        # reused directly rather than a second, separately-configured flag.
+        available_tool_hints = frozenset({"mcp"}) if settings.mcp_enabled else frozenset()
         result = router.complete_json(templates.generate_gaps(
             state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
-            guidance=state.human_guidance))
+            guidance=state.human_guidance, available_tool_hints=available_tool_hints))
         # P2-06: same validated cap_and_filter seam task_expander_node uses.
         tasks, rejected = cap_and_filter(result.get("tasks", []), state,
                                          depth=state.iteration_depth,
-                                         max_fanout=settings.max_fanout)
+                                         max_fanout=settings.max_fanout,
+                                         allowed_tool_hints=available_tool_hints)
         log_event(logger, "node.gaps", produced=len(tasks), rejected=rejected)
         counters = {"llm_node_calls": 1, **router.drain_counters()}
         if rejected:

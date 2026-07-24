@@ -194,10 +194,16 @@ class Settings(BaseSettings):
 
     # --- MCP tool seam (P2-13, implements D-26/D-30) ------------------------
     # Off by default: corpus_search.py (the original function-registry tool)
-    # remains what cli.py wires in unless this is explicitly turned on. When
-    # enabled, cli.py wires tools/mcp_client.py's tool in INSTEAD of the
-    # corpus tool -- this build supports exactly one active tool at a time,
-    # not a registry of several (that's P2-14's job, not this one's).
+    # remains cli.py's DEFAULT worker regardless of this flag. When enabled,
+    # cli.py ADDITIONALLY wires tools/mcp_client.py's tool in as a second,
+    # addressable specialist (P2-14, D-25) -- reachable only via a task's
+    # tool_hint == "mcp" (orchestration/graph.py::dispatch_tasks); the
+    # default corpus worker keeps handling every task without a hint. This
+    # is also the ONLY signal task_expander_node/gap_generator_node use to
+    # decide whether the LLM is even told "mcp" is an option to hint at
+    # (see agents/planning.py and agents/gathering.py) -- no separate
+    # "which hints are available" setting exists, deliberately, since
+    # "mcp" is the only specialist this build can ever wire in.
     mcp_enabled: bool = False
     # The command to launch a LOCAL MCP server over stdio (D-30 -- the only
     # transport this build implements; never SSE, which D-30 prohibits

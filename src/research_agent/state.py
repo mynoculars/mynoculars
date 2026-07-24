@@ -209,7 +209,9 @@ class SearchTask(BaseModel):
 
     Every SearchTask becomes exactly one parallel search_worker invocation
     (see orchestration/graph.py::dispatch_tasks, which wraps each one in a
-    LangGraph `Send`).
+    LangGraph `Send`) -- UNLESS tool_hint routes it to a different named
+    specialist node instead (P2-14, D-25) -- see dispatch_tasks's own
+    docstring for exactly how that routing decision is made.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -219,6 +221,17 @@ class SearchTask(BaseModel):
     goal_id: str
     priority: int = 0             # D-13: producers rank; top MAX_FANOUT survive
     depth: int = 0                # echoed into failed-key records (D-16)
+    # P2-14 (D-25): which specialist worker should handle this task, if any.
+    # "" (the default -- every task before this shipped, and every task a
+    # producer emits when settings.available_tool_hints is empty, which it
+    # is by default) always routes to "search_worker", byte-identical to
+    # pre-P2-14 behavior. task_utils.py::cap_and_filter is the ONLY place
+    # that ever sets this to anything else, and only ever to a value it has
+    # independently confirmed is both requested by the producer's raw
+    # output AND currently wired into the running graph (see that
+    # function's docstring) -- dispatch_tasks itself does not re-validate
+    # this field, it trusts it.
+    tool_hint: str = ""
 
 
 class Evidence(BaseModel):

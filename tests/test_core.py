@@ -74,14 +74,47 @@ def _state(**kw) -> ResearchState:
 
 def test_dispatch_empty_backlog_falls_through_to_compiler():
     # D-1: empty Send list must never silently halt the graph.
-    assert dispatch_tasks(_state()) == "compiler"
+    # P2-14: dispatch_tasks now takes hint_to_node -- {} here matches
+    # every pre-P2-14 call site and behavior exactly (no specialist
+    # wired in this graph).
+    assert dispatch_tasks(_state(), {}) == "compiler"
 
 
 def test_dispatch_fans_out_one_send_per_task():
     t = SearchTask(key="g1::x", query="x", goal_id="g1")
-    sends = dispatch_tasks(_state(pending_tasks=[t]))
+    sends = dispatch_tasks(_state(pending_tasks=[t]), {})
     assert isinstance(sends, list) and len(sends) == 1
     assert sends[0].node == "search_worker"
+
+
+def test_dispatch_routes_a_hinted_task_to_its_specialist_node():
+    """P2-14 (D-25): a task whose tool_hint is a KEY in hint_to_node
+    routes to that node name instead of the default "search_worker"."""
+    t = SearchTask(key="g1::x", query="x", goal_id="g1", tool_hint="mcp")
+    sends = dispatch_tasks(_state(pending_tasks=[t]), {"mcp": "mcp_search_worker"})
+    assert isinstance(sends, list) and len(sends) == 1
+    assert sends[0].node == "mcp_search_worker"
+
+
+def test_dispatch_falls_back_to_default_for_an_unrecognized_hint():
+    """Defense in depth: even if a hint somehow doesn't match anything in
+    hint_to_node (shouldn't happen -- cap_and_filter already only sets
+    hints present in this same set -- but dispatch_tasks doesn't re-trust
+    that), it degrades to the default rather than raising a KeyError."""
+    t = SearchTask(key="g1::x", query="x", goal_id="g1", tool_hint="nonexistent")
+    sends = dispatch_tasks(_state(pending_tasks=[t]), {"mcp": "mcp_search_worker"})
+    assert sends[0].node == "search_worker"
+
+
+def test_dispatch_mixed_backlog_routes_each_task_independently():
+    """One dispatch call, one task with a hint, one without -- each must
+    route independently, proving this isn't an all-or-nothing decision
+    per call."""
+    hinted = SearchTask(key="g1::a", query="a", goal_id="g1", tool_hint="mcp")
+    plain = SearchTask(key="g2::b", query="b", goal_id="g2")
+    sends = dispatch_tasks(_state(pending_tasks=[hinted, plain]), {"mcp": "mcp_search_worker"})
+    nodes = {s.node for s in sends}
+    assert nodes == {"mcp_search_worker", "search_worker"}
 
 
 def test_convergence_compiles_on_recall_target():

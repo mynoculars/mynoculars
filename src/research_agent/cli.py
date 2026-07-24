@@ -149,27 +149,34 @@ def build_app_and_settings(tracer=None):
         tracer=tracer)
     # P2-01: settings.min_similarity is the retrieval-time floor on the
     # dense leg — see retrieval/hybrid.py for what it filters and why.
+    # P2-14 (D-25) follow-up to P2-13: the corpus tool is now ALWAYS
+    # built and is ALWAYS the default -- settings.mcp_enabled no longer
+    # swaps it out wholesale (that was P2-13's original, simpler
+    # behavior, before P2-14's tool_hint routing existed to make a
+    # genuine choice possible). Instead, when mcp_enabled, the MCP tool
+    # is built ADDITIONALLY, as a second, ADDRESSABLE specialist --
+    # reachable only when a task's tool_hint == "mcp" (see
+    # orchestration/graph.py::dispatch_tasks and
+    # agents/planning.py::task_expander_node /
+    # agents/gathering.py::gap_generator_node, which are the only two
+    # places that ever set that hint, and only when settings.mcp_enabled
+    # is what allowed it in the first place). With mcp_enabled off (the
+    # default), mcp_tool stays None and build_graph registers no extra
+    # node at all -- behavior is unchanged from every run before this.
+    tool = make_corpus_tool(
+        HybridRetriever(dense, keyword, min_similarity=settings.min_similarity))
     mcp_bridge = None
+    mcp_tool = None
     if settings.mcp_enabled:
-        # P2-13: settings.mcp_enabled swaps the ENTIRE tool -- this build
-        # runs exactly one active tool at a time (corpus OR mcp), never
-        # both; a registry choosing between several is P2-14's job, not
-        # this one's. Everything else in this function (dense/keyword
-        # stores, HybridRetriever) is still constructed above even when
-        # unused here -- harmless, and keeps this diff to "add a branch",
-        # not "restructure the function".
         mcp_bridge = MCPBridge(
             command=settings.mcp_server_command,
             args=split_csv(settings.mcp_server_args),
             env_allowlist=split_csv(settings.mcp_server_env_allowlist),
         )
-        tool = make_mcp_tool(
+        mcp_tool = make_mcp_tool(
             mcp_bridge, settings.mcp_tool_name,
             query_arg_name=settings.mcp_query_arg_name,
             call_timeout_seconds=settings.mcp_call_timeout_seconds)
-    else:
-        tool = make_corpus_tool(
-            HybridRetriever(dense, keyword, min_similarity=settings.min_similarity))
     memory = SemanticMemory(
         QdrantStore(settings.qdrant_url, settings.memory_collection, tracer=tracer,
                     trace_label="QDRANT (semantic memory)"),
@@ -187,7 +194,8 @@ def build_app_and_settings(tracer=None):
         # (print a banner, put it in /health) without re-deriving it.
         log_event(logging.getLogger(__name__), "app.degraded_checkpointing",
                   level=logging.WARNING)
-    app = build_graph(router, tool, memory, settings, checkpointer, debug=debug)
+    app = build_graph(router, tool, memory, settings, checkpointer, debug=debug,
+                     mcp_tool=mcp_tool)  # P2-14: None unless settings.mcp_enabled
     return AppBundle(app=app, settings=settings, durable=durable,
                      checkpointer=checkpointer, mcp_bridge=mcp_bridge)
 

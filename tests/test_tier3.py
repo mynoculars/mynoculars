@@ -1527,3 +1527,176 @@ def test_mcp_bridge_timeout_error_is_actually_informative():
             assert "1.0" in message  # the configured timeout, visible in the message
     finally:
         bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# P2-14 — typed specialist workers (D-25)
+# ---------------------------------------------------------------------------
+
+
+def _p214_settings(mcp_enabled: bool):
+    from research_agent.config import Settings
+
+    return Settings(_env_file=None, llm_mode="stub", hitl_enabled=False,
+                    mcp_enabled=mcp_enabled,
+                    qdrant_url="http://127.0.0.1:1",
+                    postgres_dsn="postgresql://x:x@127.0.0.1:1/x",
+                    opensearch_url="http://127.0.0.1:1")
+
+
+def _p214_memory(settings):
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.storage.qdrant_store import QdrantStore
+
+    return SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+                          settings.memory_top_k, 90.0, 14.0)
+
+
+def test_cap_and_filter_keeps_a_hint_that_is_in_allowed_tool_hints():
+    from research_agent.agents.task_utils import cap_and_filter
+    from research_agent.state import ResearchState
+
+    raw = [{"query": "q1", "goal_id": "g1", "priority": 1, "tool_hint": "mcp"}]
+    tasks, rejected = cap_and_filter(raw, ResearchState(raw_query="q"), depth=0,
+                                     max_fanout=5, allowed_tool_hints=frozenset({"mcp"}))
+    assert rejected == 0
+    assert tasks[0].tool_hint == "mcp"
+
+
+def test_cap_and_filter_resets_a_hint_not_in_allowed_tool_hints():
+    """The core validation this item exists for: a hint the LLM emitted
+    but that isn't actually wired into THIS run must never survive into
+    a SearchTask -- it's silently reset to the default, not rejected as
+    malformed (the request itself was well-formed; the hint just isn't
+    available right now)."""
+    from research_agent.agents.task_utils import cap_and_filter
+    from research_agent.state import ResearchState
+
+    raw = [{"query": "q1", "goal_id": "g1", "priority": 1, "tool_hint": "mcp"}]
+    tasks, rejected = cap_and_filter(raw, ResearchState(raw_query="q"), depth=0,
+                                     max_fanout=5, allowed_tool_hints=frozenset())
+    assert rejected == 0
+    assert tasks[0].tool_hint == ""
+
+
+def test_cap_and_filter_default_call_with_no_allowed_tool_hints_arg_is_unchanged():
+    """Backward compatibility: a caller that doesn't even know about
+    allowed_tool_hints yet (the exact old call signature) still gets
+    tool_hint="" on everything -- byte-identical pre-P2-14 behavior."""
+    from research_agent.agents.task_utils import cap_and_filter
+    from research_agent.state import ResearchState
+
+    raw = [{"query": "q1", "goal_id": "g1", "priority": 1}]
+    tasks, rejected = cap_and_filter(raw, ResearchState(raw_query="q"), depth=0, max_fanout=5)
+    assert tasks[0].tool_hint == ""
+
+
+def test_build_graph_without_mcp_tool_never_registers_the_specialist_node(graph):
+    """graph fixture (conftest.py) never passes mcp_tool -- confirms the
+    default shape is completely unchanged from before P2-14."""
+    node_names = set(graph.get_graph().nodes.keys())
+    assert "mcp_search_worker" not in node_names
+    assert "search_worker" in node_names
+
+
+def test_build_graph_with_mcp_tool_registers_the_specialist_node():
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from research_agent.llm.client import StubClient
+    from research_agent.llm.router import FallbackRouter
+    from research_agent.orchestration.graph import build_graph
+
+    settings = _p214_settings(mcp_enabled=True)
+    router = FallbackRouter([StubClient()], quality_threshold=0.6)
+    memory = _p214_memory(settings)
+
+    def fake_tool(task):
+        return []
+
+    g = build_graph(router, fake_tool, memory, settings, MemorySaver(), mcp_tool=fake_tool)
+    node_names = set(g.get_graph().nodes.keys())
+    assert "mcp_search_worker" in node_names
+    assert "search_worker" in node_names
+
+
+def test_p2_14_mixed_backlog_routes_to_both_specialists_end_to_end():
+    """The real, definitive proof: one full graph run, one task hinted
+    "mcp", one task with no hint -- each must land on the RIGHT tool, and
+    the resulting evidence must show BOTH sources in telemetry. Uses a
+    custom StubClient subclass (only overriding the TASK=expand response;
+    every other prompt still gets StubClient's normal canned behavior)
+    rather than a full FallbackRouter fake, so this test exercises the
+    REAL agents/planning.py::task_expander_node ->
+    task_utils.py::cap_and_filter -> orchestration/graph.py::
+    dispatch_tasks chain end to end, not a shortcut around it."""
+    import json
+
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from research_agent.llm.client import StubClient
+    from research_agent.llm.router import FallbackRouter
+    from research_agent.orchestration.graph import build_graph
+    from research_agent.state import Evidence, ResearchState, Volatility
+
+    class _HintingStubClient(StubClient):
+        def complete(self, messages, temperature=0.2):
+            last = messages[-1]["content"]
+            if "TASK=expand" in last:
+                return json.dumps({"tasks": [
+                    {"query": "corpus query", "goal_id": "g1", "priority": 2},
+                    {"query": "mcp query", "goal_id": "g2", "priority": 2, "tool_hint": "mcp"},
+                ]})
+            return super().complete(messages, temperature)
+
+    settings = _p214_settings(mcp_enabled=True)
+    router = FallbackRouter([_HintingStubClient()], quality_threshold=0.6)
+    memory = _p214_memory(settings)
+
+    corpus_calls = []
+    mcp_calls = []
+
+    def fake_corpus_tool(task):
+        corpus_calls.append(task)
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="corpus",
+                         content=f"corpus result for {task.query}", score=0.9,
+                         volatility=Volatility.SEMI_STABLE)]
+
+    def fake_mcp_tool(task):
+        mcp_calls.append(task)
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="mcp",
+                         content=f"mcp result for {task.query}", score=0.9,
+                         volatility=Volatility.SEMI_STABLE)]
+
+    g = build_graph(router, fake_corpus_tool, memory, settings, MemorySaver(),
+                    mcp_tool=fake_mcp_tool)
+    result = g.invoke(ResearchState(raw_query="q"),
+                      config={"configurable": {"thread_id": "p214-mixed-backlog"}})
+
+    assert len(corpus_calls) == 1
+    assert corpus_calls[0].query == "corpus query"
+    assert corpus_calls[0].tool_hint == ""
+    assert len(mcp_calls) == 1
+    assert mcp_calls[0].query == "mcp query"
+    assert mcp_calls[0].tool_hint == "mcp"
+
+    telemetry = result["telemetry"]
+    assert telemetry["evidence_by_source"].get("corpus", 0) >= 1
+    assert telemetry["evidence_by_source"].get("mcp", 0) >= 1
+
+
+def test_p2_14_with_mcp_disabled_the_llm_is_never_even_told_about_it():
+    """settings.mcp_enabled=False (the default) -- confirms the PROMPT
+    itself carries no tool_hint schema at all, not just that no task
+    happens to use it. Proven by asserting the actual prompt text sent
+    to the router never mentions "tool_hint"."""
+    from research_agent.config import Settings
+    from research_agent.prompts import templates
+    from research_agent.state import Goal
+
+    settings = _p214_settings(mcp_enabled=False)
+    available = frozenset({"mcp"}) if settings.mcp_enabled else frozenset()
+    assert available == frozenset()
+
+    msgs = templates.expand_tasks([Goal(goal_id="g1", description="x")], 5,
+                                  available_tool_hints=available)
+    assert "tool_hint" not in msgs[1]["content"]

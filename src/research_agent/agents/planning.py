@@ -281,12 +281,20 @@ def build_task_expander_node(router: FallbackRouter, settings: Settings,
         router.set_node("task_expander")
         if debug:
             log_event(logger, "node.enter", node="task_expander")
+        # P2-14 (D-25): the ONLY specialist this build can ever wire in is
+        # "mcp" (P2-13), gated behind the same settings.mcp_enabled flag
+        # that decides whether cli.py builds an MCPBridge at all -- so
+        # there is no separate "is mcp available" setting to keep in
+        # sync; this IS that flag, reused directly.
+        available_tool_hints = frozenset({"mcp"}) if settings.mcp_enabled else frozenset()
         result = router.complete_json(
-            templates.expand_tasks(state.goals, settings.max_fanout))
+            templates.expand_tasks(state.goals, settings.max_fanout,
+                                   available_tool_hints=available_tool_hints))
         # P2-06: cap_and_filter now also validates each raw item and
         # returns how many it rejected, alongside the survivors.
         tasks, rejected = cap_and_filter(result.get("tasks", []), state, depth=0,
-                                         max_fanout=settings.max_fanout)
+                                         max_fanout=settings.max_fanout,
+                                         allowed_tool_hints=available_tool_hints)
         log_event(logger, "node.expand", produced=len(tasks), rejected=rejected)
         # D-2: replace-on-write — this IS the whole backlog for next dispatch.
         counters = {"llm_node_calls": 1, **router.drain_counters()}

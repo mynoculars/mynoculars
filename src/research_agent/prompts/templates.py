@@ -95,23 +95,47 @@ def compose_goals(query: str, intent: str, memory_hints: List[str],
             'JSON schema: {"goals": [{"goal_id": "g1", "description": "..."}]}'}]
 
 
-def expand_tasks(goals: List[Goal], max_tasks: int) -> List[Message]:
+def expand_tasks(goals: List[Goal], max_tasks: int,
+                 available_tool_hints: frozenset = frozenset()) -> List[Message]:
     """Initial task expansion (D-13: model ranks; code caps).
 
     CALLED BY   agents/planning.py::task_expander_node — the first pass,
                 always at depth 0.
+
+    P2-14 (D-25): available_tool_hints is empty for every run that hasn't
+    wired in a specialist tool (settings.mcp_enabled off, the default) --
+    in that case this function's OUTPUT is byte-identical to before P2-14
+    existed; the schema simply never mentions tool_hint at all, so there
+    is nothing new for the model to even consider. Only when a specialist
+    IS actually available does the schema grow the extra optional field
+    -- deliberately not shown otherwise, since offering a hint the run
+    can't actually route anywhere would just be confusing, unactionable
+    noise in the prompt.
     """
     listing = "\n".join(f"- {g.goal_id}: {g.description}" for g in goals)
+    hint_note = ""
+    schema = '{"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>}]}'
+    if available_tool_hints:
+        hint_names = ", ".join(sorted(available_tool_hints))
+        hint_note = (
+            f"Optionally set \"tool_hint\" on a task to route it to a specific "
+            f"specialist tool instead of the default search (available: "
+            f"{hint_names}) -- omit it for the default. ")
+        schema = ('{"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>, '
+                  '"tool_hint": "..." (optional)}]}')
     return [_SYSTEM, {"role": "user", "content":
             f"TASK=expand\nGoals:\n{listing}\n"
             f"Produce at most {max_tasks} search queries covering these goals, "
-            f"highest value first. "
-            'JSON schema: {"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>}]}'}]
+            f"highest value first. {hint_note}"
+            f'JSON schema: {schema}'}]
 
 
 def generate_gaps(goals: List[Goal], evidence: List[Evidence], depth: int,
-                  max_tasks: int, guidance: str = "") -> List[Message]:
-    """Gap analysis for uncovered goals. Same schema as expand_tasks.
+                  max_tasks: int, guidance: str = "",
+                  available_tool_hints: frozenset = frozenset()) -> List[Message]:
+    """Gap analysis for uncovered goals. Same schema as expand_tasks
+    (including the same P2-14/D-25 conditional tool_hint addition -- see
+    that function's own docstring for the full reasoning).
 
     CALLED BY   agents/gathering.py::gap_generator_node — every gather-loop
                 cycle after the first.
@@ -125,13 +149,23 @@ def generate_gaps(goals: List[Goal], evidence: List[Evidence], depth: int,
     # evidence over several gather-loop cycles.
     have = "\n".join(f"- [{e.goal_id}] {e.content[:120]}" for e in evidence[-10:]) or "(none)"
     steer = f"Human reviewer guidance (follow it): {guidance}\n" if guidance else ""
+    hint_note = ""
+    schema = '{"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>}]}'
+    if available_tool_hints:
+        hint_names = ", ".join(sorted(available_tool_hints))
+        hint_note = (
+            f"Optionally set \"tool_hint\" on a task to route it to a specific "
+            f"specialist tool instead of the default search (available: "
+            f"{hint_names}) -- omit it for the default. ")
+        schema = ('{"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>, '
+                  '"tool_hint": "..." (optional)}]}')
     return [_SYSTEM, {"role": "user", "content":
             f"TASK=gaps\nUncovered goals:\n{uncovered}\n"
             f"Evidence so far (tail):\n{have}\n"
             f"{steer}"
             f"Iteration depth: {depth}. Produce at most {max_tasks} NEW search "
-            f"queries that would cover the uncovered goals, highest value first. "
-            'JSON schema: {"tasks": [{"query": "...", "goal_id": "g1", "priority": <int>}]}'}]
+            f"queries that would cover the uncovered goals, highest value first. {hint_note}"
+            f'JSON schema: {schema}'}]
 
 
 def compile_report(query: str, goals: List[Goal], evidence: List[Evidence],

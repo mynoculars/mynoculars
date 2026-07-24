@@ -45,10 +45,23 @@ class RawTask(BaseModel):
     query: str = Field(min_length=1)
     goal_id: str = Field(min_length=1)
     priority: int = 0
+    # P2-14 (D-25): optional -- a producer MAY ask for a specific
+    # specialist worker (today, only ever "mcp" -- see
+    # tools/mcp_client.py). Validated against what's ACTUALLY wired into
+    # THIS run inside cap_and_filter below, not here: RawTask's job is
+    # "is this a well-formed string", not "is this hint currently
+    # available" -- those are different questions, checked in different
+    # places, matching this file's existing division of labor (RawTask =
+    # shape, cap_and_filter's own logic = the D-2/D-13/D-16 business
+    # rules). Absent/empty (the default -- every task before P2-14, and
+    # every task a producer emits without a reason to ask for a
+    # specialist) always means "the default corpus worker", unchanged.
+    tool_hint: str = ""
 
 
 def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
-                   max_fanout: int) -> Tuple[List[SearchTask], int]:
+                   max_fanout: int,
+                   allowed_tool_hints: frozenset = frozenset()) -> Tuple[List[SearchTask], int]:
     """Shared hygiene applied by BOTH task-producing nodes before their
     output ever becomes state.pending_tasks — task_expander_node calls this
     with depth=0 (planning.py, the first pass); gap_generator_node
@@ -103,6 +116,12 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
             every gap_generator_node pass after that).
         max_fanout: the cap — settings.max_fanout, passed through by the
             caller.
+        allowed_tool_hints: (P2-14, D-25) the set of specialist hint names
+            actually wired into THIS run's graph -- e.g. frozenset({"mcp"})
+            when settings.mcp_enabled, else the empty frozenset (the
+            default -- every existing caller that doesn't pass this at
+            all gets byte-identical pre-P2-14 behavior: every SearchTask's
+            tool_hint ends up "").
 
     Returns:
         (tasks, rejected_count) — rejected_count is how many raw_tasks
@@ -138,8 +157,21 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
         failed_at = state.failed_task_keys.get(key)
         if failed_at is not None and depth <= failed_at:
             continue  # D-16 retry gate — see the docstring above
+        # P2-14 (D-25): a raw tool_hint is only ever HONORED if it names a
+        # specialist actually wired into THIS run (allowed_tool_hints,
+        # passed down from settings.mcp_enabled at the two call sites --
+        # see agents/planning.py::task_expander_node and
+        # agents/gathering.py::gap_generator_node). Anything else --
+        # empty (the overwhelming common case), unrecognized, or a real
+        # hint name that just isn't active this run -- silently resets
+        # to "" (the default route) rather than ever reaching
+        # dispatch_tasks as something it would have to guess about. This
+        # is the ONLY place in the whole codebase that ever sets
+        # SearchTask.tool_hint to anything other than "" -- see that
+        # field's own docstring in state.py.
+        hint = raw.tool_hint if raw.tool_hint in allowed_tool_hints else ""
         tasks.append(SearchTask(key=key, query=raw.query, goal_id=raw.goal_id,
-                                priority=raw.priority, depth=depth))
+                                priority=raw.priority, depth=depth, tool_hint=hint))
     # .sort(key=..., reverse=True) sorts the list IN PLACE (it modifies
     # `tasks` directly and returns nothing). `key=lambda t: t.priority` tells
     # Python "for sorting purposes, look at each task's .priority field" — a

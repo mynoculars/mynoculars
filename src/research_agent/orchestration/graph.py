@@ -78,7 +78,7 @@ Python mechanics used in this file, if any of this is new to you:
         N simultaneous search_worker executions.
 """
 
-from typing import Any, List, Literal, Union
+from typing import Any, List, Literal, Optional, Union
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
@@ -128,21 +128,39 @@ def route_after_goals(state: ResearchState
     return "compiler" if state.planning_error else "task_expander"
 
 
-def dispatch_tasks(state: ResearchState
+def dispatch_tasks(state: ResearchState, hint_to_node: dict
                    ) -> Union[List[Send], Literal["compiler", "human_escalation"]]:
     """Wired to TWO different conditional edges below — after
     task_expander (the first pass) and after gap_generator (every later
     pass). Same backlog-to-workers logic serves both, so the two producers
     can never accidentally be dispatched differently.
 
-    READS   state.escalation_trigger, state.pending_tasks.
+    READS   state.escalation_trigger, state.pending_tasks, each task's own
+            .tool_hint (P2-14, D-25).
+    CALLED  via a lambda in build_graph, below (`lambda s: dispatch_tasks(s,
+            hint_to_node)`) — same "pre-fill an extra argument LangGraph
+            itself never passes" pattern route_convergence's own call site
+            already uses, needed here because hint_to_node is a per-BUILD
+            value (which specialist nodes THIS graph actually has), not
+            something LangGraph could know to supply itself.
     RETURNS "human_escalation" if gap_generator just raised E2/E3 (it ran
             out of new tasks to try — see agents/gathering.py); otherwise
             "compiler" if the backlog is empty (D-1 — a graph with nothing
             left to search still needs to produce a report); otherwise a
             LIST of Send objects, one per pending task, which LangGraph
-            executes as a batch of PARALLEL search_worker invocations, all
-            in the same superstep.
+            executes as a batch of PARALLEL worker invocations, all in the
+            same superstep — POSSIBLY split across more than one node
+            NAME now (P2-14): hint_to_node.get(t.tool_hint, "search_worker")
+            sends a task to its requested specialist if one is wired into
+            THIS graph, else the default "search_worker", covering both
+            "no hint" (the overwhelming common case, t.tool_hint == "") and
+            "hint given but this graph doesn't have that specialist" —
+            the second case shouldn't be reachable in practice
+            (task_utils.py::cap_and_filter already only ever sets a hint
+            to something present in hint_to_node's own key set), but the
+            fallback costs nothing and means a mismatch degrades instead
+            of crashing, matching this codebase's consistent posture
+            everywhere else a lookup could plausibly miss.
 
     Producers already capped/ranked the backlog (D-13), so dispatch is
     always total — no truncation decisions happen here by design.
@@ -151,7 +169,8 @@ def dispatch_tasks(state: ResearchState
         return "human_escalation"  # gap generator exhausted its supply (D-23)
     if not state.pending_tasks:
         return "compiler"
-    return [Send("search_worker", WorkerPayload(task=t)) for t in state.pending_tasks]
+    return [Send(hint_to_node.get(t.tool_hint, "search_worker"), WorkerPayload(task=t))
+            for t in state.pending_tasks]
 
 
 def route_convergence(state: ResearchState, settings: Settings
@@ -213,8 +232,9 @@ def route_after_critique(state: ResearchState, settings: Settings
 
 
 def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
-                settings: Settings, checkpointer: Any, debug: bool = False):
-    """Assemble and compile the workflow — the ONE function that turns 13
+                settings: Settings, checkpointer: Any, debug: bool = False,
+                mcp_tool: Optional[ToolFn] = None):
+    """Assemble and compile the workflow — the ONE function that turns
     independently-testable node functions into a single runnable graph.
 
     CALLED BY   cli.py::build_app_and_settings — the only call site in the
@@ -228,7 +248,9 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
 
     Parameters:
         router: LLM routing (real or stub).
-        tool: the retrieval tool workers invoke.
+        tool: the DEFAULT retrieval tool every plain SearchTask (no
+            tool_hint) is dispatched to — always required, unchanged from
+            before P2-14.
         memory: semantic memory (may be degraded/off).
         settings: graph bounds and thresholds.
         checkpointer: LangGraph checkpointer (Postgres or MemorySaver).
@@ -242,6 +264,19 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
             tracer.enabled — so in practice both turn on together, but this
             one reaches every node, not just the ones that touch an LLM or
             a store.
+        mcp_tool: (P2-14, D-25) an OPTIONAL second tool, routed to only
+            when a SearchTask's tool_hint == "mcp" -- see cli.py, which
+            builds this (tools/mcp_client.py::make_mcp_tool) exactly when
+            settings.mcp_enabled, and None otherwise (the default). None
+            here means this build_graph call registers NO extra node at
+            all -- the graph is byte-for-byte the same shape it was
+            before P2-14 existed, not just "the extra node happens to go
+            unused." A task with tool_hint="mcp" arriving at dispatch_tasks
+            when this is None still degrades safely to the default
+            worker (see dispatch_tasks's own docstring) -- but that
+            shouldn't happen in practice, since cap_and_filter only ever
+            sets a hint the SAME settings.mcp_enabled check already
+            confirmed is active for this run.
     """
     # StateGraph(ResearchState) creates a new, empty graph builder whose
     # shared state will be validated against the ResearchState Pydantic
@@ -262,6 +297,13 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     g.add_node("goal_manager", build_goal_manager_node(router, settings, debug))
     g.add_node("task_expander", build_task_expander_node(router, settings, debug))
     g.add_node("search_worker", build_search_worker(tool, debug))
+    # P2-14 (D-25): the ONE additional specialist this build can wire in,
+    # registered ONLY when cli.py actually built one (mcp_tool is not
+    # None) -- build_search_worker is already fully tool-agnostic (see
+    # its own docstring), so this is just a second call to the SAME
+    # function with a DIFFERENT tool closure, not new worker logic.
+    if mcp_tool is not None:
+        g.add_node("mcp_search_worker", build_search_worker(mcp_tool, debug))
     g.add_node("merger", build_merger_node(router, settings, debug))  # P2-12
     g.add_node("progress_checker", build_progress_checker_node(settings, debug))
     g.add_node("gap_generator", build_gap_generator_node(router, settings, debug))
@@ -285,9 +327,24 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     # whichever of the three listed node names it returns.
     g.add_conditional_edges("goal_manager", route_after_goals,
                             ["task_expander", "compiler", "human_escalation"])
-    g.add_conditional_edges("task_expander", dispatch_tasks,
-                            ["search_worker", "compiler", "human_escalation"])
+    # P2-14 (D-25): hint_to_node and worker_destinations are both built
+    # HERE, once, from whatever specialists this particular build_graph
+    # call actually registered above -- never a fixed, hardcoded set.
+    # With mcp_tool=None (every run before P2-14, and every run today
+    # with settings.mcp_enabled off), both are exactly what they always
+    # were: hint_to_node={} and worker_destinations lists only
+    # "search_worker" -- so dispatch_tasks and these two
+    # add_conditional_edges calls are BYTE-IDENTICAL in behavior to
+    # before P2-14 existed in that case.
+    hint_to_node = {"mcp": "mcp_search_worker"} if mcp_tool is not None else {}
+    worker_destinations = ["search_worker", "compiler", "human_escalation"]
+    if mcp_tool is not None:
+        worker_destinations.append("mcp_search_worker")
+    g.add_conditional_edges("task_expander", lambda s: dispatch_tasks(s, hint_to_node),
+                            worker_destinations)
     g.add_edge("search_worker", "merger")
+    if mcp_tool is not None:
+        g.add_edge("mcp_search_worker", "merger")
     g.add_edge("merger", "progress_checker")
     # route_convergence needs BOTH state and settings, but LangGraph only
     # ever passes ONE argument (state) to a routing function — the lambda
@@ -298,8 +355,8 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     g.add_conditional_edges("progress_checker",
                             lambda s: route_convergence(s, settings),
                             ["compiler", "gap_generator", "human_escalation"])
-    g.add_conditional_edges("gap_generator", dispatch_tasks,
-                            ["search_worker", "compiler", "human_escalation"])
+    g.add_conditional_edges("gap_generator", lambda s: dispatch_tasks(s, hint_to_node),
+                            worker_destinations)
     g.add_edge("compiler", "critic")
     g.add_conditional_edges("critic",
                             lambda s: route_after_critique(s, settings),
