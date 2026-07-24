@@ -122,7 +122,14 @@ def build_search_worker(tool: ToolFn, debug: bool = False):
             # this is an optional, duck-typed capability rather than part
             # of ToolFn's required contract).
             retrieval_counts = getattr(tool, "drain_retrieval_counts", lambda: {})()
-            log_event(logger, "worker.done", task=task.key, items=len(evidence))
+            # P2-13 follow-up: source=... gives immediate per-task
+            # visibility in a --debug trace into which tool actually
+            # answered THIS task -- evidence[0].source is enough (every
+            # item a single tool call produces shares one source; a task
+            # that got zero evidence has none to report, hence the
+            # "none" fallback rather than indexing an empty list).
+            log_event(logger, "worker.done", task=task.key, items=len(evidence),
+                      source=evidence[0].source if evidence else "none")
             return {
                 "evidence": evidence,
                 "completed_task_keys": {task.key},
@@ -138,8 +145,21 @@ def build_search_worker(tool: ToolFn, debug: bool = False):
             # collection that was never ingested) still counted as an
             # attempted retrieval call, not a silent zero.
             retrieval_counts = getattr(tool, "drain_retrieval_counts", lambda: {})()
+            # error=str(exc)[:300] follow-up: `reason` alone (the
+            # exception CLASS name) was found to be genuinely unhelpful in
+            # practice -- a real MCP-tool failure showed "reason=
+            # TimeoutError" with no way to tell what timed out, how long,
+            # or against what. str(exc) carries the actual message (for
+            # TimeoutError raised by concurrent.futures.Future.result,
+            # this is normally empty -- see tools/mcp_client.py::call_tool,
+            # which now wraps that specific case with a real message
+            # before it ever gets here). [:300] caps it the same way
+            # every other user-facing text slice in this codebase is
+            # capped (see tools/corpus_search.py's content[:800] for the
+            # same idiom), so one enormous exception message can't bloat
+            # a log line.
             log_event(logger, "worker.failed", level=logging.WARNING,
-                      task=task.key, reason=type(exc).__name__)
+                      task=task.key, reason=type(exc).__name__, error=str(exc)[:300])
             return {
                 "failed_task_keys": {task.key: task.depth},
                 "counters": {"search_failures": 1, **retrieval_counts},
@@ -236,7 +256,8 @@ def build_merger_node(router: FallbackRouter, settings: Settings, debug: bool = 
                     contested_goal_ids = set(result.get("contested_goal_ids", []))
                 except Exception as exc:  # noqa: BLE001 — fail open, never crash the run
                     log_event(logger, "merger.contradiction_detection_failed",
-                              level=logging.WARNING, reason=type(exc).__name__)
+                              level=logging.WARNING, reason=type(exc).__name__,
+                              error=str(exc)[:300])
                 counters = {"llm_node_calls": 1, **router.drain_counters()}
         else:
             # Original D-18 minimal detector, unchanged: honour an explicit

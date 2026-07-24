@@ -224,18 +224,22 @@ class SearchTask(BaseModel):
 class Evidence(BaseModel):
     """One retrieved fact, from a live tool or from long-term memory.
 
-    Two producers create these: tools/corpus_search.py (source="corpus",
-    fresh retrieval this run) and memory/semantic_memory.py::retrieve
-    (source="memory", recalled from a past run). Every downstream node that
-    reads state.evidence treats both kinds identically — there is no
-    separate code path per source.
+    Producers create these with source="corpus" (tools/corpus_search.py,
+    the default retrieval tool), source="mcp" (tools/mcp_client.py, P2-13's
+    alternative tool -- cli.py wires in exactly one of the two, never
+    both), or source="memory" (memory/semantic_memory.py::retrieve,
+    recalled from a past run). Every downstream node that reads
+    state.evidence treats all of these identically — there is no separate
+    code path per source, except memory/semantic_memory.py::store_run's
+    own explicit source != "memory" check (never re-store what was itself
+    recalled FROM memory).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     task_key: str
     goal_id: str
-    source: str                   # "corpus", "memory", ...
+    source: str                   # "corpus", "mcp", "memory", ...
     content: str
     score: float = 0.0            # relevance; consumed by coverage rule (D-17)
     volatility: Volatility = Volatility.SEMI_STABLE

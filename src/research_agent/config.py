@@ -192,6 +192,39 @@ class Settings(BaseSettings):
     # the default AND the permanent parity oracle — never deleted.
     memory_server_side_decay: bool = False
 
+    # --- MCP tool seam (P2-13, implements D-26/D-30) ------------------------
+    # Off by default: corpus_search.py (the original function-registry tool)
+    # remains what cli.py wires in unless this is explicitly turned on. When
+    # enabled, cli.py wires tools/mcp_client.py's tool in INSTEAD of the
+    # corpus tool -- this build supports exactly one active tool at a time,
+    # not a registry of several (that's P2-14's job, not this one's).
+    mcp_enabled: bool = False
+    # The command to launch a LOCAL MCP server over stdio (D-30 -- the only
+    # transport this build implements; never SSE, which D-30 prohibits
+    # outright). Empty string is a deliberately invalid default: turning
+    # mcp_enabled on without also setting a real command is a configuration
+    # mistake this should surface early, not silently do nothing.
+    mcp_server_command: str = ""
+    # Comma-separated argv for the command above (e.g. "-m,my_mcp_server").
+    # A plain string, not a List[str] Settings field, so a person editing
+    # .env doesn't need to know pydantic-settings' JSON-for-lists env
+    # convention -- split_and_strip below does the parsing this codebase's
+    # other comma-separated-feeling settings don't otherwise need.
+    mcp_server_args: str = ""
+    # Comma-separated env VAR NAMES allowed to reach the MCP server
+    # subprocess (D-30: never a blanket os.environ passthrough -- see
+    # tools/mcp_client.py::_build_subprocess_env for exactly why that
+    # matters). Empty by default: an MCP server gets NO inherited
+    # environment variables unless each one is explicitly named here.
+    mcp_server_env_allowlist: str = ""
+    # The server-side tool name this build calls (a server can expose more
+    # than one tool; this build only ever calls exactly one).
+    mcp_tool_name: str = "search"
+    # The argument name the server's tool schema expects for the search
+    # string -- not every server will call it "query".
+    mcp_query_arg_name: str = "query"
+    mcp_call_timeout_seconds: float = 30.0
+
     # Debug tracing: when true (or --debug on the CLI), dump the exact prompt,
     # raw response, provider, tokens and latency of every LLM call, plus every
     # retrieval engine's hits, to logs/trace-<run_id>.txt. Off by default.
@@ -223,7 +256,28 @@ _KNOWN_ENV_TYPOS = {
     "MEMORY_TOPK": "MEMORY_TOP_K",
     "CONTRADICTION_DETECTION": "CONTRADICTION_DETECTION_ENABLED",
     "SERVER_SIDE_DECAY": "MEMORY_SERVER_SIDE_DECAY",
+    "MCP": "MCP_ENABLED",
+    "MCP_COMMAND": "MCP_SERVER_COMMAND",
+    "MCP_ARGS": "MCP_SERVER_ARGS",
+    "MCP_ENV_ALLOWLIST": "MCP_SERVER_ENV_ALLOWLIST",
 }
+
+
+def split_csv(value: str) -> list:
+    """Split a comma-separated Settings string into a clean list.
+
+    CALLED BY   cli.py::build_app_and_settings, for
+                settings.mcp_server_args and
+                settings.mcp_server_env_allowlist -- both plain comma-
+                separated strings rather than pydantic-settings' native
+                List[str] fields (see config.py's MCP settings comments
+                for why: a person editing .env by hand shouldn't need to
+                know pydantic-settings' JSON-for-lists env convention).
+    Empty entries (from a trailing comma, double comma, or an entirely
+    empty input string) are dropped, and every remaining entry is
+    whitespace-stripped -- "a, b ,,c" -> ["a", "b", "c"].
+    """
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def warn_on_likely_env_typos() -> None:

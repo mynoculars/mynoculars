@@ -21,5 +21,12 @@ uvicorn>=0.30
 # text automatically if this isn't installed; see cli.py::main)
 grandalf>=0.8
 
+# P2-13: MCP tool seam (tools/mcp_client.py). New external dependency,
+# confirmed absent from this file before P2-13 -- flagged as a real Large-
+# complexity risk factor before it was added. Verified against the actual
+# installed version's real API (ClientSession, StdioServerParameters,
+# stdio_client), not assumed from memory.
+mcp>=1.9
+
 # Tests
 pytest>=8.0

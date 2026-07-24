@@ -49,7 +49,7 @@ from typing import NamedTuple
 
 from langgraph.types import Command
 
-from research_agent.config import get_settings
+from research_agent.config import get_settings, split_csv
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import configure_logging, log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
@@ -61,6 +61,7 @@ from research_agent.storage.opensearch_store import OpenSearchStore
 from research_agent.storage.postgres import close_checkpointer, get_checkpointer, record_run
 from research_agent.storage.qdrant_store import QdrantStore
 from research_agent.tools.corpus_search import make_corpus_tool
+from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
 
 
 class AppBundle(NamedTuple):
@@ -78,6 +79,11 @@ class AppBundle(NamedTuple):
     settings: object
     durable: bool
     checkpointer: object
+    mcp_bridge: object = None  # P2-13: an MCPBridge if settings.mcp_enabled,
+                               # else None -- see build_app_and_settings and
+                               # main()'s finally block, which closes this
+                               # exactly like close_checkpointer(checkpointer)
+                               # does, when it's not None.
 
 
 def build_app_and_settings(tracer=None):
@@ -143,7 +149,27 @@ def build_app_and_settings(tracer=None):
         tracer=tracer)
     # P2-01: settings.min_similarity is the retrieval-time floor on the
     # dense leg — see retrieval/hybrid.py for what it filters and why.
-    tool = make_corpus_tool(HybridRetriever(dense, keyword, min_similarity=settings.min_similarity))
+    mcp_bridge = None
+    if settings.mcp_enabled:
+        # P2-13: settings.mcp_enabled swaps the ENTIRE tool -- this build
+        # runs exactly one active tool at a time (corpus OR mcp), never
+        # both; a registry choosing between several is P2-14's job, not
+        # this one's. Everything else in this function (dense/keyword
+        # stores, HybridRetriever) is still constructed above even when
+        # unused here -- harmless, and keeps this diff to "add a branch",
+        # not "restructure the function".
+        mcp_bridge = MCPBridge(
+            command=settings.mcp_server_command,
+            args=split_csv(settings.mcp_server_args),
+            env_allowlist=split_csv(settings.mcp_server_env_allowlist),
+        )
+        tool = make_mcp_tool(
+            mcp_bridge, settings.mcp_tool_name,
+            query_arg_name=settings.mcp_query_arg_name,
+            call_timeout_seconds=settings.mcp_call_timeout_seconds)
+    else:
+        tool = make_corpus_tool(
+            HybridRetriever(dense, keyword, min_similarity=settings.min_similarity))
     memory = SemanticMemory(
         QdrantStore(settings.qdrant_url, settings.memory_collection, tracer=tracer,
                     trace_label="QDRANT (semantic memory)"),
@@ -163,7 +189,7 @@ def build_app_and_settings(tracer=None):
                   level=logging.WARNING)
     app = build_graph(router, tool, memory, settings, checkpointer, debug=debug)
     return AppBundle(app=app, settings=settings, durable=durable,
-                     checkpointer=checkpointer)
+                     checkpointer=checkpointer, mcp_bridge=mcp_bridge)
 
 
 def main(argv=None) -> int:
@@ -241,6 +267,12 @@ def main(argv=None) -> int:
         # the OS was never a design decision, just an oversight this item
         # closes.
         close_checkpointer(bundle.checkpointer)
+        # P2-13: same reasoning as close_checkpointer above -- if MCP is
+        # enabled, bundle.mcp_bridge owns a real subprocess and background
+        # thread that should not just be left to the OS. None when MCP is
+        # off (the default), so this is a no-op for every existing run.
+        if bundle.mcp_bridge is not None:
+            bundle.mcp_bridge.close()
 
 
 def _run(app, settings, args, thread_id, tracer) -> int:

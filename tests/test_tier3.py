@@ -1010,3 +1010,520 @@ def test_find_gc_candidates_defaults_missing_volatility_to_semi_stable():
 
     assert len(candidates) == 1
     assert candidates[0][0] == "untagged"
+
+# ---------------------------------------------------------------------------
+# P2-13 — MCP tool seam
+#
+# Unlike every other test in this suite (see conftest.py's module
+# docstring: "every test runs fully offline"), ONE test below
+# (test_mcp_tool_round_trips_through_a_real_stdio_server) genuinely spawns
+# a real subprocess and talks real MCP protocol over real stdio pipes to
+# it. This is still fully self-contained and offline in the sense that
+# matters (no network call, no external service, no non-deterministic
+# dependency) -- the "server" is tests/fixtures/mcp_echo_server.py, a
+# ~20-line fixture shipped in this repo, launched and torn down entirely
+# within the test itself. This is deliberately NOT mocked: an earlier,
+# mock-only version of this work shipped an MCPBridge.close() that raised
+# `RuntimeError: Attempted to exit cancel scope in a different task than
+# it was entered in` under real use -- a genuine anyio/asyncio structured-
+# concurrency constraint (cancel scopes must be entered and exited by the
+# SAME task, not just the same event loop/thread) that no amount of
+# mocking the SDK's objects would have caught, since a mock doesn't
+# enforce anyio's actual runtime invariants. Real subprocess, real pipes,
+# real protocol round trip is what caught it, and is kept here specifically
+# so a future change to MCPBridge's lifecycle gets the same check.
+# ---------------------------------------------------------------------------
+
+
+def test_split_csv_strips_and_drops_empty_entries():
+    from research_agent.config import split_csv
+
+    assert split_csv("a, b ,,c") == ["a", "b", "c"]
+    assert split_csv("") == []
+    assert split_csv("   ") == []
+    assert split_csv("single") == ["single"]
+
+
+def test_build_subprocess_env_only_includes_allowlisted_names(monkeypatch):
+    from research_agent.tools.mcp_client import _build_subprocess_env
+
+    monkeypatch.setenv("MCP_TEST_ALLOWED_VAR", "yes")
+    monkeypatch.setenv("MCP_TEST_FORBIDDEN_VAR", "should-not-leak")
+
+    env = _build_subprocess_env(["MCP_TEST_ALLOWED_VAR", "MCP_TEST_NOT_SET_VAR"])
+
+    assert env == {"MCP_TEST_ALLOWED_VAR": "yes"}
+    assert "MCP_TEST_FORBIDDEN_VAR" not in env
+    assert "MCP_TEST_NOT_SET_VAR" not in env  # allowlisted but never set -> absent, not an error
+
+
+def test_build_subprocess_env_returns_empty_dict_for_empty_allowlist(monkeypatch):
+    from research_agent.tools.mcp_client import _build_subprocess_env
+
+    monkeypatch.setenv("MCP_TEST_SOME_VAR", "x")
+    assert _build_subprocess_env([]) == {}
+
+
+class _FakeContentBlock:
+    def __init__(self, text=None):
+        self.text = text
+
+
+class _FakeCallToolResult:
+    def __init__(self, content=None, isError=False):
+        self.content = content or []
+        self.isError = isError
+
+
+class _FakeBridgeForToolParsing:
+    """A fake satisfying exactly what make_mcp_tool's closure calls:
+    .call_tool(name, arguments, timeout_seconds=...) -> an object with
+    .content / .isError. Never touches a real MCPBridge or real asyncio
+    machinery -- this tests ONLY the Evidence-construction/parsing logic
+    make_mcp_tool's closure wraps around whatever a bridge returns."""
+
+    def __init__(self, result):
+        self._result = result
+        self.calls = []
+
+    def call_tool(self, name, arguments, timeout_seconds=30.0):
+        self.calls.append((name, arguments, timeout_seconds))
+        return self._result
+
+
+def _task(query="q", key="t1", goal_id="g1"):
+    from research_agent.state import SearchTask
+
+    return SearchTask(key=key, goal_id=goal_id, query=query, depth=0)
+
+
+def test_make_mcp_tool_converts_text_content_to_evidence():
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    result = _FakeCallToolResult(content=[_FakeContentBlock(text="fact one")])
+    bridge = _FakeBridgeForToolParsing(result)
+    tool = make_mcp_tool(bridge, "search", query_arg_name="query")
+
+    evidence = tool(_task(query="redis vs cassandra", key="t1", goal_id="g1"))
+
+    assert len(evidence) == 1
+    assert evidence[0].content == "fact one"
+    assert evidence[0].source == "mcp"
+    assert evidence[0].task_key == "t1"
+    assert evidence[0].goal_id == "g1"
+    assert bridge.calls == [("search", {"query": "redis vs cassandra"}, 30.0)]
+
+
+def test_make_mcp_tool_produces_one_evidence_item_per_text_block():
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    result = _FakeCallToolResult(content=[
+        _FakeContentBlock(text="fact A"), _FakeContentBlock(text="fact B")])
+    bridge = _FakeBridgeForToolParsing(result)
+    tool = make_mcp_tool(bridge, "search")
+
+    evidence = tool(_task())
+    assert [e.content for e in evidence] == ["fact A", "fact B"]
+
+
+def test_make_mcp_tool_skips_non_text_content_blocks():
+    """A content block with no .text (e.g. an image) is skipped, not an
+    error -- Evidence in this build is text-only."""
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    result = _FakeCallToolResult(content=[
+        _FakeContentBlock(text=None), _FakeContentBlock(text="only this one")])
+    bridge = _FakeBridgeForToolParsing(result)
+    tool = make_mcp_tool(bridge, "search")
+
+    evidence = tool(_task())
+    assert len(evidence) == 1
+    assert evidence[0].content == "only this one"
+
+
+def test_make_mcp_tool_returns_empty_list_on_tool_reported_error():
+    """isError=True is a TOOL-level failure (the server ran fine, the
+    tool itself reported nothing useful) -- treated as "no results",
+    not raised as an exception."""
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    result = _FakeCallToolResult(content=[_FakeContentBlock(text="ignored")], isError=True)
+    bridge = _FakeBridgeForToolParsing(result)
+    tool = make_mcp_tool(bridge, "search")
+
+    assert tool(_task()) == []
+
+
+def test_make_mcp_tool_uses_the_configured_query_arg_name():
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    bridge = _FakeBridgeForToolParsing(_FakeCallToolResult())
+    tool = make_mcp_tool(bridge, "search", query_arg_name="search_text")
+
+    tool(_task(query="hello"))
+    assert bridge.calls[0][1] == {"search_text": "hello"}
+
+
+def test_make_mcp_tool_content_is_capped_at_800_chars():
+    """Same slicing cap tools/corpus_search.py's corpus_search uses --
+    one enormous content block shouldn't dominate the compile prompt."""
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    long_text = "x" * 2000
+    bridge = _FakeBridgeForToolParsing(_FakeCallToolResult(content=[_FakeContentBlock(text=long_text)]))
+    tool = make_mcp_tool(bridge, "search")
+
+    evidence = tool(_task())
+    assert len(evidence[0].content) == 800
+
+
+def test_mcp_bridge_surfaces_a_clear_error_for_a_nonexistent_command():
+    """A bad command must fail fast and clearly (FileNotFoundError, in
+    practice), not hang -- proven against the REAL subprocess-spawning
+    path, not a mock (a mock could never demonstrate a real spawn
+    failure)."""
+    from research_agent.tools.mcp_client import MCPBridge
+
+    bridge = MCPBridge(command="this-command-does-not-exist-anywhere",
+                       args=[], env_allowlist=[], startup_timeout_seconds=5.0)
+    try:
+        with __import__("pytest").raises(Exception):
+            bridge.call_tool("search", {"query": "x"}, timeout_seconds=5.0)
+    finally:
+        bridge.close()  # must not itself raise, even after a failed start
+
+
+def test_mcp_tool_round_trips_through_a_real_stdio_server():
+    """The genuine end-to-end proof: a real subprocess, real MCP protocol,
+    real stdio pipes, using tests/fixtures/mcp_echo_server.py (a ~20-line
+    FastMCP server shipped in this repo, deterministic, no external
+    dependencies of its own). This is what caught the anyio cancel-scope
+    bug in MCPBridge.close() that no amount of mocking would have --
+    see this section's module-level note for the full story."""
+    import pathlib
+    import sys
+
+    from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
+
+    server_path = str(pathlib.Path(__file__).parent / "fixtures" / "mcp_echo_server.py")
+    bridge = MCPBridge(command=sys.executable, args=[server_path], env_allowlist=[])
+    tool = make_mcp_tool(bridge, "search", query_arg_name="query")
+    try:
+        evidence = tool(_task(query="redis vs cassandra", key="t1", goal_id="g1"))
+        assert len(evidence) == 1
+        assert evidence[0].content == "canned result for: redis vs cassandra"
+        assert evidence[0].source == "mcp"
+
+        # A second call on the SAME bridge proves the connection is
+        # actually PERSISTENT (reused), not re-spawned per call -- the
+        # whole point of the background-loop design over asyncio.run()
+        # per call (see MCPBridge's own docstring).
+        evidence2 = tool(_task(query="second query", key="t2", goal_id="g1"))
+        assert evidence2[0].content == "canned result for: second query"
+    finally:
+        bridge.close()  # must succeed cleanly -- this is the regression check
+
+
+# --- scripts/mcp_corpus_server.py ---
+#
+# A real MCP server wrapping the EXISTING tools/corpus_search.py tool --
+# built because a fair question ("the MCP server just has to call the
+# corpus tools, right?") pointed out that tests/fixtures/mcp_echo_server.py
+# proves the wiring but returns nothing genuinely useful. This section
+# tests scripts/mcp_corpus_server.py's OWN wrapping logic (hits_for_query,
+# search) via a fake corpus tool substituted directly into the module's
+# _corpus_tool global -- deliberately NOT importing it in a way that would
+# trigger the real lazy QdrantStore/OpenSearchStore construction (a real
+# run showed that path takes real network round trips to build, correctly
+# degrading if unreachable but far too slow for a unit test to eat on
+# every run -- see _get_corpus_tool's docstring in that file for the fix
+# that made import alone instant).
+
+
+def _load_mcp_corpus_server():
+    import importlib.util
+    import pathlib
+
+    script_path = (pathlib.Path(__file__).parent.parent
+                  / "scripts" / "mcp_corpus_server.py")
+    spec = importlib.util.spec_from_file_location("mcp_corpus_server", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_corpus_tool_returning(*contents):
+    """A stand-in for tools/corpus_search.py's own returned closure --
+    same ToolFn shape (task in, Evidence list out), fixed canned content
+    regardless of the task's actual query, purely for testing
+    mcp_corpus_server.py's OWN wrapping logic in isolation."""
+    from research_agent.state import Evidence, Volatility
+
+    def tool(task):
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="corpus",
+                         content=c, score=0.9, volatility=Volatility.SEMI_STABLE)
+                for c in contents]
+    return tool
+
+
+def test_mcp_corpus_server_imports_instantly_without_a_live_backend():
+    """Regression guard for the real bug a manual test caught: importing
+    this module must NOT eagerly build a real QdrantStore/OpenSearchStore
+    connection (that used to take ~10s of retry/backoff even though it
+    degrades gracefully) -- _corpus_tool must start as None."""
+    import time
+
+    t0 = time.time()
+    mod = _load_mcp_corpus_server()
+    elapsed = time.time() - t0
+
+    assert mod._corpus_tool is None
+    assert elapsed < 2.0, f"import took {elapsed}s -- lazy construction regressed"
+
+
+def test_hits_for_query_wraps_the_corpus_tool_correctly():
+    mod = _load_mcp_corpus_server()
+    mod._corpus_tool = _fake_corpus_tool_returning("hit one", "hit two")
+
+    result = mod.hits_for_query("redis vs cassandra")
+
+    assert result == ["hit one", "hit two"]
+
+
+def test_hits_for_query_constructs_a_valid_search_task():
+    """The corpus tool receives a real SearchTask, not a bare string --
+    confirms the wrapping actually goes through this repo's normal
+    SearchTask/Evidence contract, not some shortcut."""
+    mod = _load_mcp_corpus_server()
+    seen_tasks = []
+
+    def capturing_tool(task):
+        seen_tasks.append(task)
+        return []
+
+    mod._corpus_tool = capturing_tool
+    mod.hits_for_query("my query")
+
+    assert len(seen_tasks) == 1
+    assert seen_tasks[0].query == "my query"
+    assert seen_tasks[0].key  # non-empty
+    assert seen_tasks[0].goal_id  # non-empty
+
+
+def test_mcp_corpus_server_search_function_matches_hits_for_query():
+    """search() (the actual @mcp.tool()-decorated function FastMCP
+    exposes) must be a thin wrapper -- same result as calling
+    hits_for_query directly."""
+    mod = _load_mcp_corpus_server()
+    mod._corpus_tool = _fake_corpus_tool_returning("a", "b", "c")
+
+    assert mod.search("q") == mod.hits_for_query("q") == ["a", "b", "c"]
+
+
+def test_get_corpus_tool_only_builds_once():
+    """The lazy-singleton pattern: _get_corpus_tool must not rebuild on
+    every call once _corpus_tool is already set."""
+    mod = _load_mcp_corpus_server()
+    sentinel = _fake_corpus_tool_returning("x")
+    mod._corpus_tool = sentinel
+
+    first = mod._get_corpus_tool()
+    second = mod._get_corpus_tool()
+
+    assert first is sentinel
+    assert second is sentinel
+
+
+# --- P2-13 follow-up: evidence_by_source telemetry + worker.done source log ---
+#
+# Direct answer to "is there any indication content was retrieved via
+# MCP": before this, there wasn't a deterministic one -- only an
+# indirect, LLM-dependent hint (whether the compiled report's own
+# citations happened to preserve a "[goal | mcp | score]" tag). These
+# tests cover the two concrete signals added instead.
+
+
+def test_telemetry_evidence_by_source_reflects_the_standard_test_fixture(graph):
+    """The standard `graph` fixture's own fake_tool tags its evidence
+    source="fake" (see conftest.py) -- confirms evidence_by_source counts
+    whatever string is ACTUALLY on each Evidence item, not a hardcoded
+    list of expected sources like "corpus"/"mcp"/"memory"."""
+    from research_agent.state import ResearchState
+
+    result = graph.invoke(ResearchState(raw_query="q"),
+                          config={"configurable": {"thread_id": "evidence-by-source-fake"}})
+
+    telemetry = result["telemetry"]
+    assert telemetry["evidence_by_source"] == {"fake": telemetry["evidence_items"]}
+
+
+def test_telemetry_evidence_by_source_distinguishes_mcp_from_corpus(settings):
+    """The scenario this was actually built for: a tool tagging its
+    evidence source="mcp" (tools/mcp_client.py::make_mcp_tool always does
+    this) must show up as such in telemetry, distinctly from any other
+    source -- proven here with a minimal stand-in tool rather than a full
+    MCPBridge, since only the source-counting behavior is under test."""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from research_agent.llm.client import StubClient
+    from research_agent.llm.router import FallbackRouter
+    from research_agent.memory.semantic_memory import SemanticMemory
+    from research_agent.orchestration.graph import build_graph
+    from research_agent.state import Evidence, ResearchState, Volatility
+    from research_agent.storage.qdrant_store import QdrantStore
+
+    def mcp_shaped_tool(task):
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="mcp",
+                         content=f"mcp fact about {task.query}", score=0.9,
+                         volatility=Volatility.SEMI_STABLE)]
+
+    router = FallbackRouter([StubClient()], quality_threshold=0.6)
+    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+                            settings.memory_top_k, 90.0, 14.0)
+    graph = build_graph(router, mcp_shaped_tool, memory, settings, MemorySaver())
+
+    result = graph.invoke(ResearchState(raw_query="q"),
+                          config={"configurable": {"thread_id": "evidence-by-source-mcp"}})
+
+    telemetry = result["telemetry"]
+    assert telemetry["evidence_by_source"] == {"mcp": telemetry["evidence_items"]}
+    assert "corpus" not in telemetry["evidence_by_source"]
+
+
+def test_worker_done_log_line_reports_the_tools_actual_source(graph, caplog):
+    """Per-task, real-time visibility in a --debug trace: which tool
+    answered THIS specific task, not just the run-level aggregate."""
+    import logging as _logging
+
+    from research_agent.state import ResearchState
+
+    with caplog.at_level(_logging.INFO):
+        graph.invoke(ResearchState(raw_query="q"),
+                    config={"configurable": {"thread_id": "worker-done-source"}})
+
+    done_lines = [r for r in caplog.records if r.message == "worker.done"]
+    assert done_lines, "expected at least one worker.done log line"
+    for line in done_lines:
+        assert line.event_fields["source"] == "fake"  # matches conftest.py's fake_tool
+
+
+def test_mcp_bridge_survives_many_concurrent_first_calls():
+    """Regression test for a REAL bug a live run caught: multiple threads
+    calling call_tool() at nearly the same moment, before the bridge has
+    finished connecting, used to make every thread EXCEPT the one that
+    created the background thread skip the readiness wait entirely and
+    crash with AttributeError ('NoneType' object has no attribute
+    'call_tool') -- exactly reproducing LangGraph fanning several
+    search_worker instances out concurrently for one gather-cycle
+    superstep. Uses the REAL fixture server (tests/fixtures/
+    mcp_echo_server.py) and REAL threads -- a mock could not have caught
+    this, since the bug was a genuine race between real OS threads."""
+    import pathlib
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
+
+    server_path = str(pathlib.Path(__file__).parent / "fixtures" / "mcp_echo_server.py")
+    bridge = MCPBridge(command=sys.executable, args=[server_path], env_allowlist=[])
+    tool = make_mcp_tool(bridge, "search", query_arg_name="query")
+
+    def run_one(i):
+        return tool(_task(query=f"concurrent query {i}", key=f"t{i}", goal_id="g1"))
+
+    try:
+        # 8 threads all calling the SAME bridge for the first time at
+        # once -- exactly the shape that crashed before the fix, at a
+        # concurrency level at least as high as this codebase's own
+        # MAX_FANOUT default ever produces in one gather cycle.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(run_one, range(8)))
+
+        for i, evidence in enumerate(results):
+            assert len(evidence) == 1
+            assert evidence[0].content == f"canned result for: concurrent query {i}"
+    finally:
+        bridge.close()
+
+
+def test_get_corpus_tool_builds_exactly_once_under_real_concurrent_load():
+    """Regression test for a REAL bug a live run caught: the original
+    _get_corpus_tool had no lock around its "if _corpus_tool is None:
+    build it" check. FastMCP dispatches concurrent tool calls to worker
+    threads (this server's search() does blocking Qdrant/OpenSearch
+    calls), so six search_worker tasks firing at once -- this codebase's
+    normal gather-cycle fan-out -- meant six threads could all see
+    _corpus_tool is None SIMULTANEOUSLY and all six would build their OWN
+    separate QdrantStore/OpenSearchStore AT THE SAME TIME, turning one
+    measured ~13s cold start into six concurrently-competing ones that
+    blew past a 30s client-side timeout. Uses REAL threads and a slow
+    fake build function (not the real Qdrant/OpenSearch, which isn't
+    available in this test environment) to prove only ONE build ever
+    happens no matter how many threads race in at once -- the actual
+    mechanism under test is the lock, not the real retrieval backend."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    mod = _load_mcp_corpus_server()
+    build_count = []
+    build_lock = threading.Lock()  # only protects the counter itself, not _get_corpus_tool
+
+    def slow_fake_build():
+        with build_lock:
+            build_count.append(1)
+        time.sleep(0.2)  # long enough that concurrent callers would
+                          # overlap if the real lock weren't doing its job
+        return _fake_corpus_tool_returning("built")
+
+    mod._build_corpus_tool = slow_fake_build
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: mod._get_corpus_tool(), range(8)))
+
+    assert len(build_count) == 1, (
+        f"expected exactly 1 build, got {len(build_count)} -- "
+        "the thundering-herd race is back")
+    assert all(r is results[0] for r in results), "every caller must get the SAME instance"
+
+
+def test_mcp_bridge_timeout_error_is_actually_informative():
+    """Regression test for a fair, direct complaint: a real failure showed
+    up in this codebase's own D-16 failure log as bare "reason=
+    TimeoutError" with zero further detail -- concurrent.futures.
+    TimeoutError's own message is EMPTY (confirmed: str(TimeoutError())
+    == ""), so there was genuinely nothing else to show. This uses a REAL
+    server (tests/fixtures/mcp_slow_server.py, which sleeps 5s) and a
+    deliberately short 1s timeout to trigger the real timeout path fast
+    and deterministically, then checks the raised exception's message
+    actually names the tool, the arguments, and how long it waited --
+    not just the exception's class name."""
+    import pathlib
+    import sys
+
+    from research_agent.tools.mcp_client import MCPBridge
+
+    server_path = str(pathlib.Path(__file__).parent / "fixtures" / "mcp_slow_server.py")
+    # sys.executable, not a hardcoded "python3" -- FOUND BY A REAL FAILURE:
+    # on Windows there's typically no "python3" on PATH at all (the
+    # official installer only provides "python.exe"), so this fell back to
+    # whichever OTHER Python happened to resolve from PATH -- a completely
+    # different interpreter than the venv running pytest, missing the mcp
+    # package entirely, which crashed the subprocess immediately (surfacing
+    # as a confusing "McpError: Connection closed" rather than the
+    # ModuleNotFoundError that was the real cause, visible only in the
+    # subprocess's own captured stderr). Every other MCP test in this file
+    # already used sys.executable correctly; this one test didn't.
+    bridge = MCPBridge(command=sys.executable, args=[server_path], env_allowlist=[])
+    try:
+        try:
+            bridge.call_tool("search", {"query": "redis vs cassandra"}, timeout_seconds=1.0)
+            assert False, "expected a TimeoutError"
+        except TimeoutError as exc:
+            message = str(exc)
+            assert message, "the whole point of this fix: the message must NOT be empty"
+            assert "search" in message
+            assert "redis vs cassandra" in message
+            assert "1.0" in message  # the configured timeout, visible in the message
+    finally:
+        bridge.close()

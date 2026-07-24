@@ -20,6 +20,7 @@ Responsibilities:
 """
 
 import logging
+from collections import Counter
 from typing import Any, Dict
 
 from research_agent.config import Settings
@@ -222,13 +223,14 @@ def build_telemetry_node(debug: bool = False):
                 to all run), state.critique_passed, state.planning_error.
         CALLS   nothing external — pure aggregation.
         WRITES  state.telemetry = {intent, goals, iterations,
-                    evidence_items, recall, llm_node_calls,
-                    llm_provider_calls, llm_fallback_hops, llm_quality_calls,
-                    llm_quality_calls_failed, retrieval_dense_calls,
-                    retrieval_keyword_calls, retrieval_leg_unavailable,
-                    producer_rejects, search_calls, search_failures,
-                    memory_hits, memory_writes, revision_cycles,
-                    critique_passed, planning_error}
+                    evidence_items, evidence_by_source, recall,
+                    llm_node_calls, llm_provider_calls, llm_fallback_hops,
+                    llm_quality_calls, llm_quality_calls_failed,
+                    retrieval_dense_calls, retrieval_keyword_calls,
+                    retrieval_leg_unavailable, producer_rejects,
+                    search_calls, search_failures, memory_hits,
+                    memory_writes, revision_cycles, critique_passed,
+                    planning_error}
         NEXT    graph.py routes unconditionally to END. cli.py then prints
                 state.final_report followed by this telemetry dict, and
                 persists a summary row to Postgres (CLI only — the API
@@ -264,15 +266,41 @@ def build_telemetry_node(debug: bool = False):
         crashing the run. Read a debug trace (--debug) for full per-call
         detail (exact prompts/latencies) beyond what these aggregate counts
         show.
+
+        "evidence_by_source" (P2-13 follow-up): a plain {source: count}
+        breakdown -- {"corpus": 6} when the corpus tool is active,
+        {"mcp": 6} when tools/mcp_client.py's tool is active instead
+        (settings.mcp_enabled), {"memory": 5, "corpus": 6} when memory
+        recall contributed too, etc. Computed FRESH from state.evidence
+        here, not threaded through as an incrementally-bumped counter the
+        way llm_*/retrieval_*/search_* above are -- state.evidence is
+        already the complete, final list by the time this node runs, so
+        there's nothing to accumulate; recounting it directly here is
+        simpler and cannot drift out of sync with the actual evidence
+        list the way a separately-bumped counter theoretically could.
+        This exists because there was previously NO deterministic way to
+        confirm evidence came from MCP versus the corpus tool -- only an
+        indirect, LLM-dependent hint (whether the compiled report's own
+        citations happened to preserve the "[goal | source | score]"
+        tag templates.py's compile_report prompt includes per item).
         """
         if debug:
             log_event(logger, "node.enter", node="telemetry")
         c = state.counters
+        # Counter(...) tallies how many Evidence items each distinct
+        # `source` value appears with -- e.g. Counter(["corpus", "corpus",
+        # "mcp"]) -> {"corpus": 2, "mcp": 1}. dict(...) converts that
+        # Counter into a plain dict so it serializes the same simple way
+        # every other telemetry field already does (json.dumps has no
+        # trouble with a plain dict; a Counter object is unnecessary here
+        # once the counting itself is done).
+        evidence_by_source = dict(Counter(e.source for e in state.evidence))
         telemetry = {
             "intent": state.classification.get("intent"),
             "goals": len(state.goals),
             "iterations": state.iteration_depth,
             "evidence_items": len(state.evidence),
+            "evidence_by_source": evidence_by_source,
             "recall": round(state.recall_score, 3),
             "llm_node_calls": int(c.get("llm_node_calls", 0)),
             "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
