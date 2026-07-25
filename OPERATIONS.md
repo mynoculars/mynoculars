@@ -6,7 +6,8 @@ what you should see. If a step's output doesn't match, that's the diagnostic.
 
 > **Note on this revision:** the test suite is now **57** tests (was 34/36
 > in earlier revisions of this document) — Tier 2 of `internal/
-> PHASE-2_PLAN.md` (producer validation, boundary-scoped telemetry, Postgres
+> PHASE-2_PLAN.md` (gitignored, so it ships only in archives like this
+> one; producer validation, boundary-scoped telemetry, Postgres
 > lifecycle + API parity, config strictness) is closed, verified against
 > both the offline suite and multiple real live traces. Telemetry examples
 > throughout this document have been updated to the current field names
@@ -66,7 +67,7 @@ logging.getLogger("qdrant_client").setLevel(logging.ERROR)
 
 **Windows (PowerShell):**
 ```powershell
-cd agentic-research-agent
+cd research-agent-dmp
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -77,7 +78,7 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
 
 **Linux/macOS:**
 ```bash
-cd agentic-research-agent
+cd research-agent-dmp
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
@@ -121,10 +122,10 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 57 passed
+# expect: 135 passed
 ```
 
-If L1 runs and 57 tests pass, your code is fine. Everything from here is about
+If L1 runs and 135 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -231,6 +232,15 @@ Your `.env` is now ready:
 POSTGRES_DSN=postgresql://agent:agent@localhost:5432/research_agent
 ```
 
+**One table worth knowing about once you're in DBeaver**: alongside
+LangGraph's own `checkpoints`/`checkpoint_blobs`/`checkpoint_writes`
+tables, this codebase's own `record_run()` creates and writes an
+`agent_runs` table — one row per completed run (CLI or API), with
+`thread_id`, `query`, `recall`, `telemetry` (JSONB), and a timestamp.
+Nothing in this codebase reads it back; it exists purely for you and
+DBeaver to inspect post-hoc run history. See README.md's Storage
+Contracts section for the full column list.
+
 ===============================================================================
 **Terminal 2 — Qdrant**
 ===============================================================================
@@ -279,7 +289,7 @@ assume localhost on standard ports:
 LLM_MODE=stub                                 # still stub — one thing at a time
 QDRANT_URL=http://localhost:6333
 OPENSEARCH_URL=http://localhost:9200
-POSTGRES_DSN=postgresql://agent:agent@localhost:5432/agent
+POSTGRES_DSN=postgresql://agent:agent@localhost:5432/research_agent
 CORPUS_INDEX=agent_corpus
 MEMORY_COLLECTION=agent_semantic_memory
 ```
@@ -472,6 +482,8 @@ LLM_MODE=live
 LLM_PRIMARY_BASE_URL=http://127.0.0.1:8080/v1       # your llama-server
 LLM_PRIMARY_MODEL=deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf                       # whatever it reports
 LLM_FALLBACK_API_KEY=your-gemini-key-here            # optional
+LLM_PRIMARY_TIMEOUT_SECONDS=120                      # local model — raise if it's timing out
+LLM_TIMEOUT_SECONDS=90                               # Mistral + Gemini fallback
 ```
 
 ### Step 3d — Run
@@ -483,6 +495,44 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
 Now the report body is a real, evidence-grounded answer the model wrote from the
 6 retrieved facts. Watch the logs for `llm.fallback` lines — those tell you when
 the primary failed or scored below threshold and Gemini took over.
+
+---
+
+## Running the API (optional, separate from the CLI)
+
+Everything above uses the CLI (`python -m research_agent.cli`). This
+codebase ALSO ships a FastAPI app (`api/server.py`) with `/health`,
+`/research`, and `/resume` — a genuinely separate, optional way to run
+this codebase, not required for L1/L2/L3 or for anything else in this
+manual. Skip this section entirely if you only ever use the CLI.
+
+**Start it:**
+```powershell
+$env:PYTHONPATH = "src"
+uvicorn research_agent.api.server:app --reload
+```
+
+**Health-check it** (also covered by `scripts/check_services.py`'s
+`--api-url`/`--skip-api` flags — see "The 60-Second Is Everything Up?
+Check" below):
+```powershell
+curl http://127.0.0.1:8000/health
+```
+`durable` in the response tells you whether the checkpointer is really
+backed by Postgres (`true`) or silently degraded to `MemorySaver()`
+(`false`) — same signal the CLI logs as `checkpointer.postgres_active`/
+`checkpointer.memory_fallback`, surfaced here for a caller that doesn't
+read logs (P2-08).
+
+**Run a query through it:**
+```powershell
+$body = @{ query = "Compare Redis and Memcached for session caching"; thread_id = "api-test-1" } | ConvertTo-Json
+Invoke-RestMethod -Uri http://127.0.0.1:8000/research -Method Post -ContentType "application/json" -Body $body
+```
+
+A run through the API writes an `agent_runs` row exactly like a CLI run
+does (P2-08 — before this, only the CLI did), and closes its checkpointer
+connection on FastAPI shutdown, not per-request.
 
 ---
 
@@ -510,7 +560,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 57 tests, all offline, ~0.6s
+python -m pytest tests/ -q   # 135 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -586,24 +636,17 @@ Run this mental checklist when something's not working:
 # 1. Is my venv active and PYTHONPATH set?
 echo $PYTHONPATH          # must print: src
 
-# 2. Are the engines reachable? (only needed for L2/L3)
+# 2. Are all four live services reachable? (only needed for L2/L3)
+#    One command, checks Qdrant + OpenSearch + Postgres + the LLM engine,
+#    clear PASS/FAIL per service, nonzero exit code if anything's down:
+python scripts/check_services.py
+
+#    Manual fallback for any one service, if you want to check it in isolation:
 curl http://localhost:6333/collections     # Qdrant: JSON response = up
 curl http://localhost:9200                 # OpenSearch: JSON response = up
+curl http://127.0.0.1:8080/v1/models       # LLM engine: JSON response = up
+psql -h localhost -U agent -d agent -c "SELECT 1"   # Postgres: "1" back = up
 
-```PowerShell
-cd D:\work\softwares\PostgreSQL\pgsql\bin
-
-.\psql.exe -h localhost -U postgres
-
-# In the resultant PostGres prompt (postgres=#)type
-SELECT version()
-
-SELECT NOW()
-
-# To exit PostGres proplt and return to parent PostGres prompt, simply type exit
-exit
-
-```
 # 3. Is the corpus loaded?
 #    Re-run ingest; "indexed 10 / embedded 10" = yes, "SKIPPED" = engine down
 
@@ -632,8 +675,8 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **57 tests**, fully offline — no services, no API keys, no
-network. It's split into four files, each testing a different layer:
+The suite is **135 tests**, fully offline — no services, no API keys, no
+network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -641,48 +684,59 @@ python -m pytest tests/ -q
 ```
 
 ```text
-tests/test_core.py              25 tests   the graph's everyday logic
-tests/test_hitl.py                8 tests   the human-in-the-loop path
-tests/test_integration_paths.py   3 tests   cross-cutting failure paths
-tests/test_tier2.py              21 tests   P2-06/07/08/09 + ingest-dedup fix
-                                 --------
-                                  57 tests
+tests/unit/                  115 tests   one file per src/research_agent/ module
+tests/integration/             20 tests   full graph.invoke() runs, offline
+                              --------
+                              135 tests
 ```
 
-**What each file is actually proving:**
+The suite is organized by MODULE, mirroring `src/research_agent/`'s own
+layout, not by the development phase each test was written in (an earlier
+revision of this suite used five files named `test_core.py`/`test_tier2.py`/
+`test_tier3.py`/etc. -- `test_tier3.py` alone had grown to 74 tests spanning
+at least six unrelated areas by the time it was split up). Two top-level
+directories:
 
-- **`test_core.py`** — the bulk of the suite. Planning (goal composition,
-  task expansion), the gather loop (dispatch, merge, coverage, gap
-  generation), compile/critique, memory read/write, the dedup and depth-gate
-  rules (D-2/D-16), and the worker return-contract enforcement
-  (`orchestration/contracts.py`, D-15). If you change anything in `agents/`
-  or `state.py`, this is the file that will catch a regression first.
-- **`test_hitl.py`** — all four escalation triggers (E1–E4), each tested for
-  both `approve` and (where applicable) `redirect`/`abort`, plus the D-28
-  idempotency invariant: exactly one `escalation_history` entry per
-  escalation, even though the escalation node itself runs twice (once
-  pausing, once resuming). If you touch `agents/escalation.py` or the
-  routing functions in `orchestration/graph.py`, run this file specifically.
-- **`test_integration_paths.py`** — the smaller, cross-cutting checks: critic
-  exhaustion correctly skips `memory_writer`, a worker that raises is
-  recorded as *failed*, not *completed* (D-16), and the stub client tolerates
-  a model wrapping its JSON in markdown fences.
-- **`test_tier2.py`** — Tier 2's four items plus the P2-03 ingest-script
-  follow-up: producer-output rejection (P2-06, at both the `cap_and_filter`
-  and full-graph level), router- and retrieval-boundary telemetry counters
-  including a dedicated concurrency test proving the retrieval-side counters
-  are genuinely thread-safe under parallel `search_worker` dispatch (P2-07),
-  checkpointer lifecycle behavior (P2-08), config-typo warnings and
-  E2/E3 disabled-mode logging parity (P2-09), and `content_id()`'s
-  determinism for the Qdrant ingest fix. If you touch `llm/router.py`,
-  `retrieval/hybrid.py`, `agents/task_utils.py`, or `storage/postgres.py`,
-  run this file specifically.
+- **`tests/unit/`** — one file per source module, named to match:
+  `test_state.py`, `test_config.py`, `test_llm_router.py`, `test_llm_client.py`,
+  `test_memory_semantic.py`, `test_orchestration_contracts.py`,
+  `test_orchestration_graph.py`, `test_agents_task_utils.py`,
+  `test_agents_gathering.py`, `test_evaluation_quality.py`,
+  `test_storage_qdrant_store.py`, `test_storage_postgres.py`,
+  `test_retrieval_hybrid.py`, `test_tools_corpus_search.py`,
+  `test_tools_mcp_client.py`, `test_mcp_corpus_server.py`, `test_gc_memory.py`,
+  `test_tracing.py`, `test_prompts.py`. If you change a function in
+  `src/research_agent/foo/bar.py`, `tests/unit/test_foo_bar.py` (or
+  `tests/unit/test_bar.py` for a top-level module) is the file that will
+  catch a regression first -- that's the whole point of the module-mirrored
+  layout.
+- **`tests/integration/`** — full `graph.invoke()` runs, offline, on
+  StubClient + fake tools: `test_graph_end_to_end.py` (the base e2e run,
+  telemetry counters, `evidence_by_source`), `test_hitl_escalation.py`
+  (all four HITL triggers E1-E4, D-28's idempotency invariant),
+  `test_failure_paths.py` (critique exhaustion, worker failure recording,
+  D-16), `test_mcp_routing_end_to_end.py` (P2-14's mixed corpus/MCP
+  backlog, real graph run). A unit-level test proves one function's logic
+  in isolation; these prove the WHOLE chain still works when everything is
+  wired together -- a telemetry field can be correctly bumped in
+  `state.counters` and still never reach `result["telemetry"]`, for
+  instance, which only a real `graph.invoke()` would catch (see
+  `test_graph_end_to_end.py::test_telemetry_surfaces_llm_quality_calls_failed_end_to_end`
+  for exactly that shape of regression).
+
+`tests/conftest.py` holds every fixture and stub shared across more than
+one file (`settings`, `stub_router`, `fake_tool`, `off_memory`, `graph`,
+and `RejectingCriticStub` -- shared between `test_failure_paths.py` and
+`test_hitl_escalation.py`, since E4 in the latter is triggered BY the same
+critique-exhaustion behavior the former tests directly). It applies
+automatically to both `tests/unit/` and `tests/integration/` -- that's
+standard pytest conftest.py scoping, not anything special to this repo.
 
 **Run just one file, or just one test:**
 
 ```powershell
-python -m pytest tests/test_hitl.py -q
-python -m pytest tests/test_hitl.py::test_e3_interrupts_then_approve_ships_partial -q
+python -m pytest tests/integration/test_hitl_escalation.py -q
+python -m pytest tests/integration/test_hitl_escalation.py::test_e3_interrupts_then_approve_ships_partial -q
 python -m pytest tests/ -k "critique" -q       # anything with "critique" in its name
 ```
 
@@ -1174,4 +1228,26 @@ real `QdrantStore`/`OpenSearchStore`/embedding model on the server's
 first request (see `mcp_corpus_server.py::_get_corpus_tool`), not the
 concurrency issue above — raise `MCP_CALL_TIMEOUT_SECONDS` (e.g. 120+)
 for that instead.
+
+**A second, separate stall, found after the above fix was already in
+place**: the FIRST `search()` call in a real deployment still stalled
+for ~120s, before any network call even started — nowhere near the
+~13s cold-start figure above. Root cause: `qdrant_client` was being
+imported lazily, for the first time in that process, on a
+`_search_executor` worker thread, while the main thread's asyncio
+Proactor loop was already running real overlapped I/O on the stdio
+pipes — that specific combination (a live Proactor loop doing real I/O,
+plus a first-time native-extension import happening on another thread)
+reproduced reliably on at least one Windows deployment machine,
+independent of any configured timeout. Two other plausible explanations
+(antivirus/EDR file-hash scanning of the DLLs; `CREATE_NO_WINDOW` plus a
+stripped-down subprocess environment) were tested directly, in
+isolation, and ruled out — it's specifically the thread/event-loop
+combination. **Fixed** by importing `qdrant_client` and `opensearchpy`
+eagerly, on the main thread, at module load time in
+`mcp_corpus_server.py`, before `mcp.run()` starts the event loop — see
+that file's own module docstring ("First-import gotcha") for the full
+account. If you ever see a mysterious ~120s stall on the very first
+`search()` call (and nowhere else), check that those two eager imports
+are still present before looking anywhere else.
 </file_text>

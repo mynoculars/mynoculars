@@ -340,11 +340,12 @@ Legend
   E1*/E2-E3*/E4* — with HITL_ENABLED=true the marked checks INTERRUPT the
   run for human review (approve / redirect with guidance / abort) and
   resume under the same thread_id.
-  With HITL disabled: E1 and E4 log `escalation.stub` at WARNING and
+  With HITL disabled: E1–E4 all log `escalation.stub` at WARNING and
   continue (E4 ships the report marked unreviewed — never silently as
-  good). E2/E3 log NOTHING — their whole trigger block sits inside
-  `if settings.hitl_enabled`. That asymmetry is a real gap, not a
-  documentation shortcut. See Documentation Corrections.
+  good). P2-09 closed the E2/E3 parity gap that used to exist here
+  (their trigger block used to sit inside `if settings.hitl_enabled`,
+  so they logged nothing when HITL was off, unlike E1/E4 — now fixed,
+  see Recent Fixes and Limitations).
 ```
 
 **Termination is guaranteed by four independent bounds** (design §6.3, all four
@@ -660,14 +661,20 @@ Plus three LangGraph indexes: `checkpoints_thread_id_idx`,
 
 Three behaviours worth knowing before you debug something:
 
-- **The API writes no run history.** `record_run` is called only from
-  `cli.py::main`. API runs checkpoint normally and produce no `agent_runs` row.
-- **Degradation is invisible in the output.** `get_checkpointer` catches *any*
-  exception and returns `MemorySaver()` with `durable=False` — and
-  `build_app_and_settings` throws that flag away. The only signal is the stderr
-  log line `checkpointer.postgres_active` or `checkpointer.memory_fallback`.
-- **The checkpointer connection is never closed.** Harmless for a one-shot CLI;
-  a leak in a long-lived FastAPI process.
+- **Both CLI and API write run history (P2-08).** `record_run` is called
+  from both `cli.py::main` and `api/server.py` on completion of
+  `/research` and `/resume` — a run through either path produces an
+  `agent_runs` row.
+- **Degradation is surfaced, not silent (P2-08).** `get_checkpointer`
+  still catches *any* exception and returns `MemorySaver()` with
+  `durable=False`, but `build_app_and_settings` no longer discards that
+  flag — it's carried on the returned `AppBundle` and surfaced in the
+  API's `/health` response. The stderr log line
+  (`checkpointer.postgres_active` / `checkpointer.memory_fallback`) still
+  fires too, so there are now two independent ways to see it, not one.
+- **The checkpointer connection is closed on exit (P2-08).**
+  `close_checkpointer()` is called from both the CLI's `finally` block
+  and the FastAPI shutdown handler.
 - **⚠ Reusing the same `--thread-id` across unrelated runs silently
   accumulates state.** Every `Annotated[..., reducer]` field on
   `ResearchState` (`counters`, `evidence`, `completed_task_keys`,
@@ -884,7 +891,8 @@ interrupt-based human station:
   D-28 made concrete: the whole node RE-EXECUTES from its top on resume.
   Everything above interrupt() is a pure read, and escalation_history is
   appended in the RESUME update — never before — so re-execution cannot
-  double-append. Six tests in tests/test_hitl.py assert exactly that from
+  double-append. Six tests in tests/integration/test_hitl_escalation.py
+  assert exactly that from
   the outside: one history entry per escalation, despite two executions.
 ```
 
@@ -1005,7 +1013,7 @@ Unchanged by tonight's fixes.
 | 2 | Namespace memory goal ids on retrieval | **Done** — `memory/semantic_memory.py::retrieve` |
 | 3 | Apply a similarity floor before hits become Evidence | **Done** — `retrieval/hybrid.py`, `min_similarity` |
 | 4 | Require at least one `source == "corpus"` item for coverage, or weight memory below fresh retrieval | Not done — still open, not part of tonight's scope |
-| 5 | Add an integration test asserting an interrupt for an out-of-corpus query | **Done** — two tests added to `tests/test_hitl.py`, both passing (57/57 total, current suite). **Live confirmation exists too**, though via the retrieval-failure path (D-16) rather than the low-relevance-evidence path these tests specifically target — see the status note at the top of this section |
+| 5 | Add an integration test asserting an interrupt for an out-of-corpus query | **Done** — two tests added (now in `tests/integration/test_hitl_escalation.py` after the later test-suite reorg), both passing (135/135 total, current suite). **Live confirmation exists too**, though via the retrieval-failure path (D-16) rather than the low-relevance-evidence path these tests specifically target — see the status note at the top of this section |
 
 Items 1–3 were each individually sufficient to make E3 reachable for the
 documented query; all three are now in place together. Item 5 is what turns
@@ -1109,13 +1117,23 @@ research-agent-dmp/
 │   ├── retrieval/           # hybrid dense+BM25 with RRF + relevance floor
 │   ├── memory/              # semantic memory with decay + namespaced ids
 │   ├── storage/             # postgres / qdrant / opensearch wrappers
-│   ├── tools/                # the corpus-search tool workers invoke (MCP seam)
+│   ├── tools/                # the corpus-search tool workers invoke (MCP seam):
+│   │                        corpus_search.py (default) + mcp_client.py (P2-13,
+│   │                        stdio transport, opt-in via MCP_ENABLED)
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 57 tests, offline (25 core, 8 HITL, 3 paths, 21 tier2)
+├── tests/                   # 135 tests, offline. Organized by module,
+│                              mirroring src/research_agent/'s own layout:
+│                              tests/unit/<module>.py (one file per source
+│                              module) + tests/integration/<scenario>.py
+│                              (full graph.invoke() runs). See
+│                              OPERATIONS.md "Running and Interpreting the
+│                              Test Suite" for the full file-by-file map.
 ├── scripts/ingest_sample_data.py
 ├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
+├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool (P2-13, off by default via MCP_ENABLED=false)
+├── scripts/check_services.py     # health check: Qdrant/OpenSearch/Postgres/LLM/MCP/API (D-33)
 ├── sample_data/corpus.jsonl # 10 docs, Redis-vs-Memcached theme
 ├── design/Research_Agent_Design.md
 ├── OPERATIONS.md   internal/LEARNING_GUIDE.md   internal/PHASE-2_PLAN.md
@@ -1137,7 +1155,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 57 passed
+python -m pytest tests/ -q    # expect: 135 passed
 ```
 
 Windows: `run.bat` does the venv, install, and a stub run in one command.
@@ -1212,9 +1230,9 @@ not a replacement.
 ## Limitations
 
 Split into what was *deferred by design* and what is simply *broken*, because
-conflating the two is how a reference build stops being trustworthy. Four
-items have moved out of "broken" since the last revision — marked below,
-left visible rather than deleted, so the history stays auditable.
+conflating the two is how a reference build stops being trustworthy. Items
+below that were fixed or added across revisions are marked as such and left
+visible rather than deleted, so the history stays auditable.
 
 **Deferred by design**
 
@@ -1271,7 +1289,9 @@ left visible rather than deleted, so the history stays auditable.
     (D-25) routes a task to a named specialist (`"mcp"` today, the only
     one this build has) instead of the default corpus worker.
     `cap_and_filter` validates the hint against what's actually wired in;
-    inert with `MCP_ENABLED=false`.
+    inert with `MCP_ENABLED=false`. **Confirmed usable under real
+    concurrency** since the fixes in item 6 below (6 concurrent calls: 13.5s
+    wall time vs 79.2s summed -- ratio 1.02, genuinely parallel).
 16. ~~Server-side hybrid fusion deferred~~ — **P2-10**,
     `storage/qdrant_store.py::search_with_decay` (Qdrant `FormulaQuery` +
     payload indexes), gated by `MEMORY_SERVER_SIDE_DECAY` (off by
@@ -1289,6 +1309,20 @@ left visible rather than deleted, so the history stays auditable.
     `pool_maxsize=20` (was relying on the client library's small
     default). Harmless before this fix (each discarded connection still
     worked, just paid a fresh TCP+TLS handshake); now avoided.
+20. ~~No way to check whether Qdrant/OpenSearch/Postgres/the LLM engine
+    (and, opt-in, MCP/the FastAPI server) are actually reachable without
+    either running a full query or checking each one by hand~~ — **D-33**,
+    `scripts/check_services.py`: one command, clear PASS/FAIL/SKIP per
+    service, non-zero exit code if anything's down (usable as a
+    precondition in your own scripts). MCP and the FastAPI server are
+    both opt-in checks (MCP: SKIPPED when `MCP_ENABLED=false`, this
+    repo's default; FastAPI: `--skip-api` for CLI-only workflows).
+    Alongside this, the test suite itself was reorganized (**D-34**) from
+    five phase-named files into `tests/unit/<module>.py` +
+    `tests/integration/<scenario>.py`, mirroring `src/research_agent/`'s
+    own layout — see OPERATIONS.md's "Running and Interpreting the Test
+    Suite" for the full per-file map. Same 135 tests, zero behavior
+    change, verified by running the full suite before and after.
 
 **Still broken, in rough order of consequence**
 
@@ -1329,6 +1363,29 @@ left visible rather than deleted, so the history stays auditable.
    `MCP_ENABLED=false` (default) is unaffected either way; P2-14's
    tool_hint routing is now usable at real concurrency.
 
+   **Update -- a second, separate stall found and fixed after the above**:
+   even with the async/executor fix in place, the FIRST ever `search()`
+   call in a real deployment still stalled for ~120s before any network
+   call started. Root cause: `qdrant_client` was imported lazily, for the
+   first time in that process, on a `_search_executor` worker thread,
+   while the main thread's asyncio Proactor loop was already doing real
+   overlapped I/O on the stdio pipes -- that specific combination (live
+   Proactor I/O + a first-time native-extension import on another thread)
+   stalled reproducibly on at least one Windows deployment machine,
+   independent of any configured timeout (isolated, reproduced, and fixed
+   live; two other plausible causes -- antivirus file-hash scanning, and
+   `CREATE_NO_WINDOW` plus a stripped subprocess environment -- were tested
+   directly and ruled out). Fixed by importing `qdrant_client` and
+   `opensearchpy` eagerly, on the main thread, at module load time in
+   `scripts/mcp_corpus_server.py`, before `mcp.run()` starts the event
+   loop -- see that file's module docstring ("First-import gotcha") for
+   the full account. **Do not remove those two imports as "dead code"**;
+   they look redundant with `QdrantStore`/`OpenSearchStore`'s own lazy
+   imports but are load-order-critical. This also loosened
+   `tests/unit/test_mcp_corpus_server.py::test_mcp_corpus_server_imports_instantly_without_a_live_backend`'s
+   import-speed guard from 2s to 30s (an intentional trade-off,
+   documented on that test).
+
 
 ## Documentation Corrections
 
@@ -1339,7 +1396,7 @@ auditable rather than invisible.
 |---|---|
 | README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and, as of this revision, each hop tier uses a different timeout** |
 | README / OPERATIONS: "28 tests" | **57** tests collected and passing (25 core + 8 HITL + 3 integration + 21 in `test_tier2.py`, covering P2-06/P2-07/P2-08/P2-09/the ingest-dedup fix) |
-| design §12: "63 files, 28/32 tests passing, 4 skipped" | 52 files in this distribution; 57 tests, **0 skipped** |
+| design §12: "63 files, 28/32 tests passing, 4 skipped" | 52 files in this distribution; 135 tests (57 at Tier 2 closure, expanded after Tier 3), **0 skipped** |
 | README legend: with HITL off the checks "log and continue" | True for E1/E4 only; E2/E3 log nothing when HITL is off |
 | OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | **Now true for both stores as of this revision** — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism (P2-03) is now actually wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
 | OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and **since re-verified end-to-end against real live runs** — both a genuine E3 escalation (via the D-16 failed-task path) and, once the corpus was properly ingested, a clean convergence at `recall 1.0` with real evidence. See The HITL Investigation |
@@ -1387,30 +1444,30 @@ The shape of it, updated with this revision's progress:
   one was confirmed. One incidental fix (opensearch-py 3.x compatibility)
   landed alongside this work, outside either tier's original scope.
                      │
-  TIER 3 ── design catch-up ──► close the D-25/26/27/30 gap        NOT STARTED
-     P2-10  Qdrant payload indexes + server-side decay      (D-27)
-     P2-11  judge-model quality scoring                      ← unblocked now
-                                                                 that P2-07 is
-                                                                 done
-     P2-12  semantic contradiction detector — E2 reachable at last
-                                                                 ← unblocked now
-                                                                 that P2-01 is
-                                                                 done
-     P2-13  MCP tool seam                                   (D-26/D-30)
-     P2-14  typed specialist workers                        (D-25)
-     P2-15  memory supersession + GC
+  TIER 3 ── design catch-up ──► close the D-25/26/27/30 gap        ✅ CLOSED
+     P2-10  Qdrant payload indexes + server-side decay      (D-27) ✅ DONE
+     P2-11  judge-model quality scoring                             ✅ DONE
+     P2-12  semantic contradiction detector — E2 reachable at last   ✅ DONE
+                                                                 (marker-only
+                                                                 detector still
+                                                                 applies, see
+                                                                 Limitations)
+     P2-13  MCP tool seam                                   (D-26/D-30) ✅ DONE
+     P2-14  typed specialist workers                        (D-25) ✅ DONE
+     P2-15  memory supersession + GC                                ✅ DONE
+                     │
+  TIER 3 STATUS: CLOSED. See DECISIONS.md D-25 through D-30 and this file's
+  Limitations section for what's confirmed live vs. offline-only for each item.
 ```
 
-**What's actually next:** Tiers 1 and 2 are both closed — 57/57 tests pass,
-verified against multiple real live traces with different fallback,
-escalation, and retrieval shapes, not just offline stub-mode runs. Tier 3
-is untouched, as scoped from the start: each item there is explicitly
-safer once Tier 1/2 provide trustworthy measurement to evaluate it
-against, which is now genuinely true rather than aspirational. Of the six
-Tier 3 items, two are now unblocked by dependency (`P2-11` depends on
-`P2-07`; `P2-12` depends on `P2-01`) and are arguably the highest-value
-next steps: `P2-12` closes the one escalation trigger (`E2`) that has
-never fired in a real run, and `P2-11` directly addresses an observed live
-failure — a report whose Cassandra/DynamoDB sections cited no retrieved
-evidence, passed anyway by same-model self-critique.
+**Status, updated**: Tiers 1, 2, and 3 are all closed — see the roadmap
+diagram above and `DECISIONS.md` (D-25 through D-30) for what each Tier 3
+item actually shipped. `P2-12` (semantic contradiction detector) made `E2`
+reachable in principle, though the detector itself remains marker-only in
+practice — see Limitations for the current honest status of that gap.
+`P2-11` (judge-model quality scoring) directly addressed the observed live
+failure this paragraph used to describe: a report whose Cassandra/DynamoDB
+sections cited no retrieved evidence, passed anyway by same-model
+self-critique — the judge is now always the next provider in the fallback
+chain, never the one being judged.
 </file_text>

@@ -1,11 +1,12 @@
 """
-tests/test_hitl.py — Human-in-the-loop escalation (D-23/D-28), fully offline.
+tests/integration/test_hitl_escalation.py — Human-in-the-loop escalation
+(D-23/D-28), fully offline.
 
-Covers: interrupts fire only when HITL is enabled; each trigger pauses with
-the right payload; approve/redirect/abort resume correctly under the same
-thread_id; escalation_history records exactly ONE entry per escalation
-(the D-28 idempotency invariant, observed from outside); every path still
-terminates with a report.
+Covers: interrupts fire only when HITL is enabled; each trigger pauses
+with the right payload; approve/redirect/abort resume correctly under
+the same thread_id; escalation_history records exactly ONE entry per
+escalation (the D-28 idempotency invariant, observed from outside); every
+path still terminates with a report.
 """
 
 import json
@@ -19,11 +20,9 @@ from research_agent.llm.client import StubClient
 from research_agent.llm.router import FallbackRouter
 from research_agent.orchestration.graph import build_graph
 from research_agent.retrieval.hybrid import HybridRetriever
-from research_agent.state import ResearchState
 from research_agent.state import Evidence, ResearchState, Volatility
 
-from tests.test_integration_paths import RejectingCriticStub
-
+from tests.conftest import RejectingCriticStub
 
 
 @pytest.fixture
@@ -119,6 +118,7 @@ def test_e3_interrupts_then_approve_ships_partial(off_memory, stub_router,
     assert result["final_report"]
     assert result["telemetry"]["recall"] == 0.0  # shipped partial, honestly
 
+
 class LowRelevanceTool:
     """Retrieval tool that always returns evidence scored BELOW the
     coverage floor — simulating exactly what corpus_search used to hand
@@ -134,6 +134,7 @@ class LowRelevanceTool:
         return [Evidence(task_key=task.key, goal_id=task.goal_id, source="fake",
                          content=f"barely-related note about {task.query}",
                          score=0.2, volatility=Volatility.SEMI_STABLE)]
+
 
 # complementary, narrower test — for the retrieval-time floor itself
 def test_e3_fires_on_low_relevance_evidence_not_just_tool_failure(
@@ -158,7 +159,8 @@ def test_e3_fires_on_low_relevance_evidence_not_just_tool_failure(
 
     result = graph.invoke(_resume("approve"), config=cfg)
     assert result["final_report"]
-    
+
+
 def test_min_similarity_floor_drops_low_relevance_dense_hits():
     """P2-01's other gate, tested in isolation from the graph. Without this,
     only the coverage-check half of the fix (above) is covered."""
@@ -174,7 +176,7 @@ def test_min_similarity_floor_drops_low_relevance_dense_hits():
     retriever = HybridRetriever(FakeDense(), FakeKeyword(), min_similarity=0.35)
     results = retriever.search("q", top_k=5)
     assert len(results) == 1
-    assert results[0]["title"] == "on-topic"    
+    assert results[0]["title"] == "on-topic"
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +229,22 @@ def test_disabled_hitl_never_interrupts(graph, settings):
         config=_cfg(settings, "hitl-off"))
     assert "__interrupt__" not in result
     assert result["escalation_history"] == []
+
+
+def test_e3_stub_logs_when_hitl_disabled(off_memory, stub_router, settings, caplog):
+    """P2-09: previously E2/E3 emitted NOTHING when HITL was off, unlike
+    E1/E4's existing 'escalation.stub' lines — this proves parity without
+    changing routing (the run still reaches telemetry normally, no
+    interrupt)."""
+    import logging
+
+    graph = build_graph(stub_router, BrokenTool(), off_memory, settings, MemorySaver())
+    with caplog.at_level(logging.WARNING):
+        result = graph.invoke(
+            ResearchState(raw_query="q"),
+            config={"configurable": {"thread_id": "test-p209-e3"},
+                    "recursion_limit": settings.recursion_limit})
+    assert "__interrupt__" not in result  # HITL off: never pauses
+    stub_lines = [r for r in caplog.records if "escalation.stub" in r.message]
+    assert stub_lines, "expected an escalation.stub WARNING when HITL is off"
+    assert stub_lines[0].event_fields["trigger"] in ("E2", "E3")

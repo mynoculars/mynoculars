@@ -5,6 +5,8 @@ Every test runs fully offline: StubClient for the LLM, an in-process fake
 retrieval tool, degraded (off) memory, and an in-memory checkpointer.
 """
 
+import json
+
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -15,6 +17,23 @@ from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.orchestration.graph import build_graph
 from research_agent.state import Evidence, SearchTask, Volatility
 from research_agent.storage.qdrant_store import QdrantStore
+
+
+class RejectingCriticStub(StubClient):
+    """StubClient whose critic ALWAYS fails the report.
+
+    Shared between tests/integration/test_failure_paths.py (critique
+    exhaustion) and tests/integration/test_hitl_escalation.py (E4, which
+    is triggered BY critique exhaustion) -- defined here, once, rather
+    than one of those files importing it from the other.
+    """
+
+    def complete(self, messages, temperature=0.2):
+        last = messages[-1]["content"]
+        if "TASK=critique" in last:
+            return json.dumps({"passed": False, "score": 0.2,
+                               "notes": ["missing tradeoff analysis"]})
+        return super().complete(messages, temperature)
 
 
 @pytest.fixture

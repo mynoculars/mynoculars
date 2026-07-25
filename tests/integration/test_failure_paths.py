@@ -1,35 +1,40 @@
 """
-tests/test_integration_paths.py — Full-graph tests for the two failure paths
-the base e2e test cannot reach (added per external review item R4).
+tests/integration/test_failure_paths.py — full-graph tests for the two
+failure paths the base e2e test cannot reach (added per external review
+item R4).
 
-1. Critique exhaustion (E4 stub path): critic rejects every draft ->
-   revision loop must terminate at MAX_REVISIONS, memory must NOT be fed,
-   the (unreviewed) report must still ship.
+1. Critique exhaustion (E4 stub path, HITL off): critic rejects every
+   draft -> revision loop must terminate at MAX_REVISIONS, memory must
+   NOT be fed, the (unreviewed) report must still ship. (The HITL-ON
+   version of this same trigger is tests/integration/
+   test_hitl_escalation.py's E4 tests — RejectingCriticStub is shared
+   between both files via conftest.py.)
 2. Worker failure (D-16 path): the tool raises on every call -> failures
-   recorded with depth, run still terminates with a report, nothing marked
-   completed.
+   recorded with depth, run still terminates with a report, nothing
+   marked completed.
 """
 
-import json
-
-import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from research_agent.llm.client import StubClient, _extract_json
+import pytest
+
 from research_agent.llm.router import FallbackRouter
 from research_agent.orchestration.graph import build_graph
 from research_agent.state import ResearchState
 
+from tests.conftest import RejectingCriticStub
 
-class RejectingCriticStub(StubClient):
-    """StubClient whose critic ALWAYS fails the report."""
 
-    def complete(self, messages, temperature=0.2):
-        last = messages[-1]["content"]
-        if "TASK=critique" in last:
-            return json.dumps({"passed": False, "score": 0.2,
-                               "notes": ["missing tradeoff analysis"]})
-        return super().complete(messages, temperature)
+@pytest.fixture
+def broken_tool():
+    """A retrieval tool that always raises (backend down). Local to this
+    file -- only test_worker_failures_recorded_and_run_terminates below
+    uses it."""
+
+    def tool(task):
+        raise ConnectionError("retrieval backend unreachable")
+
+    return tool
 
 
 def test_critique_exhaustion_terminates_and_skips_memory(
@@ -54,16 +59,6 @@ def test_critique_exhaustion_terminates_and_skips_memory(
     assert result["critique_notes"]
 
 
-@pytest.fixture
-def broken_tool():
-    """A retrieval tool that always raises (backend down)."""
-
-    def tool(task):
-        raise ConnectionError("retrieval backend unreachable")
-
-    return tool
-
-
 def test_worker_failures_recorded_and_run_terminates(
         broken_tool, off_memory, settings, stub_router):
     graph = build_graph(stub_router, broken_tool, off_memory, settings, MemorySaver())
@@ -85,8 +80,3 @@ def test_worker_failures_recorded_and_run_terminates(
     # empty-backlog fallthrough (D-1) still lands a report.
     assert tele["recall"] == 0.0
     assert result["final_report"]
-
-
-def test_stub_json_fence_tolerance():
-    """Regression guard for _extract_json's fence stripping."""
-    assert _extract_json('```json\n{"a": 1}\n```') == {"a": 1}
