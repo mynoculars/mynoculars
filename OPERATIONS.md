@@ -1148,29 +1148,30 @@ still succeeded, urllib3 just couldn't cache the connection for reuse
 headroom. If you still see this warning after updating, you've likely
 raised `MAX_FANOUT` above 20 — bump `pool_maxsize` to match.
 
-### MCP tool (`MCP_ENABLED=true`) is slow / times out under concurrent load — KNOWN, UNRESOLVED
+### MCP tool (`MCP_ENABLED=true`) was slow / timed out under concurrent load — FIXED
 
-Root cause confirmed (not a mystery, just not yet fixed): FastMCP calls a
-synchronous tool handler directly on its single event loop, with no
-thread offload (`mcp/server/fastmcp/utilities/func_metadata.py::
-call_fn_with_arg_validation` — `fn(**args)`, not `asyncio.to_thread(fn,
-**args)`). `scripts/mcp_corpus_server.py`'s `search()` does real, blocking
-Qdrant/OpenSearch I/O (~13s+ per call), so one in-flight request blocks
-the ENTIRE server — `MAX_FANOUT` concurrent search_worker calls fully
-serialize instead of running in parallel. Confirmed live: the same 6
-concurrent searches that complete in 14.4s total called directly (no
-MCP) took 100+ seconds through MCP, all still eventually succeeding
-(not a correctness bug — see the real end-to-end trace evidence in
-`README.md`'s Limitations section, item 6).
+Root cause (confirmed by reading `mcp/server/fastmcp/utilities/
+func_metadata.py::call_fn_with_arg_validation`): a synchronous tool
+handler is called directly on FastMCP's single event loop, with no
+thread offload (`fn(**args)`, not `asyncio.to_thread(fn, **args)`). A
+synchronous `scripts/mcp_corpus_server.py::search()` doing real, blocking
+Qdrant/OpenSearch I/O (~13s+ per call) therefore blocked the ENTIRE
+server for one in-flight request — `MAX_FANOUT` concurrent
+search_worker calls fully serialized instead of running in parallel.
+Confirmed live: 6 concurrent searches that complete in 14.4s total
+called directly (no MCP) took 100+ seconds through MCP, all still
+eventually succeeding (never a correctness bug — see the real
+end-to-end trace evidence in `README.md`'s Limitations section, item 6).
 
-**Not fixed yet.** `MCP_ENABLED=false` (the default) is completely
-unaffected — the corpus tool and P2-14's tool_hint routing mechanism
-both work correctly and are fully tested; this only bites you if you
-turn MCP on AND hit it with real concurrent load. If you need this
-working now: lower `MAX_FANOUT` to reduce how many requests pile up
-concurrently, and raise `MCP_CALL_TIMEOUT_SECONDS` well above 30 (e.g.
-120+) so a queued request doesn't time out before its turn. The real
-fix — making `mcp_corpus_server.py::search` `async def` with the
-blocking call wrapped in `asyncio.to_thread(...)` — is scoped but not
-implemented.
+**Fixed**: `mcp_corpus_server.py::search` is now `async def`, and the
+blocking `hits_for_query` call is offloaded to a dedicated
+`ThreadPoolExecutor` (sized by the new `MCP_MAX_WORKERS` setting,
+default 6) via `loop.run_in_executor(...)`, so FastMCP's event loop stays
+free to service other requests while one call is mid-flight.
+`MCP_ENABLED=false` (the default) was always unaffected. If you still
+see slow first calls: that's the one-time ~13s cold start building the
+real `QdrantStore`/`OpenSearchStore`/embedding model on the server's
+first request (see `mcp_corpus_server.py::_get_corpus_tool`), not the
+concurrency issue above — raise `MCP_CALL_TIMEOUT_SECONDS` (e.g. 120+)
+for that instead.
 </file_text>

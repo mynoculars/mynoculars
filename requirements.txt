@@ -30,3 +30,6 @@ mcp>=1.9
 
 # Tests
 pytest>=8.0
+
+# Windows API bindings for Python
+pywin32>=311; platform_system == "Windows"

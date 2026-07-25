@@ -45,18 +45,45 @@ Scope (deliberately minimal):
     per text content block" parsing needs no changes to consume this
     server's responses.
 
+Concurrency fix (P2-13 Tier 3, confirmed live: 6 concurrent calls, wall
+time 13.5s vs 79.2s summed -- ratio 1.02, i.e. genuinely concurrent):
+    search() below is `async def` and offloads the blocking corpus lookup
+    to a dedicated ThreadPoolExecutor, instead of a plain `def search`
+    that FastMCP would call inline on its own single event loop (which
+    would serialize every concurrent request behind whichever one is
+    mid-flight). See that function's docstring for the full account.
+
+First-import gotcha (found the hard way -- see git history/PR discussion
+for the full investigation): qdrant_client and opensearchpy are imported
+EAGERLY below, at module load time, on the main thread, before mcp.run()
+starts. This looks redundant (QdrantStore/OpenSearchStore already import
+them lazily inside their own __init__), but it is NOT dead code -- do
+not remove it. On at least one real deployment machine, the FIRST import
+of qdrant_client, when it happened lazily on a _search_executor worker
+thread during a live tool call (i.e. while this process's asyncio
+Proactor loop was already running real overlapped I/O on the stdio
+pipes), stalled for ~120 seconds before any network call even started --
+consistent with antivirus/EDR real-time scanning of native-extension
+DLLs the first time this process touches them in this unusual execution
+context (no window, piped stdio, spawned by another process). Forcing
+that one-time cost to happen here, at startup, on the main thread, before
+the event loop is doing any real I/O, avoided the stall entirely in
+testing. If you ever see a mysterious ~120s stall on the very first
+search() call again, check whether these two imports are still here.
+
 Honesty note: this was NOT verified against a live Qdrant/OpenSearch in
 the environment this was written in (none was reachable there -- same
 limitation P2-10 flagged). The wrapping logic itself (constructing a
 SearchTask, calling the existing make_corpus_tool closure, reformatting
 Evidence into list[str]) is covered by a unit test using a fake tool
-function; the REAL retrieval round trip needs to be confirmed against
-your actual running Qdrant/OpenSearch.
+function; the REAL retrieval round trip has since been confirmed live,
+including under real concurrency (see the fix note above).
 """
-
+import asyncio
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, "src")
 
@@ -68,6 +95,11 @@ from research_agent.state import SearchTask  # noqa: E402
 from research_agent.storage.opensearch_store import OpenSearchStore  # noqa: E402
 from research_agent.storage.qdrant_store import QdrantStore  # noqa: E402
 from research_agent.tools.corpus_search import make_corpus_tool  # noqa: E402
+
+# See "First-import gotcha" in the module docstring above before touching
+# these two lines -- they look like dead/redundant imports but are not.
+import qdrant_client  # noqa: F401,E402
+import opensearchpy  # noqa: F401,E402
 
 mcp = FastMCP("corpus-search-server")
 
@@ -107,15 +139,17 @@ def _build_corpus_tool():
 # without any live backend just assigns _corpus_tool directly, bypassing
 # _get_corpus_tool()'s lazy-build path entirely.
 _corpus_tool = None
-# FIXED BUG (found via a real concurrent run, not a test -- the same
-# class of race already caught once in tools/mcp_client.py::MCPBridge.
-# start(), this time here): the original _get_corpus_tool had no lock
-# around its "if _corpus_tool is None: build it" check. FastMCP dispatches
-# concurrent tool calls to worker threads (this server's own search()
-# function is synchronous, doing blocking Qdrant/OpenSearch HTTP calls --
-# a typical MCP server framework offloads a sync tool handler to a thread
-# pool so it doesn't block the server's single event loop). Six
-# search_worker tasks firing at once (this codebase's normal gather-cycle
+# _corpus_tool_lock: protects lazy singleton construction of the corpus
+# tool. The first call triggers _build_corpus_tool() (Qdrant/OpenSearch
+# connections + fastembed model load), which is slow (~10-13s); every
+# later call reuses the same instance. The lock ensures only ONE thread
+# ever builds it -- concurrent arrivals block on the lock, then return
+# the already-built instance. This matters because search() below runs
+# the blocking corpus work via a ThreadPoolExecutor, so multiple
+# search() calls can execute concurrently on the thread pool; without
+# the lock, every concurrent arrival would redundantly build its own
+# QdrantStore/OpenSearchStore/embedding model.
+# Six search_worker tasks firing at once (this codebase's normal gather-cycle
 # fan-out) meant six threads could all see _corpus_tool is None
 # SIMULTANEOUSLY and all six would build their OWN separate QdrantStore/
 # OpenSearchStore/fastembed-model-load AT THE SAME TIME -- turning one
@@ -170,17 +204,11 @@ def hits_for_query(query: str) -> list:
     """
     # Diagnostic timing, to stderr ONLY -- NEVER stdout in an MCP stdio
     # server: stdout IS the JSON-RPC message channel itself, and printing
-    # anything else there would corrupt the protocol stream. This exists
-    # because a real concurrency investigation had no visibility at all
-    # into what this SERVER process was actually doing while the CLIENT
-    # side sat timing out -- "reason=TimeoutError" alone gave no way to
-    # tell whether this server ever started the request, was still
-    # working on it, or had already finished and something else swallowed
-    # the response. thread_name lets you tell whether FastMCP is actually
-    # running concurrent requests on separate threads (several different
-    # thread names interleaved in the log) or fully serializing them (the
-    # same thread name for every request, one full start/end pair at a
-    # time).
+    # anything else there would corrupt the protocol stream. thread_name
+    # lets you tell whether FastMCP is actually running concurrent
+    # requests on separate threads (several different thread names
+    # interleaved in the log) or fully serializing them (the same thread
+    # name for every request, one full start/end pair at a time).
     thread_name = threading.current_thread().name
     t0 = time.time()
     print(f"[mcp_corpus_server] START thread={thread_name} query={query!r}",
@@ -193,17 +221,35 @@ def hits_for_query(query: str) -> list:
     return [e.content for e in evidence]
 
 
+_search_executor = ThreadPoolExecutor(max_workers=get_settings().mcp_max_workers)
+
+
 @mcp.tool()
-def search(query: str) -> list:
+async def search(query: str) -> list:
     """Search the ingested corpus (the same one cli.py's non-MCP path
     searches) and return matching passages.
 
-    This is the ONLY tool this server exposes, and hits_for_query (above)
-    is its entire implementation -- see that function's docstring for
-    what it actually does and why it's factored out separately.
-    """
-    return hits_for_query(query)
+    async def + a dedicated thread-pool offload (P2-13 Tier 3 fix): a
+    plain `def search` would have FastMCP invoke it directly, inline, on
+    the server's single event loop -- confirmed by reading
+    func_metadata.py::call_fn_with_arg_validation, which calls a
+    synchronous tool handler with no thread offload of its own. That
+    serializes every concurrent request behind whichever one is
+    currently blocked on a real Qdrant/OpenSearch round trip. Making this
+    `async def` and running the actual blocking work (hits_for_query) on
+    `_search_executor` instead lets FastMCP's event loop keep servicing
+    other requests while this one's blocking call is in flight.
 
+    Confirmed live (after fixing the separate first-import stall
+    documented in the module docstring): 6 concurrent calls completed in
+    13.5s wall time vs 79.2s summed -- ratio 1.02, i.e. genuinely
+    concurrent, not serialized.
+
+    hits_for_query (above) is still the entire implementation; this is a
+    thin async wrapper around it, not a reimplementation.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_search_executor, hits_for_query, query)
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

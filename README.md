@@ -1305,25 +1305,29 @@ left visible rather than deleted, so the history stays auditable.
    by Tier 2; no P2-xx item currently scoped to it.
 5. Contradiction detection remains marker-only — `E2` has never fired in a
    real run (`P2-12`, Tier 3, depends on P2-01 which is done).
-6. **MCP corpus server serializes under concurrent load** (`P2-13`, Tier 3):
-   `scripts/mcp_corpus_server.py`'s tool handler is synchronous; FastMCP
-   calls it directly on its single event loop with no thread offload
-   (confirmed by reading `func_metadata.py::call_fn_with_arg_validation` —
-   `fn(**args)` called inline, not via `asyncio.to_thread`). Result: one
-   real MCP request blocks the whole server for its full duration (~13s+
-   for a real Qdrant/OpenSearch round trip), so `MAX_FANOUT` concurrent
-   requests fully serialize instead of running in parallel — confirmed
-   live: 6 concurrent calls that take 14.4s total called DIRECTLY (no
-   MCP) took 100+ seconds through MCP, with two additional real
-   concurrency bugs (a `MCPBridge.start()` race and a
-   `_get_corpus_tool()` thundering-herd race, both since fixed) found and
-   fixed along the way but NOT the cause of this specific slowdown. Not
-   a correctness bug — every request eventually completes correctly, just
-   slowly. Fix (not yet done): make `mcp_corpus_server.py::search`
-   `async def` and wrap the blocking call in `asyncio.to_thread(...)`.
-   `MCP_ENABLED=false` (default) is unaffected; P2-14's tool_hint routing
-   is fully built and tested, just not practically usable at real
-   concurrency until this is fixed.
+6. **MCP corpus server serialized under concurrent load** (`P2-13`, Tier 3)
+   — **FIXED**: `scripts/mcp_corpus_server.py`'s tool handler used to be
+   synchronous; FastMCP called it directly on its single event loop with
+   no thread offload (confirmed by reading
+   `func_metadata.py::call_fn_with_arg_validation` — `fn(**args)` called
+   inline, not via `asyncio.to_thread`). Result: one real MCP request
+   blocked the whole server for its full duration (~13s+ for a real
+   Qdrant/OpenSearch round trip), so `MAX_FANOUT` concurrent requests
+   fully serialized instead of running in parallel — confirmed live: 6
+   concurrent calls that take 14.4s total called DIRECTLY (no MCP) took
+   100+ seconds through MCP, with two additional real concurrency bugs (a
+   `MCPBridge.start()` race and a `_get_corpus_tool()` thundering-herd
+   race, both since fixed) found and fixed along the way but NOT the
+   cause of this specific slowdown. Never a correctness bug — every
+   request always completed correctly, just slowly. Fixed by making
+   `mcp_corpus_server.py::search` `async def` and offloading the blocking
+   `hits_for_query` call to a dedicated `ThreadPoolExecutor` sized by the
+   new `mcp_max_workers` setting (default 6, matching `MAX_FANOUT`) via
+   `loop.run_in_executor(...)` — functionally equivalent to the
+   `asyncio.to_thread(...)` approach originally proposed here, with an
+   explicitly bounded pool instead of the default executor.
+   `MCP_ENABLED=false` (default) is unaffected either way; P2-14's
+   tool_hint routing is now usable at real concurrency.
 
 
 ## Documentation Corrections

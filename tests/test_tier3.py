@@ -1269,8 +1269,25 @@ def _fake_corpus_tool_returning(*contents):
 def test_mcp_corpus_server_imports_instantly_without_a_live_backend():
     """Regression guard for the real bug a manual test caught: importing
     this module must NOT eagerly build a real QdrantStore/OpenSearchStore
-    connection (that used to take ~10s of retry/backoff even though it
-    degrades gracefully) -- _corpus_tool must start as None."""
+    CONNECTION (that used to take ~10s of retry/backoff even though it
+    degrades gracefully) -- _corpus_tool must start as None.
+
+    The wall-clock threshold below is deliberately loose (30s, not the
+    original 2s). A later fix (see mcp_corpus_server.py's module
+    docstring, "First-import gotcha") made this module eagerly IMPORT
+    qdrant_client/opensearchpy -- not connect to them -- at module load
+    time, on purpose, to avoid a real ~120s stall that happened when
+    their first import instead happened lazily on a worker thread during
+    a live tool call. That eager import alone genuinely costs several
+    seconds (confirmed: ~9s in one environment) even with no live
+    backend reachable, which is an accepted, intentional trade-off: a few
+    seconds of slower importability in exchange for never silently
+    hanging on a real request. This test still fails fast (30s, not
+    unbounded) if that cost balloons far beyond what a plain package
+    import should cost, and still asserts _corpus_tool stays None -- the
+    thing this test actually guards against (an eager CONNECTION attempt)
+    is unchanged.
+    """
     import time
 
     t0 = time.time()
@@ -1278,7 +1295,7 @@ def test_mcp_corpus_server_imports_instantly_without_a_live_backend():
     elapsed = time.time() - t0
 
     assert mod._corpus_tool is None
-    assert elapsed < 2.0, f"import took {elapsed}s -- lazy construction regressed"
+    assert elapsed < 30.0, f"import took {elapsed}s -- far more than a plain package import should cost"
 
 
 def test_hits_for_query_wraps_the_corpus_tool_correctly():
@@ -1312,12 +1329,17 @@ def test_hits_for_query_constructs_a_valid_search_task():
 
 def test_mcp_corpus_server_search_function_matches_hits_for_query():
     """search() (the actual @mcp.tool()-decorated function FastMCP
-    exposes) must be a thin wrapper -- same result as calling
-    hits_for_query directly."""
+    exposes) is `async def` (P2-13 Tier 3 concurrency fix: the blocking
+    call is offloaded to a thread pool so FastMCP's single event loop
+    isn't held up -- see README.md Limitations #6) but must still be a
+    thin wrapper -- same result as calling hits_for_query directly, just
+    awaited."""
+    import asyncio
+
     mod = _load_mcp_corpus_server()
     mod._corpus_tool = _fake_corpus_tool_returning("a", "b", "c")
 
-    assert mod.search("q") == mod.hits_for_query("q") == ["a", "b", "c"]
+    assert asyncio.run(mod.search("q")) == mod.hits_for_query("q") == ["a", "b", "c"]
 
 
 def test_get_corpus_tool_only_builds_once():

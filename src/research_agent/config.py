@@ -230,7 +230,7 @@ class Settings(BaseSettings):
     # string -- not every server will call it "query".
     mcp_query_arg_name: str = "query"
     mcp_call_timeout_seconds: float = 30.0
-
+    mcp_max_workers: int = Field(6, ge=1)
     # Debug tracing: when true (or --debug on the CLI), dump the exact prompt,
     # raw response, provider, tokens and latency of every LLM call, plus every
     # retrieval engine's hits, to logs/trace-<run_id>.txt. Off by default.
