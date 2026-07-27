@@ -148,6 +148,79 @@ class ChatClient(Protocol):
         ...
 
 
+def strip_code_fence(text: str) -> str:
+    r"""Remove one leading/trailing markdown code fence, any language tag.
+
+    CALLED BY   agents/compilation.py::compiler_node, on the raw string
+                complete() returns for templates.py::compile_report — the
+                ONE call site in this file whose caller expects prose back,
+                not JSON (see that function's own docstring).
+    WHY THIS EXISTS: compile_report's prompt explicitly asks for Markdown
+    prose, but a model under fallback (observed live: Mistral, reached
+    after a quality-reject bounced the call out of the primary provider)
+    can still answer with a ```json ...``` block despite that instruction
+    -- the same "small models fence everything even when told not to"
+    behaviour _extract_json below already exists to handle for the
+    JSON-mode call sites. compiler_node had NO equivalent handling on its
+    free-text path, so the fence markers (and, if the model ignored the
+    instruction outright, a full JSON document instead of prose) landed
+    verbatim in state.final_report and were printed to the user as-is.
+
+    This strips the FENCE, whatever the language tag -- ```json,
+    ```markdown, bare ```, or a tag containing non-word characters like
+    ```c++ or ```objective-c. It deliberately does NOT try to detect or
+    reformat JSON *content* into Markdown: that would mean guessing a
+    schema-to-prose transform for arbitrary model output, a much larger
+    and riskier change than removing three delimiter lines. A model that
+    ignores the prompt and answers with genuine JSON *content* still
+    produces JSON content after this call -- just without a fence wrapped
+    around it. Closing that remaining gap is a prompting/model-selection
+    question, not a safe one-line code fix, and out of scope here.
+
+    IMPLEMENTATION NOTE (this replaced an earlier, buggier version): a
+    single regex with a `|` alternation -- one side matching the opening
+    fence, the other the closing one -- looks tidy but conflates two
+    independent jobs into one expression, and `\w+` for the language tag
+    is too narrow: it does not match `c++`, `objective-c`, or any tag
+    with a non-word character, silently leaving a stray fragment (e.g.
+    "-c\n...") behind in the output instead of the actual content.
+
+    This version does the two jobs separately and in sequence: match the
+    OPENING fence first (```<anything but a backtick/newline><newline>,
+    so the tag itself is unconstrained -- unlike `\w+`, it can never
+    misparse a punctuated tag). Only then does it search for a CLOSING
+    fence, and only within the text AFTER the opening match -- never
+    independently against the whole string. That ordering is what makes
+    the two steps safe to combine: a closing search scoped to "everything
+    after the opening" can't be fooled by, and can't overlap with, the
+    opening match itself, so no extra bookkeeping is needed to keep the
+    two sides from stepping on each other. It also means an unfenced
+    string (or one with only an opening OR only a closing marker, not
+    both) is left completely untouched -- there is no way for one bare
+    delimiter to be "half stripped".
+
+    A single line with no newline at all -- e.g. `` ```hello``` `` -- is
+    intentionally left AS-IS: per CommonMark, a fenced code block's
+    opening delimiter must end its own line, so a fence-like run with no
+    newline separating a "tag" from what follows is not a real fence,
+    just three backticks as literal content. Treating it as unfenced
+    avoids swallowing genuine content into a falsely-detected tag.
+    """
+    if not text:
+        return text
+    body = text.strip()
+    if not body:
+        return body
+    open_match = re.match(r"```[^`\n]*\n", body)
+    if not open_match:
+        return body
+    rest = body[open_match.end():]
+    close_match = re.search(r"\n?```[ \t]*$", rest)
+    if not close_match:
+        return body
+    return rest[:close_match.start()]
+
+
 def _extract_json(text: str) -> Dict[str, Any]:
     """Parse JSON out of a model reply, tolerating ```json fences AND
     trailing chat-template sentinels.

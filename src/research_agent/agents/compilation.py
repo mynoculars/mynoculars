@@ -24,6 +24,7 @@ from collections import Counter
 from typing import Any, Dict
 
 from research_agent.config import Settings
+from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event
 from research_agent.memory.semantic_memory import SemanticMemory
@@ -93,6 +94,13 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         router.set_node("compiler")
         report = router.complete(templates.compile_report(
             state.raw_query, state.goals, state.evidence, state.critique_notes))
+        # A model under fallback can still wrap its answer in a code fence
+        # despite compile_report's explicit "write Markdown, not JSON, no
+        # fence" instruction -- observed live from Mistral after a
+        # quality-reject bounced the call off the primary provider. See
+        # llm/client.py::strip_code_fence for why this exists and what it
+        # deliberately does NOT attempt to fix.
+        report = strip_code_fence(report)
         # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
         # complete() (not complete_json) is the only free-text path, so this
         # is the one node whose drained counters can include
