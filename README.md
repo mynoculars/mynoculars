@@ -1,10 +1,40 @@
 # Agentic Research Agent — Reference Implementation (Core Build)
 
-A production-style (not production-grade) research agent built on LangGraph,
-showcasing production-oriented architecture and engineering practices. Given
-a research question, it plans goals, retrieves evidence in parallel,
-iteratively deepens coverage, self-critiques its report, pauses for human
-review when it cannot converge, and remembers what it learned for future runs.
+<p align="center">
+  <img src="mynoculars_logo.png" alt="Mynoculars Logo" width="250">
+</p>
+
+A LangGraph research agent that plans goals, retrieves evidence in parallel, 
+iteratively deepens coverage, and self-critiques until it produces a cited 
+report. If it cannot converge, it halts for human review rather than 
+hallucinating a conclusion. State and learnings persist across sessions.
+
+This is a reference implementation of production agent architecture—graph-based 
+state machines, provider fallback chains, structured observability, and 
+exhaustive regression testing—not a hosted SaaS, but a demonstration of how 
+to build agentic systems that degrade gracefully and improve with oversight.
+
+> **CORRECTED THIS PASS** (post-Tier-3 session, 4 further live-tested
+> patches applied on top of everything below): `api/server.py`'s
+> `AppBundle` unpack crashed the whole API at import — fixed. MCP
+> evidence's hardcoded `score=1.0` bypassed the coverage gate — fixed.
+> Mid-run retrieval-leg failures are now isolated per-leg (previously
+> only *boot-time* unavailability degraded gracefully; a store dying
+> mid-run used to kill the whole task, discarding the healthy leg's hits
+> too). Postgres checkpointer is now pooled (`psycopg_pool`, with a
+> fallback to a single connection). A `qdrant_client` embedder race under
+> parallel fan-out is now locked. Retrieved evidence is now fenced against
+> prompt injection (`<evidence>...</evidence>` + an explicit system-prompt
+> clause) in every prompt that inlines it. `escalation_history` now
+> surfaces in telemetry (`telemetry["escalations"]`) — previously written
+> by `human_escalation`, read by nothing. **The CLI's exit code is no
+> longer always 0** (Limitations item 27, corrected below). The compiler's
+> free-text output now survives a fallback provider wrapping it in a code
+> fence or echoing the `<evidence>` tag back literally (`strip_code_fence`,
+> tested against 15 edge cases including punctuated language tags like
+> `c++`). **Test suite: 157/157**, up from 135 — every count below is
+> corrected to match. Nothing else changed: the architecture, D-xx
+> decisions, and Tier 1/2/3 narrative below are all still accurate.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
@@ -33,7 +63,7 @@ review when it cannot converge, and remembers what it learned for future runs.
 > `opensearch-py` 3.x compatibility break (`indices.exists`/`.create`/
 > `.index`/`indices.refresh` now require `index=` as a keyword argument,
 > not positional) surfaced during live ingest testing and is fixed in
-> `storage/opensearch_store.py`. Full suite: **57/57 tests passing**.
+> `storage/opensearch_store.py`. Full suite: **157/157 tests passing**.
 >
 > The escalation path remains confirmed live, end-to-end, from the prior
 > revision — a real run with `HITL_ENABLED=true` reached
@@ -107,7 +137,7 @@ below for continuity); Tier 2's table follows it.
 | **Incidental — opensearch-py 3.x compatibility** | `storage/opensearch_store.py`'s `indices.exists`/`.create`/`.index`/`indices.refresh` calls passed the index/document name **positionally**; the installed `opensearch-py` 3.x client makes this a hard `TypeError` (`index=` must be a keyword). Fixed at all four call sites — `search()` already used the keyword form and was unaffected | Live: `python scripts/ingest_sample_data.py` failed with exactly this `TypeError` before the fix and completed cleanly (`OpenSearch: indexed 10`) after it |
 | **P2-03 follow-up — ingest script now actually idempotent** | `scripts/ingest_sample_data.py` was still calling `QdrantStore.upsert_texts(docs)` with no `id_fn` — the mechanism P2-03 added existed but nothing used it, so every re-ingest still duplicated the dense leg. New `content_id()` helper (`uuid.uuid5` of each document's content — deterministic, and a valid Qdrant point-id shape, unlike a raw hash digest) is now passed as `id_fn` | Three new unit tests (determinism, distinctness, valid-UUID shape); **your own Qdrant collection still has the ~20 duplicate points from ingest runs before this fix landed** — this only stops future re-ingests from adding more, it doesn't retroactively clean up what's already there (a `reset_stores.py --yes` + re-ingest gets you back to a clean 10) |
 
-**Full test suite: 57/57 passing** (36 from Tier 1 + 12 from Tier 2's four items + 6 from the P2-07 retrieval-side follow-up + 3 from the P2-03 ingest-script wiring).
+**Full test suite: 157/157 passing.**
 
 **A calibration caveat, stated plainly rather than buried:** `0.5` and
 `0.35` are starting points anchored to a real debug trace, not values
@@ -174,10 +204,10 @@ dependencies, which is why the whole system can be rewired with fakes in a
 single test fixture.
 
 ```text
-            ┌────────────────────────────────────────────────────┐
-            │  CLI (cli.py)               FastAPI (api/server.py)│
-            │  build_app_and_settings()   — one wiring point     │
-            └──────────────────────────┬─────────────────────────┘
+            ┌─────────────────────────────────────────────────────┐
+            │  CLI (cli.py)               FastAPI (api/server.py) │
+            │  build_app_and_settings()   — one wiring point      │
+            └──────────────────────────┬──────────────────────────┘
                                        │  ResearchState(raw_query=…)
                                        │  config={thread_id, recursion_limit}
                                        ▼
@@ -198,9 +228,8 @@ single test fixture.
   │      │   │     │ RRF in Python │          │        │      PostgreSQL       │
   │      │   │     │ + min_similar.│          │        │ ┌───────────────────┐ │
   │      │   │     │ floor (P2-01) │          │        │ │ checkpoints       │ │
-  │      │   │     └──┬─────────┬──┘          │        │ │ checkpoint_blobs  │ │
-  ▼      ▼   ▼        ▼         ▼             ▼        │ │ checkpoint_writes │ │
-┌─────┐┌────┐┌────┐┌───────┐┌─────────┐┌─────────────┐ │ │ checkpoint_migra. │ │
+  ▼      ▼   ▼        ▼         ▼             ▼        │ │ checkpoint_blobs  │ │
+┌─────┐┌────┐┌────┐┌───────┐┌─────────┐┌─────────────┐ │ │ checkpoint_writes │ │
 │Cogi-││Mist││Gem ││Qdrant ││OpenSea- ││Qdrant       │ │ ├───────────────────┤ │
 │to   ││ral ││ini ││agent_ ││rch      ││agent_seman- │ │ │ agent_runs  (app) │ │
 │local││    ││    ││corpus ││agent_   ││tic_memory   │ │ └───────────────────┘ │
@@ -210,10 +239,10 @@ single test fixture.
                        ▲          ▲            ▲
                        └─────┬────┘            │
                              │                 │
-                   ┌─────────┴─────────┐  ┌────┴──────────────┐
-                   │ingest_sample_data │  │memory_writer node │
-                   │.py (manual, 1×)   │  │(after a PASSED    │
-                   └───────────────────┘  │ critique only)    │
+               ┌─────────────┴─────────┐  ┌────┴──────────────┐
+               │ingest_sample_data.py  │  │memory_writer node │
+               │    (manual, 1×)       │  │(after a PASSED    │
+               └───────────────────────┘  │ critique only)    │
                                           └───────────────────┘
 ```
 
@@ -636,10 +665,13 @@ for **which timeout each hop uses**.
 Note the asymmetry between the two columns, because it is deliberate. JSON calls
 have **no quality gate** — a parsed object either satisfies the caller's schema
 or it does not, and the nodes validate their own required keys. Free-text calls
-do have one. And that quality score comes from asking the *same* provider to
-rate its own answer: cheap, weak, and honest about being weak in
-`evaluation/quality.py`. A scorer that itself errors returns `1.0`, so a flaky
-scoring call can never burn a working answer path.
+do have one. And that quality score comes from asking the *next provider in the
+fallback chain* to rate the answer — never the same provider that produced it
+(P2-11): cheap and honest about being weak in `evaluation/quality.py`. A scorer
+that itself errors returns `1.0`, so a flaky scoring call can never burn a
+working answer path — and that fail-open path is itself counted
+(`llm_quality_calls_failed`), so it's visible in telemetry rather than only
+in a log line.
 
 ## Storage Contracts
 
@@ -654,7 +686,7 @@ when something is in the wrong place.
 | `checkpoints` | same | LangGraph, once per superstep | Serialized `ResearchState` channel values keyed by `thread_id`. This is what makes `interrupt()`/resume and `--thread-id` replay work (D-8/D-20). |
 | `checkpoint_blobs` | same | LangGraph | Out-of-line channel values too large to inline. |
 | `checkpoint_writes` | same | LangGraph | Pending per-task writes for a superstep — including the interrupt resume payload. |
-| `agent_runs` | **our code**, via `CREATE TABLE IF NOT EXISTS` on *every* `record_run` call | **our code**, one row per completed CLI run | Post-hoc run history: `id BIGSERIAL PK`, `thread_id TEXT`, `query TEXT`, `recall REAL`, `telemetry JSONB`, `created_at TIMESTAMPTZ DEFAULT now()`. Nothing reads it back — it exists for you and DBeaver. |
+| `agent_runs` | **our code**, via `CREATE TABLE IF NOT EXISTS` on *every* `record_run` call | **our code**, one row per completed run (CLI or API) | Post-hoc run history: `id BIGSERIAL PK`, `thread_id TEXT`, `query TEXT`, `recall REAL`, `telemetry JSONB`, `created_at TIMESTAMPTZ DEFAULT now()`. Nothing reads it back — it exists for you and DBeaver. |
 
 Plus three LangGraph indexes: `checkpoints_thread_id_idx`,
 `checkpoint_blobs_thread_id_idx`, `checkpoint_writes_thread_id_idx`.
@@ -664,7 +696,10 @@ Three behaviours worth knowing before you debug something:
 - **Both CLI and API write run history (P2-08).** `record_run` is called
   from both `cli.py::main` and `api/server.py` on completion of
   `/research` and `/resume` — a run through either path produces an
-  `agent_runs` row.
+  `agent_runs` row. **Corrected this pass:** `api/server.py` previously
+  couldn't even import (`AppBundle` unpack crash) — if you were on an
+  un-patched checkout, this path wasn't reachable at all until this
+  session's fix.
 - **Degradation is surfaced, not silent (P2-08).** `get_checkpointer`
   still catches *any* exception and returns `MemorySaver()` with
   `durable=False`, but `build_app_and_settings` no longer discards that
@@ -672,6 +707,9 @@ Three behaviours worth knowing before you debug something:
   API's `/health` response. The stderr log line
   (`checkpointer.postgres_active` / `checkpointer.memory_fallback`) still
   fires too, so there are now two independent ways to see it, not one.
+  **Corrected this pass:** you may now also see `checkpointer.pool_active`
+  logged (Postgres checkpointer pooling, new this session) — a healthy
+  sign, not an error.
 - **The checkpointer connection is closed on exit (P2-08).**
   `close_checkpointer()` is called from both the CLI's `finally` block
   and the FastAPI shutdown handler.
@@ -687,7 +725,12 @@ Three behaviours worth knowing before you debug something:
   reuse a thread-id for a second, unrelated question — the second run's
   compiled report can silently draw on leftover evidence from the first.
   Not yet fixed; the practical workaround is simply not reusing thread-ids
-  for unrelated queries.
+  for unrelated queries. **Corrected this pass:** `escalation_history`
+  from this same reducer set is, as of this session, ALSO surfaced in
+  every run's final telemetry (`telemetry["escalations"]`) — previously
+  written and never read anywhere; the accumulation risk described here
+  is unchanged, but the escalation history itself is now visible in the
+  output, not only in Postgres.
 
 ### Qdrant
 
@@ -707,7 +750,10 @@ query hiding in there.
 argument** — fastembed's own default small English model, downloaded on first
 use (~100 MB). The dimension is never hardcoded: at collection creation the
 store embeds the literal string `"probe"` and takes `len(vector)`. Distance is
-`COSINE`.
+`COSINE`. **Corrected this pass:** the lazy build of this embedder is now
+guarded by a lock (`threading.Lock`) — one `QdrantStore` is shared across
+every parallel `search_worker`, and without the lock a fan-out could
+previously trigger several concurrent embedder builds at once.
 
 **Per-vector payload**
 
@@ -875,18 +921,18 @@ interrupt-based human station:
                                                            │    Command(goto=) │
                                                            └─────────┬─────────┘
                                                                      │
-                 ┌───────────────────────────────────────────────────┤
-                 ▼                      ▼                            ▼
-           approve                  redirect                      abort
-      ┌──────────────┐        ┌──────────────────┐         ┌────────────────┐
- E1   │ ─► compiler  │        │ ─► goal_manager  │         │ ─► compiler    │
-      │  (error rpt) │        │  + human_guidance│         │  + abort_reason│
- E2/3 │ ─► compiler  │        │ ─► gap_generator │         │ ─► compiler    │
-      │  (ship thin) │        │  + human_guidance│         │  + abort_reason│
- E4   │ ─► telemetry │        │ ─► compiler      │         │ ─► telemetry   │
-      │  (unreviewed,│        │  + note "HUMAN   │         │  (no memory)   │
-      │   no memory) │        │    REVIEWER: …"  │         │                │
-      └──────────────┘        └──────────────────┘         └────────────────┘
+                 ┌───────────────────────┬───────────────────────────┤
+                 ▼                       ▼                           ▼
+             approve                  redirect                    abort
+        ┌──────────────┐       ┌───────────────────┐      ┌─────────────────┐
+   E1   │ ─► compiler  │       │ ─► goal_manager   │      │ ─► compiler     │
+        │  (error rpt) │       │  + human_guidance │      │  + abort_reason │
+   E2/3 │ ─► compiler  │       │ ─► gap_generator  │      │ ─► compiler     │
+        │  (ship thin) │       │  + human_guidance │      │  + abort_reason │
+   E4   │ ─► telemetry │       │ ─► compiler       │      │ ─► telemetry    │
+        │  (unreviewed,│       │  + note "HUMAN    │      │  (no memory)    │
+        │   no memory) │       │    REVIEWER: …"   │      │                 │
+        └──────────────┘       └───────────────────┘      └─────────────────┘
 
   D-28 made concrete: the whole node RE-EXECUTES from its top on resume.
   Everything above interrupt() is a pure read, and escalation_history is
@@ -913,15 +959,18 @@ goal_manager → task_expander → 6 workers → compiler → critic → END` �
 ```text
   ┌──────────────────────────────────────────────────────────────────────┐
   │ 1. MIN_EVIDENCE_SCORE defaulted to 0.0            [FIXED — now 0.5]  │
-  │    the coverage predicate is  e.score >= min_evidence_score          │
+  │    the coverage predicate WAS  e.score >= min_evidence_score          │
   │    at 0.0 that was TRUE for every item — even one scored exactly 0.0 │
+  │    (the predicate is now the STRICT  e.score > min_evidence_score,   │
+  │     which additionally closes a separate exact-boundary collision   │
+  │     — see the P2-01 follow-up row in Recent Fixes)                  │
   └───────────────────────────────┬──────────────────────────────────────┘
                                   ▼
   ┌──────────────────────────────────────────────────────────────────────┐
   │ 2. No relevance floor existed ANYWHERE       [FIXED — min_similarity]│
   │      QdrantStore.search      ─► top-k neighbours, unconditionally    │
   │      HybridRetriever.search  ─► NOW drops dense hits below the floor │
-  │                                 BEFORE fusion (P2-01)                │
+  │                                   BEFORE fusion (P2-01)              │
   │      corpus_search           ─► converts every SURVIVING hit         │
   │    an out-of-domain query can now, in principle, produce zero        │
   │    evidence — not yet confirmed end-to-end against a live run (P2-05)│
@@ -946,9 +995,12 @@ goal_manager → task_expander → 6 workers → compiler → critic → END` �
 E4 did not fire either: both critics returned `passed: true` on the **first**
 pass — including on a report whose Cassandra and DynamoDB sections were
 supported by no retrieved evidence whatsoever. Self-critique by the same
-model family is optimistic; that is what it costs. **This one is unrelated to
-P2-01/P2-02 and remains unfixed** — it's `P2-11` (judge-model quality
-scoring) in `internal/PHASE-2_PLAN.md`'s Tier 3, not something touched tonight.
+model family is optimistic; that is what it costs. **P2-11 (judge-model
+quality scoring, Tier 3) directly addressed this** by making the quality
+judge always the next provider in the fallback chain rather than the
+answering one — it closes the same-model-optimism half of the problem;
+there is still no programmatic, claim-by-claim grounding check, which
+remains a separate, genuinely open gap (see Limitations).
 
 Reproduced deterministically before the fix, no services required:
 `hitl_enabled=True`, stub LLM, and a tool returning one `score=0.0` item per
@@ -1003,7 +1055,6 @@ accepted and does nothing** — no warning, no error, HITL stays off:
 ```
 
 If HITL "isn't working", check the variable name before you check the code.
-Unchanged by tonight's fixes.
 
 ### What it takes to make the documented test real — updated status
 
@@ -1012,8 +1063,8 @@ Unchanged by tonight's fixes.
 | 1 | Raise `MIN_EVIDENCE_SCORE` above the measured off-topic floor | **Done** — now `0.5`, was `0.0` |
 | 2 | Namespace memory goal ids on retrieval | **Done** — `memory/semantic_memory.py::retrieve` |
 | 3 | Apply a similarity floor before hits become Evidence | **Done** — `retrieval/hybrid.py`, `min_similarity` |
-| 4 | Require at least one `source == "corpus"` item for coverage, or weight memory below fresh retrieval | Not done — still open, not part of tonight's scope |
-| 5 | Add an integration test asserting an interrupt for an out-of-corpus query | **Done** — two tests added (now in `tests/integration/test_hitl_escalation.py` after the later test-suite reorg), both passing (135/135 total, current suite). **Live confirmation exists too**, though via the retrieval-failure path (D-16) rather than the low-relevance-evidence path these tests specifically target — see the status note at the top of this section |
+| 4 | Require at least one `source == "corpus"` item for coverage, or weight memory below fresh retrieval | Not done — still open |
+| 5 | Add an integration test asserting an interrupt for an out-of-corpus query | **Done** — two tests in `tests/integration/test_hitl_escalation.py`, both passing (**157/157** total, current suite). **Live confirmation exists too**, though via the retrieval-failure path (D-16) rather than the low-relevance-evidence path these tests specifically target — see the status note at the top of this section |
 
 Items 1–3 were each individually sufficient to make E3 reachable for the
 documented query; all three are now in place together. Item 5 is what turns
@@ -1022,24 +1073,24 @@ documented query; all three are now in place together. Item 5 is what turns
 ## Telemetry — read it honestly
 
 `telemetry_node` aggregates counters that nodes recorded. It invents nothing,
-exactly as D-12 requires. **As of P2-07 (this revision), the counters are
-boundary-scoped, not just node-scoped** — the single biggest gap this
-section used to describe is now closed, on both the LLM side and the
-retrieval side:
+exactly as D-12 requires. **As of P2-07, the counters are boundary-scoped,
+not just node-scoped** — the single biggest gap this section used to
+describe is now closed, on both the LLM side and the retrieval side:
 
 | Field | Counts | Boundary |
 |---|---|---|
 | `llm_node_calls` | one per LLM-using **node execution** — renamed from `llm_calls` for honesty; a node that fell through two fallback hops still counts as one | node |
 | `llm_provider_calls` | one per **real provider attempt**, win or lose — fallback hops now visible | `llm/router.py::FallbackRouter` |
 | `llm_fallback_hops` | one per actual hop to the next provider (error or low-quality) | same |
-| `llm_quality_calls` | one per self-scoring call (`compiler_node`'s free-text path only — the only path with a quality gate) | same |
+| `llm_quality_calls` | one per self-scoring call (`compiler_node`'s free-text path only — the only path with a quality gate); `llm_quality_calls_failed` counts a fail-open scoring call separately | same |
 | `retrieval_dense_calls` / `retrieval_keyword_calls` | one pair per real `HybridRetriever.search()` attempt, bumped before either leg is even queried — so an attempt that raises partway through still counts | `retrieval/hybrid.py::HybridRetriever` |
-| `retrieval_leg_unavailable` | counts a store being unreachable at the moment of the call — **not** a leg that queried fine and legitimately returned nothing | same |
+| `retrieval_leg_unavailable` | counts a store being unreachable **at the moment of the call** — now includes a leg going down MID-RUN, not only one down at boot (per-leg failure isolation added this session), so this field is a more complete signal than in earlier revisions | same |
 | `producer_rejects` | malformed goal/task dicts the LLM returned, dropped by P2-06's validation instead of crashing the run | `agents/task_utils.py`, `agents/planning.py::goal_manager_node` |
 | `search_calls` | one per **successful worker** | node |
 | `search_failures` | one per worker that raised | node |
 | `memory_hits` / `memory_writes` | items in / points out | node |
 | `revision_cycles` | critic passes | node |
+| `escalations` *(new this session)* | `[{"trigger":..., "action":...}]` — every entry from `state.escalation_history`, previously written and never read anywhere | `agents/compilation.py::telemetry_node` |
 
 A real live trace showed this working correctly under genuinely messy
 conditions — two provider timeouts, a low-quality rejection, and a 429 —
@@ -1056,23 +1107,21 @@ every `retrieval.hybrid` log line that cycle).
 counts node executions, not provider requests — that's the *point* of the
 rename, not a residual bug. If you need "how many nodes touched an LLM at
 all" that's still the right field; if you need real provider traffic or
-spend, use `llm_provider_calls` now, which didn't exist before this
-revision.
+spend, use `llm_provider_calls`.
 
 **The trace is still the honest view for exact prompt/response detail, but
-it's no longer the only signal for volume.** `--debug` (or
-`DEBUG_TRACE=true`) records every LLM call and every retrieval call at the
-boundary it actually crosses, to `logs/trace-<run_id>.txt` — and, since a
-prior revision, **also emits a `"node.enter"` line to stderr for every
-node**, including `merger` and `progress_checker`, which touch neither an
-LLM nor a store and so still never appear in the trace file itself. See
-[Debugging a live run](#debugging-a-live-run) for exactly how to use both
-together. In one traced run, this combination revealed something telemetry
-alone never would: **OpenSearch never appeared at all**, because the keyword
-leg was down — the "hybrid" retriever was running single-legged, and nothing
-in the report or the (then node-scoped-only) telemetry said so.
-`retrieval_leg_unavailable` (this revision) now surfaces that same fact
-directly in the telemetry block itself, without needing the trace.
+it's not the only signal for volume.** `--debug` (or `DEBUG_TRACE=true`)
+records every LLM call and every retrieval call at the boundary it actually
+crosses, to `logs/trace-<run_id>.txt` — and also emits a `"node.enter"` line
+to stderr for every node, including `merger` and `progress_checker`, which
+touch neither an LLM nor a store and so still never appear in the trace file
+itself. See [Debugging a live run](#debugging-a-live-run) for exactly how to
+use both together. In one traced run, this combination revealed something
+telemetry alone never would: **OpenSearch never appeared at all**, because
+the keyword leg was down — the "hybrid" retriever was running single-legged,
+and nothing in the report or the (then node-scoped-only) telemetry said so.
+`retrieval_leg_unavailable` now surfaces that same fact directly in the
+telemetry block itself, without needing the trace.
 
 ## Design
 
@@ -1086,20 +1135,26 @@ directly in the telemetry block itself, without needing the trace.
   nothing.
 - **LLM routing** (`llm/`): one OpenAI-compatible client serves all three
   providers; fallback policy lives in exactly one place (`router.py`), which
-  now also owns the per-hop timeout split (local vs. cloud).
+  now also owns the per-hop timeout split (local vs. cloud). Both the router
+  and the underlying client now expose `close()` (this session), called on
+  CLI exit, so the httpx connections per provider are no longer leaked.
 - **Retrieval** (`retrieval/`, `storage/`, `tools/`): storage modules are
   policy-free wrappers; fusion math is a pure function; the tool translates
   hits into domain Evidence. `HybridRetriever` now also owns the
-  `min_similarity` relevance floor. `tools/corpus_search.py` is the MCP seam —
-  the calling pattern is already MCP-shaped, so the upgrade touches one module.
+  `min_similarity` relevance floor, and (this session) per-leg failure
+  isolation at runtime, not just at boot. `tools/corpus_search.py` is the MCP
+  seam — the calling pattern is already MCP-shaped, so the upgrade touches
+  one module.
 - **Memory** (`memory/`): similarity × volatility-decay reranking; memory items
   re-enter the graph as ordinary evidence, so every downstream rule (coverage,
   contradiction) treats memory and fresh sources identically — **except for
   goal-id equality specifically**, which is now deliberately asymmetric after
   P2-02, so memory can inform but not falsely satisfy coverage.
-- **Evaluation** (`evaluation/`): the self-scoring signal behind fallback.
+- **Evaluation** (`evaluation/`): the self-scoring signal behind fallback,
+  now judged by the next provider in the chain, never the answering one.
 - **Escalation** (`agents/escalation.py`): one parametrized node for all four
-  triggers, carrying the D-28 idempotency obligation.
+  triggers, carrying the D-28 idempotency obligation. `escalation_history`
+  now surfaces in telemetry (this session), rather than only in Postgres.
 
 ## Project Structure
 
@@ -1123,13 +1178,15 @@ research-agent-dmp/
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 135 tests, offline. Organized by module,
+├── tests/                   # 157 tests, offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
 │                              (full graph.invoke() runs). See
 │                              OPERATIONS.md "Running and Interpreting the
 │                              Test Suite" for the full file-by-file map.
+│                              Two new unit files this session:
+│                              test_api_server.py, test_agents_compilation.py.
 ├── scripts/ingest_sample_data.py
 ├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
 ├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool (P2-13, off by default via MCP_ENABLED=false)
@@ -1155,7 +1212,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 135 passed
+python -m pytest tests/ -q    # expect: 157 passed
 ```
 
 Windows: `run.bat` does the venv, install, and a stub run in one command.
@@ -1189,11 +1246,16 @@ there is simply nothing to search yet. `OPERATIONS.md` walks you up from there.
    completeness only, and rewritten against explicit notes up to
    `MAX_REVISIONS` (**code default 2**, not the 3 in design §9); exhaustion
    either interrupts for human review or logs the E4 stub and ships the report
-   marked unreviewed — never silently.
+   marked unreviewed — never silently. **Corrected this pass:** the compiler's
+   free-text output now passes through `strip_code_fence()` before being
+   stored — a fallback provider that wraps its answer in a code fence (or
+   echoes the evidence-fencing tag back literally) no longer leaks that into
+   the final report.
 6. **Persist & learn**: a *passed* report's fresh evidence enters semantic
    memory (with its raw, unnamespaced goal_id, per the storage note above);
-   telemetry aggregates node-recorded counters; a run-history row lands in
-   Postgres when available — **from the CLI only**.
+   telemetry aggregates node-recorded counters (including, this session,
+   `escalations`); a run-history row lands in Postgres when available —
+   **from the CLI or the API, both** (see P2-08 above).
 
 ## Design Decisions
 
@@ -1218,8 +1280,8 @@ This table lists only decisions with code behind them here.
 | D-23/D-28 | Escalation via `interrupt()`; nothing non-idempotent precedes the interrupt | The node re-executes on resume — history is appended in the resume update only |
 | D-24 | Memory decay = rerank by volatility class, never an age filter | One TTL is wrong for both stable and volatile facts. Coverage-matching by goal_id is now namespaced away from this rerank (P2-02) — the two are independent axes |
 | D-29 | `ConfigDict(extra="forbid")` on all state models | Construction-time pollution and worker-return pollution are two failure modes; two layers |
-| D-31 *(proposed, P2-03)* | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script, deliberately not for memory writes (P2-15's problem) |
-| D-32 *(proposed, P2-04)* | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks |
+| D-31 *(proposed, P2-03)* | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script AND memory writes (P2-15). Evidence.task_key for memory items is the one identity-related thing NOT yet fixed this way (still `hash()`-based) |
+| D-32 *(proposed, P2-04)* | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks. This session extended the same principle to the compiler's free-text output (`strip_code_fence`) |
 | — | Graceful degradation everywhere | First run must succeed on a bare laptop |
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
@@ -1283,8 +1345,7 @@ visible rather than deleted, so the history stays auditable.
 14. ~~MCP deferred~~ — **P2-13**, `tools/mcp_client.py` (stdio transport,
     D-30 constraints) + `scripts/mcp_corpus_server.py` (real server
     wrapping the existing corpus tool). Off by default
-    (`MCP_ENABLED=false`) — see new "Still broken" item below, this is
-    NOT yet usable under real concurrent load.
+    (`MCP_ENABLED=false`).
 15. ~~Single tool, single worker type~~ — **P2-14**, `SearchTask.tool_hint`
     (D-25) routes a task to a named specialist (`"mcp"` today, the only
     one this build has) instead of the default corpus worker.
@@ -1313,30 +1374,69 @@ visible rather than deleted, so the history stays auditable.
     (and, opt-in, MCP/the FastAPI server) are actually reachable without
     either running a full query or checking each one by hand~~ — **D-33**,
     `scripts/check_services.py`: one command, clear PASS/FAIL/SKIP per
-    service, non-zero exit code if anything's down (usable as a
-    precondition in your own scripts). MCP and the FastAPI server are
-    both opt-in checks (MCP: SKIPPED when `MCP_ENABLED=false`, this
-    repo's default; FastAPI: `--skip-api` for CLI-only workflows).
-    Alongside this, the test suite itself was reorganized (**D-34**) from
-    five phase-named files into `tests/unit/<module>.py` +
-    `tests/integration/<scenario>.py`, mirroring `src/research_agent/`'s
-    own layout — see OPERATIONS.md's "Running and Interpreting the Test
-    Suite" for the full per-file map. Same 135 tests, zero behavior
-    change, verified by running the full suite before and after.
+    service, non-zero exit code if anything's down. Alongside this, the
+    test suite itself was reorganized (**D-34**) into
+    `tests/unit/<module>.py` + `tests/integration/<scenario>.py`,
+    mirroring `src/research_agent/`'s own layout.
+21. ~~`api/server.py` couldn't even import~~ — **fixed, post-Tier-3
+    session.** `AppBundle` had grown a 5th field (`mcp_bridge`, P2-13) but
+    `_graph, _settings, _durable, _checkpointer = _bundle` still unpacked
+    four — a `ValueError` at import that made the entire API unreachable.
+    Fixed to named-field access; `tests/unit/test_api_server.py` (new)
+    covers this so the class of regression can't ship silently again.
+22. ~~MCP evidence hardcoded `score=1.0`~~ — **fixed, post-Tier-3 session.**
+    `tools/mcp_client.py` stamped every MCP-sourced Evidence item at
+    `score=1.0`, which cleared `MIN_EVIDENCE_SCORE` unconditionally — the
+    exact defect P2-01 fixed on the corpus path, reintroduced on the MCP
+    path. Now scored at `settings.min_evidence_score` (never higher), so
+    MCP evidence can't single-handedly satisfy coverage.
+23. ~~Retrieval only degraded gracefully at BOOT, not mid-run~~ — **fixed,
+    post-Tier-3 session.** A store dying after startup used to raise
+    straight through `HybridRetriever`, killing the whole task and
+    discarding the healthy leg's hits too. Now genuinely per-leg
+    fail-safe at runtime — matches what the docstring always claimed.
+24. ~~Postgres checkpointer was a single, unpooled connection~~ — **fixed,
+    post-Tier-3 session.** Every parallel `search_worker`'s checkpoint
+    write serialized behind it. Now a `psycopg_pool.ConnectionPool`
+    (falls back to a single connection if `psycopg[pool]` isn't
+    installed).
+25. ~~No defense against prompt injection via retrieved evidence~~ —
+    **fixed, post-Tier-3 session.** Corpus/MCP content is now wrapped in
+    `<evidence>...</evidence>` in every prompt that inlines it, with an
+    explicit system-prompt clause marking that span as untrusted data,
+    never instructions, and forbidding the model from echoing the tag
+    itself back literally (added after a live trace showed a fallback
+    provider doing exactly that in a citation).
+26. ~~`escalation_history` was written and never read~~ — **fixed,
+    post-Tier-3 session.** Now surfaced in `telemetry["escalations"]`.
+27. ~~CLI exit code was always 0~~ — **fixed, post-Tier-3 session.**
+    `main()` now returns 2 on `GraphRecursionError` and 1 when a run ends
+    with no telemetry, instead of unconditionally 0.
+28. ~~Compiler free-text output could leak a wrapping code fence, or echo
+    the evidence-fencing tag literally~~ — **fixed, post-Tier-3 session.**
+    `strip_code_fence()` (tested against 15 edge cases, including
+    punctuated language tags like `c++` that an earlier, buggier version
+    of this same fix mishandled) plus the system-prompt clause in item 25.
 
 **Still broken, in rough order of consequence**
 
 1. Self-critique can pass a report whose claims appear in no retrieved
-   evidence — unaffected by anything in this revision; separate root cause
-   (`P2-11`, Tier 3).
+   evidence. P2-11 fixed the same-model-optimism half of this (the judge
+   is now always a different provider than the writer); there is still no
+   programmatic, claim-by-claim grounding check — a confident hallucination
+   can still slip past a different model just as it slipped past the same
+   one.
 2. RRF joins the two legs on `title`, not on any store id — silently wrong for
-   a corpus with duplicate or missing titles.
+   a corpus with duplicate or missing titles. This codebase already has the
+   right primitive to fix it (`content_id()`, the same UUID5-of-content
+   function used for Qdrant/memory dedup) — it just hasn't been applied to
+   the OpenSearch join key yet.
 3. `Evidence.task_key` for memory items uses `hash()`, which is per-process
    randomised — memory task keys are not stable across runs.
 4. Reusing the same `--thread-id` across unrelated runs silently accumulates
    reducer-backed state (`evidence`, `counters`, etc.) — see the Postgres
    section above for the full explanation and a live example. Not addressed
-   by Tier 2; no P2-xx item currently scoped to it.
+   by any Tier; no P2-xx item currently scoped to it.
 5. Contradiction detection remains marker-only — `E2` has never fired in a
    real run (`P2-12`, Tier 3, depends on P2-01 which is done).
 6. **MCP corpus server serialized under concurrent load** (`P2-13`, Tier 3)
@@ -1394,19 +1494,20 @@ auditable rather than invisible.
 
 | Claim in older docs | Reality in code |
 |---|---|
-| README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and, as of this revision, each hop tier uses a different timeout** |
-| README / OPERATIONS: "28 tests" | **57** tests collected and passing (25 core + 8 HITL + 3 integration + 21 in `test_tier2.py`, covering P2-06/P2-07/P2-08/P2-09/the ingest-dedup fix) |
-| design §12: "63 files, 28/32 tests passing, 4 skipped" | 52 files in this distribution; 135 tests (57 at Tier 2 closure, expanded after Tier 3), **0 skipped** |
+| README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and each hop tier uses a different timeout** |
+| README / OPERATIONS: "28 tests" | **157** tests collected and passing (grew across Tier 2/3 to 135, then to 157 with a further post-Tier-3 round of fixes) |
+| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~95 files in this distribution (grown again this session — new tests, no new source modules); **157** tests, **0 skipped** |
 | README legend: with HITL off the checks "log and continue" | True for E1/E4 only; E2/E3 log nothing when HITL is off |
-| OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | **Now true for both stores as of this revision** — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism (P2-03) is now actually wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
-| OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and **since re-verified end-to-end against real live runs** — both a genuine E3 escalation (via the D-16 failed-task path) and, once the corpus was properly ingested, a clean convergence at `recall 1.0` with real evidence. See The HITL Investigation |
+| OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | True for both stores — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism is wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
+| OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and re-verified end-to-end against real live runs — both a genuine E3 escalation (via the D-16 failed-task path) and a clean convergence at `recall 1.0` with real evidence once the corpus was properly ingested. See The HITL Investigation |
 | design §9: `MAX_REVISIONS` default 3 | Code default is **2** (`config.py`) |
 | README structure tree: root `agentic-research-agent/` | Distributed directory is `research-agent-dmp/` |
 | Storage diagram implied one Qdrant use | Two collections; `CORPUS_INDEX` names **both** a Qdrant collection and an OpenSearch index |
-| `DECISIONS.md` referenced as the decision log | Was 0 bytes; **populated as of P2-09** (D-1 through D-32, sourced from code comments and this document's own citations — a few numbers, D-7/9/10/11, are flagged as ungrounded rather than invented) |
+| `DECISIONS.md` referenced as the decision log | Populated (D-1 through D-32, sourced from code comments and this document's own citations — a few numbers, D-7/9/10/11, are flagged as ungrounded rather than invented) |
 | `internal/LEARNING_GUIDE.md` cited as a companion doc | `internal/` is in `.gitignore`, so it ships only in archives like this one |
 | OPERATIONS §L1: "add two `logging.getLogger(...)` lines" | Already present in `logging_setup.py::configure_logging` |
-| This README's own citations of "`PHASE2_PLAN.md`" | The actual tracked file is `internal/PHASE-2_PLAN.md` (hyphenated, under `internal/`) — fixed throughout this revision |
+| This README's own citations of "`PHASE2_PLAN.md`" | The actual tracked file is `internal/PHASE-2_PLAN.md` (hyphenated, under `internal/`) |
+| **Limitations, "Exit code is always 0"** *(this pass)* | **Fixed.** `main()` now returns 2 on `GraphRecursionError`, 1 when telemetry never populated. See Limitations item 27 above. |
 
 ## Future Improvements
 
@@ -1439,10 +1540,7 @@ The shape of it, updated with this revision's progress:
      P2-08  postgres lifecycle + API run-history parity       ✅ DONE
      P2-09  config strictness + populate DECISIONS.md         ✅ DONE
                      │
-  TIER 2 STATUS: CLOSED. All four items verified against real live traces,
-  not just the offline suite — see Recent Fixes above for exactly how each
-  one was confirmed. One incidental fix (opensearch-py 3.x compatibility)
-  landed alongside this work, outside either tier's original scope.
+  TIER 2 STATUS: CLOSED.
                      │
   TIER 3 ── design catch-up ──► close the D-25/26/27/30 gap        ✅ CLOSED
      P2-10  Qdrant payload indexes + server-side decay      (D-27) ✅ DONE
@@ -1456,18 +1554,28 @@ The shape of it, updated with this revision's progress:
      P2-14  typed specialist workers                        (D-25) ✅ DONE
      P2-15  memory supersession + GC                                ✅ DONE
                      │
-  TIER 3 STATUS: CLOSED. See DECISIONS.md D-25 through D-30 and this file's
-  Limitations section for what's confirmed live vs. offline-only for each item.
+  TIER 3 STATUS: CLOSED.
+                     │
+  POST-TIER-3 SESSION ── a further round of live-tested fixes    ✅ CLOSED
+     api/server.py AppBundle unpack crash                    ✅ FIXED
+     MCP evidence hardcoded score=1.0                         ✅ FIXED
+     Mid-run retrieval-leg failure isolation                  ✅ FIXED
+     Postgres checkpointer pooling                            ✅ FIXED
+     qdrant_client embedder race under fan-out                ✅ FIXED
+     Prompt-injection fencing on retrieved evidence            ✅ FIXED
+     escalation_history surfaced in telemetry                  ✅ FIXED
+     CLI exit code no longer always 0                          ✅ FIXED
+     Compiler free-text fence/tag-echo leakage                 ✅ FIXED
+     Test suite: 135 → 157
 ```
 
-**Status, updated**: Tiers 1, 2, and 3 are all closed — see the roadmap
-diagram above and `DECISIONS.md` (D-25 through D-30) for what each Tier 3
-item actually shipped. `P2-12` (semantic contradiction detector) made `E2`
-reachable in principle, though the detector itself remains marker-only in
-practice — see Limitations for the current honest status of that gap.
-`P2-11` (judge-model quality scoring) directly addressed the observed live
-failure this paragraph used to describe: a report whose Cassandra/DynamoDB
+**Status, updated**: Tiers 1, 2, and 3 are all closed, and a further,
+post-Tier-3 session of live-tested fixes has landed on top (see the roadmap
+above). `P2-12` (semantic contradiction detector) made `E2` reachable in
+principle, though the detector itself remains marker-only in practice — see
+Limitations for the current honest status of that gap. `P2-11` (judge-model
+quality scoring) directly addressed a report whose Cassandra/DynamoDB
 sections cited no retrieved evidence, passed anyway by same-model
 self-critique — the judge is now always the next provider in the fallback
-chain, never the one being judged.
-</file_text>
+chain, never the one being judged; a programmatic grounding check remains
+open.

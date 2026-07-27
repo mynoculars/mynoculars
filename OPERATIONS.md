@@ -1,27 +1,44 @@
 # OPERATIONS — How To Actually Run This Thing
 
-This is the operations manual. No architecture theory. Just: what to install, 
-how toload data, how to run, in the exact order, with copy-paste commands and 
-what you should see. If a step's output doesn't match, that's the diagnostic.
+The operations manual. No diagrams, no theory—just the exact sequence to go 
+from zero to running. Copy-paste each command; compare your output to what's 
+shown. 
 
-> **Note on this revision:** the test suite is now **57** tests (was 34/36
-> in earlier revisions of this document) — Tier 2 of `internal/
-> PHASE-2_PLAN.md` (gitignored, so it ships only in archives like this
-> one; producer validation, boundary-scoped telemetry, Postgres
-> lifecycle + API parity, config strictness) is closed, verified against
-> both the offline suite and multiple real live traces. Telemetry examples
-> throughout this document have been updated to the current field names
-> (`llm_node_calls`/`llm_provider_calls`/etc. — see **Understanding and
-> Interpreting the Debug Logs** below for what changed and why). A new
-> troubleshooting entry covers an `opensearch-py` 3.x compatibility break
-> hit live while re-testing ingest. Qdrant ingest is now genuinely
-> idempotent by default (previously the mechanism existed but nothing
-> called it) — see **Writing Your Own Test Corpus** below for the one
-> caveat that still applies to a collection that already has stale
-> duplicates in it from before this fix. Everything else — including all
-> of **Development & Debugging Workflows** — is otherwise unchanged from
-> the previous revision. All PowerShell-targeted command examples remain
-> PowerShell, per how this environment actually runs.
+**Mismatch** means stop and debug.
+
+> **CORRECTED THIS PASS** (post-Tier-3 session, 4 further live-tested
+> patches applied on top of everything below): test suite is now
+> **157** (was 57, then 135 across Tier 2/3 — every count in this document
+> is corrected to match). CLI exit code is no longer always 0 — `main()`
+> now returns 2 on `GraphRecursionError`, 1 when a run ends with no
+> telemetry. Postgres checkpointer is now pooled — you may see a new
+> `checkpointer.pool_active` log line alongside or instead of
+> `checkpointer.postgres_active`; both are healthy signs. MCP evidence no
+> longer defaults to a fabricated `score=1.0` — expect real evidence-gate
+> behavior on MCP-routed tasks now, same as corpus-routed ones.
+> `api/server.py` previously could not even import (`AppBundle` unpack
+> crash) — if you were following "Running the API" on an un-patched
+> checkout, `uvicorn` would have raised `ValueError` at startup; fixed.
+> Everything else in this document — the L1/L2/L3 ladder, native Windows
+> service startup, DBeaver setup, ingest steps, HITL testing, every
+> troubleshooting entry — is unchanged and still accurate as written.
+
+> **Note on this revision:** the test suite is now **157** tests (grew
+> from 57 → 135 across Tier 2/3, then to 157 with a further post-Tier-3
+> round of fixes). Telemetry examples throughout this document use the
+> current field names (`llm_node_calls`/`llm_provider_calls`/etc. — see
+> **Understanding and Interpreting the Debug Logs** below for what
+> changed and why), plus a new `escalations` field (post-Tier-3 session)
+> surfacing `escalation_history` in every run's telemetry, previously
+> written and never read anywhere. A new troubleshooting entry covers an
+> `opensearch-py` 3.x compatibility break hit live while re-testing
+> ingest. Qdrant ingest is now genuinely idempotent by default — see
+> **Writing Your Own Test Corpus** below for the one caveat that still
+> applies to a collection that already has stale duplicates in it from
+> before this fix. Everything else — including all of **Development &
+> Debugging Workflows** — is otherwise unchanged from the previous
+> revision. All PowerShell-targeted command examples remain PowerShell,
+> per how this environment actually runs.
 
 ---
 
@@ -108,7 +125,8 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "memory_writes": 0,
   "revision_cycles": 1,
   "critique_passed": true, 
-  "planning_error": null  
+  "planning_error": null,
+  "escalations": []
 
 }
 ```
@@ -122,10 +140,10 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 135 passed
+# expect: 157 passed
 ```
 
-If L1 runs and 135 tests pass, your code is fine. Everything from here is about
+If L1 runs and 157 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -239,7 +257,10 @@ tables, this codebase's own `record_run()` creates and writes an
 `thread_id`, `query`, `recall`, `telemetry` (JSONB), and a timestamp.
 Nothing in this codebase reads it back; it exists purely for you and
 DBeaver to inspect post-hoc run history. See README.md's Storage
-Contracts section for the full column list.
+Contracts section for the full column list. **Corrected this pass:** you
+may also now see a `checkpointer.pool_active` log line at startup
+(Postgres checkpointer pooling, added post-Tier-3) — a healthy sign, not
+an error.
 
 ===============================================================================
 **Terminal 2 — Qdrant**
@@ -364,7 +385,8 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "memory_writes": 6,        <-- passed report fed evidence into memory
   "revision_cycles": 1,
   "critique_passed": true,
-  "planning_error": null
+  "planning_error": null,
+  "escalations": []
 }
 ```
 
@@ -506,6 +528,13 @@ codebase ALSO ships a FastAPI app (`api/server.py`) with `/health`,
 this codebase, not required for L1/L2/L3 or for anything else in this
 manual. Skip this section entirely if you only ever use the CLI.
 
+> **Corrected this pass:** on a checkout from before the post-Tier-3
+> session, `api/server.py` could not even be imported — `AppBundle` had
+> grown a 5th field and the module unpacked it as a 4-tuple, raising
+> `ValueError` at `uvicorn` startup. If you're on the current, patched
+> checkout this is fixed; if you hit exactly this error, you're on an
+> older checkout and need to update the code, not your config.
+
 **Start it:**
 ```powershell
 $env:PYTHONPATH = "src"
@@ -560,12 +589,12 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 135 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 157 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
-Interpreting the Test Suite" below for what each of the three test files
-actually verifies, and how to run just one of them.**
+Interpreting the Test Suite" below for what each test file actually verifies,
+and how to run just one of them.**
 
 **2. Test one query by hand (proves retrieval + flow):**
 Do L2 above. Change the question to something your corpus can answer:
@@ -655,7 +684,8 @@ python -m research_agent.cli "test"        # telemetry prints = graph OK
 
 # 5. Read the logs. Every run prints JSON log lines to stderr. The truth is
 #    there: qdrant.unavailable, opensearch.unavailable, llm.fallback,
-#    checkpointer.memory_fallback. Grep for ".unavailable" to see what's down.
+#    checkpointer.memory_fallback, checkpointer.pool_active. Grep for
+#    ".unavailable" to see what's down.
 ```
 
 The logs are the diagnostic. Degradation is silent by design in the *output*,
@@ -675,7 +705,7 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **135 tests**, fully offline — no services, no API keys, no
+The suite is **157 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -684,10 +714,10 @@ python -m pytest tests/ -q
 ```
 
 ```text
-tests/unit/                  115 tests   one file per src/research_agent/ module
+tests/unit/                  ~137 tests   one file per src/research_agent/ module
 tests/integration/             20 tests   full graph.invoke() runs, offline
                               --------
-                              135 tests
+                              157 tests
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -705,7 +735,11 @@ directories:
   `test_storage_qdrant_store.py`, `test_storage_postgres.py`,
   `test_retrieval_hybrid.py`, `test_tools_corpus_search.py`,
   `test_tools_mcp_client.py`, `test_mcp_corpus_server.py`, `test_gc_memory.py`,
-  `test_tracing.py`, `test_prompts.py`. If you change a function in
+  `test_tracing.py`, `test_prompts.py`. **Two new files this session:**
+  `test_api_server.py` (this file had ZERO coverage before, which is exactly
+  how the `AppBundle` unpack crash shipped unnoticed) and
+  `test_agents_compilation.py` (covers `strip_code_fence` and the compiler's
+  fence-stripping wiring). If you change a function in
   `src/research_agent/foo/bar.py`, `tests/unit/test_foo_bar.py` (or
   `tests/unit/test_bar.py` for a top-level module) is the file that will
   catch a regression first -- that's the whole point of the module-mirrored
@@ -965,11 +999,11 @@ what a *healthy* line looks like for each node, and what to actually check.
 | `merger` | `node.enter` only — no LLM, no store; this is the node that was invisible before node-level logging existed | — |
 | `progress_checker` | `node.progress`, `"recall"` and `"depth"` — this is the number that decides whether the loop continues | `"recall": 1.0, "depth": 1` means it converged on the first pass |
 | `gap_generator` | only reached if recall was below target; one `llm.call`, `node=gap_generator` | (absent entirely on a converged run — that's normal) |
-| `compiler` | one `llm.call` with `mode=text` — the only free-text call in the system; large `prompt_tokens` here is normal (it inlines all gathered evidence). **Watch for `llm.truncated_runaway_generation`** — a WARNING that fires if the model kept generating past its own answer (a fake follow-up conversation, a repeated turn); if you see it often, check your `llama-server`'s stop-token/chat-template config | `prompt_tokens` in the thousands is expected, not a problem; `llm.truncated_runaway_generation` appearing occasionally is handled gracefully — appearing on nearly every call across every node is a sign of a real server-config issue worth fixing at the source |
+| `compiler` | one `llm.call` with `mode=text` — the only free-text call in the system; large `prompt_tokens` here is normal (it inlines all gathered evidence). **Watch for `llm.truncated_runaway_generation`** — a WARNING that fires if the model kept generating past its own answer (a fake follow-up conversation, a repeated turn); if you see it often, check your `llama-server`'s stop-token/chat-template config. **Corrected this pass**: the compiled report itself now passes through `strip_code_fence()` before being stored, so a fallback provider wrapping its answer in a code fence (or echoing the `<evidence>` fencing tag back literally in a citation) no longer leaks that into the final report — if you see clean, unfenced Markdown here where you might once have seen stray backticks, that's this fix working, not a coincidence | `prompt_tokens` in the thousands is expected, not a problem; `llm.truncated_runaway_generation` appearing occasionally is handled gracefully — appearing on nearly every call across every node is a sign of a real server-config issue worth fixing at the source |
 | `critic` | `node.critique`, `"passed"` and `"revision"` | `"passed": true, "revision": 1` |
 | `memory_writer` | only reached if critique passed; `memory.stored`, `"count"` | `"count"` roughly matching this run's own fresh evidence |
-| `telemetry` | `run.telemetry` — the final summary; `llm_node_calls`/`search_calls` are still **node-scoped counts**, but `llm_provider_calls`/`llm_fallback_hops`/`llm_quality_calls`/`retrieval_dense_calls`/`retrieval_keyword_calls`/`retrieval_leg_unavailable` (P2-07) are real boundary-crossing counts now — see below | — |
-| `human_escalation` | only with `HITL_ENABLED=true` and a trigger fired; **fires twice** on one escalation (once pausing, once resuming) — expected, not a duplicate | one `escalation_history` entry recorded despite the two log lines |
+| `telemetry` | `run.telemetry` — the final summary; `llm_node_calls`/`search_calls` are still **node-scoped counts**, but `llm_provider_calls`/`llm_fallback_hops`/`llm_quality_calls`/`retrieval_dense_calls`/`retrieval_keyword_calls`/`retrieval_leg_unavailable` (P2-07) are real boundary-crossing counts now — see below. **New this session:** `escalations`, an array of every `{trigger, action}` pair from `state.escalation_history` — previously written by `human_escalation` and never read anywhere | — |
+| `human_escalation` | only with `HITL_ENABLED=true` and a trigger fired; **fires twice** on one escalation (once pausing, once resuming) — expected, not a duplicate | one `escalation_history` entry recorded despite the two log lines, now also visible in the final `telemetry["escalations"]` |
 
 **This used to be the single biggest gotcha in the telemetry block; as of
 P2-07 it mostly isn't anymore.** `llm_node_calls` and `search_calls` still
@@ -1050,7 +1084,10 @@ accumulated, not replacing it. Harmless here because all four runs asked the
 same question. **It would not be harmless** if run 2 had asked something
 unrelated — its compiled report could silently include leftover evidence
 from run 1's completely different topic, with nothing in the output telling
-you that happened.
+you that happened. **Corrected this pass:** `escalation_history` from this
+same reducer set is now surfaced in telemetry (`escalations`) — the
+accumulation risk described here is unchanged, but at least the escalation
+history is now visible in the output, not only in Postgres.
 
 **The practical rule:** use a fresh thread-id (or none at all — let it
 auto-generate) for every new, independent question. Only ever reuse one
@@ -1250,4 +1287,22 @@ that file's own module docstring ("First-import gotcha") for the full
 account. If you ever see a mysterious ~120s stall on the very first
 `search()` call (and nowhere else), check that those two eager imports
 are still present before looking anywhere else.
-</file_text>
+
+### `AppBundle` unpack crash on API startup — FIXED (post-Tier-3 session)
+
+If `uvicorn research_agent.api.server:app` raises `ValueError` at import
+(something like `too many values to unpack (expected 4)`), you're on a
+checkout from before this fix. `AppBundle` grew a 5th field (`mcp_bridge`,
+P2-13) while `api/server.py` still destructured it as a 4-tuple. Fixed to
+named-field access (`bundle.app`, `bundle.settings`, etc.) — update the
+code rather than trying to work around it in config.
+
+### MCP evidence always satisfies coverage — FIXED (post-Tier-3 session)
+
+If MCP-routed tasks (`MCP_ENABLED=true`, a task with `tool_hint="mcp"`)
+always mark their goal as covered regardless of actual relevance, you're on
+a checkout from before this fix — `tools/mcp_client.py` used to hardcode
+`score=1.0` on every MCP-sourced Evidence item, which cleared
+`MIN_EVIDENCE_SCORE` unconditionally. Fixed: MCP evidence is now scored at
+`settings.min_evidence_score` (never higher), so it behaves like corpus
+evidence with respect to the coverage gate.
