@@ -51,6 +51,7 @@ Python mechanics used in this file, if any of this is new to you:
 
 import datetime
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
@@ -116,6 +117,15 @@ class QdrantStore:
         self.available = False
         self._client = None
         self._embedder = None
+        # Guards the lazy TextEmbedding() build in _embed below. ONE
+        # QdrantStore is shared across every parallel search_worker, so
+        # without this every worker in a MAX_FANOUT fan-out can observe
+        # self._embedder is None SIMULTANEOUSLY and each build its own ONNX
+        # model — turning one cold start into N concurrent, competing cold
+        # starts on the same CPU. This is the identical thundering-herd
+        # scripts/mcp_corpus_server.py::_get_corpus_tool already documents
+        # fixing one layer up, with the same remedy.
+        self._embedder_lock = threading.Lock()
         try:
             # Import happens here, not at module load time — see the
             # module docstring's explanation of why.
@@ -150,8 +160,13 @@ class QdrantStore:
         subsequent call.
         """
         if self._embedder is None:
-            from fastembed import TextEmbedding
-            self._embedder = TextEmbedding()  # default small English model
+            with self._embedder_lock:
+                # Re-check inside the lock: the losing threads of a race
+                # arrive here after the winner has already built it, and
+                # must reuse that instance rather than build a second one.
+                if self._embedder is None:
+                    from fastembed import TextEmbedding
+                    self._embedder = TextEmbedding()  # default small English model
         # self._embedder.embed(texts) returns an iterator of numpy arrays,
         # one per input text; list(v) converts each array into a plain
         # Python list of floats so the rest of this codebase (which has no

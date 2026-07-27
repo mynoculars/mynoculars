@@ -27,14 +27,15 @@ Relationship to cli.py's HITL loop:
     "interrupted" look identical regardless of which endpoint produced
     them — a caller only needs to branch on the one status field.
 
-⚠ Unlike cli.py::main, NOTHING in this file ever calls record_run(), so
-no Postgres agent_runs history row is written for API-driven runs — only
-CLI runs get one. Checkpointing itself (the thing that makes /resume work
-at all) is unaffected; that comes from the graph's own checkpointer, not
-from this app.
+Run history: _respond() calls record_run() on every completed run (P2-08),
+so API-driven runs get an agent_runs row exactly like CLI runs do. (This
+paragraph previously claimed the opposite -- it predated P2-08 and was
+never updated.) Checkpointing itself, the thing that makes /resume work,
+comes from the graph's own checkpointer, not from this app.
 """
 
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from langgraph.types import Command
@@ -44,8 +45,6 @@ from research_agent.cli import build_app_and_settings
 from research_agent.logging_setup import run_id_var
 from research_agent.state import ResearchState
 from research_agent.storage.postgres import close_checkpointer, record_run
-
-app = FastAPI(title="Agentic Research Agent (core build)")
 
 # Built ONCE, at import time (i.e. when uvicorn loads this module) — not
 # per-request. This is the exact same build_app_and_settings() call cli.py
@@ -58,16 +57,35 @@ app = FastAPI(title="Agentic Research Agent (core build)")
 # this file at all, which is what made both the /health gap and the
 # leaked-connection-on-shutdown gap possible.
 _bundle = build_app_and_settings()
-_graph, _settings, _durable, _checkpointer = _bundle
+# Field-by-field, NEVER tuple-unpacking. AppBundle gained a fifth field
+# (mcp_bridge) in P2-13 while this line still unpacked four, which raised
+# ValueError at import time and made the entire API unstartable -- every
+# endpoint below, plus /health and the P2-08 record_run parity, unreachable.
+# Named access cannot break that way when a future field is added.
+_graph = _bundle.app
+_settings = _bundle.settings
+_durable = _bundle.durable
+_checkpointer = _bundle.checkpointer
+_mcp_bridge = _bundle.mcp_bridge
 
 
-@app.on_event("shutdown")
-def _close_checkpointer_on_shutdown() -> None:
-    """P2-08: close whatever connection get_checkpointer opened at import
-    time. Harmless no-op for the degraded MemorySaver case (nothing to
-    close); closes the leaked-until-now Postgres connection otherwise.
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Own the shutdown of everything build_app_and_settings opened.
+
+    Replaces the deprecated @app.on_event("shutdown") hook. Closes BOTH
+    the checkpointer connection (P2-08) and, when MCP is enabled, the
+    MCPBridge -- which owns a real subprocess and a background thread
+    that were previously left running past shutdown here, even though
+    cli.py has always closed them in its own finally block.
     """
+    yield
     close_checkpointer(_checkpointer)
+    if _mcp_bridge is not None:
+        _mcp_bridge.close()
+
+
+app = FastAPI(title="Agentic Research Agent (core build)", lifespan=_lifespan)
 
 
 class ResearchRequest(BaseModel):
@@ -161,11 +179,14 @@ def _respond(thread_id: str, result: dict) -> dict:
     if "__interrupt__" in result:
         return {"thread_id": thread_id, "status": "interrupted",
                 "review": result["__interrupt__"][0].value}
-    telemetry = result["telemetry"]
+    # .get(), not [] -- a run that ends without reaching telemetry_node
+    # (recursion limit, an aborted resume) would otherwise raise KeyError
+    # here and turn a degraded run into a 500 with no diagnostic.
+    telemetry = result.get("telemetry") or {}
     record_run(_settings.postgres_dsn, thread_id, result.get("raw_query", ""),
               telemetry.get("recall", 0.0), telemetry)
     return {"thread_id": thread_id, "status": "done",
-            "report": result["final_report"],
+            "report": result.get("final_report", ""),
             "telemetry": telemetry}
 
 

@@ -220,7 +220,8 @@ def build_telemetry_node(debug: bool = False):
         READS   state.classification, state.goals, state.iteration_depth,
                 state.evidence, state.recall_score, state.counters (the
                 additive tallies every earlier node has been contributing
-                to all run), state.critique_passed, state.planning_error.
+                to all run), state.critique_passed, state.planning_error,
+                state.escalation_history.
         CALLS   nothing external — pure aggregation.
         WRITES  state.telemetry = {intent, goals, iterations,
                     evidence_items, evidence_by_source, recall,
@@ -318,6 +319,16 @@ def build_telemetry_node(debug: bool = False):
             "revision_cycles": int(c.get("revision_cycles", 0)),
             "critique_passed": state.critique_passed,
             "planning_error": state.planning_error,
+            # escalation_history was written by human_escalation on every
+            # resume and then read by NOTHING — the audit trail for D-23
+            # existed in state and never left it. Surfacing the trigger/
+            # action pairs here puts it in the same place every other
+            # per-run fact already lands (telemetry, the agent_runs row,
+            # the run.telemetry log line).
+            "escalations": [
+                {"trigger": h.get("trigger"), "action": h.get("action")}
+                for h in state.escalation_history
+            ],
         }
         log_event(logger, "run.telemetry", **telemetry)
         return {"telemetry": telemetry}

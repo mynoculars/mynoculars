@@ -47,6 +47,7 @@ import sys
 import uuid
 from typing import NamedTuple
 
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from research_agent.config import get_settings, split_csv
@@ -73,6 +74,12 @@ class AppBundle(NamedTuple):
     close (`durable` was previously computed inside build_app_and_settings
     and never returned at all; see get_checkpointer in storage/postgres.py
     for what durable=False actually means operationally).
+
+    CONSUME THESE BY NAME (bundle.app, bundle.settings, ...), never by
+    tuple-unpacking. api/server.py unpacked four names from what had become
+    a five-field bundle and raised ValueError at import, taking the entire
+    HTTP interface down; named access cannot break that way when a field is
+    added, which is the whole reason this is a NamedTuple and not a tuple.
     """
 
     app: object
@@ -84,6 +91,10 @@ class AppBundle(NamedTuple):
                                # main()'s finally block, which closes this
                                # exactly like close_checkpointer(checkpointer)
                                # does, when it's not None.
+    router: object = None      # the FallbackRouter, so main()'s finally block
+                               # can close its providers' httpx clients --
+                               # previously unreachable from either caller,
+                               # exactly like checkpointer was before P2-08.
 
 
 def build_app_and_settings(tracer=None):
@@ -176,7 +187,12 @@ def build_app_and_settings(tracer=None):
         mcp_tool = make_mcp_tool(
             mcp_bridge, settings.mcp_tool_name,
             query_arg_name=settings.mcp_query_arg_name,
-            call_timeout_seconds=settings.mcp_call_timeout_seconds)
+            call_timeout_seconds=settings.mcp_call_timeout_seconds,
+            # This build's MCP schema carries no per-hit relevance score,
+            # so evidence from it must not be able to SATISFY the coverage
+            # gate on its own -- see make_mcp_tool's own docstring for what
+            # the previous hardcoded 1.0 did to recall.
+            unscored_score=settings.min_evidence_score)
     memory = SemanticMemory(
         QdrantStore(settings.qdrant_url, settings.memory_collection, tracer=tracer,
                     trace_label="QDRANT (semantic memory)"),
@@ -197,7 +213,8 @@ def build_app_and_settings(tracer=None):
     app = build_graph(router, tool, memory, settings, checkpointer, debug=debug,
                      mcp_tool=mcp_tool)  # P2-14: None unless settings.mcp_enabled
     return AppBundle(app=app, settings=settings, durable=durable,
-                     checkpointer=checkpointer, mcp_bridge=mcp_bridge)
+                     checkpointer=checkpointer, mcp_bridge=mcp_bridge,
+                     router=router)
 
 
 def main(argv=None) -> int:
@@ -269,6 +286,16 @@ def main(argv=None) -> int:
 
     try:
         return _run(app, settings, args, thread_id, tracer)
+    except GraphRecursionError as exc:
+        # One of the four termination bounds (D-8's invoke-time backstop)
+        # actually firing is an operational event, not a crash: print a
+        # diagnosable message and return a NON-ZERO exit code instead of a
+        # raw traceback. main() previously returned 0 unconditionally, so
+        # no script or CI step could detect a failed run at all.
+        print(f"[run hit the recursion limit ({settings.recursion_limit}) — "
+              f"the graph did not terminate within budget: {exc}]",
+              file=sys.stderr)
+        return 2
     finally:
         # P2-08: close whatever connection get_checkpointer opened, even if
         # _run raised — a CLI process is short-lived, but leaving this to
@@ -281,6 +308,10 @@ def main(argv=None) -> int:
         # off (the default), so this is a no-op for every existing run.
         if bundle.mcp_bridge is not None:
             bundle.mcp_bridge.close()
+        # Same reasoning again for the LLM providers' httpx clients, one
+        # per configured provider, none of which was ever closed.
+        if bundle.router is not None:
+            bundle.router.close()
 
 
 def _run(app, settings, args, thread_id, tracer) -> int:
@@ -356,12 +387,16 @@ def _run(app, settings, args, thread_id, tracer) -> int:
     if trace_path:
         print(f"[debug trace written to {trace_path}]")
 
-    print(result["final_report"])
+    # .get(), not [] — an interrupted-then-abandoned run, or any path that
+    # ends without reaching telemetry_node, left these keys absent and
+    # turned a degraded run into a bare KeyError traceback.
+    telemetry = result.get("telemetry") or {}
+    print(result.get("final_report", "(no report was produced)"))
     print("\n--- telemetry ---")
-    print(json.dumps(result["telemetry"], indent=2))
+    print(json.dumps(telemetry, indent=2))
     record_run(settings.postgres_dsn, thread_id, args.query,
-               result["telemetry"].get("recall", 0.0), result["telemetry"])
-    return 0
+               telemetry.get("recall", 0.0), telemetry)
+    return 0 if telemetry else 1
 
 
 if __name__ == "__main__":

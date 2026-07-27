@@ -46,13 +46,20 @@ one failed. This makes it usable as a precondition in your own scripts:
     python scripts/check_services.py && python -m research_agent.cli "..."
 """
 import argparse
+import pathlib
 import json
 import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-sys.path.insert(0, "src")
+# Resolve "src" RELATIVE TO THIS FILE, never relative to the current
+# working directory. `sys.path.insert(0, "src")` only resolved when the
+# process happened to be launched from the repo root -- not guaranteed
+# for a script launched as an MCP_SERVER_COMMAND subprocess, from a
+# Windows shortcut or scheduled task, or from any other directory --
+# and failed with an opaque ModuleNotFoundError when it did not.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
 from research_agent.config import get_settings, split_csv  # noqa: E402
 

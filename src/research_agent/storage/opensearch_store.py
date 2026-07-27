@@ -34,6 +34,7 @@ import logging
 from typing import Any, Dict, List
 
 from research_agent.logging_setup import log_event
+from research_agent.storage.qdrant_store import content_id
 
 logger = logging.getLogger(__name__)
 
@@ -120,16 +121,25 @@ class OpenSearchStore:
         if not self.available or not docs:
             return 0
         self.ensure_index()
-        # enumerate(docs) pairs each document with its position (0, 1, 2,
-        # ...); str(i) becomes that document's OpenSearch _id. Because this
-        # id is DETERMINISTIC (always the same for the same position in the
-        # same file), re-running ingest on an unchanged corpus.jsonl
-        # OVERWRITES the existing documents in place rather than creating
-        # duplicates — unlike Qdrant's upsert_texts, which always generates
-        # a brand-new random id per call. That asymmetry is a documented
-        # difference between the two stores in this codebase.
+        # content_id(doc["content"]) — the SAME uuid5 content identity
+        # scheme storage/qdrant_store.py uses for its point ids, so BOTH
+        # legs of hybrid retrieval now address a document the same way.
+        #
+        # This replaces a POSITIONAL str(i) id. Positional ids are
+        # idempotent only for a byte-identical corpus: delete or reorder a
+        # line in corpus.jsonl and re-ingest, and OpenSearch overwrites by
+        # position while Qdrant overwrites by content — leaving stale
+        # documents at now-unused positions and silently drifting the two
+        # legs apart, which surfaces as a fused ranking neither leg agrees
+        # with. One identity scheme for both stores removes that class of
+        # divergence, and makes the id usable as an RRF join key if the
+        # title-based key in retrieval/hybrid.py is ever replaced.
+        #
+        # A doc with no "content" falls back to its position, so a
+        # malformed corpus line still ingests rather than raising.
         for i, doc in enumerate(docs):
-            self._client.index(index=self.index, body=doc, id=str(i))
+            doc_id = content_id(doc["content"]) if doc.get("content") else str(i)
+            self._client.index(index=self.index, body=doc, id=doc_id)
         # indices.refresh(...) forces OpenSearch to make the just-indexed
         # documents immediately searchable. Without it, there can be a
         # short delay before new documents show up in search results — this

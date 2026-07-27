@@ -63,6 +63,7 @@ Python mechanics used in this file, if any of this is new to you:
 """
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 from research_agent.config import Settings
@@ -106,11 +107,31 @@ class FallbackRouter:
         # by each calling node into its own returned counters dict (see
         # drain_counters below) — never written to ResearchState directly,
         # since this class has no knowledge of the graph at all.
-        self._counters: Dict[str, float] = {}
+        #
+        # threading.local(), not a plain dict: ONE router instance is shared
+        # process-wide, and _bump/drain_counters is an unlocked
+        # read-modify-write. That is correct TODAY only because no two
+        # LLM-calling nodes ever share a superstep — an invariant nothing
+        # enforced and nothing wrote down. The first Send-parallelised
+        # LLM node (parallel gap generation, per-goal critique) would
+        # silently lose counts. Per-thread storage makes it structurally
+        # safe instead, matching what retrieval/hybrid.py already does for
+        # the same reason.
+        self._local = threading.local()
+
+    @property
+    def _counters(self) -> Dict[str, float]:
+        """This thread's own counter dict, created on first touch."""
+        counters = getattr(self._local, "counters", None)
+        if counters is None:
+            counters = {}
+            self._local.counters = counters
+        return counters
 
     def _bump(self, key: str, amount: float = 1.0) -> None:
         """Internal: add `amount` to one accumulated counter."""
-        self._counters[key] = self._counters.get(key, 0.0) + amount
+        counters = self._counters
+        counters[key] = counters.get(key, 0.0) + amount
 
     def drain_counters(self) -> Dict[str, float]:
         """Return everything accumulated since the last drain, and reset.
@@ -128,7 +149,7 @@ class FallbackRouter:
         something every call site has to remember to do correctly.
         """
         drained = self._counters
-        self._counters = {}
+        self._local.counters = {}
         return drained
 
     def set_node(self, node: Optional[str]) -> None:
@@ -151,6 +172,24 @@ class FallbackRouter:
             setter = getattr(p, "set_trace_node", None)
             if setter:
                 setter(node)
+
+    def close(self) -> None:
+        """Release every provider's HTTP resources. Safe to call twice.
+
+        CALLED BY   cli.py::main's finally block, alongside
+                    close_checkpointer — see llm/client.py::
+                    OpenAICompatibleClient.close for what actually leaks
+                    without this.
+        """
+        for p in self.providers:
+            closer = getattr(p, "close", None)
+            if closer:
+                try:
+                    closer()
+                except Exception as exc:  # noqa: BLE001 — closing is best-effort
+                    log_event(logger, "llm.close_failed", level=logging.WARNING,
+                              provider=getattr(p, "name", "?"),
+                              reason=type(exc).__name__)
 
     # -- factory ------------------------------------------------------------
 

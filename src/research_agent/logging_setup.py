@@ -126,6 +126,22 @@ def configure_logging(level: str = "INFO") -> None:
     # twice.
     if getattr(root, "_agent_configured", False):
         return
+    # JsonLineFormatter emits ensure_ascii=False, so log lines can contain
+    # non-ASCII (a query in any non-English script, an em dash in a node
+    # message, a corpus snippet). On a Windows console still defaulting to
+    # a legacy code page such as cp1252, writing those raises
+    # UnicodeEncodeError from inside the logging handler -- which surfaces
+    # as a "--- Logging error ---" traceback on stderr and silently drops
+    # the log line, i.e. the run loses exactly the diagnostic output it was
+    # trying to produce. reconfigure() exists on Python 3.7+ TextIOWrapper;
+    # guarded because sys.stderr may be a plain object under pytest capture
+    # or a redirected pipe.
+    reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError):  # already-detached or non-seekable stream
+            pass
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(JsonLineFormatter())
     # root.handlers[:] = [handler] REPLACES the entire list of handlers

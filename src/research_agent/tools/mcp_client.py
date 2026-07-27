@@ -346,7 +346,15 @@ class MCPBridge:
                           outcome="exception", reason=type(exc).__name__)
                 raise
 
-        future = asyncio.run_coroutine_threadsafe(_traced_call(), self._loop)
+        # Read self._loop ONCE into a local: close() (running on another
+        # thread) sets it to None, and run_coroutine_threadsafe(coro, None)
+        # raises an opaque AttributeError instead of a usable message.
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError(
+                f"MCP bridge for '{self._command}' is closed; cannot call "
+                f"tool {name!r}")
+        future = asyncio.run_coroutine_threadsafe(_traced_call(), loop)
         started_at = time.time()
         try:
             return future.result(timeout=timeout_seconds)
@@ -393,26 +401,33 @@ class MCPBridge:
             return
         if self._shutdown_event is not None:
             self._loop.call_soon_threadsafe(self._shutdown_event.set)
-        joined_in_time = True
         self._thread.join(timeout=10.0)
         if self._thread.is_alive():
-            joined_in_time = False
+            # Best-effort cleanup only -- the thread is a daemon thread (see
+            # start()), so it will not block process exit even if it never
+            # finishes; this just means the subprocess/session teardown
+            # didn't complete cleanly within the timeout.
             log_event(logger, "mcp.close_timed_out", level=logging.WARNING,
                       command=self._command)
         self._loop = None
         self._thread = None
         self._shutdown_event = None
-        if not joined_in_time:
-            # Best-effort cleanup only -- the thread is a daemon thread
-            # (see start()), so it will not block process exit even if
-            # it never finishes; this just means the subprocess/session
-            # teardown didn't complete cleanly within the timeout.
-            return
+        # Reset the readiness handshake too, not just the thread/loop
+        # handles. Leaving _ready SET and _session STALE meant a bridge
+        # that was closed and then started again would sail past
+        # start()'s _ready.wait() instantly and call into a dead session
+        # -- the same class of race start()'s own docstring documents
+        # fixing for concurrent first calls, but on the reuse path.
+        self._ready.clear()
+        self._session = None
+        self._exit_stack = None
+        self._start_error = None
 
 
 def make_mcp_tool(bridge: MCPBridge, tool_name: str,
                   query_arg_name: str = "query",
-                  call_timeout_seconds: float = 30.0):
+                  call_timeout_seconds: float = 30.0,
+                  unscored_score: float = 0.0):
     """Build the MCP-mediated tool bound to a bridge and a specific
     server-side tool name.
 
@@ -434,6 +449,20 @@ def make_mcp_tool(bridge: MCPBridge, tool_name: str,
             "query", so this is configurable rather than hardcoded.
         call_timeout_seconds: passed straight through to
             bridge.call_tool.
+        unscored_score: the Evidence.score stamped on every item this
+            server returns, since this build's minimal MCP schema carries
+            no per-hit ranking score. cli.py passes
+            settings.min_evidence_score. This MUST NOT be raised above
+            that threshold: agents/gathering.py::progress_checker_node
+            gates coverage on `e.score > settings.min_evidence_score`, so
+            a fabricated high score marks every touched goal covered on
+            the first cycle, forcing recall=1.0 and making the gap loop
+            and the E2/E3 escalations structurally unreachable. That is
+            exactly the defect P2-01 fixed for the corpus path
+            (MIN_EVIDENCE_SCORE=0.0 made the same predicate inert); this
+            parameter exists so the MCP path cannot reintroduce it. A
+            server that DOES report real relevance should populate this
+            per item from structuredContent instead.
 
     Returns:
         callable(task: SearchTask) -> List[Evidence]. May raise -- same
@@ -492,10 +521,10 @@ def make_mcp_tool(bridge: MCPBridge, tool_name: str,
                 goal_id=task.goal_id,
                 source="mcp",
                 content=text[:800],  # same cap corpus_search.py uses
-                score=1.0,  # MCP tools return no ranking score of their
-                            # own in this build's minimal schema; a future
-                            # server that DOES report one could populate
-                            # this from structuredContent instead.
+                # Was a hardcoded 1.0, which cleared ANY min_evidence_score
+                # and silently defeated the coverage gate -- see
+                # unscored_score in this factory's docstring.
+                score=unscored_score,
                 volatility=Volatility.SEMI_STABLE,
             ))
         return evidence

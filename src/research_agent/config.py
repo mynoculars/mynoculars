@@ -307,6 +307,35 @@ def warn_on_likely_env_typos() -> None:
                       set_key=wrong, probably_meant=right)
 
 
+def warn_on_inert_coverage_gate(s: "Settings") -> None:
+    """Log a WARNING when settings would make the D-17 coverage gate inert.
+
+    CALLED BY   get_settings(), below, once per process.
+    WHY THIS EXISTS: min_evidence_score defaults to 0.5 here, but a .env
+    carrying the ORIGINAL 0.0 silently reverts P2-01 entirely — the
+    coverage predicate in agents/gathering.py::progress_checker_node
+    (`e.score > settings.min_evidence_score`) then passes essentially every
+    hit a dense index returns, recall pins at 1.0 on the first cycle, the
+    gap loop never runs, and E2/E3 become unreachable. That is a config
+    value undoing a code fix, and it is completely silent: the run looks
+    like a fast, confident success. Same for min_similarity, the
+    retrieval-time half of the same two-stage gate.
+
+    A warning, never a hard failure: 0.0 stays legal (it is the documented
+    way to reproduce pre-P2-01 behaviour deliberately), it just can no
+    longer happen without anyone noticing.
+    """
+    if s.min_evidence_score <= 0.0:
+        log_event(logger, "config.coverage_gate_inert", level=logging.WARNING,
+                  setting="MIN_EVIDENCE_SCORE", value=s.min_evidence_score,
+                  effect="every retrieved item satisfies coverage; recall "
+                         "will pin at 1.0 and E2/E3 cannot fire")
+    if s.min_similarity <= 0.0:
+        log_event(logger, "config.relevance_floor_inert", level=logging.WARNING,
+                  setting="MIN_SIMILARITY", value=s.min_similarity,
+                  effect="every dense hit enters fusion regardless of relevance")
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Return the process-wide Settings singleton (cached after first load).
@@ -322,4 +351,6 @@ def get_settings() -> Settings:
                 (see the @lru_cache explanation in the module docstring).
     """
     warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
-    return Settings()
+    settings = Settings()
+    warn_on_inert_coverage_gate(settings)
+    return settings

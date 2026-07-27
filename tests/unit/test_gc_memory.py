@@ -14,6 +14,15 @@ own history for that migration).
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
+# qdrant-client is an OPTIONAL runtime dependency (storage/qdrant_store.py
+# imports it lazily, inside methods, precisely so the rest of the codebase
+# runs without it). A minimal install should therefore SKIP these, not
+# fail them -- a hard failure reports a missing optional extra as a
+# broken test suite.
+pytest.importorskip("qdrant_client")
+
 from research_agent.storage.qdrant_store import QdrantStore
 
 

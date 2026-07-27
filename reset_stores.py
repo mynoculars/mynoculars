@@ -18,7 +18,8 @@ Usage:
     This file lives at the REPO ROOT, not under scripts/ (only
     ingest_sample_data.py is there) -- a stale "scripts/reset_stores.py"
     path lived in this docstring and in reset_stores.bat until a live run
-    surfaced it. No PYTHONPATH needed either: sys.path.insert(0, "src")
+    surfaced it. No PYTHONPATH needed either: a repo-relative "src" is put
+    on sys.path (resolved from __file__, not the CWD)
     two lines below does that already, on every OS.
 
 Scope (endpoints and names always come from Settings / .env — never hardcoded):
@@ -45,9 +46,16 @@ Exit codes:
 """
 
 import argparse
+import pathlib
 import sys
 
-sys.path.insert(0, "src")
+# Resolve "src" RELATIVE TO THIS FILE, never relative to the current
+# working directory. `sys.path.insert(0, "src")` only resolved when the
+# process happened to be launched from the repo root -- not guaranteed
+# for a script launched as an MCP_SERVER_COMMAND subprocess, from a
+# Windows shortcut or scheduled task, or from any other directory --
+# and failed with an opaque ModuleNotFoundError when it did not.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from research_agent.config import get_settings              # noqa: E402
 from research_agent.logging_setup import configure_logging  # noqa: E402

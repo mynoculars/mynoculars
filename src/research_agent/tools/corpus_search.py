@@ -22,6 +22,13 @@ from typing import List
 from research_agent.retrieval.hybrid import HybridRetriever
 from research_agent.state import Evidence, SearchTask, Volatility
 
+# One dense+one keyword first-rank hit ≈ 2/60 ≈ 0.033 fused. Scale so that a
+# top hit in both legs lands near 1.0 — keeps MIN_EVIDENCE_SCORE tunable on
+# an intuitive 0..1 axis. Declared HERE, above its only use, rather than at
+# the bottom of the file: it resolved at call time either way, but a reader
+# hit the name before its definition.
+RRF_SQUASH = 30.0
+
 
 def make_corpus_tool(retriever: HybridRetriever, top_k: int = 3):
     """Build the corpus-search tool bound to a retriever.
@@ -98,9 +105,3 @@ def make_corpus_tool(retriever: HybridRetriever, top_k: int = 3):
     corpus_search.drain_retrieval_counts = retriever.drain_counts
 
     return corpus_search
-
-
-# One dense+one keyword first-rank hit ≈ 2/60 ≈ 0.033 fused. Scale so that a
-# top hit in both legs lands near 1.0 — keeps MIN_EVIDENCE_SCORE tunable on
-# an intuitive 0..1 axis.
-RRF_SQUASH = 30.0

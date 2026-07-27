@@ -51,7 +51,7 @@ Python mechanics used in this file, if any of this is new to you:
 
 import logging
 import math
-from typing import List
+from typing import Any, List
 
 from research_agent.logging_setup import log_event
 from research_agent.state import Evidence, Volatility
@@ -87,6 +87,30 @@ def decay_factor(age_days: float, volatility: Volatility,
     # was written and when it's read back) — never let "freshness" exceed
     # 1.0 because of a negative age making the exponent negative.
     return math.exp(-math.log(2.0) * max(age_days, 0.0) / half_life)
+
+
+def coerce_volatility(raw: Any) -> Volatility:
+    """Turn a stored payload's raw "volatility" value into a Volatility.
+
+    CALLED BY   SemanticMemory.retrieve, below, on BOTH the Python and the
+                server-side-decay paths.
+    WHY THIS EXISTS: Volatility(<unrecognised string>) raises ValueError,
+    and memory_retrieve_node (agents/planning.py) wraps this in no
+    try/except -- so a single point whose payload carries an unexpected
+    value (hand-edited, a schema change, a half-migrated collection of the
+    exact "mixed old/new points" kind ensure_payload_indexes's docstring
+    warns about) killed the entire run at the second node. That directly
+    contradicts this class's own contract, which promises retrieve()
+    "quietly returns []" rather than raising. Unknown values now fall back
+    to SEMI_STABLE -- the same default the .get() call already used for a
+    MISSING key -- and are logged once so the bad data is still visible.
+    """
+    try:
+        return Volatility(raw)
+    except ValueError:
+        log_event(logger, "memory.unknown_volatility", level=logging.WARNING,
+                  value=str(raw)[:60])
+        return Volatility.SEMI_STABLE
 
 
 class SemanticMemory:
@@ -164,7 +188,7 @@ class SemanticMemory:
                            Volatility.VOLATILE.value: self.half_life_volatile})
             scored = [
                 (h.get("similarity", 0.0), h,
-                 Volatility(h.get("volatility", Volatility.SEMI_STABLE.value)))
+                 coerce_volatility(h.get("volatility", Volatility.SEMI_STABLE.value)))
                 for h in hits
             ]
             # Already ranked best-first by Qdrant and already cut to
@@ -178,7 +202,7 @@ class SemanticMemory:
                 # Volatility.SEMI_STABLE. The .get(..., default) call supplies
                 # "semi_stable" as a fallback if this particular stored point
                 # somehow has no "volatility" key in its payload at all.
-                vol = Volatility(h.get("volatility", Volatility.SEMI_STABLE.value))
+                vol = coerce_volatility(h.get("volatility", Volatility.SEMI_STABLE.value))
                 d = decay_factor(h["age_days"], vol, self.half_life_semi, self.half_life_volatile)
                 # Build a tuple of (combined_score, original_hit_dict,
                 # volatility) for each hit — a common Python pattern for
@@ -205,7 +229,15 @@ class SemanticMemory:
                 # SearchTask (unlike fresh corpus evidence — see
                 # tools/corpus_search.py). abs(hash(...)) % 10_000 turns
                 # arbitrary content text into a short numeric suffix.
-                task_key=f"memory-{abs(hash(h.get('content',''))) % 10_000}",
+                # Built from content_id (the same uuid5 content identity
+                # storage/qdrant_store.py already uses for point ids) rather
+                # than the previous abs(hash(content)) % 10_000: Python
+                # randomises str hashes per process unless PYTHONHASHSEED is
+                # pinned, so the OLD key for the same remembered fact changed
+                # on every run and collided freely inside a 10k space. This
+                # one is stable across runs and machines, for free --
+                # content_id is already imported here for store_run.
+                task_key=f"memory-{content_id(h.get('content', ''))}",
                 # P2-02: NAMESPACED, not the raw stored goal_id. Before this
                 # fix, a memory item's goal_id was whichever earlier run's
                 # goal it happened to be filed under — and since every

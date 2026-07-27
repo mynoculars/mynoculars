@@ -138,6 +138,46 @@ class HybridRetriever:
             counts.get("retrieval_leg_unavailable", 0) + unavailable)
         self._counts.data = counts
 
+    def _bump(self, key: str) -> None:
+        """Add one to a single thread-local retrieval counter."""
+        counts: Dict[str, float] = getattr(self._counts, "data", {})
+        counts[key] = counts.get(key, 0) + 1
+        self._counts.data = counts
+
+    def _safe_leg(self, leg: Any, name: str, query: str,
+                  top_k: int) -> List[Dict[str, Any]]:
+        """Call one retrieval leg, converting a MID-RUN failure into [].
+
+        WHY THIS EXISTS: both stores only decide availability ONCE, from a
+        liveness probe in their own __init__. self.available therefore says
+        nothing about whether the store is still reachable NOW. A store that
+        dies AFTER startup (restart, network blip, expired credential, a
+        collection dropped underneath us) raises straight out of .search(),
+        through this class, through tools/corpus_search.py, and lands in
+        agents/gathering.py::search_worker's except -- which records the
+        whole task as a D-16 failure and discards the OTHER, healthy leg's
+        hits along with it. With MAX_FANOUT workers all hitting the same
+        dead store at once, every task in the cycle fails together and the
+        run reports a research failure for what was a transient store
+        outage.
+
+        Catching per LEG (here) rather than per store keeps the stores
+        policy-free -- they stay thin wrappers that raise -- while making
+        the degradation this class's docstring has always PROMISED
+        ("each one independently returns [] if unreachable") actually true.
+        retrieval_leg_unavailable is bumped so a mid-run failure is visible
+        in telemetry, not just in the log; before this it only ever counted
+        boot-time unavailability.
+        """
+        try:
+            return leg.search(query, top_k)
+        except Exception as exc:  # noqa: BLE001 -- degrade this leg, not the task
+            log_event(logger, "retrieval.leg_failed", level=logging.WARNING,
+                      leg=name, query=query, reason=type(exc).__name__,
+                      error=str(exc)[:300])
+            self._bump("retrieval_leg_unavailable")
+            return []
+
     def drain_counts(self) -> Dict[str, float]:
         """Return this thread's accumulated retrieval counts, and reset them.
 
@@ -182,8 +222,11 @@ class HybridRetriever:
         (order-preserving); none -> [].
         """
         self._bump_retrieval_counts()
-        dense_hits = self.dense.search(query, top_k)
-        kw_hits = self.keyword.search(query, top_k)
+        # Each leg is independently failure-isolated -- see _safe_leg. One
+        # dead backend degrades to single-leg fusion; it never costs the
+        # healthy leg's hits or burns the task as a D-16 failure.
+        dense_hits = self._safe_leg(self.dense, "dense", query, top_k)
+        kw_hits = self._safe_leg(self.keyword, "keyword", query, top_k)
 
         # P2-01: drop dense hits below the similarity floor BEFORE they can
         # enter fusion or become Evidence at all. Without this, a dense
@@ -212,12 +255,15 @@ class HybridRetriever:
             # This is the JOIN KEY between the two legs — see the module's
             # design decision above and this project's README for the
             # known limitation this creates with duplicate/missing titles.
-            doc_id = h.get("title") or h["content"][:60]
+            # .get("content", "") -- not h["content"] -- so a hit missing
+            # the field can't KeyError here while every OTHER read of the
+            # same field in this codebase already tolerates its absence.
+            doc_id = h.get("title") or h.get("content", "")[:60]
             by_id[doc_id] = h
             dense_rank.append(doc_id)
         kw_rank: List[str] = []
         for h in kw_hits:
-            doc_id = h.get("title") or h["content"][:60]
+            doc_id = h.get("title") or h.get("content", "")[:60]
             # by_id.setdefault(doc_id, h): if doc_id is ALREADY a key in
             # by_id (e.g. this same document also appeared in the dense
             # leg above), leave the existing value untouched; only insert

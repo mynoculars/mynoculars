@@ -285,7 +285,6 @@ class ResearchState(BaseModel):
     # Inputs — set once, by the caller (cli.py or api/server.py), before the
     # very first node runs. Nothing inside the graph ever changes raw_query.
     raw_query: str
-    thread_note: str = ""
 
     # Planning — written by agents/planning.py's nodes, read by everything
     # downstream.

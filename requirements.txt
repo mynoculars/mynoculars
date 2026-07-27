@@ -11,7 +11,11 @@ qdrant-client>=1.14
 fastembed>=0.3
 opensearch-py>=2.6
 langgraph-checkpoint-postgres>=2.0
-psycopg[binary]>=3.1
+# [pool] adds psycopg_pool, used by storage/postgres.py::get_checkpointer so
+# the parallel search_worker fan-out's checkpoint writes don't all serialise
+# behind a single connection. That module falls back to one connection when
+# psycopg_pool is absent, so an existing [binary]-only install still works.
+psycopg[binary,pool]>=3.1
 
 # API
 fastapi>=0.111

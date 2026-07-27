@@ -19,6 +19,17 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
+# mcp is an OPTIONAL extra (only reached when MCP_ENABLED=true). Skip
+# rather than fail on a minimal install -- see tests/unit/test_gc_memory.py.
+# qdrant_client/opensearchpy are named too because scripts/mcp_corpus_server.py
+# imports BOTH eagerly at module load (deliberately -- see that file's
+# "First-import gotcha"), so importing it here needs them present.
+pytest.importorskip("mcp")
+pytest.importorskip("qdrant_client")
+pytest.importorskip("opensearchpy")
+
 
 def _load_mcp_corpus_server():
     import importlib.util

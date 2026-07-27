@@ -148,10 +148,6 @@ class Tracer:
         body = "\n".join(body_lines) or "(no hits)"
         self._entries.append(f"{_BANNER}\n{header}\n{_BANNER}\n{body}\n")
 
-    def note(self, text: str) -> None:
-        """Free-form marker (e.g. run header/footer)."""
-        self._entries.append(text)
-
     def flush(self) -> Optional[str]:
         """Write all accumulated entries to logs/trace-<run_id>.txt. Returns
         the path written, or None if there was nothing to write.
@@ -216,9 +212,6 @@ class NullTracer(Tracer):
         return None
 
     def record_retrieval(self, *a: Any, **k: Any) -> None:
-        return None
-
-    def note(self, text: str) -> None:
         return None
 
     def flush(self) -> Optional[str]:

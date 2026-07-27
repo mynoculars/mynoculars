@@ -56,6 +56,7 @@ Python mechanics used in this file, if any of this is new to you:
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -240,7 +241,13 @@ class OpenAICompatibleClient:
         # "private" keyword. The underscore just signals to other
         # developers "this is an internal implementation detail, please
         # don't reach in and use it directly from outside this class."
-        self._trace_node: Optional[str] = None
+        # threading.local(), not a plain attribute: ONE client instance is
+        # shared by every node in the process, and set_trace_node mutates
+        # it out-of-band from the call it labels. Under any future
+        # concurrent LLM node that races, mislabelling trace entries and
+        # llm.call log lines. Per-thread storage removes the race without
+        # changing the single-threaded behaviour at all.
+        self._trace_local = threading.local()
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {api_key}"},
@@ -255,7 +262,25 @@ class OpenAICompatibleClient:
                     trace entry (see tracing.py) knows which graph node
                     (e.g. "goal_manager") issued a given LLM call.
         """
-        self._trace_node = node
+        self._trace_local.node = node
+
+    @property
+    def _trace_node(self) -> Optional[str]:
+        """The node name set on THIS thread, or None if none was set."""
+        return getattr(self._trace_local, "node", None)
+
+    def close(self) -> None:
+        """Close the underlying httpx.Client. Safe to call twice.
+
+        CALLED BY   llm/router.py::FallbackRouter.close.
+        WHY THIS EXISTS: this class opens a persistent httpx.Client in
+        __init__ (one per configured provider) and nothing ever closed it.
+        Harmless for a short CLI process the OS is about to reap, a real
+        leak for the long-lived FastAPI process — and, like the
+        checkpointer connection P2-08 closed, never a design decision,
+        just an oversight.
+        """
+        self._http.close()
 
     def complete(self, messages: List[Message], temperature: float = 0.2) -> str:
         """POST the transcript; return assistant text. Raises httpx errors
@@ -337,10 +362,19 @@ class StubClient:
 
     def __init__(self, tracer: Any = None):
         self._tracer = tracer
-        self._trace_node: Optional[str] = None
+        self._trace_local = threading.local()
 
     def set_trace_node(self, node: Optional[str]) -> None:
-        self._trace_node = node
+        self._trace_local.node = node
+
+    @property
+    def _trace_node(self) -> Optional[str]:
+        return getattr(self._trace_local, "node", None)
+
+    def close(self) -> None:
+        """No transport to release — present so FallbackRouter.close can
+        call close() uniformly across every provider in the chain."""
+        return None
 
     # A class-level dict (defined once, shared by every StubClient
     # instance — it is never mutated at runtime, so sharing it is safe).

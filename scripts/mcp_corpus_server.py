@@ -28,7 +28,8 @@ Usage (as an MCP_SERVER_COMMAND, not run directly by a person):
     MCP_QUERY_ARG_NAME=query
 
     This file lives at the REPO ROOT's scripts/ directory (like
-    ingest_sample_data.py) and does its own sys.path.insert(0, "src"), so
+    ingest_sample_data.py) and puts its own repo-relative "src" on
+    sys.path (resolved from __file__, not the CWD), so
     it needs no PYTHONPATH set in the MCP subprocess's environment --
     matching every other script in this repo, and matching P2-13's own
     env-allowlist design (MCP_SERVER_ENV_ALLOWLIST can stay empty; this
@@ -80,12 +81,20 @@ function; the REAL retrieval round trip has since been confirmed live,
 including under real concurrency (see the fix note above).
 """
 import asyncio
+import atexit
+import pathlib
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, "src")
+# Resolve "src" RELATIVE TO THIS FILE, never relative to the current
+# working directory. `sys.path.insert(0, "src")` only resolved when the
+# process happened to be launched from the repo root -- not guaranteed
+# for a script launched as an MCP_SERVER_COMMAND subprocess, from a
+# Windows shortcut or scheduled task, or from any other directory --
+# and failed with an opaque ModuleNotFoundError when it did not.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
@@ -222,6 +231,12 @@ def hits_for_query(query: str) -> list:
 
 
 _search_executor = ThreadPoolExecutor(max_workers=get_settings().mcp_max_workers)
+# Shut the pool down on interpreter exit. Without this a server process torn
+# down by MCPBridge.close() sits in atexit's default join waiting on
+# in-flight worker threads with no bound and no diagnostic -- and on Windows
+# an un-joined pool still holding a live Qdrant/OpenSearch client is exactly
+# the shape of hang that is hardest to attribute after the fact.
+atexit.register(_search_executor.shutdown, wait=False)
 
 
 @mcp.tool()

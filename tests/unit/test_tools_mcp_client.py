@@ -33,6 +33,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+# See tests/unit/test_mcp_corpus_server.py for why this is a skip.
+pytest.importorskip("mcp")
+
 
 def test_split_csv_strips_and_drops_empty_entries():
     from research_agent.config import split_csv

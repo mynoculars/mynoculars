@@ -137,6 +137,9 @@ def close_checkpointer(checkpointer: Any) -> None:
     conn = getattr(checkpointer, "conn", None)
     if conn is not None:
         try:
+            # A ConnectionPool exposes close() too, so this one call covers
+            # both branches of get_checkpointer below (pooled and single
+            # connection) with no type check.
             conn.close()
             log_event(logger, "checkpointer.closed")
         except Exception as exc:  # noqa: BLE001 — closing is best-effort
@@ -167,11 +170,32 @@ def get_checkpointer(dsn: str) -> Tuple[Any, bool]:
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
         import psycopg
-        # autocommit=True means each SQL statement takes effect immediately
-        # rather than needing an explicit conn.commit() call — appropriate
-        # here since PostgresSaver manages its own transactions internally
-        # once it has a connection to use.
-        conn = psycopg.connect(dsn, autocommit=True)
+        # A POOL when psycopg_pool is installed, a single connection
+        # otherwise. LangGraph dispatches every fanned-out search_worker in
+        # one superstep and checkpoints after it, so all of those writes
+        # previously queued behind ONE connection — psycopg3 is thread-safe
+        # but serialises on an internal lock, so concurrency at the graph
+        # level was silently serialised at the storage level. A pool sized
+        # for the fan-out removes that ceiling.
+        #
+        # Falls back rather than hard-requiring the extra: psycopg_pool
+        # ships as `psycopg[pool]`, and an existing install that only has
+        # `psycopg[binary]` must keep working exactly as before.
+        conn = None
+        try:
+            from psycopg_pool import ConnectionPool
+            conn = ConnectionPool(dsn, min_size=1, max_size=10, open=True,
+                                  kwargs={"autocommit": True})
+            log_event(logger, "checkpointer.pool_active", max_size=10)
+        except ImportError:
+            # autocommit=True means each SQL statement takes effect
+            # immediately rather than needing an explicit conn.commit()
+            # call — appropriate here since PostgresSaver manages its own
+            # transactions internally once it has a connection to use.
+            conn = psycopg.connect(dsn, autocommit=True)
+            log_event(logger, "checkpointer.single_connection",
+                      level=logging.WARNING,
+                      reason="psycopg_pool not installed; install psycopg[pool]")
         # serde=_build_checkpoint_serde() is the fix for the LangGraph
         # "Deserializing unregistered type" warning — see that function's
         # docstring above for exactly why this matters, not just how.

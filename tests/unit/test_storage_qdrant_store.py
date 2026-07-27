@@ -36,6 +36,11 @@ import datetime as _dt
 import uuid as _uuid
 from unittest.mock import MagicMock
 
+import pytest
+
+# See tests/unit/test_gc_memory.py for why this is a skip, not a failure.
+pytest.importorskip("qdrant_client")
+
 from research_agent.storage.qdrant_store import QdrantStore, content_id
 
 
