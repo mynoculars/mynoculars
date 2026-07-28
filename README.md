@@ -28,13 +28,23 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > clause) in every prompt that inlines it. `escalation_history` now
 > surfaces in telemetry (`telemetry["escalations"]`) — previously written
 > by `human_escalation`, read by nothing. **The CLI's exit code is no
-> longer always 0** (Limitations item 27, corrected below). The compiler's
+> longer always 0** (previously Limitations item 27, now fixed). The compiler's
 > free-text output now survives a fallback provider wrapping it in a code
 > fence or echoing the `<evidence>` tag back literally (`strip_code_fence`,
 > tested against 15 edge cases including punctuated language tags like
 > `c++`). **Test suite: 157/157**, up from 135 — every count below is
 > corrected to match. Nothing else changed: the architecture, D-xx
 > decisions, and Tier 1/2/3 narrative below are all still accurate.
+
+> **Phase 3 — Langfuse observability, now documented.** A dedicated
+> `research_agent/langfuse/` module adds optional, non-invasive tracing —
+> traces, spans, generations, events, and scores — over every node in the
+> graph, every LLM provider call, retrieval, memory, and HITL action.
+> Disabled by default (`LANGFUSE_ENABLED=false`, zero SDK import, zero
+> network calls); enabling it changes no business logic, prompts, or graph
+> topology. See [Observability — Langfuse (Phase 3)](#observability--langfuse-phase-3)
+> below. **Test suite: 190/190** (157 carried forward + 33 new, fully
+> offline). D-35 logs the module-boundary decision in `DECISIONS.md`.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
@@ -184,6 +194,11 @@ and `score` values in the trace/log output — see
   provider, tokens and latency of every LLM call plus every retrieval engine's
   raw hits, **plus a `node.enter` log line for every node that runs**,
   including the ones that touch neither an LLM nor a store.
+- Optional **Langfuse observability** (`LANGFUSE_ENABLED=true`, Phase 3):
+  traces, spans, generations, events, and scores over every node, LLM call,
+  retrieval, memory op, and HITL decision — with per-call cost, fail-open
+  behaviour, and zero SDK import/network calls when disabled (the default).
+  See [Observability — Langfuse (Phase 3)](#observability--langfuse-phase-3).
 - `--print-graph`: the compiled graph's static topology, independent of any
   run.
 - Fully offline demo mode (`LLM_MODE=stub`) — the entire graph runs with zero
@@ -220,30 +235,38 @@ single test fixture.
 │FallbackRouter│   │ Corpus tool  │    │SemanticMemory│   │   Checkpointer   │
 │ hop on error │   │ plain callab-│    │ decay rerank │   │   + run history  │
 │ OR on low    │   │ le (MCP seam)│    │ in Python    │   │                  │
-│ quality      │   └──────┬───────┘    └──────┬───────┘   └───┬──────────┬───┘
-└─┬──────┬───┬─┘          │                   │       LangGraph│      app │
-  │      │   │            ▼                   │         writes │    writes│
-  │      │   │     ┌───────────────┐          │                ▼          ▼
-  │      │   │     │HybridRetriever│          │        ┌───────────────────────┐
-  │      │   │     │ RRF in Python │          │        │      PostgreSQL       │
-  │      │   │     │ + min_similar.│          │        │ ┌───────────────────┐ │
-  │      │   │     │ floor (P2-01) │          │        │ │ checkpoints       │ │
-  ▼      ▼   ▼        ▼         ▼             ▼        │ │ checkpoint_blobs  │ │
-┌─────┐┌────┐┌────┐┌───────┐┌─────────┐┌─────────────┐ │ │ checkpoint_writes │ │
-│Cogi-││Mist││Gem ││Qdrant ││OpenSea- ││Qdrant       │ │ ├───────────────────┤ │
-│to   ││ral ││ini ││agent_ ││rch      ││agent_seman- │ │ │ agent_runs  (app) │ │
-│local││    ││    ││corpus ││agent_   ││tic_memory   │ │ └───────────────────┘ │
-│hop 0││hop1││hop2││dense  ││corpus   ││namespaced   │ │                       │
-│120s ││90s ││90s ││       ││         ││ids (P2-02)  │ │                       │
-└─────┘└────┘└────┘└───────┘└─────────┘└─────────────┘ └───────────────────────┘
-                       ▲          ▲            ▲
-                       └─────┬────┘            │
-                             │                 │
-               ┌─────────────┴─────────┐  ┌────┴──────────────┐
-               │ingest_sample_data.py  │  │memory_writer node │
-               │    (manual, 1×)       │  │(after a PASSED    │
-               └───────────────────────┘  │ critique only)    │
-                                          └───────────────────┘
+│ quality      │   └──────┬───────┘    └─────────┬────┘   └───┬──────────┬───┘
+└─┬──────┬───┬─┘          │                      │   LangGraph│      app │
+  │      │   │            ▼                      │     writes │    writes│
+  │      │   │    ┌───────────────────┐          │            │          │
+  │      │   │    │ HybridRetriever   │          │            │          │
+  │      │   │    │   RRF in Python   │          │            ▼          ▼
+  │      │   │    │   + min_similar.  │          │        ┌───────────────────────┐
+  │      │   │    │  floor (P2-01)    │          │        │    PostGreSQL         │
+  │      │   │    └───────────────────┘          │        │ ┌───────────────────┐ │
+  │      │   └──┐         ▲        ▲             │        │ │ checkpoints       │ │
+  │      │      │         │        │             │        │ │ checkpoint_blobs  │ │
+  ▼      ▼      ▼         │        │             │        │ │ checkpoint_writes │ │
+┌─────┐ ┌────┐┌────┐  ┌───┴───┐┌───┴────────┐    │        │ ├───────────────────┤ │
+│  C  │ │ M  ││ G  │  │Qdrant ││ OpenSearch │    │        │ │ agent_runs (app)  │ │
+│  O  │ │ I  ││ E  │  │agent_ ││   agent_   │    │        │ └───────────────────┘ │
+│  G  │ │ S  ││ M  │  │corpus ││     corpus │    │        └───────────────────────┘
+│  I  │ │ T  ││ I  │  │       ││            │    │
+│  T  │ │ R  ││ N  │  │ dense ││ sparse     │    │         
+│  O  │ │ A  ││ I  │  └───────┘└────────────┘    │       ┌──────────────────────────┐  
+│     │ │ L  ││    │      ▲          ▲           │       │ Qdrant                   │
+│     │ │    ││    │      └─────┬────┘           └──────►│   agent_semantic_memory  │ 
+│local│ │    ││    │            │                        │   namespaced ids (P2-02) │ 
+│hop 0│ │hop1││hop2│   ┌────────┴──────────────┐         └──────────────────────────┘ 
+│     │ │    ││    │   │ ingest_sample_data.py │                      ▲
+│120s │ │ 90s││ 90s│   │                       │                      |  
+└─────┘ └────┘└────┘   │     (manual, 1×)      │            ┌─────────┴──────────┐
+                       └───────────────────────┘            │ memory_writer node │
+                                                            │ (after a PASSED    │
+                                                            │    critique only)  │
+                                                            └────────────────────┘
+
+
 ```
 
 Three things this picture is telling you that the previous one did not.
@@ -273,10 +296,12 @@ whose check fired**, never by the router that reads it.
               ┌──────────────────┐
               │     classify     │  LLM ─► {intent, confidence}
               └────────┬─────────┘
+                       │
                        ▼
               ┌──────────────────┐
               │ memory_retrieve  │  Qdrant ─► past evidence, decay-reranked,
-              └────────┬─────────┘  goal_id namespaced (P2-02)
+              └────────┬─────────┘      goal_id namespaced (P2-02)
+                       │
                        ▼
               ┌──────────────────┐
               │   goal_manager   │  LLM ─► goals (+ human redirect guidance)
@@ -286,7 +311,7 @@ whose check fired**, never by the router that reads it.
         ┌────────────────────────────┐
         │ goals present? (D-21/E1*)  │
         └───────┬─────────────┬──────┘
-                │ no          │ yes
+                │ NO          │ YES
                 ▼             ▼
         (ERROR report)   ┌──────────────────┐
                 │        │  task_expander   │  LLM ─► ranked backlog, capped
@@ -537,26 +562,29 @@ LangGraph. Below it, us. Both halves are recreated automatically after a wipe �
       ┌───────────────────┐                   ┌───────────────────┐
       │  10 documents     │                   │  10 points        │
       └─────────┬─────────┘                   └─────────┬─────────┘
+                │                                       │      
    run ingest 2 ▼                          run ingest 2 ▼
       ┌───────────────────┐                   ┌───────────────────┐
       │  10 documents     │                   │  10 points        │
       │  same ids ─►      │                   │  same content ─►  │
       │  overwritten      │                   │  SAME uuid5 id ─► │
       └─────────┬─────────┘                   │  overwritten too  │
-   run ingest 3 ▼                             └─────────┬─────────┘
-      ┌───────────────────┐               run ingest 3 ▼
+                |                             └─────────┬─────────┘
+   run ingest 3 ▼                                       |
+      ┌───────────────────┐               run ingest 3  ▼
       │  10 documents     │                  ┌───────────────────┐
       └─────────┬─────────┘                  │  10 points, still │
                 │                            └─────────┬─────────┘
                 └──────────────────┬───────────────────┘
+                                   |
                                    ▼
-                 ┌───────────────────────────────────┐
-                 │ rrf_fuse() joins on `title`       │
-                 │ ── still fragile for a corpus     │
-                 │    with repeated/missing titles,  │
-                 │    but no longer masking a growing│
-                 │    pile of duplicate points       │
-                 └───────────────────────────────────┘
+                 ┌────────────────────────────────────┐
+                 │ rrf_fuse() joins on `title`        │
+                 │ ── still fragile for a corpus      │
+                 │    with repeated/missing titles,   │
+                 │    but no longer masking a growing │
+                 │    pile of duplicate points        │
+                 └────────────────────────────────────┘
 ```
 
 **P2-03 added the MECHANISM for idempotent ingest** —
@@ -672,6 +700,125 @@ that itself errors returns `1.0`, so a flaky scoring call can never burn a
 working answer path — and that fail-open path is itself counted
 (`llm_quality_calls_failed`), so it's visible in telemetry rather than only
 in a log line.
+
+### Observability — Langfuse (Phase 3)
+
+A dedicated package is the *only* place the Langfuse SDK is imported. Every
+business module talks to it through five thin, always-safe functions —
+`start_trace`, `span`, `generation`, `event`, `score` (plus `end_trace`,
+`flush`, `shutdown`) — and never sees an SDK object, a trace handle, or a
+span handle:
+
+```text
+research_agent/langfuse/
+    __init__.py   thin public functions only (the whole import surface)
+    client.py     the ONLY file that imports the langfuse SDK; build_client()
+                   returns a real client or None, never raises
+    observer.py   Observer — trace lifecycle, spans, generations, events,
+                   scores, cost, shutdown, thread safety (threading.Lock)
+    pricing.py     cost = f(Settings-configured $/1M rates, token usage)
+    helpers.py     thread_id_from_config, traced_node (generic node wrapper)
+```
+
+```text
+ cli.py / graph.py / llm / retrieval / memory / agents
+              │  from research_agent import langfuse as lf
+              ▼
+   research_agent/langfuse/__init__.py  (thin functions, always safe)
+              │
+              ▼
+        observer.py::Observer  ──fail-open, never raises──►  caller
+              │  (enabled?)
+              ▼
+        client.py::build_client()  →  langfuse SDK v4 (OTel-based)
+              │
+              ▼
+     Langfuse Cloud  /  self-hosted  /  enterprise  (LANGFUSE_HOST)
+```
+
+```text
+  Langfuse Observability — Instrumentation Points (Phase 3)
+
+┌─────────────────────────────────────────────────────┐
+│  CLI (cli.py)               FastAPI (api/server.py) │
+│  build_app_and_settings()   — one wiring point      │◄──┐
+└──────────────────────────┬──────────────────────────┘   │ start_trace()/
+                           │                              │ end_trace()
+                           ▼                              │ (root, per thread_id)
+┌─────────────────────────────────────────────────────┐   │
+│       LangGraph workflow — 13 nodes, fixed          │◄──┤ traced_node() wraps
+└───────┬──────────────────┬────────────────────┬─────┘   │ EVERY add_node() call
+        │                  │                    │         │ (span per node)
+        ▼                  ▼                    ▼         │
+┌──────────────┐   ┌────────────────┐   ┌──────────────┐  │
+│FallbackRouter│◄──┼─ event()       │   │SemanticMemory│◄─┤ event()
+│ hop on error │   │  "llm.fallback"│   │ decay rerank │  │  memory.retrieved/
+└─┬─────┬────┬─┘   └──────┬─────────┘   └──────────────┘  │  memory.stored
+  │     │    │            │                               │
+  ▼     ▼    ▼            ▼                               │
+┌───┐ ┌───┐ ┌───┐     ┌─────────────────┐                 │
+│ C │ │ M │ │ G │     │ HybridRetriever │◄────────────────┤ span()
+│ o │ │ i │ │ e │     │  RRF + floor    │                 │  retrieval.hybrid_search
+│ g │ │ s │ │ m │     │                 │                 │
+│ i │ │ t │ │ i │     │  RRF + floor    │                 │
+│ t │ │ r │ │ n │     └─────────────────┘                 │
+│ o │ │ a │ │ i │                                         │
+└───┘ │ l │ └───┘                                         │
+  ▲   └───┘   ▲                                           │
+  │      ▲    │                                           │
+  │      │    │                                           │
+  └──────┴────┴───────────────────────────────────────────┤
+     generation()                                         │
+        — tokens, latency, cost                           │
+        — temperature, per real provider call             │
+                                                          │
+                                                          │
+                    ┌─────────────────────────────────────┴────────────┐
+                    │         research_agent/langfuse/                 │
+                    │  start_trace / end_trace / span / generation /   │
+                    │  event / score / flush / shutdown                │
+                    │                                                  │
+                    │  client.py → Langfuse SDK v4 (OTel) → Langfuse   │
+                    │  Cloud / self-hosted / enterprise (LANGFUSE_HOST)│
+                    │                                                  │
+                    │  Off by default (LANGFUSE_ENABLED=false):        │
+                    │  zero import, zero network calls                 │
+                    └──────────────────────────────────────────────────┘
+```
+
+Disabled by default (`LANGFUSE_ENABLED=false`): the package never imports the
+`langfuse` SDK and makes zero network calls. A client that raises on every
+call (bad credentials, unreachable host) never propagates an exception to a
+caller — the agent runs identically either way. `traced_node()` wraps each of
+the 13 `add_node(...)` call sites in `orchestration/graph.py` in one place,
+so every node is spanned (real `input`/`output`, timing, error state) without
+touching any of the 13 node function bodies.
+
+**Instrumented:** one root trace per query keyed by `thread_id`
+(`cli.py::_run`); every graph node (`traced_node`); every real LLM provider
+call — tokens, latency, cost, temperature (`llm/client.py`); every fallback
+hop (`llm/router.py`); hybrid retrieval hit counts and degraded-leg state
+(`retrieval/hybrid.py`); memory retrieve/store counts
+(`memory/semantic_memory.py`); recall/coverage per gather cycle
+(`agents/gathering.py`); critique pass/fail and self-score
+(`agents/compilation.py`); and the HITL trigger, human decision, and resume
+latency as both an event and a `human_review` score (`cli.py`'s HITL loop).
+Session grouping (`propagate_attributes(session_id=thread_id, ...)`) survives
+LangGraph's own parallel `Send` dispatch, so `search_worker`'s fan-out
+inherits the correct session with no special-casing.
+
+**Cost** (`langfuse/pricing.py`) maps `FallbackRouter`'s own provider names
+(`"primary"`, `"mistral"`, `"gemini"`) to Settings-configured `$/1M`-token
+rates — an unconfigured provider costs `$0` (correct for a free local model,
+honest "unknown" for cloud), and a misconfigured negative rate clamps to
+zero rather than reporting negative dollars.
+
+**Known limitation, by decision:** every span/generation is a flat child of
+the trace root — there is no `parent_span_id` tracking, so the Langfuse UI
+renders a flat list per trace, not a tree following
+`classify → goal_manager → search_worker×N → merger → ...`. Threading real
+parent-span state through every call site was judged a bigger design change
+than this phase's remit; not fixed. See `DECISIONS.md` D-35.
 
 ## Storage Contracts
 
@@ -1171,30 +1318,36 @@ research-agent-dmp/
 │   ├── orchestration/       # graph wiring + worker contract enforcement
 │   ├── retrieval/           # hybrid dense+BM25 with RRF + relevance floor
 │   ├── memory/              # semantic memory with decay + namespaced ids
-│   ├── storage/             # postgres / qdrant / opensearch wrappers
+│   ├── storage/             # Postgres / Qdrant / OpenSearch wrappers
+│   ├── langfuse/             # Phase 3: optional Langfuse tracing, the only
+│   │                        package that imports the langfuse SDK — see
+│   │                        Observability — Langfuse (Phase 3) above
 │   ├── tools/                # the corpus-search tool workers invoke (MCP seam):
 │   │                        corpus_search.py (default) + mcp_client.py (P2-13,
 │   │                        stdio transport, opt-in via MCP_ENABLED)
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 157 tests, offline. Organized by module,
+├── tests/                   # 190 tests, offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
 │                              (full graph.invoke() runs). See
 │                              OPERATIONS.md "Running and Interpreting the
 │                              Test Suite" for the full file-by-file map.
-│                              Two new unit files this session:
+│                              Two new unit files, prior session:
 │                              test_api_server.py, test_agents_compilation.py.
+│                              Phase 3: test_langfuse.py (33 tests, fully
+│                              offline — no real Langfuse project, no network).
 ├── scripts/ingest_sample_data.py
 ├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
-├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool (P2-13, off by default via MCP_ENABLED=false)
+├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool 
+│                                    (P2-13, off by default via MCP_ENABLED=false)
 ├── scripts/check_services.py     # health check: Qdrant/OpenSearch/Postgres/LLM/MCP/API (D-33)
 ├── sample_data/corpus.jsonl # 10 docs, Redis-vs-Memcached theme
 ├── design/Research_Agent_Design.md
 ├── OPERATIONS.md   internal/LEARNING_GUIDE.md   internal/PHASE-2_PLAN.md
-├── docker-compose.yml       # optional: postgres + qdrant + opensearch
+├── docker-compose.yml       # optional: Postgres + Qdrant + OpenSearch
 ├── requirements.txt  .env.example  run.bat  reset.bat
 └── DECISIONS.md             # populated: D-1..D-32, sourced from code comments
 ```
@@ -1212,10 +1365,15 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 157 passed
+python -m pytest tests/ -q    # expect: 190 passed
 ```
 
 Windows: `run.bat` does the venv, install, and a stub run in one command.
+
+Langfuse tracing is opt-in and does not affect the steps above: `langfuse` is
+an installed dependency (`requirements.txt`), but `LANGFUSE_ENABLED=false`
+(the `.env.example` default) means it is never imported and makes no network
+calls. Flip it on later per [Observability — Langfuse (Phase 3)](#observability--langfuse-phase-3).
 
 Defaults are `LLM_MODE=stub` with every store unreachable, so the first run
 reports `evidence_items: 0`. **That is success for L1** — the graph is proven,
@@ -1282,11 +1440,12 @@ This table lists only decisions with code behind them here.
 | D-29 | `ConfigDict(extra="forbid")` on all state models | Construction-time pollution and worker-return pollution are two failure modes; two layers |
 | D-31 *(proposed, P2-03)* | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script AND memory writes (P2-15). Evidence.task_key for memory items is the one identity-related thing NOT yet fixed this way (still `hash()`-based) |
 | D-32 *(proposed, P2-04)* | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks. This session extended the same principle to the compiler's free-text output (`strip_code_fence`) |
+| D-35 *(Phase 3)* | All Langfuse SDK usage isolated in one package (`langfuse/`); every business module imports only thin, always-safe functions and never sees an SDK/trace/span object | Non-invasive observability must not leak a third-party SDK's shape into business logic, and must be safe to call even when disabled or misconfigured |
 | — | Graceful degradation everywhere | First run must succeed on a bare laptop |
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
 `DECISIONS.md` (populated as of P2-09) is now the authoritative consolidated
-log for D-1 through D-32 — this table is a curated subset for readability,
+log for D-1 through D-35 — this table is a curated subset for readability,
 not a replacement.
 
 ## Limitations
@@ -1418,6 +1577,57 @@ visible rather than deleted, so the history stays auditable.
     punctuated language tags like `c++` that an earlier, buggier version
     of this same fix mishandled) plus the system-prompt clause in item 25.
 
+**MCP corpus server concurrency — fixed, kept visible for auditability**
+
+29. ~~MCP corpus server serialized under concurrent load~~ — **P2-13,
+    Tier 3, fixed.** `scripts/mcp_corpus_server.py`'s tool handler used
+    to be synchronous; FastMCP called it directly on its single event
+    loop with no thread offload (confirmed by reading
+    `func_metadata.py::call_fn_with_arg_validation` — `fn(**args)`
+    called inline, not via `asyncio.to_thread`). Result: one real MCP
+    request blocked the whole server for its full duration (~13s+ for a
+    real Qdrant/OpenSearch round trip), so `MAX_FANOUT` concurrent
+    requests fully serialized instead of running in parallel — confirmed
+    live: 6 concurrent calls that take 14.4s total called DIRECTLY (no
+    MCP) took 100+ seconds through MCP, with two additional real
+    concurrency bugs (a `MCPBridge.start()` race and a
+    `_get_corpus_tool()` thundering-herd race, both since fixed) found
+    and fixed along the way but NOT the cause of this specific slowdown.
+    Never a correctness bug — every request always completed correctly,
+    just slowly. Fixed by making `mcp_corpus_server.py::search` `async
+    def` and offloading the blocking `hits_for_query` call to a
+    dedicated `ThreadPoolExecutor` sized by the new `mcp_max_workers`
+    setting (default 6, matching `MAX_FANOUT`) via
+    `loop.run_in_executor(...)` — functionally equivalent to the
+    `asyncio.to_thread(...)` approach originally proposed here, with an
+    explicitly bounded pool instead of the default executor.
+    `MCP_ENABLED=false` (default) is unaffected either way; P2-14's
+    tool_hint routing is now usable at real concurrency.
+
+    **A second, separate stall found and fixed after the above:** even
+    with the async/executor fix in place, the FIRST ever `search()` call
+    in a real deployment still stalled for ~120s before any network call
+    started. Root cause: `qdrant_client` was imported lazily, for the
+    first time in that process, on a `_search_executor` worker thread,
+    while the main thread's asyncio Proactor loop was already doing real
+    overlapped I/O on the stdio pipes -- that specific combination (live
+    Proactor I/O + a first-time native-extension import on another
+    thread) stalled reproducibly on at least one Windows deployment
+    machine, independent of any configured timeout (isolated,
+    reproduced, and fixed live; two other plausible causes --
+    antivirus file-hash scanning, and `CREATE_NO_WINDOW` plus a stripped
+    subprocess environment -- were tested directly and ruled out). Fixed
+    by importing `qdrant_client` and `opensearchpy` eagerly, on the main
+    thread, at module load time in `scripts/mcp_corpus_server.py`,
+    before `mcp.run()` starts the event loop -- see that file's module
+    docstring ("First-import gotcha") for the full account. **Do not
+    remove those two imports as "dead code"**; they look redundant with
+    `QdrantStore`/`OpenSearchStore`'s own lazy imports but are
+    load-order-critical. This also loosened
+    `tests/unit/test_mcp_corpus_server.py::test_mcp_corpus_server_imports_instantly_without_a_live_backend`'s
+    import-speed guard from 2s to 30s (an intentional trade-off,
+    documented on that test).
+
 **Still broken, in rough order of consequence**
 
 1. Self-critique can pass a report whose claims appear in no retrieved
@@ -1438,54 +1648,9 @@ visible rather than deleted, so the history stays auditable.
    section above for the full explanation and a live example. Not addressed
    by any Tier; no P2-xx item currently scoped to it.
 5. Contradiction detection remains marker-only — `E2` has never fired in a
-   real run (`P2-12`, Tier 3, depends on P2-01 which is done).
-6. **MCP corpus server serialized under concurrent load** (`P2-13`, Tier 3)
-   — **FIXED**: `scripts/mcp_corpus_server.py`'s tool handler used to be
-   synchronous; FastMCP called it directly on its single event loop with
-   no thread offload (confirmed by reading
-   `func_metadata.py::call_fn_with_arg_validation` — `fn(**args)` called
-   inline, not via `asyncio.to_thread`). Result: one real MCP request
-   blocked the whole server for its full duration (~13s+ for a real
-   Qdrant/OpenSearch round trip), so `MAX_FANOUT` concurrent requests
-   fully serialized instead of running in parallel — confirmed live: 6
-   concurrent calls that take 14.4s total called DIRECTLY (no MCP) took
-   100+ seconds through MCP, with two additional real concurrency bugs (a
-   `MCPBridge.start()` race and a `_get_corpus_tool()` thundering-herd
-   race, both since fixed) found and fixed along the way but NOT the
-   cause of this specific slowdown. Never a correctness bug — every
-   request always completed correctly, just slowly. Fixed by making
-   `mcp_corpus_server.py::search` `async def` and offloading the blocking
-   `hits_for_query` call to a dedicated `ThreadPoolExecutor` sized by the
-   new `mcp_max_workers` setting (default 6, matching `MAX_FANOUT`) via
-   `loop.run_in_executor(...)` — functionally equivalent to the
-   `asyncio.to_thread(...)` approach originally proposed here, with an
-   explicitly bounded pool instead of the default executor.
-   `MCP_ENABLED=false` (default) is unaffected either way; P2-14's
-   tool_hint routing is now usable at real concurrency.
-
-   **Update -- a second, separate stall found and fixed after the above**:
-   even with the async/executor fix in place, the FIRST ever `search()`
-   call in a real deployment still stalled for ~120s before any network
-   call started. Root cause: `qdrant_client` was imported lazily, for the
-   first time in that process, on a `_search_executor` worker thread,
-   while the main thread's asyncio Proactor loop was already doing real
-   overlapped I/O on the stdio pipes -- that specific combination (live
-   Proactor I/O + a first-time native-extension import on another thread)
-   stalled reproducibly on at least one Windows deployment machine,
-   independent of any configured timeout (isolated, reproduced, and fixed
-   live; two other plausible causes -- antivirus file-hash scanning, and
-   `CREATE_NO_WINDOW` plus a stripped subprocess environment -- were tested
-   directly and ruled out). Fixed by importing `qdrant_client` and
-   `opensearchpy` eagerly, on the main thread, at module load time in
-   `scripts/mcp_corpus_server.py`, before `mcp.run()` starts the event
-   loop -- see that file's module docstring ("First-import gotcha") for
-   the full account. **Do not remove those two imports as "dead code"**;
-   they look redundant with `QdrantStore`/`OpenSearchStore`'s own lazy
-   imports but are load-order-critical. This also loosened
-   `tests/unit/test_mcp_corpus_server.py::test_mcp_corpus_server_imports_instantly_without_a_live_backend`'s
-   import-speed guard from 2s to 30s (an intentional trade-off,
-   documented on that test).
-
+   real run (`P2-12`, Tier 3, depends on P2-01 which is done). Wiring the
+   detector to something more than explicit markers is the only remaining
+   step to make `E2` reachable in practice, not just in principle.
 
 ## Documentation Corrections
 
@@ -1495,15 +1660,15 @@ auditable rather than invisible.
 | Claim in older docs | Reality in code |
 |---|---|
 | README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and each hop tier uses a different timeout** |
-| README / OPERATIONS: "28 tests" | **157** tests collected and passing (grew across Tier 2/3 to 135, then to 157 with a further post-Tier-3 round of fixes) |
-| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~95 files in this distribution (grown again this session — new tests, no new source modules); **157** tests, **0 skipped** |
+| README / OPERATIONS: "28 tests" | **190** tests collected and passing (grew across Tier 2/3 to 135, then to 157 post-Tier-3, then to **190** with Phase 3's 33 new `test_langfuse.py` tests) |
+| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~100 files in this distribution (Phase 3 added 5 source files + 1 test file, no other new source modules); **190** tests, **0 skipped** |
 | README legend: with HITL off the checks "log and continue" | True for E1/E4 only; E2/E3 log nothing when HITL is off |
 | OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | True for both stores — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism is wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
 | OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and re-verified end-to-end against real live runs — both a genuine E3 escalation (via the D-16 failed-task path) and a clean convergence at `recall 1.0` with real evidence once the corpus was properly ingested. See The HITL Investigation |
 | design §9: `MAX_REVISIONS` default 3 | Code default is **2** (`config.py`) |
 | README structure tree: root `agentic-research-agent/` | Distributed directory is `research-agent-dmp/` |
 | Storage diagram implied one Qdrant use | Two collections; `CORPUS_INDEX` names **both** a Qdrant collection and an OpenSearch index |
-| `DECISIONS.md` referenced as the decision log | Populated (D-1 through D-32, sourced from code comments and this document's own citations — a few numbers, D-7/9/10/11, are flagged as ungrounded rather than invented) |
+| `DECISIONS.md` referenced as the decision log | Populated (D-1 through D-35, sourced from code comments and this document's own citations — a few numbers, D-7/9/10/11, are flagged as ungrounded rather than invented) |
 | `internal/LEARNING_GUIDE.md` cited as a companion doc | `internal/` is in `.gitignore`, so it ships only in archives like this one |
 | OPERATIONS §L1: "add two `logging.getLogger(...)` lines" | Already present in `logging_setup.py::configure_logging` |
 | This README's own citations of "`PHASE2_PLAN.md`" | The actual tracked file is `internal/PHASE-2_PLAN.md` (hyphenated, under `internal/`) |
@@ -1545,16 +1710,13 @@ The shape of it, updated with this revision's progress:
   TIER 3 ── design catch-up ──► close the D-25/26/27/30 gap        ✅ CLOSED
      P2-10  Qdrant payload indexes + server-side decay      (D-27) ✅ DONE
      P2-11  judge-model quality scoring                             ✅ DONE
-     P2-12  semantic contradiction detector — E2 reachable at last   ✅ DONE
-                                                                 (marker-only
-                                                                 detector still
-                                                                 applies, see
-                                                                 Limitations)
+     P2-12  semantic contradiction detector — E2 wiring reachable,  ⚠ PARTIAL
+              detector itself still marker-only (see Limitations)
      P2-13  MCP tool seam                                   (D-26/D-30) ✅ DONE
      P2-14  typed specialist workers                        (D-25) ✅ DONE
      P2-15  memory supersession + GC                                ✅ DONE
                      │
-  TIER 3 STATUS: CLOSED.
+  TIER 3 STATUS: CLOSED (P2-12 wiring done; detector quality tracked separately).
                      │
   POST-TIER-3 SESSION ── a further round of live-tested fixes    ✅ CLOSED
      api/server.py AppBundle unpack crash                    ✅ FIXED
@@ -1567,15 +1729,25 @@ The shape of it, updated with this revision's progress:
      CLI exit code no longer always 0                          ✅ FIXED
      Compiler free-text fence/tag-echo leakage                 ✅ FIXED
      Test suite: 135 → 157
+                     │
+  PHASE 3 ── observability ───► optional Langfuse tracing, off by default ✅ CLOSED
+     research_agent/langfuse/ package (D-35)                     ✅ DONE
+     Every node, LLM call, retrieval, memory op traced            ✅ DONE
+     Cost tracking from Settings-configured $/1M rates             ✅ DONE
+     propagate_attributes session/environment grouping             ✅ DONE
+     Crash-safe end_trace (try/except in cli.py::_run)              ✅ DONE
+     Test suite: 157 → 190
 ```
 
 **Status, updated**: Tiers 1, 2, and 3 are all closed, and a further,
 post-Tier-3 session of live-tested fixes has landed on top (see the roadmap
 above). `P2-12` (semantic contradiction detector) made `E2` reachable in
-principle, though the detector itself remains marker-only in practice — see
-Limitations for the current honest status of that gap. `P2-11` (judge-model
-quality scoring) directly addressed a report whose Cassandra/DynamoDB
-sections cited no retrieved evidence, passed anyway by same-model
-self-critique — the judge is now always the next provider in the fallback
-chain, never the one being judged; a programmatic grounding check remains
-open.
+principle — the interrupt wiring is correct and tested — though the detector
+itself remains marker-only in practice, so no real run has triggered `E2`
+yet; see Limitations for the current honest status of that gap. `P2-11`
+(judge-model quality scoring) directly addressed a report whose
+Cassandra/DynamoDB sections cited no retrieved evidence, passed anyway by
+same-model self-critique — the judge is now always the next provider in the
+fallback chain, never the one being judged; a programmatic, claim-by-claim
+grounding check remains open and is the top item on this document's honest
+list of what's still missing.

@@ -400,6 +400,19 @@ D-28 invariants:
 
 ## 8. Observability — unchanged from v3.0 §8, plus one counter: `worker_contract_violations` (D-15 prod-mode filtered keys), which should alert at any nonzero value.
 
+**Core-build addition (D-35, not adopted into this document's own §10 table —
+same treatment as D-31/D-32/D-33/D-34: `DECISIONS.md` is a separate, later
+consolidation and is the formal record for it):** an optional Langfuse tracing
+layer, isolated entirely in `research_agent/langfuse/`, sits alongside the
+counters above rather than replacing them. It is off by default
+(`LANGFUSE_ENABLED=false`, zero SDK import, zero network calls) and adds no
+new control-flow paths — every trace/span/generation/event/score call is a
+side effect recorded around an existing node or provider call, never a
+condition the graph branches on. See `DECISIONS.md` D-35 and the
+implementation-level record in `internal/PHASE-3_LANG-FUSE-CHANGES.md` for
+the full account (module layout, SDK-version reality check, instrumentation
+coverage, cost calculation, and the known flat-span-tree limitation).
+
 ---
 
 ## 9. Configuration Reference (additions/changes in v3.1)

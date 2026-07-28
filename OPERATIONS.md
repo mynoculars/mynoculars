@@ -7,38 +7,49 @@ shown.
 **Mismatch** means stop and debug.
 
 > **CORRECTED THIS PASS** (post-Tier-3 session, 4 further live-tested
-> patches applied on top of everything below): test suite is now
-> **157** (was 57, then 135 across Tier 2/3 — every count in this document
-> is corrected to match). CLI exit code is no longer always 0 — `main()`
-> now returns 2 on `GraphRecursionError`, 1 when a run ends with no
-> telemetry. Postgres checkpointer is now pooled — you may see a new
-> `checkpointer.pool_active` log line alongside or instead of
-> `checkpointer.postgres_active`; both are healthy signs. MCP evidence no
-> longer defaults to a fabricated `score=1.0` — expect real evidence-gate
-> behavior on MCP-routed tasks now, same as corpus-routed ones.
-> `api/server.py` previously could not even import (`AppBundle` unpack
-> crash) — if you were following "Running the API" on an un-patched
-> checkout, `uvicorn` would have raised `ValueError` at startup; fixed.
+> patches applied on top of everything below): test suite reached
+> **157** at this point (was 57, then 135 across Tier 2/3 — see the
+> **Phase 3 note** below for the current, higher count). CLI exit code is
+> no longer always 0 — `main()` now returns 2 on `GraphRecursionError`, 1
+> when a run ends with no telemetry. Postgres checkpointer is now pooled
+> — you may see a new `checkpointer.pool_active` log line alongside or
+> instead of `checkpointer.postgres_active`; both are healthy signs. MCP
+> evidence no longer defaults to a fabricated `score=1.0` — expect real
+> evidence-gate behavior on MCP-routed tasks now, same as corpus-routed
+> ones. `api/server.py` previously could not even import (`AppBundle`
+> unpack crash) — if you were following "Running the API" on an
+> un-patched checkout, `uvicorn` would have raised `ValueError` at
+> startup; fixed. Telemetry examples throughout this document use the
+> current field names (`llm_node_calls`/`llm_provider_calls`/etc. — see
+> **Understanding and Interpreting the Debug Logs** below), plus an
+> `escalations` field surfacing `escalation_history` in every run's
+> telemetry, previously written and never read anywhere. Qdrant ingest is
+> now genuinely idempotent by default — see **Writing Your Own Test
+> Corpus** below for the one caveat that still applies to a collection
+> that already has stale duplicates in it from before this fix.
 > Everything else in this document — the L1/L2/L3 ladder, native Windows
 > service startup, DBeaver setup, ingest steps, HITL testing, every
-> troubleshooting entry — is unchanged and still accurate as written.
+> troubleshooting entry, all of **Development & Debugging Workflows** —
+> is unchanged and still accurate as written. All PowerShell-targeted
+> command examples remain PowerShell, per how this environment actually
+> runs.
 
-> **Note on this revision:** the test suite is now **157** tests (grew
-> from 57 → 135 across Tier 2/3, then to 157 with a further post-Tier-3
-> round of fixes). Telemetry examples throughout this document use the
-> current field names (`llm_node_calls`/`llm_provider_calls`/etc. — see
-> **Understanding and Interpreting the Debug Logs** below for what
-> changed and why), plus a new `escalations` field (post-Tier-3 session)
-> surfacing `escalation_history` in every run's telemetry, previously
-> written and never read anywhere. A new troubleshooting entry covers an
-> `opensearch-py` 3.x compatibility break hit live while re-testing
-> ingest. Qdrant ingest is now genuinely idempotent by default — see
-> **Writing Your Own Test Corpus** below for the one caveat that still
-> applies to a collection that already has stale duplicates in it from
-> before this fix. Everything else — including all of **Development &
-> Debugging Workflows** — is otherwise unchanged from the previous
-> revision. All PowerShell-targeted command examples remain PowerShell,
-> per how this environment actually runs.
+> **Phase 3 note:** test suite is now **190** (157 + 33 new
+> `test_langfuse.py` tests, still fully offline). Optional Langfuse
+> tracing is documented in **Observability — Langfuse (Phase 3)** below;
+> it is off by default (`LANGFUSE_ENABLED=false`) and every step above and
+> below this note works identically whether it's on or off.
+
+> **This is a hands-on manual, not the honesty audit.** `README.md`'s
+> [Limitations](../README.md#limitations) section is the authoritative,
+> itemized account of what's fixed vs. still broken (28 fixed items, plus
+> a short list of genuine open gaps — most notably that self-critique can
+> still pass a report whose claims aren't backed by any retrieved
+> evidence; there is no programmatic, claim-by-claim grounding check yet).
+> For the rationale behind a specific design decision, see `DECISIONS.md`
+> (D-1 through D-35). If a step below "works" but the result looks thin
+> or oddly confident, check those two documents before assuming your
+> setup is broken — it may be a known, documented gap instead.
 
 ---
 
@@ -140,15 +151,29 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 157 passed
+# expect: 190 passed
 ```
 
-If L1 runs and 157 tests pass, your code is fine. Everything from here is about
+If L1 runs and 190 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
 
 ## Level 2 — Real Retrieval (the level you actually want to see)
+
+**What changed recently, briefly** (full detail and rationale in README.md's
+"Recent Fixes" — this is a pointer, not a duplicate): `min_similarity`
+(P2-01) drops low-relevance dense hits before fusion; `min_evidence_score`
+(also P2-01) was raised from an inert `0.0` to `0.5` at the coverage check
+— together these are why `recall` on a genuinely off-topic query now
+behaves honestly instead of always reading `1.0`. Memory-sourced evidence
+is now namespaced on retrieval (P2-02) so it can't falsely satisfy a
+*current* run's goal by id collision with an unrelated earlier run.
+Provider output (chat-template sentinels, runaway free-text generation) is
+now sanitized at the client boundary (P2-04). Escalation reachability is
+now covered by integration tests, not just claimed (P2-05). None of this
+changes anything you type below — it changes what `evidence_items` and
+`recall` actually report.
 
 Now we bring up the two search engines and load the sample corpus so the
 workers have something to find. **Still `LLM_MODE=stub`** — we are NOT touching
@@ -575,6 +600,7 @@ connection on FastAPI shutdown, not per-request.
 | **Postgres** | Durable checkpointer + run history | 5432 | Falls back to in-memory checkpointer; HITL still works within a run |
 | **llama-server (Qwen)** | Primary LLM (L3 only) | 8080 | L3 fails unless Gemini fallback is set |
 | **Gemini API** | Fallback LLM (L3 only) | cloud | No fallback; primary must work |
+| **Langfuse** (Phase 3, optional) | Hosted trace/cost UI | cloud/self-hosted | Traces just don't appear; agent runs identically — `LANGFUSE_ENABLED=false` is the default |
 
 **Key mental model:** every one of these is *optional* and degrades gracefully.
 The agent is designed to run on a bare laptop (L1) and light up more capability
@@ -589,7 +615,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 157 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 190 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -622,6 +648,25 @@ The CLI will PAUSE and print a review payload, then prompt:
 `redirect` then give guidance to send it back for another pass, or `abort` to
 stop with an explicit aborted-report. This is the interrupt/resume machinery
 running live.
+
+**If it converges instead of escalating**, check `recall` in the printed
+telemetry — if it's `≥ 0.85`, the agent believes it found enough evidence
+and has no reason to pause. Use `--debug` (see below) to inspect whether
+memory items or off-topic corpus hits are being counted as coverage; a
+corpus that happens to contain something relevant-sounding to this exact
+query can make it converge cleanly instead of escalating. For the full
+story of why this specific documented query didn't escalate on an earlier
+revision, what was fixed, and one honest caveat about which trigger a real
+escalation has actually been confirmed on, see README.md's
+[The HITL Investigation](../README.md#the-hitl-investigation) section.
+
+**Note on which trigger you'll actually see:** in practice, real
+escalations observed so far have been **E3** (cannot-converge) or **E1**
+(zero goals). **E2** (contested goals) is wired correctly end-to-end — the
+interrupt/resume machinery works for it exactly like the others — but its
+underlying contradiction detector is marker-only and no tool in this build
+sets that marker, so E2 has not yet fired in a real run. Don't read a
+missing E2 escalation as something broken in your setup.
 
 ---
 
@@ -705,7 +750,7 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **157 tests**, fully offline — no services, no API keys, no
+The suite is **190 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -714,10 +759,10 @@ python -m pytest tests/ -q
 ```
 
 ```text
-tests/unit/                  ~137 tests   one file per src/research_agent/ module
+tests/unit/                   170 tests   one file per src/research_agent/ module
 tests/integration/             20 tests   full graph.invoke() runs, offline
                               --------
-                              157 tests
+                              190 tests
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -739,7 +784,14 @@ directories:
   `test_api_server.py` (this file had ZERO coverage before, which is exactly
   how the `AppBundle` unpack crash shipped unnoticed) and
   `test_agents_compilation.py` (covers `strip_code_fence` and the compiler's
-  fence-stripping wiring). If you change a function in
+  fence-stripping wiring). **Phase 3 adds `test_langfuse.py`** (33 tests):
+  disabled-by-default is genuinely zero-cost, SDK-not-installed degrades
+  cleanly, a client that raises on every call never propagates, `config`
+  forwarding in `traced_node`, cost calculation (zero-rate, configured-rate,
+  unrecognized provider, negative-rate clamping), and the
+  `propagate_attributes` session lifecycle including the `shutdown()`
+  backstop — all fully offline, same convention as the rest of the suite.
+  If you change a function in
   `src/research_agent/foo/bar.py`, `tests/unit/test_foo_bar.py` (or
   `tests/unit/test_bar.py` for a top-level module) is the file that will
   catch a regression first -- that's the whole point of the module-mirrored
@@ -841,6 +893,48 @@ ever goes into the trace file. What *does* print live to your screen (via
 stderr) is the shorter JSON breadcrumb trail — provider names, node names,
 fallback decisions, timings. If you want the full prompt/response detail,
 open the trace file; it is never going to appear in your terminal directly.
+
+---
+
+## Enabling Langfuse Observability (Phase 3, optional)
+
+`--debug`/`DEBUG_TRACE` above is local and file-based. Langfuse is the
+alternative for a hosted, queryable trace UI (Langfuse Cloud, self-hosted, or
+enterprise) — the two are independent and can both be on at once.
+
+```ini
+# .env
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-...
+LANGFUSE_SECRET_KEY=sk-...
+LANGFUSE_HOST=https://cloud.langfuse.com    # no stray quotes -- see below
+LANGFUSE_ENVIRONMENT=development
+```
+
+```powershell
+pip install langfuse
+python -m pytest -q                          # 190/190, fully offline, unaffected
+python -m research_agent.cli "your question" --debug
+```
+
+**Confirming it's actually working:** watch the startup log for
+`langfuse.client_active`, and confirm there's no
+`opentelemetry.exporter...` `WARNING`/`ERROR` line during the run — that
+combination means both the host and the credentials are correct. If neither
+appears (no error, but no `client_active` either), `LANGFUSE_ENABLED` is
+still `false` — check `.env` was actually loaded, not a leftover shell
+variable overriding it (same class of trap as the `HITL_ENABLED` one
+described in **Running and Interpreting the Test Suite** above).
+
+**Cost tracking is opt-in per provider.** `LANGFUSE_PRICE_PRIMARY_IN_PER_1M`,
+`..._OUT_PER_1M`, and the `MISTRAL`/`GEMINI` equivalents default to `0.0` —
+leave a provider unpriced and its generations show `$0` (correct for a free
+local model, an honest "unknown" for an unpriced cloud one) rather than a
+guessed figure.
+
+**Turning it off** is just `LANGFUSE_ENABLED=false` (or deleting the four
+credential lines) — nothing else in this document changes; the graph, the
+CLI, and the test suite behave identically either way.
 
 ---
 
@@ -1004,6 +1098,14 @@ what a *healthy* line looks like for each node, and what to actually check.
 | `memory_writer` | only reached if critique passed; `memory.stored`, `"count"` | `"count"` roughly matching this run's own fresh evidence |
 | `telemetry` | `run.telemetry` — the final summary; `llm_node_calls`/`search_calls` are still **node-scoped counts**, but `llm_provider_calls`/`llm_fallback_hops`/`llm_quality_calls`/`retrieval_dense_calls`/`retrieval_keyword_calls`/`retrieval_leg_unavailable` (P2-07) are real boundary-crossing counts now — see below. **New this session:** `escalations`, an array of every `{trigger, action}` pair from `state.escalation_history` — previously written by `human_escalation` and never read anywhere | — |
 | `human_escalation` | only with `HITL_ENABLED=true` and a trigger fired; **fires twice** on one escalation (once pausing, once resuming) — expected, not a duplicate | one `escalation_history` entry recorded despite the two log lines, now also visible in the final `telemetry["escalations"]` |
+
+**One thing to expect, not investigate, if you inspect a raw prompt in the
+trace file:** every prompt that inlines retrieved content wraps it in
+`<evidence>...</evidence>` tags, with a system-prompt clause telling the
+model that span is untrusted data, never instructions. This is deliberate
+prompt-injection fencing, not a formatting bug — if you see literal
+`<evidence>` tags around corpus/MCP text in `logs\trace-<run_id>.txt`,
+that's the defense working as intended.
 
 **This used to be the single biggest gotcha in the telemetry block; as of
 P2-07 it mostly isn't anymore.** `llm_node_calls` and `search_calls` still
@@ -1203,6 +1305,31 @@ $env:HITL_ENABLED = "true"     # correct
 $env:HITL = "true"             # silently does NOTHING — common typo
 ```
 
+### Tuning Retrieval Thresholds
+
+Two independent knobs decide what counts as evidence, and both ship with
+defaults anchored to one real debug trace, not to your corpus specifically:
+
+```ini
+MIN_SIMILARITY=0.35        # dense-leg floor, applied BEFORE fusion (P2-01)
+MIN_EVIDENCE_SCORE=0.5     # post-fusion floor, applied at the coverage check
+```
+
+`min_similarity` drops low-relevance dense hits before they can enter RRF
+fusion or become an `Evidence` object at all. `min_evidence_score` filters
+again afterward, when `progress_checker` decides whether a goal is covered.
+Raising either makes the agent harder to satisfy (more likely to escalate
+or keep searching); lowering either makes it easier to satisfy (more likely
+to converge, possibly on thin evidence).
+
+**Calibrate them for your own corpus** rather than trusting the defaults —
+run one query you know is on-topic and one you know is off-topic, both with
+`--debug`, and compare the actual `similarity` (dense leg, pre-fusion) and
+`score` (post-fusion) values that show up in `logs\trace-<run_id>.txt` and
+in the `retrieval.hybrid` log lines. See **Debugging a Workflow Execution**
+above for the exact commands. README.md's "Debugging a live run" section
+has the same guidance in more detail.
+
 ### Tuning the LLM Timeouts
 
 The local primary model and the two cloud fallbacks (Mistral, Gemini) use
@@ -1228,6 +1355,20 @@ $env:LLM_PRIMARY_TIMEOUT_SECONDS = "150"
 python -m research_agent.cli "your question" --debug
 ```
 
+### Local model generates fake follow-up turns after its answer
+
+Watch for `llm.truncated_runaway_generation` in the log (see the `compiler`
+row of **Understanding and Interpreting the Debug Logs** above — this is
+the free-text path's equivalent of the JSON path's sentinel-stripping,
+`_truncate_at_sentinel()` in `llm/client.py`). It fires when the local
+model keeps generating past its actual answer — a fabricated `system`
+turn, the prompt echoed back, a duplicate report — and the extra content is
+cut before it can reach `final_report`. Occasional occurrences are handled
+gracefully and not worth chasing; if you see it on nearly every call across
+every node, that's a real `llama-server` configuration issue, not something
+this codebase should keep silently absorbing — check the stop-token and
+`--chat-template` settings on your model server first.
+
 ### `Connection pool is full, discarding connection: localhost` (WARNING, fixed)
 
 Seen under real concurrent corpus search (`MAX_FANOUT` search_workers all
@@ -1252,7 +1393,9 @@ search_worker calls fully serialized instead of running in parallel.
 Confirmed live: 6 concurrent searches that complete in 14.4s total
 called directly (no MCP) took 100+ seconds through MCP, all still
 eventually succeeding (never a correctness bug — see the real
-end-to-end trace evidence in `README.md`'s Limitations section, item 6).
+end-to-end trace evidence in `README.md`'s Limitations section, item 29 —
+filed there as a fixed item, not an open one, despite the historical
+"still broken" framing of that part of the list).
 
 **Fixed**: `mcp_corpus_server.py::search` is now `async def`, and the
 blocking `hits_for_query` call is offloaded to a dedicated
@@ -1306,3 +1449,22 @@ a checkout from before this fix — `tools/mcp_client.py` used to hardcode
 `MIN_EVIDENCE_SCORE` unconditionally. Fixed: MCP evidence is now scored at
 `settings.min_evidence_score` (never higher), so it behaves like corpus
 evidence with respect to the coverage gate.
+
+### DNS failure or a request going to an unexpected host with Langfuse enabled
+
+If `LANGFUSE_HOST` resolves to something that doesn't look like what you
+typed — check for a **stray trailing quote** in `.env`, e.g.
+`LANGFUSE_HOST=https://cloud.langfuse.com"` (trailing `"`, no leading one).
+Standard `.env` parsing only strips *matched* leading+trailing quote pairs,
+so an unmatched one becomes a literal character in the value, gets
+percent-encoded into the request URL, and produces a DNS failure that
+doesn't obviously point back to the `.env` file. Confirmed live:
+
+```python
+Settings(_env_file='.env').langfuse_host == 'https://cloud.langfuse.com"'  # broken
+```
+
+Not yet patched with a defensive validator — check every `LANGFUSE_*` value
+for balanced quotes by hand if you hit this. Every other quoted value in the
+file with properly matched quotes parses cleanly, so this is specific to
+values with an odd number of `"` characters.
