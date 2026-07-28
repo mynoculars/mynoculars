@@ -53,7 +53,8 @@ import logging
 import math
 from typing import Any, List
 
-from research_agent.logging_setup import log_event
+from research_agent import langfuse as lf
+from research_agent.logging_setup import log_event, run_id_var
 from research_agent.state import Evidence, Volatility
 from research_agent.storage.qdrant_store import QdrantStore, content_id
 
@@ -260,6 +261,8 @@ class SemanticMemory:
             ))
         if out:
             log_event(logger, "memory.retrieved", count=len(out))
+        lf.event(run_id_var.get(), "memory.retrieved",
+                input={"query": query}, metadata={"count": len(out)})
         return out
 
     def store_run(self, query: str, evidence: List[Evidence]) -> int:
@@ -343,4 +346,6 @@ class SemanticMemory:
         written = self.store.upsert_texts(
             items, id_fn=lambda item: content_id(item["content"]))
         log_event(logger, "memory.stored", count=written, new=new, overwritten=overwritten)
+        lf.event(run_id_var.get(), "memory.stored",
+                metadata={"count": written, "new": new, "overwritten": overwritten})
         return written

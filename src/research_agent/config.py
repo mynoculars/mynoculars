@@ -238,6 +238,34 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Phase 3 -- Langfuse observability. Off by default; when off, the
+    # langfuse/ package never imports the langfuse SDK, never constructs a
+    # client, and makes zero network calls (see langfuse/client.py). This
+    # config block only PARSES the env vars -- every actual SDK call lives
+    # inside research_agent/langfuse/, never here and never in any business
+    # module. LANGFUSE_HOST is deliberately a plain configurable string, not
+    # a Literal of known hosts, so this same code works unmodified against
+    # Langfuse Cloud, a self-hosted instance, or an enterprise install --
+    # only the URL changes.
+    langfuse_enabled: bool = False
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_project: str = ""
+    langfuse_environment: str = "development"
+    langfuse_release: str = ""
+    # Per-provider $ cost per 1M tokens, input/output. Never hardcoded in
+    # the SDK-facing code (see langfuse/pricing.py) -- a provider with no
+    # entry here costs $0, which is the correct default for a local model
+    # and an honest "unknown" for anything else rather than a silently
+    # wrong guessed number.
+    langfuse_price_primary_in_per_1m: float = 0.0
+    langfuse_price_primary_out_per_1m: float = 0.0
+    langfuse_price_mistral_in_per_1m: float = 0.0
+    langfuse_price_mistral_out_per_1m: float = 0.0
+    langfuse_price_gemini_in_per_1m: float = 0.0
+    langfuse_price_gemini_out_per_1m: float = 0.0
+
 
 # P2-09: known-typo list. Each key here is a plausible mistyped env var name
 # someone might set, mapped to the CORRECT field-backed name they probably

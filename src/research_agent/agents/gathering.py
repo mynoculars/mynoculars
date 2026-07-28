@@ -45,10 +45,11 @@ Python mechanics used in this file, if any of this is new to you:
 import logging
 from typing import Any, Callable, Dict, List
 
+from research_agent import langfuse as lf
 from research_agent.agents.task_utils import cap_and_filter
 from research_agent.config import Settings
 from research_agent.llm.router import FallbackRouter
-from research_agent.logging_setup import log_event
+from research_agent.logging_setup import log_event, run_id_var
 from research_agent.orchestration.contracts import validated_worker
 from research_agent.prompts import templates
 from research_agent.state import Evidence, ResearchState, SearchTask, WorkerPayload
@@ -341,6 +342,9 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         recall = (sum(g.covered for g in goals) / len(goals)) if goals else 1.0
         depth = state.iteration_depth + 1  # D-3: exactly one tick per cycle
         log_event(logger, "node.progress", recall=round(recall, 3), depth=depth)
+        lf.score(run_id_var.get(), "recall", recall, comment=f"depth={depth}")
+        lf.score(run_id_var.get(), "coverage",
+                sum(g.covered for g in goals) / len(goals) if goals else 1.0)
         update = {"goals": goals, "recall_score": recall, "iteration_depth": depth}
         # D-23: at terminal non-convergence the CHECK raises the trigger
         # (E2 if a contradiction blocks a goal, else E3). Routing reads it.

@@ -1,0 +1,337 @@
+"""
+tests/unit/test_langfuse.py — Phase 3 Langfuse observability module.
+
+WHY THIS FILE EXISTS: this is offline-only, matching the rest of
+tests/unit/ (no real Langfuse project, no network). It proves the two
+guarantees Phase 3 actually depends on:
+
+  1. Disabled (the default) is genuinely zero-cost: no SDK import
+     attempted, no client built, every thin call a silent no-op.
+  2. Enabled-but-broken (no SDK installed, bad credentials, a client
+     that raises) degrades the same way -- never propagates an
+     exception into the caller.
+
+It does NOT test against a live Langfuse project (there isn't one in
+this environment) -- see the module's own docstrings for what was
+additionally confirmed by hand against the real, installed SDK.
+"""
+
+import sys
+import types
+
+import pytest
+
+from research_agent.config import Settings
+from research_agent.langfuse import client as lf_client
+from research_agent.langfuse.helpers import thread_id_from_config, traced_node
+from research_agent.langfuse.observer import Observer
+from research_agent.langfuse.pricing import TokenUsage, calculate_cost
+
+
+def _settings(**overrides):
+    return Settings(**overrides)
+
+
+# ---------------------------------------------------------------------------
+# client.build_client -- the one place the SDK is ever imported
+# ---------------------------------------------------------------------------
+
+def test_build_client_returns_none_when_disabled():
+    assert lf_client.build_client(_settings(langfuse_enabled=False)) is None
+
+
+def test_build_client_returns_none_without_credentials():
+    s = _settings(langfuse_enabled=True, langfuse_public_key="",
+                  langfuse_secret_key="")
+    assert lf_client.build_client(s) is None
+
+
+def test_build_client_returns_none_if_sdk_import_fails(monkeypatch):
+    """Simulates `langfuse` not being installed at all -- disabled must
+    degrade to None, never raise, regardless of what settings say."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name, *a, **kw):
+        if name == "langfuse":
+            raise ImportError("no langfuse installed")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    s = _settings(langfuse_enabled=True, langfuse_public_key="pk",
+                  langfuse_secret_key="sk")
+    assert lf_client.build_client(s) is None
+
+
+def test_build_client_returns_none_if_construction_raises(monkeypatch):
+    """A real `langfuse` module whose Langfuse(...) constructor raises
+    (bad host, version mismatch, whatever) must still degrade to None."""
+    fake_module = types.ModuleType("langfuse")
+
+    class _ExplodingLangfuse:
+        def __init__(self, **kwargs):
+            raise RuntimeError("boom")
+
+    fake_module.Langfuse = _ExplodingLangfuse
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+    s = _settings(langfuse_enabled=True, langfuse_public_key="pk",
+                  langfuse_secret_key="sk")
+    assert lf_client.build_client(s) is None
+
+
+def test_build_client_returns_client_on_success(monkeypatch):
+    fake_module = types.ModuleType("langfuse")
+    built_kwargs = {}
+
+    class _FakeLangfuse:
+        def __init__(self, **kwargs):
+            built_kwargs.update(kwargs)
+
+    fake_module.Langfuse = _FakeLangfuse
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+    s = _settings(langfuse_enabled=True, langfuse_public_key="pk",
+                  langfuse_secret_key="sk", langfuse_host="https://example.test")
+    client = lf_client.build_client(s)
+    assert isinstance(client, _FakeLangfuse)
+    assert built_kwargs["host"] == "https://example.test"
+
+
+# ---------------------------------------------------------------------------
+# pricing.calculate_cost -- never hardcoded, settings-driven
+# ---------------------------------------------------------------------------
+
+def test_cost_is_zero_for_local_primary_by_default():
+    s = _settings()
+    cost = calculate_cost(s, "primary", TokenUsage(prompt_tokens=1000, completion_tokens=500))
+    assert cost.total_usd == 0.0
+
+
+def test_cost_uses_configured_rates_not_hardcoded_ones():
+    s = _settings(langfuse_price_mistral_in_per_1m=2.0,
+                 langfuse_price_mistral_out_per_1m=6.0)
+    cost = calculate_cost(s, "mistral", TokenUsage(prompt_tokens=1_000_000,
+                                                    completion_tokens=1_000_000))
+    assert cost.input_cost_usd == 2.0
+    assert cost.output_cost_usd == 6.0
+    assert cost.total_usd == 8.0
+
+
+def test_cost_is_none_for_an_unrecognized_provider():
+    assert calculate_cost(_settings(), "some_new_provider", TokenUsage()) is None
+
+
+# ---------------------------------------------------------------------------
+# Observer -- every method is a safe no-op with client=None
+# ---------------------------------------------------------------------------
+
+def test_observer_with_no_client_never_raises():
+    obs = Observer(client=None, settings=_settings())
+    assert obs.enabled is False
+    # None of these should raise, regardless of arguments:
+    obs.start_trace("t1", "run")
+    obs.span("t1", "x")
+    obs.generation("t1", "g", provider="primary", model="m")
+    obs.event("t1", "e")
+    obs.score("t1", "s", 0.5)
+    obs.end_trace("t1")
+    obs.flush()
+    obs.shutdown()
+
+
+def test_observer_degrades_when_the_client_itself_raises():
+    """Every SDK call raises RuntimeError -- Observer must swallow every
+    single one and never propagate."""
+    class _ExplodingClient:
+        def __getattr__(self, name):
+            def _raise(*a, **kw):
+                raise RuntimeError(f"{name} failed")
+            return _raise
+
+    obs = Observer(client=_ExplodingClient(), settings=_settings())
+    assert obs.enabled is True
+    obs.start_trace("t1", "run")
+    obs.span("t1", "x")
+    obs.generation("t1", "g", provider="primary", model="m")
+    obs.event("t1", "e")
+    obs.score("t1", "s", 0.5)
+    obs.end_trace("t1")
+    obs.flush()
+    obs.shutdown()  # must not raise even though _client.shutdown() raises too
+
+
+def test_observer_span_uses_a_real_trace_context(monkeypatch):
+    """Confirms the real call shape reaches the client: a deterministic
+    trace_id derived from thread_id via create_trace_id(seed=...), and
+    start_observation/... .end() actually invoked."""
+    calls = []
+
+    class _FakeObservation:
+        def end(self, **kwargs):
+            calls.append(("end", kwargs))
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-for-{seed}"
+
+        def start_observation(self, **kwargs):
+            calls.append(("start_observation", kwargs))
+            return _FakeObservation()
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs.span("thread-abc", "my-span", input={"a": 1}, output={"b": 2})
+
+    assert calls[0][0] == "start_observation"
+    assert calls[0][1]["name"] == "my-span"
+    assert calls[0][1]["trace_context"].get("trace_id") == "trace-for-thread-abc"
+    assert calls[1][0] == "end"
+
+
+def test_observer_generation_computes_cost_and_usage(monkeypatch):
+    calls = []
+
+    class _FakeObservation:
+        def end(self, **kwargs):
+            pass
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-{seed}"
+
+        def start_observation(self, **kwargs):
+            calls.append(kwargs)
+            return _FakeObservation()
+
+    s = _settings(langfuse_price_mistral_in_per_1m=1.0,
+                 langfuse_price_mistral_out_per_1m=3.0)
+    obs = Observer(client=_FakeClient(), settings=s)
+    obs.generation("t1", "gen", provider="mistral", model="mistral-small",
+                   prompt_tokens=1_000_000, completion_tokens=1_000_000)
+
+    assert calls[0]["as_type"] == "generation"
+    assert calls[0]["usage_details"] == {"input": 1_000_000, "output": 1_000_000,
+                                         "total": 2_000_000}
+    assert calls[0]["cost_details"]["total"] == 4.0
+
+
+def test_observer_score_passes_trace_id_directly():
+    calls = []
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-{seed}"
+
+        def create_score(self, **kwargs):
+            calls.append(kwargs)
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs.score("thread-xyz", "recall", 0.85, comment="depth=1")
+
+    assert calls[0]["name"] == "recall"
+    assert calls[0]["value"] == 0.85
+    assert calls[0]["trace_id"] == "trace-thread-xyz"
+
+
+def test_observer_end_trace_is_a_noop_without_a_matching_start():
+    """Calling end_trace for a thread_id that never had start_trace called
+    must not raise -- a documented no-op, not a KeyError."""
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return "x"
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs.end_trace("never-started")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# helpers.traced_node -- the one change point that instruments every node
+# ---------------------------------------------------------------------------
+
+def test_thread_id_from_config_extracts_the_configurable_thread_id():
+    config = {"configurable": {"thread_id": "run-abc"}, "recursion_limit": 60}
+    assert thread_id_from_config(config) == "run-abc"
+
+
+def test_thread_id_from_config_falls_back_when_missing():
+    assert thread_id_from_config(None) == "unknown"
+    assert thread_id_from_config({}) == "unknown"
+
+
+def test_traced_node_preserves_the_wrapped_functions_return_value():
+    def fake_node(state):
+        return {"field": state["x"] + 1}
+
+    spans = []
+
+    class _FakeObserver:
+        def span(self, thread_id, name, **kwargs):
+            spans.append((thread_id, name, kwargs))
+
+    wrapped = traced_node(lambda: _FakeObserver(), "fake", fake_node)
+    result = wrapped({"x": 1}, config={"configurable": {"thread_id": "t1"}})
+
+    assert result == {"field": 2}
+    assert spans[0][0] == "t1"
+    assert spans[0][1] == "node:fake"
+
+
+def test_traced_node_still_spans_and_reraises_on_exception():
+    def failing_node(state):
+        raise ValueError("boom")
+
+    spans = []
+
+    class _FakeObserver:
+        def span(self, thread_id, name, **kwargs):
+            spans.append(kwargs)
+
+    wrapped = traced_node(lambda: _FakeObserver(), "fake", failing_node)
+    with pytest.raises(ValueError):
+        wrapped({"x": 1}, config=None)
+
+    assert spans[0]["level"] == "ERROR"
+    assert "boom" in spans[0]["metadata"]["error"]
+
+
+def test_traced_node_works_with_no_config_argument_at_all():
+    """LangGraph calls a node with just (state) if it doesn't declare a
+    config parameter of its own -- traced_node's wrapper must still work
+    when called that way (config defaults to None)."""
+    def fake_node(state):
+        return {"ok": True}
+
+    class _NullObserver:
+        def span(self, *a, **kw):
+            pass
+
+    wrapped = traced_node(lambda: _NullObserver(), "fake", fake_node)
+    assert wrapped({"x": 1}) == {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# __init__.py -- the public, business-module-facing surface
+# ---------------------------------------------------------------------------
+
+def test_init_module_is_safe_before_init_from_settings_is_ever_called():
+    """Import-time safety: a test or script that imports research_agent.
+    langfuse and calls a thin function without ever calling
+    init_from_settings must not crash -- get_observer() lazily builds a
+    disabled Observer."""
+    import research_agent.langfuse as lf
+    lf._observer = None  # simulate "never initialized" for this test
+    lf._init_settings = None
+    assert lf.is_enabled() is False
+    lf.span("t1", "x")  # must not raise
+    lf.generation("t1", "g", provider="primary", model="m")
+    lf.event("t1", "e")
+    lf.score("t1", "s", 1.0)
+    lf.start_trace("t1", "run")
+    lf.end_trace("t1")
+    lf.flush()
+    lf.shutdown()
+
+
+def test_init_from_settings_wires_a_real_disabled_observer():
+    import research_agent.langfuse as lf
+    obs = lf.init_from_settings(_settings(langfuse_enabled=False))
+    assert obs.enabled is False
+    assert lf.get_observer() is obs

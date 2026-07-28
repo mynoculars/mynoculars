@@ -44,12 +44,14 @@ import argparse
 import json
 import logging
 import sys
+import time
 import uuid
 from typing import NamedTuple
 
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
+from research_agent import langfuse as lf
 from research_agent.config import get_settings, split_csv
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import configure_logging, log_event, run_id_var
@@ -131,6 +133,11 @@ def build_app_and_settings(tracer=None):
     """
     settings = get_settings()
     configure_logging(settings.log_level)
+    # Phase 3: build the process-wide Langfuse Observer here, alongside
+    # everything else this function wires up. LANGFUSE_ENABLED=false (the
+    # default) makes this a zero-cost no-op -- see langfuse/client.py's
+    # build_client() for exactly what "disabled" guarantees.
+    lf.init_from_settings(settings)
     # `tracer or NullTracer()` — if the caller passed a real Tracer, use it;
     # if they passed None (the default), fall back to a NullTracer instead,
     # so every line below can hand `tracer` to a constructor unconditionally
@@ -312,6 +319,10 @@ def main(argv=None) -> int:
         # per configured provider, none of which was ever closed.
         if bundle.router is not None:
             bundle.router.close()
+        # Phase 3: flush and release the Langfuse client last, same
+        # pattern as every other closeable resource above -- a no-op
+        # when observability is disabled or was never reachable.
+        lf.shutdown()
 
 
 def _run(app, settings, args, thread_id, tracer) -> int:
@@ -341,6 +352,10 @@ def _run(app, settings, args, thread_id, tracer) -> int:
 
     config = {"configurable": {"thread_id": thread_id},
               "recursion_limit": settings.recursion_limit}
+    # Phase 3: one root trace per user query (Phase 3's own requirement),
+    # keyed by the SAME thread_id already used for Postgres checkpointing
+    # and structured-log correlation. No-op when observability is off.
+    lf.start_trace(thread_id, "research_run", input={"query": args.query})
     # This is the single line that actually RUNS the entire graph: PLAN,
     # GATHER (looping as many times as needed), COMPILE, PERSIST — all of
     # it happens inside this one call, unless a node calls interrupt()
@@ -367,6 +382,16 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         # first one, and .value is the actual payload dict
         # agents/escalation.py::_payload_for built.
         payload = result["__interrupt__"][0].value
+        # Phase 3: HITL event -- trigger, and (once resumed) approval/
+        # rejection and how long the human took. `pause_started` is this
+        # process's own wall-clock, not a durable timestamp -- fine here
+        # since resume latency is only meaningful within one CLI session
+        # anyway (a resume from a NEW process, per Thread IDs in
+        # OPERATIONS.md, would need a durable timestamp to measure this
+        # honestly, which this event does not attempt).
+        lf.event(thread_id, "hitl.escalation_raised",
+                 input=payload, metadata={"trigger": payload.get("trigger")})
+        pause_started = time.time()
         print("\n=== HUMAN REVIEW REQUIRED ===")
         print(json.dumps(payload, indent=2, default=str))
         action = ""
@@ -376,6 +401,9 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         while action not in ("approve", "redirect", "abort"):
             action = input("action [approve/redirect/abort]: ").strip().lower()
         guidance = input("guidance: ").strip() if action == "redirect" else ""
+        lf.event(thread_id, "hitl.resumed",
+                 metadata={"trigger": payload.get("trigger"), "action": action,
+                           "resume_latency_s": round(time.time() - pause_started, 2)})
         # Command(resume={...}) is how you tell LangGraph "continue the
         # paused run, and this is what interrupt() should return this
         # time" — see agents/escalation.py's docstring for exactly how that
@@ -391,11 +419,29 @@ def _run(app, settings, args, thread_id, tracer) -> int:
     # ends without reaching telemetry_node, left these keys absent and
     # turned a degraded run into a bare KeyError traceback.
     telemetry = result.get("telemetry") or {}
-    print(result.get("final_report", "(no report was produced)"))
+    report = result.get("final_report", "(no report was produced)")
+    print(report)
     print("\n--- telemetry ---")
     print(json.dumps(telemetry, indent=2))
     record_run(settings.postgres_dsn, thread_id, args.query,
                telemetry.get("recall", 0.0), telemetry)
+
+    # Phase 3: custom scores pulled straight from the SAME telemetry dict
+    # the report already printed above -- D-12's own rule ("aggregate,
+    # never invent") applies here too: these scores repeat numbers
+    # telemetry already computed, they never derive new ones.
+    if "recall" in telemetry:
+        lf.score(thread_id, "recall", telemetry["recall"])
+    if "critique_passed" in telemetry:
+        lf.score(thread_id, "critique_passed", bool(telemetry["critique_passed"]))
+    if telemetry.get("evidence_items", 0) and telemetry.get("goals", 0):
+        lf.score(thread_id, "evidence_per_goal",
+                 telemetry["evidence_items"] / telemetry["goals"])
+    if telemetry.get("search_calls", 0):
+        memory_hit_rate = telemetry.get("memory_hits", 0) / telemetry["search_calls"]
+        lf.score(thread_id, "memory_hit_rate", memory_hit_rate)
+    lf.end_trace(thread_id, output={"final_report": report, "telemetry": telemetry})
+
     return 0 if telemetry else 1
 
 

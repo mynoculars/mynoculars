@@ -62,7 +62,8 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
 
-from research_agent.logging_setup import log_event
+from research_agent import langfuse as lf
+from research_agent.logging_setup import log_event, run_id_var
 
 logger = logging.getLogger(__name__)
 
@@ -373,6 +374,7 @@ class OpenAICompatibleClient:
                 entirely to FallbackRouter (llm/router.py).
         """
         started = time.perf_counter()
+        wall_start = time.time()
         resp = self._http.post(
             "/chat/completions",
             json={"model": self._model, "messages": messages, "temperature": temperature},
@@ -403,6 +405,21 @@ class OpenAICompatibleClient:
                   label=self._label, node=self._trace_node,
                   latency_s=round(latency, 3),
                   prompt_tokens=pt, completion_tokens=ct)
+        # Phase 3: one Langfuse generation per real provider call -- the
+        # SAME provider/model/latency/token figures the log line above
+        # just recorded, so this can never drift from what's already
+        # logged. thread_id comes from run_id_var, the SAME ContextVar
+        # log_event itself reads (see logging_setup.py) -- reusing it
+        # here means this class still knows nothing about the graph or
+        # about cli.py's thread_id, exactly as its own docstring says.
+        lf.generation(
+            run_id_var.get(), self._trace_node or "llm",
+            provider=self.name, model=self._model,
+            input=messages, output=text,
+            prompt_tokens=pt or 0, completion_tokens=ct or 0,
+            start_time=wall_start, end_time=wall_start + latency,
+            metadata={"label": self._label},
+        )
         if self._tracer is not None:
             self._tracer.record_llm(self._label, self._trace_node, messages,
                                     raw_text, pt, ct, latency)

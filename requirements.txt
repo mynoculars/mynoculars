@@ -32,6 +32,16 @@ grandalf>=0.8
 # stdio_client), not assumed from memory.
 mcp>=1.9
 
+# Phase 3: Langfuse observability (research_agent/langfuse/). Optional --
+# LANGFUSE_ENABLED=false (the default) never imports this package at all
+# (see langfuse/client.py's lazy import), so an install without it still
+# runs every existing test and every disabled-by-default code path with
+# no error. Verified against the actual installed version's real,
+# OpenTelemetry-based v4.x API (start_observation/create_event/
+# create_score/create_trace_id), not assumed from older v2/v3-style
+# tutorials -- see langfuse/observer.py's module docstring.
+langfuse>=4.0
+
 # Tests
 pytest>=8.0
 

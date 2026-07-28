@@ -70,7 +70,8 @@ from research_agent.config import Settings
 from research_agent.tracing import NullTracer, Tracer
 from research_agent.evaluation.quality import score_answer
 from research_agent.llm.client import ChatClient, Message, OpenAICompatibleClient, StubClient
-from research_agent.logging_setup import log_event
+from research_agent import langfuse as lf
+from research_agent.logging_setup import log_event, run_id_var
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +323,9 @@ class FallbackRouter:
                     self._bump("llm_fallback_hops")  # P2-07: a real hop, not the last dead end
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=nxt, reason=type(exc).__name__, mode="json")
+                lf.event(run_id_var.get(), "llm.fallback",
+                        metadata={"from_provider": provider.name, "to_provider": nxt,
+                                  "reason": type(exc).__name__, "mode": "json"})
         # If we reach this line, every provider in the loop above raised.
         # `assert last_exc is not None` is a sanity check for a human reader
         # (and for tools like mypy) that this line is only reachable when
@@ -364,6 +368,9 @@ class FallbackRouter:
                     self._bump("llm_fallback_hops")
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=nxt, reason=type(exc).__name__, mode="text")
+                lf.event(run_id_var.get(), "llm.fallback",
+                        metadata={"from_provider": provider.name, "to_provider": nxt,
+                                  "reason": type(exc).__name__, "mode": "text"})
                 continue  # move on to the next provider in the loop
 
             last_answer, last_name = answer, provider.name
@@ -387,6 +394,10 @@ class FallbackRouter:
                 log_event(logger, "llm.fallback", from_provider=provider.name,
                           to_provider=self.providers[i + 1].name,
                           reason="low_quality", mode="text")
+                lf.event(run_id_var.get(), "llm.fallback",
+                        metadata={"from_provider": provider.name,
+                                  "to_provider": self.providers[i + 1].name,
+                                  "reason": "low_quality", "mode": "text"})
                 continue
 
             if i > 0:

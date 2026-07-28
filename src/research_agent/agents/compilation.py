@@ -23,10 +23,11 @@ import logging
 from collections import Counter
 from typing import Any, Dict
 
+from research_agent import langfuse as lf
 from research_agent.config import Settings
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
-from research_agent.logging_setup import log_event
+from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
 from research_agent.state import ResearchState
@@ -183,6 +184,16 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
                     log_event(logger, "escalation.stub", level=logging.WARNING,
                               trigger="E4", revisions=revision, notes=notes)
         log_event(logger, "node.critique", passed=passed, revision=revision)
+        lf.score(run_id_var.get(), "critique_passed", passed,
+                comment=f"revision={revision}")
+        # `result.get("score")` is the critic's own self-reported 0..1
+        # confidence -- part of templates.critique's schema but otherwise
+        # unread anywhere in this codebase (see Learning Guide Part 7).
+        # Recording it here costs nothing and gives Langfuse a
+        # "groundedness"-shaped signal without changing what any node
+        # itself does with it.
+        if "score" in result:
+            lf.score(run_id_var.get(), "critique_self_score", result.get("score"))
         return update
 
     return critic_node

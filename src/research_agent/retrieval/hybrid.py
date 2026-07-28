@@ -23,9 +23,11 @@ Design decision (Python-side fusion in the core build):
 
 import logging
 import threading
+import time
 from typing import Any, Dict, List
 
-from research_agent.logging_setup import log_event
+from research_agent import langfuse as lf
+from research_agent.logging_setup import log_event, run_id_var
 from research_agent.storage.opensearch_store import OpenSearchStore
 from research_agent.storage.qdrant_store import QdrantStore
 
@@ -222,6 +224,7 @@ class HybridRetriever:
         (order-preserving); none -> [].
         """
         self._bump_retrieval_counts()
+        _span_start = time.time()
         # Each leg is independently failure-isolated -- see _safe_leg. One
         # dead backend degrades to single-leg fusion; it never costs the
         # healthy leg's hits or burns the task as a D-16 failure.
@@ -282,6 +285,11 @@ class HybridRetriever:
         rankings = [r for r in (dense_rank, kw_rank) if r]
         if not rankings:
             log_event(logger, "retrieval.no_backends", level=logging.WARNING)
+            lf.span(run_id_var.get(), "retrieval.hybrid_search",
+                   input={"query": query}, output={"fused": 0},
+                   metadata={"dense": 0, "keyword": 0, "degraded": True,
+                             "reason": "no_backends_available"},
+                   start_time=_span_start, end_time=time.time(), level="WARNING")
             return []
 
         fused = rrf_fuse(rankings)
@@ -302,4 +310,15 @@ class HybridRetriever:
             results.append(doc)
         log_event(logger, "retrieval.hybrid", query=query,
                   dense=len(dense_rank), keyword=len(kw_rank), fused=len(results))
+        # Phase 3: one span per hybrid search call -- dense/keyword/RRF
+        # hit counts, plus whether this call ran degraded (one leg down),
+        # which is exactly what retrieval_leg_unavailable already tracks
+        # in telemetry (see agents/gathering.py) -- this just makes the
+        # SAME fact visible per-call in Langfuse, not a new signal.
+        lf.span(run_id_var.get(), "retrieval.hybrid_search",
+               input={"query": query}, output={"fused_doc_ids": ordered},
+               metadata={"dense_hits": len(dense_rank), "keyword_hits": len(kw_rank),
+                         "fused_results": len(results),
+                         "degraded": not (dense_rank and kw_rank)},
+               start_time=_span_start, end_time=time.time())
         return results

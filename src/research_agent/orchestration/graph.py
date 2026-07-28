@@ -91,6 +91,7 @@ from research_agent.agents.gathering import (ToolFn, build_gap_generator_node,
                                              build_search_worker)
 from research_agent.agents.planning import (build_classify_node, build_goal_manager_node,
                                             build_memory_retrieve_node, build_task_expander_node)
+from research_agent import langfuse as lf
 from research_agent.config import Settings
 from research_agent.llm.router import FallbackRouter
 from research_agent.memory.semantic_memory import SemanticMemory
@@ -292,28 +293,38 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     # agents/planning.py's docstring that build_classify_node(router)
     # doesn't run classify_node itself; it returns the ready-to-call
     # classify_node function, already holding onto `router` via closure.
-    g.add_node("classify", build_classify_node(router, debug))
-    g.add_node("memory_retrieve", build_memory_retrieve_node(memory, debug))
-    g.add_node("goal_manager", build_goal_manager_node(router, settings, debug))
-    g.add_node("task_expander", build_task_expander_node(router, settings, debug))
-    g.add_node("search_worker", build_search_worker(tool, debug))
+    # Phase 3: every node is wrapped with a Langfuse span via
+    # lf.traced_node -- ONE change point here, not thirteen changes across
+    # agents/*.py, and it changes nothing about what any node itself does
+    # or returns (see langfuse/helpers.py::traced_node's own docstring).
+    # `lf.get_observer` is passed as a callable, not `lf.get_observer()`,
+    # so the wrapper always uses whichever Observer is active at CALL
+    # time -- important for tests, which build a fresh Observer per test.
+    def _tn(name, fn):
+        return lf.traced_node(lf.get_observer, name, fn)
+
+    g.add_node("classify", _tn("classify", build_classify_node(router, debug)))
+    g.add_node("memory_retrieve", _tn("memory_retrieve", build_memory_retrieve_node(memory, debug)))
+    g.add_node("goal_manager", _tn("goal_manager", build_goal_manager_node(router, settings, debug)))
+    g.add_node("task_expander", _tn("task_expander", build_task_expander_node(router, settings, debug)))
+    g.add_node("search_worker", _tn("search_worker", build_search_worker(tool, debug)))
     # P2-14 (D-25): the ONE additional specialist this build can wire in,
     # registered ONLY when cli.py actually built one (mcp_tool is not
     # None) -- build_search_worker is already fully tool-agnostic (see
     # its own docstring), so this is just a second call to the SAME
     # function with a DIFFERENT tool closure, not new worker logic.
     if mcp_tool is not None:
-        g.add_node("mcp_search_worker", build_search_worker(mcp_tool, debug))
-    g.add_node("merger", build_merger_node(router, settings, debug))  # P2-12
-    g.add_node("progress_checker", build_progress_checker_node(settings, debug))
-    g.add_node("gap_generator", build_gap_generator_node(router, settings, debug))
-    g.add_node("compiler", build_compiler_node(router, debug))
-    g.add_node("critic", build_critic_node(router, settings, debug))
-    g.add_node("memory_writer", build_memory_writer_node(memory, debug))
-    g.add_node("telemetry", build_telemetry_node(debug))
+        g.add_node("mcp_search_worker", _tn("mcp_search_worker", build_search_worker(mcp_tool, debug)))
+    g.add_node("merger", _tn("merger", build_merger_node(router, settings, debug)))  # P2-12
+    g.add_node("progress_checker", _tn("progress_checker", build_progress_checker_node(settings, debug)))
+    g.add_node("gap_generator", _tn("gap_generator", build_gap_generator_node(router, settings, debug)))
+    g.add_node("compiler", _tn("compiler", build_compiler_node(router, debug)))
+    g.add_node("critic", _tn("critic", build_critic_node(router, settings, debug)))
+    g.add_node("memory_writer", _tn("memory_writer", build_memory_writer_node(memory, debug)))
+    g.add_node("telemetry", _tn("telemetry", build_telemetry_node(debug)))
     # D-23/D-28: single parametrized escalation node. It returns Command
     # (goto inferred from its type hint), so no static edges are added.
-    g.add_node("human_escalation", build_escalation_node(settings, debug))
+    g.add_node("human_escalation", _tn("human_escalation", build_escalation_node(settings, debug)))
 
     # g.add_edge(from_node, to_node) wires a FIXED, unconditional edge:
     # whenever `from_node` finishes, always run `to_node` next, no decision
