@@ -65,8 +65,12 @@ def calculate_cost(settings, provider: str, usage: TokenUsage) -> Optional[CostB
     if fields is None:
         return None
     in_field, out_field = fields
-    rate_in = getattr(settings, in_field, 0.0) or 0.0
-    rate_out = getattr(settings, out_field, 0.0) or 0.0
+    # max(0.0, ...) guards a misconfigured negative LANGFUSE_PRICE_* env
+    # var from producing a negative cost figure -- a typo (e.g. a stray
+    # "-" pasted into the value) should degrade to "treat it as free",
+    # not silently report negative dollars.
+    rate_in = max(0.0, getattr(settings, in_field, 0.0) or 0.0)
+    rate_out = max(0.0, getattr(settings, out_field, 0.0) or 0.0)
     input_cost = (usage.prompt_tokens / 1_000_000.0) * rate_in
     output_cost = (usage.completion_tokens / 1_000_000.0) * rate_out
     return CostBreakdown(input_cost_usd=input_cost, output_cost_usd=output_cost)

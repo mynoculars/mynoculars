@@ -251,8 +251,27 @@ class Observer:
     def shutdown(self) -> None:
         """Flush any buffered events, then release the client. Safe to
         call even if start_trace/end_trace were never called, and safe
-        to call twice."""
+        to call twice.
+
+        End every still-OPEN root span first. In v4's OTel model, a span
+        that never had `.end()` called is never handed to the exporter
+        at all -- not "possibly stuck," genuinely never sent. Before this
+        fix, `self._roots.clear()` discarded the Python-side handle
+        without ever calling `.end()`, so ANY run that reached shutdown()
+        without going through end_trace() (a genuine crash, not just
+        GraphRecursionError -- see cli.py's own try/finally, which is the
+        primary fix) silently lost its entire trace, including exactly
+        the crashed runs you'd most want visibility into. This is the
+        backstop for whatever cli.py's try/finally doesn't catch, not a
+        replacement for it -- see cli.py::_run's docstring."""
         def _do():
+            for thread_id, root in list(self._roots.items()):
+                try:
+                    root.end()
+                except Exception as exc:  # noqa: BLE001 -- best-effort
+                    logger.warning("langfuse.root_end_failed",
+                                   extra={"thread_id": thread_id,
+                                          "reason": type(exc).__name__})
             self._client.shutdown()
         self._safe("shutdown", _do)
         self._roots.clear()

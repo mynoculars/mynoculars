@@ -362,87 +362,99 @@ def _run(app, settings, args, thread_id, tracer) -> int:
     # along the way (see agents/escalation.py), in which case invoke()
     # returns EARLY with "__interrupt__" in the result instead of a
     # finished report.
-    result = app.invoke(ResearchState(raw_query=args.query), config=config)
+    # Phase 3 (#2): guarantee end_trace() fires even on a genuine
+    # crash, not just the normal-completion path below. Before this,
+    # only GraphRecursionError was caught (in main(), not even here),
+    # and ANY other exception left the root span dangling -- which,
+    # in v4's OTel model, means the trace is never exported at all,
+    # not just "incomplete". This is the primary fix; Observer.
+    # shutdown()'s end-open-roots loop is the backstop for whatever
+    # this doesn't catch.
+    try:
+        result = app.invoke(ResearchState(raw_query=args.query), config=config)
 
-    # HITL loop (D-23): an interrupted run surfaces "__interrupt__" instead
-    # of finishing. Show the review payload, collect a decision, resume under
-    # the SAME thread_id (D-20). Blocking stdin IS the timeout policy for a
-    # CLI — the deferred operational decision, resolved per-interface.
-    #
-    # `while "__interrupt__" in result:` — result is a plain dict here;
-    # this checks for the presence of that one special key, which LangGraph
-    # adds only when a node paused via interrupt(). The loop keeps calling
-    # invoke() again (each time with a human's decision) until a call
-    # finally returns a result WITHOUT that key — i.e. the run has actually
-    # finished.
-    while "__interrupt__" in result:
-        # result["__interrupt__"] is a list (LangGraph supports multiple
-        # simultaneous interrupts in more advanced graphs, though this
-        # project's graph only ever produces one at a time); [0] takes the
-        # first one, and .value is the actual payload dict
-        # agents/escalation.py::_payload_for built.
-        payload = result["__interrupt__"][0].value
-        # Phase 3: HITL event -- trigger, and (once resumed) approval/
-        # rejection and how long the human took. `pause_started` is this
-        # process's own wall-clock, not a durable timestamp -- fine here
-        # since resume latency is only meaningful within one CLI session
-        # anyway (a resume from a NEW process, per Thread IDs in
-        # OPERATIONS.md, would need a durable timestamp to measure this
-        # honestly, which this event does not attempt).
-        lf.event(thread_id, "hitl.escalation_raised",
-                 input=payload, metadata={"trigger": payload.get("trigger")})
-        pause_started = time.time()
-        print("\n=== HUMAN REVIEW REQUIRED ===")
-        print(json.dumps(payload, indent=2, default=str))
-        action = ""
-        # This loop keeps asking until the user types one of exactly three
-        # valid words — input(...) blocks (pauses this Python process
-        # entirely) until the person at the keyboard presses Enter.
-        while action not in ("approve", "redirect", "abort"):
-            action = input("action [approve/redirect/abort]: ").strip().lower()
-        guidance = input("guidance: ").strip() if action == "redirect" else ""
-        lf.event(thread_id, "hitl.resumed",
-                 metadata={"trigger": payload.get("trigger"), "action": action,
-                           "resume_latency_s": round(time.time() - pause_started, 2)})
-        # Command(resume={...}) is how you tell LangGraph "continue the
-        # paused run, and this is what interrupt() should return this
-        # time" — see agents/escalation.py's docstring for exactly how that
-        # resume value flows back into the escalation node.
-        result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
-                            config=config)
+        # HITL loop (D-23): an interrupted run surfaces "__interrupt__" instead
+        # of finishing. Show the review payload, collect a decision, resume under
+        # the SAME thread_id (D-20). Blocking stdin IS the timeout policy for a
+        # CLI — the deferred operational decision, resolved per-interface.
+        #
+        # `while "__interrupt__" in result:` — result is a plain dict here;
+        # this checks for the presence of that one special key, which LangGraph
+        # adds only when a node paused via interrupt(). The loop keeps calling
+        # invoke() again (each time with a human's decision) until a call
+        # finally returns a result WITHOUT that key — i.e. the run has actually
+        # finished.
+        while "__interrupt__" in result:
+            # result["__interrupt__"] is a list (LangGraph supports multiple
+            # simultaneous interrupts in more advanced graphs, though this
+            # project's graph only ever produces one at a time); [0] takes the
+            # first one, and .value is the actual payload dict
+            # agents/escalation.py::_payload_for built.
+            payload = result["__interrupt__"][0].value
+            # Phase 3: HITL event -- trigger, and (once resumed) approval/
+            # rejection and how long the human took. `pause_started` is this
+            # process's own wall-clock, not a durable timestamp -- fine here
+            # since resume latency is only meaningful within one CLI session
+            # anyway (a resume from a NEW process, per Thread IDs in
+            # OPERATIONS.md, would need a durable timestamp to measure this
+            # honestly, which this event does not attempt).
+            lf.event(thread_id, "hitl.escalation_raised",
+                     input=payload, metadata={"trigger": payload.get("trigger")})
+            pause_started = time.time()
+            print("\n=== HUMAN REVIEW REQUIRED ===")
+            print(json.dumps(payload, indent=2, default=str))
+            action = ""
+            # This loop keeps asking until the user types one of exactly three
+            # valid words — input(...) blocks (pauses this Python process
+            # entirely) until the person at the keyboard presses Enter.
+            while action not in ("approve", "redirect", "abort"):
+                action = input("action [approve/redirect/abort]: ").strip().lower()
+            guidance = input("guidance: ").strip() if action == "redirect" else ""
+            lf.event(thread_id, "hitl.resumed",
+                     metadata={"trigger": payload.get("trigger"), "action": action,
+                               "resume_latency_s": round(time.time() - pause_started, 2)})
+            # Command(resume={...}) is how you tell LangGraph "continue the
+            # paused run, and this is what interrupt() should return this
+            # time" — see agents/escalation.py's docstring for exactly how that
+            # resume value flows back into the escalation node.
+            result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
+                                config=config)
 
-    trace_path = tracer.flush()
-    if trace_path:
-        print(f"[debug trace written to {trace_path}]")
+        trace_path = tracer.flush()
+        if trace_path:
+            print(f"[debug trace written to {trace_path}]")
 
-    # .get(), not [] — an interrupted-then-abandoned run, or any path that
-    # ends without reaching telemetry_node, left these keys absent and
-    # turned a degraded run into a bare KeyError traceback.
-    telemetry = result.get("telemetry") or {}
-    report = result.get("final_report", "(no report was produced)")
-    print(report)
-    print("\n--- telemetry ---")
-    print(json.dumps(telemetry, indent=2))
-    record_run(settings.postgres_dsn, thread_id, args.query,
-               telemetry.get("recall", 0.0), telemetry)
+        # .get(), not [] — an interrupted-then-abandoned run, or any path that
+        # ends without reaching telemetry_node, left these keys absent and
+        # turned a degraded run into a bare KeyError traceback.
+        telemetry = result.get("telemetry") or {}
+        report = result.get("final_report", "(no report was produced)")
+        print(report)
+        print("\n--- telemetry ---")
+        print(json.dumps(telemetry, indent=2))
+        record_run(settings.postgres_dsn, thread_id, args.query,
+                   telemetry.get("recall", 0.0), telemetry)
 
-    # Phase 3: custom scores pulled straight from the SAME telemetry dict
-    # the report already printed above -- D-12's own rule ("aggregate,
-    # never invent") applies here too: these scores repeat numbers
-    # telemetry already computed, they never derive new ones.
-    if "recall" in telemetry:
-        lf.score(thread_id, "recall", telemetry["recall"])
-    if "critique_passed" in telemetry:
-        lf.score(thread_id, "critique_passed", bool(telemetry["critique_passed"]))
-    if telemetry.get("evidence_items", 0) and telemetry.get("goals", 0):
-        lf.score(thread_id, "evidence_per_goal",
-                 telemetry["evidence_items"] / telemetry["goals"])
-    if telemetry.get("search_calls", 0):
-        memory_hit_rate = telemetry.get("memory_hits", 0) / telemetry["search_calls"]
-        lf.score(thread_id, "memory_hit_rate", memory_hit_rate)
-    lf.end_trace(thread_id, output={"final_report": report, "telemetry": telemetry})
+        # Phase 3: custom scores pulled straight from the SAME telemetry dict
+        # the report already printed above -- D-12's own rule ("aggregate,
+        # never invent") applies here too: these scores repeat numbers
+        # telemetry already computed, they never derive new ones.
+        if "recall" in telemetry:
+            lf.score(thread_id, "recall", telemetry["recall"])
+        if "critique_passed" in telemetry:
+            lf.score(thread_id, "critique_passed", bool(telemetry["critique_passed"]))
+        if telemetry.get("evidence_items", 0) and telemetry.get("goals", 0):
+            lf.score(thread_id, "evidence_per_goal",
+                     telemetry["evidence_items"] / telemetry["goals"])
+        if telemetry.get("search_calls", 0):
+            memory_hit_rate = telemetry.get("memory_hits", 0) / telemetry["search_calls"]
+            lf.score(thread_id, "memory_hit_rate", memory_hit_rate)
+        lf.end_trace(thread_id, output={"final_report": report, "telemetry": telemetry})
 
-    return 0 if telemetry else 1
+        return 0 if telemetry else 1
+    except Exception as exc:
+        lf.end_trace(thread_id, metadata={"error": f"{type(exc).__name__}: {str(exc)[:300]}"})
+        raise
 
 
 if __name__ == "__main__":

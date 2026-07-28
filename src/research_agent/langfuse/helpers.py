@@ -18,6 +18,7 @@ Two things live here:
 from __future__ import annotations
 
 import functools
+import inspect
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -33,6 +34,40 @@ def thread_id_from_config(config: Optional[dict]) -> str:
     return str(config.get("configurable", {}).get("thread_id", "unknown"))
 
 
+def _fn_accepts_config(fn: Callable) -> bool:
+    """True if `fn` itself declares a `config` parameter (positional-or-
+    keyword or keyword-only), OR accepts **kwargs that would swallow one.
+
+    WHY THIS EXISTS -- fixes a real bug from the first cut of this file:
+    the wrapper below used to unconditionally call `fn(state)`, silently
+    dropping any `config` argument on the floor. No node in this
+    codebase currently declares `config` (every `build_*_node` factory
+    returns a plain `def X_node(state) -> Dict`), so nothing broke in
+    practice -- but the wrapper's own docstring claimed a wrapped node
+    COULD receive its thread_id via `config`, which was simply false: it
+    never reached the node at all. The first node ever written to accept
+    `config` would have hit `fn(state)` with a missing required argument
+    the moment it was wrapped. Inspecting the ACTUAL signature, once,
+    here, and forwarding conditionally, is what makes the docstring's
+    claim true instead of aspirational.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # A small number of callables (some C-implemented ones) refuse
+        # signature introspection entirely -- degrade to "config not
+        # accepted" rather than raising out of the wrapper itself.
+        return False
+    for p in sig.parameters.values():
+        if p.name == "config" and p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
 def traced_node(observer_getter: Callable[[], Any], node_name: str,
                  fn: Callable[[Any], Dict[str, Any]]) -> Callable:
     """Wrap a LangGraph node function with a Langfuse span, changing
@@ -44,13 +79,15 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
     active at CALL time -- important for tests, which construct a fresh
     Observer per test rather than relying on the module-level singleton.
 
-    The wrapped function accepts an optional second `config` parameter.
-    LangGraph inspects a node's signature and passes `config` only to
-    functions that declare it (see LangGraph's own node-calling
-    convention) -- accepting it here, once, is what lets every wrapped
-    node receive its thread_id without any of the underlying
-    `agents/*.py` functions changing their own signature at all.
+    The OUTER wrapper always accepts an optional second `config`
+    parameter, so LangGraph (which inspects the wrapper's own signature,
+    not the wrapped function's) always hands it one. Whether that
+    `config` is then forwarded to the INNER `fn` depends on whether `fn`
+    itself declared one -- checked once, at wrap time, via
+    `_fn_accepts_config` above, not on every call.
     """
+    forward_config = _fn_accepts_config(fn)
+
     @functools.wraps(fn)
     def wrapper(state, config=None):
         thread_id = thread_id_from_config(config)
@@ -58,7 +95,7 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
         start = time.time()
         error: Optional[str] = None
         try:
-            result = fn(state)
+            result = fn(state, config=config) if forward_config else fn(state)
             return result
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:200]}"

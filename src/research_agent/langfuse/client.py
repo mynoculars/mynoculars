@@ -83,6 +83,15 @@ def build_client(settings) -> Optional[Any]:
             secret_key=settings.langfuse_secret_key,
             host=settings.langfuse_host,
             release=settings.langfuse_release or None,
+            # Was missing entirely -- environment used to only ever reach
+            # Langfuse buried inside a generic metadata dict on the root
+            # span (observer.py::start_trace), never as the SDK's actual
+            # first-class `environment` parameter, which is what the
+            # Langfuse UI's environment filter/grouping actually reads.
+            # Set once here, at the client level, since it's fixed for
+            # the life of this process -- not per-run, so it belongs at
+            # construction time, not threaded through every trace call.
+            environment=settings.langfuse_environment or None,
         )
         logger.info("langfuse.client_active", extra={"host": settings.langfuse_host})
         return client

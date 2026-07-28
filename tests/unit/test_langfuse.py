@@ -335,3 +335,140 @@ def test_init_from_settings_wires_a_real_disabled_observer():
     obs = lf.init_from_settings(_settings(langfuse_enabled=False))
     assert obs.enabled is False
     assert lf.get_observer() is obs
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the reviewed-and-confirmed fixes -- batch 1 (bugs)
+# ---------------------------------------------------------------------------
+
+def test_traced_node_forwards_config_when_the_node_declares_it():
+    """Fix for #1: a node that DOES declare config must actually receive
+    it -- the bug was that fn(state) was always called regardless."""
+    def node_with_config(state, config):
+        return {"thread_id": config["configurable"]["thread_id"]}
+
+    class _NullObserver:
+        def span(self, *a, **kw):
+            pass
+
+    wrapped = traced_node(lambda: _NullObserver(), "cfg", node_with_config)
+    result = wrapped({"x": 1}, config={"configurable": {"thread_id": "t1"}})
+    assert result == {"thread_id": "t1"}
+
+
+def test_traced_node_still_omits_config_for_a_plain_single_arg_node():
+    """The common case (12 of 13 real nodes): fn(state) only, never
+    fn(state, config) -- forwarding unconditionally would TypeError here."""
+    def plain_node(state):
+        return {"ok": True}
+
+    class _NullObserver:
+        def span(self, *a, **kw):
+            pass
+
+    wrapped = traced_node(lambda: _NullObserver(), "plain", plain_node)
+    assert wrapped({"x": 1}, config={"configurable": {"thread_id": "t1"}}) == {"ok": True}
+
+
+def test_traced_node_forwards_config_even_via_kwargs_catchall():
+    """A node written as def n(state, **kwargs) should also receive
+    config, since **kwargs would silently swallow it otherwise."""
+    received = {}
+
+    def kwargs_node(state, **kwargs):
+        received.update(kwargs)
+        return {}
+
+    class _NullObserver:
+        def span(self, *a, **kw):
+            pass
+
+    wrapped = traced_node(lambda: _NullObserver(), "kw", kwargs_node)
+    wrapped({"x": 1}, config={"configurable": {"thread_id": "t1"}})
+    assert received.get("config") == {"configurable": {"thread_id": "t1"}}
+
+
+def test_observer_shutdown_ends_every_still_open_root_span():
+    """Fix for #2 (backstop half): a root span that never went through
+    end_trace() must still be .end()ed on shutdown -- otherwise, in v4's
+    OTel model, it's never exported at all, not just incomplete."""
+    ended = []
+
+    class _FakeRoot:
+        def end(self, **kwargs):
+            ended.append("ended")
+
+    class _FakeClient:
+        def shutdown(self):
+            pass
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs._roots["t1"] = _FakeRoot()
+    obs._roots["t2"] = _FakeRoot()
+    obs.shutdown()
+
+    assert ended == ["ended", "ended"]
+    assert obs._roots == {}
+
+
+def test_observer_shutdown_survives_a_root_that_raises_on_end():
+    """One bad root.end() must not stop the others from being ended, or
+    stop client.shutdown() from still being called."""
+    ended = []
+
+    class _ExplodingRoot:
+        def end(self, **kwargs):
+            raise RuntimeError("boom")
+
+    class _FakeRoot:
+        def end(self, **kwargs):
+            ended.append("ended")
+
+    shutdown_called = []
+
+    class _FakeClient:
+        def shutdown(self):
+            shutdown_called.append(True)
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs._roots["bad"] = _ExplodingRoot()
+    obs._roots["good"] = _FakeRoot()
+    obs.shutdown()  # must not raise
+
+    assert ended == ["ended"]
+    assert shutdown_called == [True]
+
+
+def test_build_client_passes_environment_to_the_constructor():
+    """Fix for #12 (constructor half): environment must be a first-class
+    kwarg to Langfuse(...), not only buried in per-trace metadata --
+    that's what the Langfuse UI's environment filter actually reads."""
+    built_kwargs = {}
+
+    fake_module = types.ModuleType("langfuse")
+
+    class _FakeLangfuse:
+        def __init__(self, **kwargs):
+            built_kwargs.update(kwargs)
+
+    fake_module.Langfuse = _FakeLangfuse
+    import sys as _sys
+    _sys.modules["langfuse"] = fake_module
+
+    s = _settings(langfuse_enabled=True, langfuse_public_key="pk",
+                 langfuse_secret_key="sk", langfuse_environment="staging")
+    lf_client.build_client(s)
+
+    assert built_kwargs["environment"] == "staging"
+    del _sys.modules["langfuse"]
+
+
+def test_cost_clamps_a_misconfigured_negative_rate_to_zero():
+    """Fix for #14: a typo'd negative LANGFUSE_PRICE_* must not produce a
+    negative dollar figure."""
+    s = _settings(langfuse_price_mistral_in_per_1m=-5.0,
+                 langfuse_price_mistral_out_per_1m=-2.0)
+    cost = calculate_cost(s, "mistral", TokenUsage(prompt_tokens=1_000_000,
+                                                    completion_tokens=1_000_000))
+    assert cost.input_cost_usd == 0.0
+    assert cost.output_cost_usd == 0.0
