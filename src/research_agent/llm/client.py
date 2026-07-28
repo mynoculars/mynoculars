@@ -418,7 +418,10 @@ class OpenAICompatibleClient:
             input=messages, output=text,
             prompt_tokens=pt or 0, completion_tokens=ct or 0,
             start_time=wall_start, end_time=wall_start + latency,
-            metadata={"label": self._label},
+            # temperature is already this method's own parameter --
+            # was computed and available here all along, just never
+            # threaded into the metadata dict.
+            metadata={"label": self._label, "temperature": temperature},
         )
         if self._tracer is not None:
             self._tracer.record_llm(self._label, self._trace_node, messages,

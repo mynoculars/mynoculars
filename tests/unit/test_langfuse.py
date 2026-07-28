@@ -472,3 +472,124 @@ def test_cost_clamps_a_misconfigured_negative_rate_to_zero():
                                                     completion_tokens=1_000_000))
     assert cost.input_cost_usd == 0.0
     assert cost.output_cost_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the reviewed-and-confirmed fixes -- batch 2 (enrichment)
+# ---------------------------------------------------------------------------
+
+def _fake_client_and_propagate_attributes(monkeypatch):
+    """Shared fixture-ish helper: a fake langfuse module with a fake
+    propagate_attributes context manager, wired in place of the real
+    import inside Observer.start_trace/end_trace. Returns (calls list,
+    fake client instance)."""
+    calls = []
+
+    class _FakeCtx:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def __enter__(self):
+            calls.append(("enter", self.kwargs))
+            return self
+
+        def __exit__(self, *exc):
+            calls.append(("exit", None))
+            return False
+
+    def fake_propagate_attributes(**kwargs):
+        return _FakeCtx(**kwargs)
+
+    fake_module = types.ModuleType("langfuse")
+    fake_module.propagate_attributes = fake_propagate_attributes
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+
+    class _FakeRoot:
+        def end(self, **kwargs):
+            calls.append(("root_end", None))
+
+        def update(self, **kwargs):
+            calls.append(("root_update", kwargs))
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-{seed}"
+
+        def start_observation(self, **kwargs):
+            calls.append(("start_observation", kwargs))
+            return _FakeRoot()
+
+    return calls, _FakeClient()
+
+
+def test_start_trace_enters_propagate_attributes_with_session_id(monkeypatch):
+    """Fix for #12 (propagation half): start_trace must open a
+    propagate_attributes context carrying session_id=thread_id, entered
+    BEFORE the root span is created (ordering is load-bearing -- see
+    module docstring)."""
+    calls, client = _fake_client_and_propagate_attributes(monkeypatch)
+    obs = Observer(client=client, settings=_settings(langfuse_environment="staging"))
+
+    obs.start_trace("thread-42", "research_run", input={"query": "x"})
+
+    assert calls[0] == ("enter", {"session_id": "thread-42", "trace_name": "research_run",
+                                  "environment": "staging"})
+    assert calls[1][0] == "start_observation"
+    assert "thread-42" in obs._session_contexts
+
+
+def test_end_trace_exits_the_matching_propagate_attributes_context(monkeypatch):
+    calls, client = _fake_client_and_propagate_attributes(monkeypatch)
+    obs = Observer(client=client, settings=_settings())
+
+    obs.start_trace("t1", "run")
+    obs.end_trace("t1", output={"done": True})
+
+    assert calls[-1] == ("exit", None)
+    assert "t1" not in obs._session_contexts
+    assert "t1" not in obs._roots
+
+
+def test_start_trace_does_not_leak_the_context_if_start_observation_fails(monkeypatch):
+    """The bug I caught in my own review before shipping it: if
+    start_observation() raises AFTER propagate_attributes was already
+    entered, the context must still be exited -- otherwise it leaks for
+    the life of the thread."""
+    calls, _ = _fake_client_and_propagate_attributes(monkeypatch)
+
+    class _ExplodingClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-{seed}"
+
+        def start_observation(self, **kwargs):
+            raise RuntimeError("network hiccup")
+
+    obs = Observer(client=_ExplodingClient(), settings=_settings())
+    obs.start_trace("t1", "run")  # must not raise (caught by _safe)
+
+    assert ("enter", {"session_id": "t1", "trace_name": "run", "environment": "development"}) in calls
+    assert ("exit", None) in calls  # the context WAS closed despite the failure
+    assert "t1" not in obs._session_contexts  # and never recorded as open
+
+
+def test_shutdown_closes_any_still_open_session_contexts(monkeypatch):
+    """Backstop half of the same fix: a context left open by a crashed
+    run (end_trace never reached) must still be closed on shutdown."""
+    calls, client = _fake_client_and_propagate_attributes(monkeypatch)
+    obs = Observer(client=client, settings=_settings())
+
+    obs.start_trace("t1", "run")
+    calls.clear()
+    obs.shutdown()
+
+    assert ("exit", None) in calls
+    assert obs._session_contexts == {}
+    assert obs._roots == {}
+
+
+def test_observer_has_a_lock_guarding_its_dicts():
+    """Fix for #3: cheap, direct assertion that the hardening is
+    actually present, not just that behavior happens to look right."""
+    import threading as _threading
+    obs = Observer(client=None, settings=_settings())
+    assert isinstance(obs._lock, _threading.Lock().__class__)

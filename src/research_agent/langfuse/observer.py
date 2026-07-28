@@ -21,26 +21,57 @@ This module derives that trace_id DETERMINISTICALLY from the thread_id
 via `client.create_trace_id(seed=thread_id)` -- the same thread_id
 always maps to the same trace_id, so every span/generation/event/score
 for one run lands on the same trace with NO in-memory registry required
-(unlike an earlier draft of this file, which tried to cache live trace
-objects per thread_id -- unnecessary complexity once the seed-based id
-is available, and it would have leaked memory across long-lived
-processes like the API server).
+for the trace_id itself.
 
-ONE HONEST LIMITATION: v4's Python client exposes no dedicated
-"set trace session_id" call in its public API (confirmed by inspecting
-`dir(Langfuse)` on the installed version -- no `update_current_trace`).
-Session/thread_id is therefore attached as `metadata={"session_id":
-thread_id, ...}` on the root span only, which is the documented
-convention for grouping in the Langfuse UI but is NOT independently
-verified here against a live Langfuse project (no live credentials in
-this environment). If your Langfuse project doesn't group runs by
-thread_id the way you expect, check this convention against your
-Langfuse version's current docs before assuming this module is wrong.
+SESSION_ID / ENVIRONMENT GROUPING -- fixed and VERIFIED, not assumed
+(this was an open gap in an earlier revision of this file). v4 has no
+`session_id=` kwarg on `start_observation`/`create_event`/`create_score`
+directly; the documented mechanism is the top-level `propagate_attributes
+(session_id=..., environment=...)` context manager (OTel context/baggage
+under the hood), entered in `start_trace()` and exited in `end_trace()`.
+Two things had to hold for this to be safe to rely on in THIS codebase,
+and both were checked against the real, installed SDK and LangGraph with
+an in-memory OTel span exporter, not inferred from docs alone:
+  1. Does a span created well OUTSIDE the `with propagate_attributes(...)`
+     block's own lexical scope -- which is how every call in this module
+     works, since start_trace() opens the context and dozens of separate
+     function calls across other files create spans long after that --
+     still pick up the propagated session_id? CONFIRMED: entered the
+     context, called `__enter__()` directly (not via `with`), created a
+     span from a completely separate function afterward, and the
+     exported span carried `session.id` correctly.
+  2. Does it survive LangGraph's OWN parallel-fan-out thread dispatch
+     (search_worker's `Send` fan-out runs on a background thread pool)?
+     CONFIRMED by reproducing LangGraph's exact dispatch pattern --
+     `langgraph/pregel/_executor.py::BackgroundExecutor.submit` calls
+     `contextvars.copy_context()` then runs the task via `ctx.run(fn,
+     ...)` on a `ThreadPoolExecutor` -- against the real SDK with an
+     in-memory exporter: a span created inside that exact pattern still
+     carried the correct `session.id`.
+Both checks are reproduced as offline regression tests in
+tests/unit/test_langfuse.py using a fake client (a live in-memory-
+exporter check isn't reproducible in the normal offline suite, since it
+depends on which exact SDK version happens to be installed) -- the fakes
+assert the CALL SHAPE (propagate_attributes entered/exited with the
+right kwargs), which is what this module actually controls; the SDK's
+own behavior given that call shape was verified separately, above, by
+hand, against the real package.
+
+THREAD SAFETY: `self._roots` and `self._session_contexts` are guarded by
+one `threading.Lock`. Not because today's specific access pattern is
+provably unsafe under CPython's GIL (it likely isn't, for the reasons
+discussed when this was reviewed) -- but because this module's own
+docstrings claim support for "long-lived processes like the API server,"
+where genuinely concurrent requests (different thread_ids) DO write to
+these dicts concurrently, and relying on GIL implementation details
+instead of an explicit lock is the kind of thing that's cheap to just
+not do.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -57,11 +88,21 @@ class Observer:
     def __init__(self, client: Optional[Any], settings: Any):
         self._client = client
         self._settings = settings
-        # Only tracks OPEN root spans (start_trace -> end_trace pairs),
-        # so end_trace can attach final output/duration. Nothing else
-        # needs state: every other call derives its trace_id fresh from
-        # the deterministic seed, see _trace_context().
+        # Guards both dicts below -- see the module docstring's Thread
+        # Safety section.
+        self._lock = threading.Lock()
+        # Tracks OPEN root spans (start_trace -> end_trace pairs), so
+        # end_trace can attach final output/duration. Every other call
+        # derives its trace_id fresh from the deterministic seed, see
+        # _trace_context() -- no registry needed for THAT.
         self._roots: Dict[str, Any] = {}
+        # The open propagate_attributes(...) context per thread_id,
+        # entered in start_trace and exited in end_trace -- this is what
+        # makes session_id/environment grouping (see module docstring)
+        # actually reach every span/generation/event for the run,
+        # including ones created on LangGraph's parallel-fan-out worker
+        # threads.
+        self._session_contexts: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -111,27 +152,57 @@ class Observer:
         as a root SPAN (v4 has no separate "trace" object to open) that
         end_trace() closes."""
         def _do():
-            root = self._client.start_observation(
-                name=name, as_type="span",
-                trace_context=self._trace_context(thread_id),
-                input=input,
-                metadata={**(metadata or {}), "session_id": thread_id,
-                          "environment": self._settings.langfuse_environment,
-                          "project": self._settings.langfuse_project or None},
+            # Enter propagate_attributes FIRST, so the root span itself
+            # (created next) is already inside the propagation context --
+            # the SDK's own docs warn pre-existing spans are never
+            # retroactively updated, so this ordering is load-bearing,
+            # not stylistic. See module docstring for what this was
+            # verified to do (and not do) against the real SDK.
+            from langfuse import propagate_attributes
+            ctx = propagate_attributes(
+                session_id=thread_id, trace_name=name,
+                environment=self._settings.langfuse_environment or None,
             )
-            self._roots[thread_id] = root
+            ctx.__enter__()
+            try:
+                root = self._client.start_observation(
+                    name=name, as_type="span",
+                    trace_context=self._trace_context(thread_id),
+                    input=input,
+                    metadata={**(metadata or {}),
+                              "project": self._settings.langfuse_project or None},
+                )
+            except Exception:
+                # start_observation failed AFTER the context was already
+                # entered -- exit it here rather than leaking it, since
+                # nothing else will ever reach the paired __exit__ in
+                # end_trace() for a root that was never recorded.
+                ctx.__exit__(None, None, None)
+                raise
+            with self._lock:
+                self._roots[thread_id] = root
+                self._session_contexts[thread_id] = ctx
         self._safe("start_trace", _do)
 
     def end_trace(self, thread_id: str, *, output: Any = None,
                   metadata: Optional[dict] = None) -> None:
         def _do():
-            root = self._roots.pop(thread_id, None)
+            with self._lock:
+                root = self._roots.pop(thread_id, None)
+                ctx = self._session_contexts.pop(thread_id, None)
             if root is None:
                 logger.debug("langfuse.no_active_root_trace", extra={"thread_id": thread_id})
-                return
-            if output is not None or metadata is not None:
-                root.update(output=output, metadata=metadata)
-            root.end()
+            else:
+                if output is not None or metadata is not None:
+                    root.update(output=output, metadata=metadata)
+                root.end()
+            # Exit the propagation context regardless of whether a root
+            # span was found -- an orphaned open context left on this
+            # thread is worse than a slightly-redundant close, since it
+            # would leak session_id into whatever OTel activity happens
+            # next on this thread/process.
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
         self._safe("end_trace", _do)
 
     # ------------------------------------------------------------------
@@ -263,15 +334,33 @@ class Observer:
         primary fix) silently lost its entire trace, including exactly
         the crashed runs you'd most want visibility into. This is the
         backstop for whatever cli.py's try/finally doesn't catch, not a
-        replacement for it -- see cli.py::_run's docstring."""
+        replacement for it -- see cli.py::_run's docstring.
+
+        Also closes any still-open propagate_attributes context for the
+        same reason: an unclosed one would otherwise leak session_id
+        into whatever OTel activity happens on that thread next."""
         def _do():
-            for thread_id, root in list(self._roots.items()):
+            with self._lock:
+                roots = list(self._roots.items())
+                contexts = list(self._session_contexts.items())
+                self._roots.clear()
+                self._session_contexts.clear()
+            for thread_id, root in roots:
                 try:
                     root.end()
                 except Exception as exc:  # noqa: BLE001 -- best-effort
                     logger.warning("langfuse.root_end_failed",
                                    extra={"thread_id": thread_id,
                                           "reason": type(exc).__name__})
+            for thread_id, ctx in contexts:
+                try:
+                    ctx.__exit__(None, None, None)
+                except Exception as exc:  # noqa: BLE001 -- best-effort
+                    logger.warning("langfuse.context_exit_failed",
+                                   extra={"thread_id": thread_id,
+                                          "reason": type(exc).__name__})
             self._client.shutdown()
         self._safe("shutdown", _do)
-        self._roots.clear()
+        with self._lock:
+            self._roots.clear()
+            self._session_contexts.clear()

@@ -94,6 +94,7 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
         observer = observer_getter()
         start = time.time()
         error: Optional[str] = None
+        result = None
         try:
             result = fn(state, config=config) if forward_config else fn(state)
             return result
@@ -101,8 +102,24 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
             raise
         finally:
+            # Phase 3 review (#7/#9): this used to carry NO content at
+            # all -- just start/end/error. Passing input/output here,
+            # generically, for every node in one place, is consistent
+            # with how every OTHER span/generation call in this codebase
+            # already works (e.g. retrieval/hybrid.py, llm/client.py) --
+            # this is the one node-agnostic fix that makes a search_
+            # worker's actual query and a memory node's actual counts
+            # visible without hand-writing per-node instrumentation,
+            # which would have meant re-introducing the thirteen-files
+            # problem this wrapper exists specifically to avoid. The
+            # tradeoff, stated plainly: `state`/`result` grow larger as
+            # a run progresses (evidence accumulates), so later nodes'
+            # spans carry more payload than earlier ones -- accepted
+            # here as consistent with the rest of the module rather than
+            # solved with per-node truncation logic.
             observer.span(
                 thread_id, f"node:{node_name}",
+                input=state, output=result,
                 metadata={"error": error} if error else None,
                 start_time=start, end_time=time.time(),
                 level="ERROR" if error else "DEFAULT",

@@ -413,6 +413,13 @@ def _run(app, settings, args, thread_id, tracer) -> int:
             lf.event(thread_id, "hitl.resumed",
                      metadata={"trigger": payload.get("trigger"), "action": action,
                                "resume_latency_s": round(time.time() - pause_started, 2)})
+            # Phase 3 (#11): the event above carries the point-in-time
+            # detail (trigger, timing); this score is the aggregatable
+            # form of the SAME decision -- "what fraction of runs get
+            # approved vs redirected vs aborted" is a dashboard-shaped
+            # question the event alone doesn't answer as cleanly.
+            lf.score(thread_id, "human_review", action,
+                    comment=guidance if action == "redirect" else None)
             # Command(resume={...}) is how you tell LangGraph "continue the
             # paused run, and this is what interrupt() should return this
             # time" — see agents/escalation.py's docstring for exactly how that
