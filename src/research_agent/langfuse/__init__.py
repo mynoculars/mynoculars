@@ -5,10 +5,12 @@ modules are allowed to use for observability.
     from research_agent.langfuse import start_trace, span, generation, \\
         event, score, end_trace
 
-Every business file (cli.py, orchestration/graph.py, llm/router.py,
-retrieval/hybrid.py, memory/semantic_memory.py, agents/escalation.py,
-storage/postgres.py, evaluation/quality.py, agents/gathering.py,
-agents/compilation.py) imports ONLY these thin functions. None of them
+Every business file that records anything (cli.py,
+orchestration/graph.py, llm/router.py, llm/client.py,
+retrieval/hybrid.py, memory/semantic_memory.py, agents/gathering.py,
+agents/compilation.py -- that is the complete list; `grep -rln "from
+research_agent import langfuse" src/` is the check) imports ONLY these
+thin functions. None of them
 ever see a Langfuse SDK object, a trace handle, or a span handle -- that
 is the whole point of the module boundary Phase 3 asked for. All of the
 actual SDK usage, trace-lifecycle bookkeeping, and fail-open behaviour
@@ -71,9 +73,10 @@ def get_observer() -> Observer:
 
 
 def is_enabled() -> bool:
-    """True only when a real, working Langfuse client is active. Useful
-    for a call site that wants to skip building an expensive metadata
-    payload for what would be a no-op anyway (see llm/router.py)."""
+    """True only when a real, working Langfuse client is active.
+    Exported for a call site that wants to skip building an expensive
+    metadata payload for what would be a no-op anyway; no business module
+    needs that today, so nothing in src/ currently calls it."""
     return get_observer().enabled
 
 

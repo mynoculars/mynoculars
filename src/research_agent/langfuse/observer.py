@@ -25,10 +25,16 @@ for the trace_id itself.
 
 SESSION_ID / ENVIRONMENT GROUPING -- fixed and VERIFIED, not assumed
 (this was an open gap in an earlier revision of this file). v4 has no
-`session_id=` kwarg on `start_observation`/`create_event`/`create_score`
-directly; the documented mechanism is the top-level `propagate_attributes
+`session_id=` kwarg on `start_observation`/`create_event` directly; the
+documented mechanism is the top-level `propagate_attributes
 (session_id=..., environment=...)` context manager (OTel context/baggage
 under the hood), entered in `start_trace()` and exited in `end_trace()`.
+`create_score` is the ONE exception, and it cuts the other way: it DOES
+take `session_id=` (and `environment=`), and it has to be used, because a
+score is not an OTel span at all -- it goes out through the separate
+score-ingestion path (`ScoreBody(sessionId=...)`), which reads nothing
+from OTel context, so `propagate_attributes` can never reach it. See
+`score()` below.
 Two things had to hold for this to be safe to rely on in THIS codebase,
 and both were checked against the real, installed SDK and LangGraph with
 an in-memory OTel span exporter, not inferred from docs alone:
@@ -108,11 +114,26 @@ class Observer:
     # internal helpers
     # ------------------------------------------------------------------
 
-    def _safe(self, op_name: str, fn) -> None:
+    def _safe(self, op_name: str, fn, thread_id: Optional[str] = None) -> None:
         """Run `fn`, swallowing and logging any exception. The single
         chokepoint every public method below routes through, so the
-        fail-open guarantee lives in exactly one place."""
+        fail-open guarantee lives in exactly one place.
+
+        `thread_id`, when supplied, is validated here for the same reason:
+        a blank run identity has no trace to attach anything to. Every
+        non-CLI call site reads its thread_id from `run_id_var`
+        (logging_setup.py), whose default is the EMPTY STRING -- and
+        Langfuse's own `create_trace_id(seed="")` treats an empty seed as
+        "no seed at all" and returns a fresh RANDOM id. So an observation
+        emitted outside a run (a script importing SemanticMemory, say)
+        would silently mint a brand-new orphan trace holding exactly one
+        observation, every single call. Dropping it is the honest outcome,
+        and a debug log says so."""
         if self._client is None:
+            return
+        if thread_id is not None and not str(thread_id).strip():
+            logger.debug("langfuse.skipped_blank_thread_id",
+                         extra={"op": op_name})
             return
         try:
             fn()
@@ -132,6 +153,31 @@ class Observer:
     def _trace_context(self, thread_id: str):
         from langfuse.types import TraceContext
         return TraceContext(trace_id=self._trace_id(thread_id))
+
+    def _close_root(self, thread_id: str, root: Any) -> None:
+        """End one root span, best-effort. Shared by end_trace's replace
+        path, start_trace's stale path, and shutdown's drain loop, so all
+        three fail the same way and log the same event name."""
+        if root is None:
+            return
+        try:
+            root.end()
+        except Exception as exc:  # noqa: BLE001 -- best-effort
+            logger.warning("langfuse.root_end_failed",
+                           extra={"thread_id": thread_id,
+                                  "reason": type(exc).__name__})
+
+    def _close_context(self, thread_id: str, ctx: Any) -> None:
+        """Exit one propagate_attributes context, best-effort. Same
+        sharing rationale as _close_root above."""
+        if ctx is None:
+            return
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception as exc:  # noqa: BLE001 -- best-effort
+            logger.warning("langfuse.context_exit_failed",
+                           extra={"thread_id": thread_id,
+                                  "reason": type(exc).__name__})
 
     @property
     def enabled(self) -> bool:
@@ -180,9 +226,21 @@ class Observer:
                 ctx.__exit__(None, None, None)
                 raise
             with self._lock:
+                stale_root = self._roots.pop(thread_id, None)
+                stale_ctx = self._session_contexts.pop(thread_id, None)
                 self._roots[thread_id] = root
                 self._session_contexts[thread_id] = ctx
-        self._safe("start_trace", _do)
+            # A second start_trace() for a thread_id that still has one open
+            # (a retry, or any caller that never reached end_trace) used to
+            # just overwrite both dicts. That dropped the previous root span
+            # without ever calling .end() -- which in v4's OTel model means
+            # it is never exported at all, not merely left incomplete -- and
+            # dropped the previous propagate_attributes context without
+            # __exit__, leaking its session_id onto this thread for good.
+            # Close both, outside the lock, before moving on.
+            self._close_root(thread_id, stale_root)
+            self._close_context(thread_id, stale_ctx)
+        self._safe("start_trace", _do, thread_id)
 
     def end_trace(self, thread_id: str, *, output: Any = None,
                   metadata: Optional[dict] = None) -> None:
@@ -190,20 +248,31 @@ class Observer:
             with self._lock:
                 root = self._roots.pop(thread_id, None)
                 ctx = self._session_contexts.pop(thread_id, None)
-            if root is None:
-                logger.debug("langfuse.no_active_root_trace", extra={"thread_id": thread_id})
-            else:
-                if output is not None or metadata is not None:
-                    root.update(output=output, metadata=metadata)
-                root.end()
-            # Exit the propagation context regardless of whether a root
-            # span was found -- an orphaned open context left on this
-            # thread is worse than a slightly-redundant close, since it
-            # would leak session_id into whatever OTel activity happens
-            # next on this thread/process.
-            if ctx is not None:
-                ctx.__exit__(None, None, None)
-        self._safe("end_trace", _do)
+            try:
+                if root is None:
+                    logger.debug("langfuse.no_active_root_trace",
+                                 extra={"thread_id": thread_id})
+                else:
+                    # try/finally, not a plain sequence: root.update() can
+                    # raise on its own (an output payload the SDK cannot
+                    # serialize, say), and _safe would then swallow that
+                    # exception with root.end() never reached -- losing the
+                    # WHOLE trace rather than just its final output, since
+                    # an un-.end()ed span is never exported.
+                    try:
+                        if output is not None or metadata is not None:
+                            root.update(output=output, metadata=metadata)
+                    finally:
+                        root.end()
+            finally:
+                # Exit the propagation context regardless of whether a root
+                # span was found, and regardless of whether ending it
+                # raised -- an orphaned open context left on this thread is
+                # worse than a slightly-redundant close, since it would leak
+                # session_id into whatever OTel activity happens next on
+                # this thread/process.
+                self._close_context(thread_id, ctx)
+        self._safe("end_trace", _do, thread_id)
 
     # ------------------------------------------------------------------
     # spans (non-LLM units of work: retrieval, memory, checkpointing, ...)
@@ -223,18 +292,23 @@ class Observer:
         plain metadata instead of fighting the SDK's internal OTel
         timing."""
         def _do():
-            duration_ms = None
+            meta = dict(metadata or {})
+            # Only carry duration_ms when it was actually measured. Writing
+            # the key with a None value made every span whose caller passed
+            # no timings show an empty "duration_ms" field in the Langfuse
+            # UI, which reads as "measured, and it was nothing" rather than
+            # "not measured".
             if start_time is not None and end_time is not None:
-                duration_ms = round((end_time - start_time) * 1000, 2)
+                meta["duration_ms"] = round((end_time - start_time) * 1000, 2)
             obs = self._client.start_observation(
                 name=name, as_type="span",
                 trace_context=self._trace_context(thread_id),
                 input=input, output=output,
-                metadata={**(metadata or {}), "duration_ms": duration_ms},
+                metadata=meta,
                 level=level,
             )
             obs.end()
-        self._safe("span", _do)
+        self._safe("span", _do, thread_id)
 
     # ------------------------------------------------------------------
     # generations (LLM calls specifically -- carries usage + cost)
@@ -256,9 +330,12 @@ class Observer:
         def _do():
             usage = TokenUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
             cost = calculate_cost(self._settings, provider, usage)
-            duration_ms = None
+            meta = dict(metadata or {})
+            meta["provider"] = provider
+            # Same reasoning as span() above: an unmeasured duration is
+            # absent, not present-and-null.
             if start_time is not None and end_time is not None:
-                duration_ms = round((end_time - start_time) * 1000, 2)
+                meta["duration_ms"] = round((end_time - start_time) * 1000, 2)
             usage_details = {
                 "input": int(prompt_tokens),
                 "output": int(completion_tokens),
@@ -275,12 +352,12 @@ class Observer:
                 name=name, as_type="generation", model=model,
                 trace_context=self._trace_context(thread_id),
                 input=input, output=output,
-                metadata={**(metadata or {}), "provider": provider, "duration_ms": duration_ms},
+                metadata=meta,
                 usage_details=usage_details,
                 cost_details=cost_details,
             )
             obs.end()
-        self._safe("generation", _do)
+        self._safe("generation", _do, thread_id)
 
     # ------------------------------------------------------------------
     # events (instantaneous facts: fallback hop, HITL trigger, error, ...)
@@ -294,7 +371,7 @@ class Observer:
                 trace_context=self._trace_context(thread_id),
                 name=name, input=input, metadata=metadata, level=level,
             )
-        self._safe("event", _do)
+        self._safe("event", _do, thread_id)
 
     # ------------------------------------------------------------------
     # scores (recall, coverage, critique score, groundedness, ...)
@@ -304,13 +381,22 @@ class Observer:
               comment: Optional[str] = None) -> None:
         """`value` may be a float (0..1 scores like recall/coverage) or a
         string for categorical scores -- passed straight through; v4's
-        create_score infers NUMERIC vs CATEGORICAL from the Python type."""
+        create_score infers NUMERIC vs CATEGORICAL from the Python type.
+
+        `session_id` is passed EXPLICITLY here, unlike every other method on
+        this class. A score is not an OTel span: it leaves through the
+        separate score-ingestion path, which reads nothing from OTel
+        context, so the `propagate_attributes(session_id=...)` context
+        start_trace() opened cannot reach it (see the module docstring).
+        Without this argument every score in the project arrived with no
+        session at all, silently un-grouped from the run that produced it."""
         def _do():
             self._client.create_score(
                 name=name, value=value, trace_id=self._trace_id(thread_id),
+                session_id=thread_id,
                 comment=comment,
             )
-        self._safe("score", _do)
+        self._safe("score", _do, thread_id)
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -346,21 +432,19 @@ class Observer:
                 self._roots.clear()
                 self._session_contexts.clear()
             for thread_id, root in roots:
-                try:
-                    root.end()
-                except Exception as exc:  # noqa: BLE001 -- best-effort
-                    logger.warning("langfuse.root_end_failed",
-                                   extra={"thread_id": thread_id,
-                                          "reason": type(exc).__name__})
+                self._close_root(thread_id, root)
             for thread_id, ctx in contexts:
-                try:
-                    ctx.__exit__(None, None, None)
-                except Exception as exc:  # noqa: BLE001 -- best-effort
-                    logger.warning("langfuse.context_exit_failed",
-                                   extra={"thread_id": thread_id,
-                                          "reason": type(exc).__name__})
+                self._close_context(thread_id, ctx)
             self._client.shutdown()
         self._safe("shutdown", _do)
         with self._lock:
             self._roots.clear()
             self._session_contexts.clear()
+        # Actually release the client, which is half of what this method's
+        # own name and docstring promise. Keeping the reference meant
+        # `enabled` stayed True after shutdown and every later call went to
+        # a client the SDK had already torn down -- each one failing into a
+        # langfuse.call_failed warning rather than the silent no-op the
+        # module's fail-open contract describes. Dropping it here also makes
+        # a second shutdown() genuinely free instead of merely harmless.
+        self._client = None

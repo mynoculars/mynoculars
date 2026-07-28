@@ -85,6 +85,9 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
     `config` is then forwarded to the INNER `fn` depends on whether `fn`
     itself declared one -- checked once, at wrap time, via
     `_fn_accepts_config` above, not on every call.
+
+    See the `del wrapper.__wrapped__` line at the bottom of this function
+    for what has to be undone to make that first sentence actually true.
     """
     forward_config = _fn_accepts_config(fn)
 
@@ -124,4 +127,22 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
                 start_time=start, end_time=time.time(),
                 level="ERROR" if error else "DEFAULT",
             )
+
+    # `functools.wraps` above sets `wrapper.__wrapped__ = fn`, and
+    # `inspect.signature()` FOLLOWS `__wrapped__` by default -- so an
+    # introspecting caller sees `fn`'s signature, `(state)`, not the
+    # wrapper's own `(state, config=None)`. LangGraph decides whether to
+    # inject `config` by reading exactly that
+    # (`inspect.signature(func).parameters` in
+    # langgraph/_internal/_runnable.py::RunnableCallable.__init__), so with
+    # `__wrapped__` left in place NO wrapped node ever receives a config at
+    # all: `thread_id_from_config(None)` returns "unknown", and every node
+    # span of every run in every process lands on the one deterministic
+    # trace seeded by "unknown" rather than on its own run's trace. Deleting
+    # just this one attribute restores the wrapper's real signature to
+    # introspection while keeping everything else functools.wraps copied --
+    # notably `__annotations__`, which LangGraph's Command-destination
+    # inference (`get_type_hints`, used for human_escalation's
+    # `Command[Destination]` return hint) still reads.
+    del wrapper.__wrapped__
     return wrapper
