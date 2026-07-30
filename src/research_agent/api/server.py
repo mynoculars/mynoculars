@@ -35,12 +35,13 @@ comes from the graph's own checkpointer, not from this app.
 """
 
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI
 from langgraph.types import Command
 from pydantic import BaseModel
 
+from research_agent import langfuse as lf
 from research_agent.cli import build_app_and_settings
 from research_agent.logging_setup import run_id_var
 from research_agent.state import ResearchState
@@ -78,11 +79,21 @@ async def _lifespan(_app: FastAPI):
     MCPBridge -- which owns a real subprocess and a background thread
     that were previously left running past shutdown here, even though
     cli.py has always closed them in its own finally block.
+
+    Also shuts the Langfuse Observer down, which cli.py's own finally
+    block has always done and this file previously never did: without it
+    a uvicorn process could exit with buffered observations still in the
+    SDK's queue, and any root span left open by a request that died
+    mid-flight would never be exported at all (an un-.end()ed span is
+    not "incomplete" in the OTel model -- it is never sent). Deliberately
+    LAST, after the checkpointer and bridge, so an exception closing
+    either of those cannot skip the flush.
     """
     yield
     close_checkpointer(_checkpointer)
     if _mcp_bridge is not None:
         _mcp_bridge.close()
+    lf.shutdown()
 
 
 app = FastAPI(title="Agentic Research Agent (core build)", lifespan=_lifespan)
@@ -190,6 +201,84 @@ def _respond(thread_id: str, result: dict) -> dict:
             "telemetry": telemetry}
 
 
+@contextmanager
+def _traced_request(thread_id: str, name: str, *, input: dict):
+    """Open and close ONE Langfuse root span around ONE HTTP request.
+
+    WHY A CONTEXT MANAGER AND NOT start_trace/end_trace INLINE, and why
+    the pairing is per-REQUEST rather than per-RUN: Observer.start_trace
+    enters a `propagate_attributes(...)` context (that is what carries
+    session_id/environment onto every span the run produces) and
+    end_trace exits it. That context manager is SYNC-ONLY -- the
+    installed SDK exposes no __aenter__/__aexit__ -- and it attaches to
+    the OTel context of the CALLING THREAD.
+
+    Both endpoints below are plain `def`, so FastAPI runs each one in a
+    threadpool worker, and threadpool workers are REUSED across
+    requests. If a context were entered on the thread serving /research
+    and only exited on whichever thread later served /resume, the
+    detach would target a context that thread never had: the SDK
+    swallows that failure silently, and the original thread keeps the
+    attached session_id FOREVER -- bleeding it into whatever unrelated
+    request that worker picks up next. With one external consumer that
+    is a confusing trace; with several it is one caller's session id
+    stamped on another caller's run.
+
+    So: enter and exit inside the SAME handler invocation, always, via
+    the finally below. A HITL run spanning /research + /resume therefore
+    produces TWO root spans rather than one -- but both land on the SAME
+    Langfuse trace, because Observer derives trace_id deterministically
+    from thread_id (see observer.py's SDK VERSION NOTE). Two HTTP
+    requests showing up as two spans on one trace is an honest
+    representation of what actually happened, and it is the version that
+    cannot leak.
+
+    Yields a dict the caller fills in: set `output` (and optionally
+    `metadata`) before the block exits and they are attached to the root
+    span on the way out.
+    """
+    lf.start_trace(thread_id, name, input=input)
+    holder: dict = {"output": None, "metadata": None}
+    try:
+        yield holder
+    except Exception as exc:
+        # Same reasoning as cli.py::_run's own except/raise: a span that
+        # never gets .end()ed is never exported, so a request that blew
+        # up would otherwise produce NO trace -- precisely the request
+        # you most want to look at. Record the error, then re-raise
+        # untouched so FastAPI still returns its 500.
+        holder["metadata"] = {**(holder["metadata"] or {}),
+                              "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        raise
+    finally:
+        lf.end_trace(thread_id, output=holder["output"],
+                     metadata=holder["metadata"])
+
+
+def _record_scores(thread_id: str, response: dict) -> None:
+    """Emit the same four Langfuse scores cli.py emits at end-of-run, so
+    an API-served run is not silently less observable than a CLI one.
+
+    Reads ONLY the telemetry dict the graph already produced -- D-12's
+    "aggregate, never invent" rule, exactly as cli.py applies it. A
+    still-interrupted response has no telemetry to score yet and is
+    skipped entirely rather than scored as zeros.
+    """
+    if response.get("status") != "done":
+        return
+    telemetry = response.get("telemetry") or {}
+    if "recall" in telemetry:
+        lf.score(thread_id, "recall", telemetry["recall"])
+    if "critique_passed" in telemetry:
+        lf.score(thread_id, "critique_passed", bool(telemetry["critique_passed"]))
+    if telemetry.get("evidence_items", 0) and telemetry.get("goals", 0):
+        lf.score(thread_id, "evidence_per_goal",
+                 telemetry["evidence_items"] / telemetry["goals"])
+    if telemetry.get("search_calls", 0):
+        lf.score(thread_id, "memory_hit_rate",
+                 telemetry.get("memory_hits", 0) / telemetry["search_calls"])
+
+
 class ResumeRequest(BaseModel):
     """Request body for POST /resume — the human's escalation decision.
 
@@ -245,9 +334,14 @@ def research(req: ResearchRequest) -> dict:
     """
     thread_id = req.thread_id or f"api-{uuid.uuid4().hex[:12]}"
     run_id_var.set(thread_id)
-    result = _graph.invoke(ResearchState(raw_query=req.query),
-                           config=_config(thread_id))
-    return _respond(thread_id, result)
+    with _traced_request(thread_id, "research_run",
+                         input={"query": req.query}) as trace:
+        result = _graph.invoke(ResearchState(raw_query=req.query),
+                               config=_config(thread_id))
+        response = _respond(thread_id, result)
+        trace["output"] = response
+        _record_scores(thread_id, response)
+        return response
 
 
 @app.post("/resume")
@@ -285,7 +379,13 @@ def resume(req: ResumeRequest) -> dict:
     and this endpoint will find nothing to resume.
     """
     run_id_var.set(req.thread_id)
-    result = _graph.invoke(
-        Command(resume={"action": req.action, "guidance": req.guidance}),
-        config=_config(req.thread_id))
-    return _respond(req.thread_id, result)
+    with _traced_request(req.thread_id, "research_resume",
+                         input={"action": req.action,
+                                "guidance": req.guidance}) as trace:
+        result = _graph.invoke(
+            Command(resume={"action": req.action, "guidance": req.guidance}),
+            config=_config(req.thread_id))
+        response = _respond(req.thread_id, result)
+        trace["output"] = response
+        _record_scores(req.thread_id, response)
+        return response
