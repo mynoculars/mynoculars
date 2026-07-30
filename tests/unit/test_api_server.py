@@ -24,7 +24,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from research_agent.cli import AppBundle  # noqa: E402
+from research_agent.assembly import AppBundle  # noqa: E402
 
 
 class _FakeGraph:
@@ -73,7 +73,7 @@ def _import_server(bundle):
     the patch has no effect.
     """
     sys.modules.pop("research_agent.api.server", None)
-    with patch("research_agent.cli.build_app_and_settings", return_value=bundle):
+    with patch("research_agent.assembly.build_app_and_settings", return_value=bundle):
         return importlib.import_module("research_agent.api.server")
 
 

@@ -1,0 +1,121 @@
+# =============================================================================
+# Packaging, and how another project should depend on this one.
+#
+# WHY THIS FILE EXISTS: until now this repo was run exclusively via
+# `PYTHONPATH=src python -m research_agent.cli`, with one monolithic
+# requirements.txt. That works for a developer sitting in the checkout; it
+# gives a SEPARATE project nothing to depend on. This file makes the repo
+# build an installable artifact so a consumer can pin a version rather than
+# vendoring a path.
+#
+# CONSUMING PROJECT -- pick the smallest extra that covers your use:
+#     pip install research-agent                # library + CLI only
+#     pip install research-agent[api]           # + the FastAPI HTTP surface
+#     pip install research-agent[api,langfuse]  # + observability
+#     pip install research-agent[all]           # everything requirements.txt has
+#
+# From a git URL, until this is published to an index:
+#     pip install "research-agent[api] @ git+ssh://...@v0.3.0"
+# Pin the TAG, never a branch -- see the versioning note below for why.
+#
+# VERSIONING: manual SemVer in the `version` field below, bumped in the same
+# commit as the change it describes, and tagged. Deliberately not derived
+# from git (setuptools-scm et al.) -- that adds a build-time dependency and
+# makes the version invisible when reading the file, and this project has
+# exactly one publisher.
+#   PATCH  bug fix, no interface change            (0.3.0 -> 0.3.1)
+#   MINOR  new capability, existing callers fine   (0.3.0 -> 0.4.0)
+#   MAJOR  a consumer must change code             (0.3.0 -> 1.0.0)
+#
+# WHAT COUNTS AS THIS PACKAGE'S PUBLIC INTERFACE, i.e. what a MAJOR bump is
+# owed for. Stated explicitly because "it's all importable" is not an answer
+# once someone else depends on you:
+#     research_agent.assembly   build_app_and_settings(), AppBundle
+#     research_agent.api.server the /research, /resume, /health request and
+#                               response shapes
+#     the `research-agent` console script's arguments
+#     the .env setting NAMES in config.py (renaming one breaks deployments)
+# Everything else -- agents/, orchestration/, retrieval/, prompts/, and the
+# internals of langfuse/ -- is internal and may change in a MINOR release.
+#
+# NOTE ON requirements.txt: it stays, unchanged, and still works
+# (`pip install -r requirements.txt` for a dev checkout). It is now the
+# development pin-set; THIS file is what a consumer resolves against. If you
+# add a dependency, add it to both or they will drift.
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-agent"
+version = "0.3.0"
+description = "Agentic research assistant: LangGraph workflow with hybrid retrieval, semantic memory, human-in-the-loop escalation and Langfuse observability."
+readme = "README.md"
+# 3.11 because that is what this project is actually tested on. The source
+# needs 3.10+ at minimum (api/server.py uses PEP 604 `str | None` with no
+# `from __future__ import annotations`), but claiming 3.10 support without
+# running the suite on 3.10 would be an untested assertion -- widen this
+# only after a real 3.10 run.
+requires-python = ">=3.11"
+
+# CORE: everything `python -m research_agent.cli` needs. Each storage
+# backend degrades gracefully at RUNTIME when its server is unreachable
+# (see storage/*.py), but the client libraries themselves are not
+# optional -- assembly.py imports all of them at module level, so a core
+# install must be able to build the graph.
+dependencies = [
+    "langgraph>=0.2.60",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "qdrant-client>=1.14",
+    "fastembed>=0.3",
+    "opensearch-py>=2.6",
+    "langgraph-checkpoint-postgres>=2.0",
+    # [pool] adds psycopg_pool -- see requirements.txt for why the fan-out's
+    # checkpoint writes need it.
+    "psycopg[binary,pool]>=3.1",
+    "pywin32>=311; platform_system == 'Windows'",
+]
+
+# EXTRAS are exactly the dependencies whose code paths are OFF BY DEFAULT
+# and whose imports are lazy, so a core install neither needs nor loads
+# them. Each was checked against the source, not assumed:
+#   api      -- only api/server.py imports fastapi/uvicorn; nothing else
+#               in src/ references either.
+#   mcp      -- MCP_ENABLED=false by default; tools/mcp_client.py has no
+#               module-level `import mcp`.
+#   langfuse -- LANGFUSE_ENABLED=false by default; langfuse/client.py's
+#               build_client() returns None before importing the SDK.
+#   viz      -- cli.py --print-graph falls back to Mermaid text and prints
+#               a hint when grandalf is absent.
+[project.optional-dependencies]
+api = ["fastapi>=0.111", "uvicorn>=0.30"]
+mcp = ["mcp>=1.9"]
+langfuse = ["langfuse>=4.0"]
+viz = ["grandalf>=0.8"]
+dev = ["pytest>=8.0"]
+# Everything, matching what requirements.txt installs today. This is the
+# extra a consuming project wants if it does not care about install size.
+all = [
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "mcp>=1.9",
+    "langfuse>=4.0",
+    "grandalf>=0.8",
+]
+
+[project.scripts]
+research-agent = "research_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["research_agent*"]
+
+# NOTE: pytest configuration deliberately stays in pytest.ini, not here.
+# pytest.ini takes PRECEDENCE over pyproject.toml's [tool.pytest.ini_options],
+# so duplicating it here would create a second copy that silently does
+# nothing -- and pytest.ini's filterwarnings=always is load-bearing (see
+# its own comment for the warnings it stopped hiding).

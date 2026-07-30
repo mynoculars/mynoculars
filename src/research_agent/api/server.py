@@ -42,7 +42,7 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from research_agent import langfuse as lf
-from research_agent.cli import build_app_and_settings
+from research_agent.assembly import build_app_and_settings
 from research_agent.logging_setup import run_id_var
 from research_agent.state import ResearchState
 from research_agent.storage.postgres import close_checkpointer, record_run
