@@ -277,6 +277,10 @@ def _record_scores(thread_id: str, response: dict) -> None:
     if telemetry.get("search_calls", 0):
         lf.score(thread_id, "memory_hit_rate",
                  telemetry.get("memory_hits", 0) / telemetry["search_calls"])
+    if "grounding_ratio" in telemetry:
+        unevidenced = telemetry.get("goals_without_evidence") or []
+        lf.score(thread_id, "grounding_ratio", telemetry["grounding_ratio"],
+                 comment=f"unevidenced={','.join(unevidenced) or 'none'}")
 
 
 class ResumeRequest(BaseModel):

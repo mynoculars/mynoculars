@@ -43,6 +43,11 @@ def test_full_graph_runs_offline(graph, settings):
     assert tele["recall"] == 1.0             # fake tool covers both goals
     assert tele["critique_passed"] is True
     assert tele["iterations"] >= 1
+    # Grounding audit: the fake tool answers both goals, so nothing is
+    # unevidenced and the ratio is perfect. The interesting case (a goal
+    # the retriever never fed) is exercised separately below.
+    assert tele["goals_without_evidence"] == []
+    assert tele["grounding_ratio"] == 1.0
 
 
 class MalformedGoalsStub(StubClient):
@@ -238,3 +243,62 @@ def test_worker_done_log_line_reports_the_tools_actual_source(graph, caplog):
     assert done_lines, "expected at least one worker.done log line"
     for line in done_lines:
         assert line.event_fields["source"] == "fake"  # matches conftest.py's fake_tool
+
+
+def test_grounding_ratio_flags_a_goal_the_retriever_never_fed(graph, settings):
+    """The failure this measurement exists for: a goal reaches the compiler
+    with NO evidence behind it, so anything the report says about it came
+    from the model's parametric knowledge rather than the corpus.
+
+    Deliberately asserted on state, not on the report text -- across four
+    live runs the model cited goal ids four different ways and in one run
+    used no bracket citations at all, so a report-parsing check would be
+    silent exactly when it mattered most.
+    """
+    result = graph.invoke(
+        ResearchState(raw_query="Compare Redis and Memcached for session caching"),
+        config={"configurable": {"thread_id": "test-grounding"},
+                "recursion_limit": settings.recursion_limit},
+    )
+    tele = result["telemetry"]
+    # Sanity: this fixture DOES evidence every goal, so the audit must not
+    # produce false positives -- a check that fires on a healthy run is
+    # worse than no check.
+    assert tele["grounding_ratio"] == 1.0
+    assert set(tele["goals_without_evidence"]).issubset(
+        {g.goal_id for g in result["goals"]})
+
+
+def test_grounding_ratio_is_computed_from_state_not_from_the_report():
+    """Directly exercise telemetry_node's arithmetic with a goal that has
+    no evidence -- the graph fixture always covers every goal, so the
+    uncovered case has to be constructed."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.state import Goal
+
+    state = ResearchState(
+        raw_query="q",
+        goals=[Goal(goal_id="g1", description="covered"),
+               Goal(goal_id="g2", description="NOT covered")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="something", score=0.9)],
+    )
+    node = build_telemetry_node(debug=False)
+    tele = node(state)["telemetry"]
+
+    assert tele["goals_without_evidence"] == ["g2"]
+    assert tele["grounding_ratio"] == 0.5
+    # The point of keeping this separate from recall: recall is 0.0 here
+    # because progress_checker never ran, but the two answer genuinely
+    # different questions and must not be conflated.
+    assert "recall" in tele
+
+
+def test_grounding_ratio_survives_a_run_with_no_goals_at_all():
+    """A planning failure produces zero goals; 0/0 must not raise."""
+    from research_agent.agents.compilation import build_telemetry_node
+
+    state = ResearchState(raw_query="q", goals=[], evidence=[])
+    tele = build_telemetry_node(debug=False)(state)["telemetry"]
+    assert tele["grounding_ratio"] == 0.0
+    assert tele["goals_without_evidence"] == []

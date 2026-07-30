@@ -39,3 +39,68 @@ def test_system_prompt_forbids_echoing_the_evidence_tag_literally():
     assert "<evidence>" in system_content  # the tag itself is still named...
     assert "never reproduce" in system_content.lower()  # ...but now with a
     # matching instruction not to echo it back literally.
+
+
+def test_single_leg_ceiling_still_matches_the_real_rrf_constants():
+    """Drift guard. SINGLE_LEG_SCORE_CEILING is hardcoded in templates.py
+    (deliberately -- see its comment for why it does not import from the
+    retrieval stack), so this test does the cross-module import instead. If
+    RRF_K or RRF_SQUASH ever change, the threshold rots silently and every
+    WEAK verdict becomes wrong; this fails loudly instead."""
+    from research_agent.prompts.templates import SINGLE_LEG_SCORE_CEILING
+    from research_agent.retrieval.hybrid import RRF_K
+    from research_agent.tools.corpus_search import RRF_SQUASH
+
+    assert SINGLE_LEG_SCORE_CEILING == min(1.0, (1 / RRF_K) * RRF_SQUASH)
+
+
+def test_compile_report_states_per_goal_evidence_coverage():
+    """The observed failure: 41 evidence items all scoring exactly 0.50,
+    per-item scores already inlined, and the model wrote a long confident
+    report of unretrievable specifics anyway. An explicit per-goal verdict
+    is harder to read past than 41 repetitions of score=0.50."""
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Evidence, Goal
+
+    goals = [Goal(goal_id="g1", description="well covered"),
+             Goal(goal_id="g2", description="single-leg only"),
+             Goal(goal_id="g3", description="nothing at all")]
+    evidence = [
+        Evidence(task_key="a", goal_id="g1", source="corpus", content="x", score=0.98),
+        Evidence(task_key="b", goal_id="g1", source="corpus", content="y", score=0.50),
+        Evidence(task_key="c", goal_id="g2", source="corpus", content="z", score=0.50),
+    ]
+    body = compile_report("q", goals, evidence, [])[-1]["content"]
+
+    assert "EVIDENCE: 2 item(s), best score 0.98" in body
+    assert "WEAK" in body                      # g2: best score sits ON the ceiling
+    assert "NO EVIDENCE RETRIEVED" in body     # g3: never retrieved anything
+    # g1 is strong and must NOT be flagged -- a warning that fires on
+    # healthy goals trains the model to ignore it.
+    g1_block = body.split("- g1:")[1].split("- g2:")[0]
+    assert "WEAK" not in g1_block
+
+
+def test_compile_report_forbids_filling_gaps_from_model_knowledge():
+    """The instruction has to be specific about WHAT must not be invented.
+    'State clearly when evidence is thin' was the previous wording and the
+    model satisfied it while still naming equipment, doctrines and dates
+    absent from the corpus."""
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Goal
+
+    body = compile_report("q", [Goal(goal_id="g1", description="d")], [], [])[-1]["content"]
+    assert "GROUNDING RULE" in body
+    for forbidden in ("model numbers", "doctrine names", "figures"):
+        assert forbidden in body
+    assert "Do NOT fill the gap" in body
+
+
+def test_compile_report_coverage_block_handles_zero_evidence_overall():
+    """A run where retrieval returned nothing at all must still render."""
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Goal
+
+    body = compile_report("q", [Goal(goal_id="g1", description="d")], [], [])[-1]["content"]
+    assert "NO EVIDENCE RETRIEVED" in body
+    assert "(no evidence gathered)" in body

@@ -243,7 +243,8 @@ def build_telemetry_node(debug: bool = False):
                 state.escalation_history.
         CALLS   nothing external — pure aggregation.
         WRITES  state.telemetry = {intent, goals, iterations,
-                    evidence_items, evidence_by_source, recall,
+                    evidence_items, evidence_by_source,
+                    goals_without_evidence, grounding_ratio, recall,
                     llm_node_calls, llm_provider_calls, llm_fallback_hops,
                     llm_quality_calls, llm_quality_calls_failed,
                     retrieval_dense_calls, retrieval_keyword_calls,
@@ -315,12 +316,55 @@ def build_telemetry_node(debug: bool = False):
         # trouble with a plain dict; a Counter object is unnecessary here
         # once the counting itself is done).
         evidence_by_source = dict(Counter(e.source for e in state.evidence))
+        # GROUNDING AUDIT -- which goals reached the compiler with NO
+        # evidence behind them at all.
+        #
+        # WHY THIS IS MEASURED HERE AND NOT PARSED OUT OF THE REPORT: the
+        # obvious check is "extract every [gN] citation from final_report
+        # and verify that goal has evidence". That does not survive contact
+        # with real output -- across four live runs the model cited as
+        # `[g1 | corpus | score=0.50]`, `[g1, g4]`, `(g1)` in headings, and
+        # in one run used no bracket citations whatsoever. A regex would
+        # have found zero citations in exactly the run whose report was
+        # LEAST grounded (it named Cassandra's compression codecs from a
+        # corpus containing no Cassandra documents), and zero citations is
+        # not evidence of grounding -- it is evidence the citation
+        # instruction was ignored.
+        #
+        # state.evidence is structured data with goal_id on every item, so
+        # counting it needs no parsing, no LLM, and no format stability. A
+        # goal with zero items that still gets discussed in the report is a
+        # provable gap-fill from the model's parametric knowledge; this
+        # does not prove it HAPPENED, but it is the precondition, and it is
+        # the number that tells you how often the opportunity arises.
+        #
+        # D-12 holds: every figure below is counted from state, not judged.
+        goal_ids = [g.goal_id for g in state.goals]
+        evidenced = {e.goal_id for e in state.evidence}
+        goals_without_evidence = [g for g in goal_ids if g not in evidenced]
+        # Ratio, not just the list, so it is trendable across runs and
+        # comparable across queries with different goal counts. Guarded
+        # against a run that produced no goals at all (a planning failure),
+        # where 0/0 is undefined rather than perfect.
+        grounding_ratio = (
+            round((len(goal_ids) - len(goals_without_evidence)) / len(goal_ids), 3)
+            if goal_ids else 0.0
+        )
         telemetry = {
             "intent": state.classification.get("intent"),
             "goals": len(state.goals),
             "iterations": state.iteration_depth,
             "evidence_items": len(state.evidence),
             "evidence_by_source": evidence_by_source,
+            # Deliberately distinct from `recall`. recall asks "did enough
+            # evidence clear the coverage threshold" and is computed from
+            # scores; grounding_ratio asks the cruder, prior question "did
+            # this goal get ANY evidence at all", and cannot be affected by
+            # threshold tuning. A run can show recall 1.0 and
+            # grounding_ratio 0.5 -- that combination means the coverage
+            # rule is passing goals the retriever never fed.
+            "goals_without_evidence": goals_without_evidence,
+            "grounding_ratio": grounding_ratio,
             "recall": round(state.recall_score, 3),
             "llm_node_calls": int(c.get("llm_node_calls", 0)),
             "llm_provider_calls": int(c.get("llm_provider_calls", 0)),

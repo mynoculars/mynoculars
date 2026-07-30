@@ -295,6 +295,14 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         if telemetry.get("search_calls", 0):
             memory_hit_rate = telemetry.get("memory_hits", 0) / telemetry["search_calls"]
             lf.score(thread_id, "memory_hit_rate", memory_hit_rate)
+        # Trendable across prompt revisions -- which is what item 5's
+        # prompt_name/prompt_version tagging on every generation was for.
+        # The comment carries WHICH goals were unevidenced, so a low score
+        # in the Langfuse UI is actionable without opening the run's logs.
+        if "grounding_ratio" in telemetry:
+            unevidenced = telemetry.get("goals_without_evidence") or []
+            lf.score(thread_id, "grounding_ratio", telemetry["grounding_ratio"],
+                     comment=f"unevidenced={','.join(unevidenced) or 'none'}")
         lf.end_trace(thread_id, output={"final_report": report, "telemetry": telemetry})
 
         return 0 if telemetry else 1
