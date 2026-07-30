@@ -95,7 +95,7 @@ logging.getLogger("qdrant_client").setLevel(logging.ERROR)
 
 **Windows (PowerShell):**
 ```powershell
-cd research-agent-dmp
+cd research-agent
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -442,7 +442,7 @@ cd D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\llama-precompiled
 # START TEST: -c 8192
 .\llama-server.exe -m ..\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf -ngl 999 -c 8192 --chat-template chatml --port 8080 > ..\logs\llama-server_cogito.log 2>&1
 
-# Stable on 8 GB VRAM: -c 1536, typically ~28 GPU layers (~4 layers remain in RAM)
+# USE THIS" Stable on 8 GB VRAM: -c 1536, typically ~28 GPU layers (~4 layers remain in RAM)
 .\llama-server.exe -m ..\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf -ngl 28 -c 1536 --chat-template chatml --port 8080 > ..\logs\llama-server_cogito.log 2>&1
 
 # DIAGNOSTICS
@@ -851,8 +851,9 @@ good practice, since other env vars (timeouts, corpus paths) aren't guarded
 the same way:
 
 ```powershell
+$env:PYTHONPATH = "src"
 Remove-Item Env:\HITL_ENABLED -ErrorAction SilentlyContinue
-python -m pytest tests\ -q
+$env:PYTHONPATH = "src"
 ```
 
 ---

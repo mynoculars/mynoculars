@@ -29,6 +29,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from research_agent.langfuse.masking import MODE_OFF, build_mask, resolve_mode
+
 logger = logging.getLogger("research_agent.langfuse")
 
 
@@ -92,8 +94,25 @@ def build_client(settings) -> Optional[Any]:
             # the life of this process -- not per-run, so it belongs at
             # construction time, not threaded through every trace call.
             environment=settings.langfuse_environment or None,
+            # Redaction of input/output/metadata before anything leaves
+            # this process. None for mode "off", which makes the SDK skip
+            # masking entirely rather than run an identity callable. See
+            # langfuse/masking.py for what is and is not covered.
+            mask=build_mask(settings),
         )
-        logger.info("langfuse.client_active", extra={"host": settings.langfuse_host})
+        mask_mode = resolve_mode(settings.langfuse_mask_mode)
+        logger.info("langfuse.client_active",
+                    extra={"host": settings.langfuse_host,
+                           "mask_mode": mask_mode})
+        if mask_mode == MODE_OFF:
+            # Loud on purpose, matching the config.coverage_gate_inert
+            # precedent: a disabled safety control should never be silent.
+            logger.warning(
+                "langfuse.masking_off",
+                extra={"reason": "LANGFUSE_MASK_MODE=off -- prompts, model "
+                                  "outputs and retrieved evidence are sent "
+                                  "to Langfuse verbatim"},
+            )
         return client
     except Exception as exc:  # noqa: BLE001 -- observability must fail open
         logger.warning(

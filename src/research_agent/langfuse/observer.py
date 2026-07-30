@@ -29,12 +29,13 @@ SESSION_ID / ENVIRONMENT GROUPING -- fixed and VERIFIED, not assumed
 documented mechanism is the top-level `propagate_attributes
 (session_id=..., environment=...)` context manager (OTel context/baggage
 under the hood), entered in `start_trace()` and exited in `end_trace()`.
-`create_score` is the ONE exception, and it cuts the other way: it DOES
-take `session_id=` (and `environment=`), and it has to be used, because a
-score is not an OTel span at all -- it goes out through the separate
-score-ingestion path (`ScoreBody(sessionId=...)`), which reads nothing
-from OTel context, so `propagate_attributes` can never reach it. See
-`score()` below.
+`create_score` LOOKS like an exception -- a score is not an OTel span
+(it leaves through the separate score-ingestion path, which reads nothing
+from OTel context) and the SDK's `create_score` signature does accept
+`session_id=`. It must NOT be used anyway: the ingestion API accepts
+exactly ONE score target and rejects traceId+sessionId together with HTTP
+400. Scores pass traceId only and inherit the session from the trace they
+attach to. See `score()` below.
 Two things had to hold for this to be safe to rely on in THIS codebase,
 and both were checked against the real, installed SDK and LangGraph with
 an in-memory OTel span exporter, not inferred from docs alone:
@@ -62,6 +63,27 @@ assert the CALL SHAPE (propagate_attributes entered/exited with the
 right kwargs), which is what this module actually controls; the SDK's
 own behavior given that call shape was verified separately, above, by
 hand, against the real package.
+
+TRACE NESTING -- verified against the installed SDK, not assumed. Passing
+`TraceContext(trace_id=...)` alone does NOT make an observation a child of
+the run's root span; the SDK synthesizes a remote parent from the trace_id
+and every observation comes out a sibling at the top of the trace, which is
+what made traces read as a flat list. `TraceContext` also accepts an
+OPTIONAL `parent_span_id`, and supplying the root span's own `.id` there
+produces real OTel parentage. Confirmed by exporting spans through an
+in-memory OTel exporter and reading `span.parent.span_id` back: with
+`parent_span_id` the child's parent is the root's span id exactly, without
+it the parent is an unrelated synthesized id.
+
+The root span handle is already tracked in `self._roots` for end_trace's
+sake, and `LangfuseSpan.id` is the OTel span id, so nesting needs NO new
+state and NO call-site changes -- `_trace_context()` looks the open root up
+on the way past. Two consequences worth knowing: (1) nesting is only
+available while a root is open, so an observation emitted outside a
+start_trace/end_trace pair still lands flat on the trace rather than being
+dropped, and (2) `start_trace` itself must ask for a NON-nesting context
+(`nest=False`), or a retry would parent the new root under the stale one it
+is about to close.
 
 THREAD SAFETY: `self._roots` and `self._session_contexts` are guarded by
 one `threading.Lock`. Not because today's specific access pattern is
@@ -97,10 +119,12 @@ class Observer:
         # Guards both dicts below -- see the module docstring's Thread
         # Safety section.
         self._lock = threading.Lock()
-        # Tracks OPEN root spans (start_trace -> end_trace pairs), so
-        # end_trace can attach final output/duration. Every other call
-        # derives its trace_id fresh from the deterministic seed, see
-        # _trace_context() -- no registry needed for THAT.
+        # Tracks OPEN root spans (start_trace -> end_trace pairs). Two
+        # jobs: end_trace attaches final output/duration to the handle,
+        # and _trace_context() reads `.id` off it to parent every other
+        # observation under it (see the module docstring's Trace Nesting
+        # section). The trace_id itself still needs no registry -- every
+        # call derives it fresh from the deterministic seed.
         self._roots: Dict[str, Any] = {}
         # The open propagate_attributes(...) context per thread_id,
         # entered in start_trace and exited in end_trace -- this is what
@@ -150,9 +174,30 @@ class Observer:
         lands on one trace with no registry needed."""
         return self._client.create_trace_id(seed=thread_id)
 
-    def _trace_context(self, thread_id: str):
+    def _trace_context(self, thread_id: str, *, nest: bool = True):
+        """The TraceContext every observation for `thread_id` is created
+        against. When `nest` is true (the default) and a root span is
+        currently open for this thread_id, the root's span id is added as
+        `parent_span_id`, which is what actually produces a nested trace
+        rather than a flat list of siblings -- see the module docstring's
+        Trace Nesting section.
+
+        `nest=False` exists for exactly one caller: start_trace(), whose
+        own root must never be parented under a previous, still-open root
+        it is in the middle of replacing."""
         from langfuse.types import TraceContext
-        return TraceContext(trace_id=self._trace_id(thread_id))
+        ctx = TraceContext(trace_id=self._trace_id(thread_id))
+        if not nest:
+            return ctx
+        with self._lock:
+            root = self._roots.get(thread_id)
+        # getattr, and an explicit str check, deliberately: a root handle
+        # is whatever the SDK returned, and this must degrade to "flat,
+        # as before" rather than raise if that object has no usable `.id`.
+        parent_span_id = getattr(root, "id", None)
+        if isinstance(parent_span_id, str) and parent_span_id:
+            ctx["parent_span_id"] = parent_span_id
+        return ctx
 
     def _close_root(self, thread_id: str, root: Any) -> None:
         """End one root span, best-effort. Shared by end_trace's replace
@@ -213,7 +258,7 @@ class Observer:
             try:
                 root = self._client.start_observation(
                     name=name, as_type="span",
-                    trace_context=self._trace_context(thread_id),
+                    trace_context=self._trace_context(thread_id, nest=False),
                     input=input,
                     metadata={**(metadata or {}),
                               "project": self._settings.langfuse_project or None},
@@ -383,17 +428,21 @@ class Observer:
         string for categorical scores -- passed straight through; v4's
         create_score infers NUMERIC vs CATEGORICAL from the Python type.
 
-        `session_id` is passed EXPLICITLY here, unlike every other method on
-        this class. A score is not an OTel span: it leaves through the
-        separate score-ingestion path, which reads nothing from OTel
-        context, so the `propagate_attributes(session_id=...)` context
-        start_trace() opened cannot reach it (see the module docstring).
-        Without this argument every score in the project arrived with no
-        session at all, silently un-grouped from the run that produced it."""
+        `trace_id` is the ONLY target passed, and that is deliberate. The
+        SDK's create_score signature also accepts `session_id=`, and
+        passing both looks like the way to get session grouping onto a
+        score -- but the ingestion API requires exactly one of traceId /
+        sessionId / datasetRunId and returns HTTP 400 ("Provide exactly
+        one of the following: traceId (with optional observationId),
+        sessionId or datasetRunId") for the combination, which silently
+        dropped EVERY score in every run. Confirmed against the live API:
+        traceId alone returns 201. Do not re-add it. Session grouping
+        still works transitively -- the score attaches to the trace, and
+        the trace carries the session from start_trace()'s
+        propagate_attributes context."""
         def _do():
             self._client.create_score(
                 name=name, value=value, trace_id=self._trace_id(thread_id),
-                session_id=thread_id,
                 comment=comment,
             )
         self._safe("score", _do, thread_id)

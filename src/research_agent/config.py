@@ -254,6 +254,13 @@ class Settings(BaseSettings):
     langfuse_project: str = ""
     langfuse_environment: str = "development"
     langfuse_release: str = ""
+    # What leaves the process for Langfuse. "patterns" (the default)
+    # redacts four distinctive PII/secret shapes and keeps everything
+    # else; "all" replaces every string leaf; "off" sends payloads
+    # verbatim. Defaults to ON deliberately: an observability feature
+    # that ships inert is the same mistake min_evidence_score=0.0 was.
+    # The redaction itself lives in langfuse/masking.py.
+    langfuse_mask_mode: str = "patterns"
     # Per-provider $ cost per 1M tokens, input/output. Never hardcoded in
     # the SDK-facing code (see langfuse/pricing.py) -- a provider with no
     # entry here costs $0, which is the correct default for a local model

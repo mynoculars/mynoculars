@@ -24,6 +24,14 @@ import pytest
 from research_agent.config import Settings
 from research_agent.langfuse import client as lf_client
 from research_agent.langfuse.helpers import thread_id_from_config, traced_node
+from research_agent.langfuse.masking import (
+    MODE_ALL,
+    MODE_OFF,
+    MODE_PATTERNS,
+    build_mask,
+    redact_text,
+    resolve_mode,
+)
 from research_agent.langfuse.observer import Observer
 from research_agent.langfuse.pricing import TokenUsage, calculate_cost
 
@@ -94,6 +102,122 @@ def test_build_client_returns_client_on_success(monkeypatch):
     client = lf_client.build_client(s)
     assert isinstance(client, _FakeLangfuse)
     assert built_kwargs["host"] == "https://example.test"
+    # Masking must reach the constructor, not just exist as a module.
+    assert callable(built_kwargs["mask"])
+
+
+def test_build_client_passes_no_mask_when_masking_is_off(monkeypatch):
+    """mask=None makes the SDK skip masking entirely rather than call an
+    identity function, so "off" must produce None, not a callable."""
+    fake_module = types.ModuleType("langfuse")
+    built_kwargs = {}
+
+    class _FakeLangfuse:
+        def __init__(self, **kwargs):
+            built_kwargs.update(kwargs)
+
+    fake_module.Langfuse = _FakeLangfuse
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+    s = _settings(langfuse_enabled=True, langfuse_public_key="pk",
+                  langfuse_secret_key="sk", langfuse_mask_mode="off")
+    lf_client.build_client(s)
+    assert built_kwargs["mask"] is None
+
+
+# ---------------------------------------------------------------------------
+# masking -- what actually leaves the process
+# ---------------------------------------------------------------------------
+
+def test_mask_mode_off_returns_no_callable():
+    assert build_mask(_settings(langfuse_mask_mode="off")) is None
+
+
+def test_mask_default_is_patterns_not_off():
+    """A safety control that ships inert is the mistake this default
+    exists to avoid -- assert it explicitly."""
+    assert _settings().langfuse_mask_mode == MODE_PATTERNS
+    assert build_mask(_settings()) is not None
+
+
+def test_redact_text_catches_each_supported_shape():
+    assert "[REDACTED:email]" in redact_text("write to a.b+x@example.co.uk today")
+    assert "[REDACTED:bearer]" in redact_text("Authorization: Bearer abcdef1234567890")
+    assert "[REDACTED:api_key]" in redact_text("key sk-abcdefghij0123456789 used")
+    assert "[REDACTED:card]" in redact_text("paid with 4111 1111 1111 1111 ok")
+
+
+def test_redact_text_leaves_ordinary_research_prose_alone():
+    """A pattern that fires on corpus text would destroy the traces this
+    package exists to produce -- years and plain figures must survive."""
+    prose = "In 1994 the study of 250 subjects reported a 12.5% increase."
+    assert redact_text(prose) == prose
+
+
+def test_mask_patterns_preserves_structure_and_non_pii():
+    mask = build_mask(_settings(langfuse_mask_mode="patterns"))
+    out = mask(data={"messages": [{"role": "user",
+                                   "content": "mail me at x@y.com"}],
+                     "depth": 3, "ok": True, "none": None})
+    assert out["depth"] == 3
+    assert out["ok"] is True
+    assert out["none"] is None
+    assert out["messages"][0]["role"] == "user"
+    assert "x@y.com" not in out["messages"][0]["content"]
+    assert "[REDACTED:email]" in out["messages"][0]["content"]
+
+
+def test_mask_all_removes_every_string_leaf_but_keeps_shape():
+    mask = build_mask(_settings(langfuse_mask_mode="all"))
+    out = mask(data={"report": "a long compiled report",
+                     "tokens": 1200,
+                     "goals": ["g1", "g2"]})
+    assert out["report"] == "[REDACTED]"
+    assert out["tokens"] == 1200
+    assert out["goals"] == ["[REDACTED]", "[REDACTED]"]
+
+
+def test_mask_stringifies_and_redacts_unknown_objects():
+    """The SDK would serialize an unknown object with default=str, which
+    would carry its repr through unmasked -- so it must be redacted here."""
+    class _Thing:
+        def __repr__(self):
+            return "<Thing owner=a@b.com>"
+
+    mask = build_mask(_settings(langfuse_mask_mode="patterns"))
+    out = mask(data={"thing": _Thing()})
+    assert "a@b.com" not in out["thing"]
+
+
+def test_mask_survives_a_repr_that_raises():
+    class _Hostile:
+        def __repr__(self):
+            raise RuntimeError("no repr for you")
+
+    mask = build_mask(_settings(langfuse_mask_mode="patterns"))
+    assert mask(data=_Hostile()) == "[REDACTED]"
+
+
+def test_mask_caps_recursion_depth():
+    """Deeply nested payloads must not turn masking into runaway
+    recursion on the request path."""
+    payload = "leaf@example.com"
+    for _ in range(200):
+        payload = {"n": payload}
+    mask = build_mask(_settings(langfuse_mask_mode="patterns"))
+    out = mask(data=payload)          # must not raise
+    flat = str(out)
+    assert "leaf@example.com" not in flat
+    assert "[REDACTED:depth]" in flat
+
+
+def test_unrecognized_mask_mode_fails_toward_more_redaction():
+    """An unparseable setting must never silently mean "send everything"."""
+    assert resolve_mode("nonsense") == MODE_PATTERNS
+    assert resolve_mode("") == MODE_PATTERNS
+    assert resolve_mode(None) == MODE_PATTERNS
+    assert resolve_mode("OFF") == MODE_OFF
+    assert resolve_mode("  All ") == MODE_ALL
+    assert build_mask(_settings(langfuse_mask_mode="nonsense")) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +308,102 @@ def test_observer_span_uses_a_real_trace_context(monkeypatch):
     assert calls[0][1]["name"] == "my-span"
     assert calls[0][1]["trace_context"].get("trace_id") == "trace-for-thread-abc"
     assert calls[1][0] == "end"
+
+
+def test_observer_nests_observations_under_the_open_root_span():
+    """With a root span open, every later observation must carry the
+    root's span id as parent_span_id -- that is what makes the trace a
+    tree instead of a flat list of siblings."""
+    calls = []
+
+    class _FakeObservation:
+        def __init__(self, span_id):
+            self.id = span_id
+
+        def end(self, **kwargs):
+            pass
+
+        def update(self, **kwargs):
+            pass
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-for-{seed}"
+
+        def start_observation(self, **kwargs):
+            calls.append(kwargs)
+            return _FakeObservation("root-span-id")
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs.start_trace("t1", "research_run")
+    obs.span("t1", "node:classify")
+    obs.generation("t1", "llm", provider="primary", model="m")
+    obs.event("t1", "memory.retrieved")
+
+    # The root itself must NOT be parented under anything.
+    assert "parent_span_id" not in calls[0]["trace_context"]
+    # Everything after it must be.
+    for kwargs in calls[1:]:
+        assert kwargs["trace_context"]["parent_span_id"] == "root-span-id"
+        assert kwargs["trace_context"]["trace_id"] == "trace-for-t1"
+
+
+def test_observer_does_not_nest_once_the_root_is_closed():
+    """After end_trace the root is gone, so an observation must fall back
+    to a flat, trace-only context rather than raising or reusing a stale
+    parent id."""
+    calls = []
+
+    class _FakeObservation:
+        id = "root-span-id"
+
+        def end(self, **kwargs):
+            pass
+
+        def update(self, **kwargs):
+            pass
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-for-{seed}"
+
+        def start_observation(self, **kwargs):
+            calls.append(kwargs)
+            return _FakeObservation()
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs.start_trace("t1", "research_run")
+    obs.end_trace("t1")
+    obs.span("t1", "late-span")
+
+    assert "parent_span_id" not in calls[-1]["trace_context"]
+
+
+def test_observer_nesting_degrades_when_the_root_handle_has_no_id():
+    """A root handle without a usable `.id` must produce the old flat
+    behavior, not an exception and not a garbage parent_span_id."""
+    calls = []
+
+    class _IdlessObservation:
+        def end(self, **kwargs):
+            pass
+
+        def update(self, **kwargs):
+            pass
+
+    class _FakeClient:
+        def create_trace_id(self, *, seed):
+            return f"trace-for-{seed}"
+
+        def start_observation(self, **kwargs):
+            calls.append(kwargs)
+            return _IdlessObservation()
+
+    obs = Observer(client=_FakeClient(), settings=_settings())
+    obs.start_trace("t1", "research_run")
+    obs.span("t1", "x")
+
+    assert "parent_span_id" not in calls[-1]["trace_context"]
 
 
 def test_observer_generation_computes_cost_and_usage(monkeypatch):
