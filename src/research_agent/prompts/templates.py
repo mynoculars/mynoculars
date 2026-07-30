@@ -43,6 +43,52 @@ from typing import List
 from research_agent.llm.client import Message
 from research_agent.state import Evidence, Goal
 
+# ---------------------------------------------------------------------------
+# Prompt version tagging (Langfuse Item 5, metadata-only variant)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: llm/client.py records exactly ONE Langfuse generation
+# call site, shared by every node in the graph. By the time a call reaches
+# it, the prompt is already flattened into a plain `messages` list -- the
+# client has no way to know which builder function in this file produced
+# it, only the enclosing node's name (`self._trace_node`, e.g. "compiler").
+# This registry closes that gap with a plain lookup table, so client.py can
+# tag every generation with WHICH prompt template and WHICH revision of it
+# produced the call -- enough to filter/group generations by prompt version
+# in the Langfuse UI and compare, e.g., critique_passed rate across a
+# critique() revision, without any new runtime dependency.
+#
+# WHAT THIS DELIBERATELY IS NOT: Langfuse's own hosted-prompt feature
+# (`get_prompt()` + the `prompt=` kwarg on a generation, native Prompts tab,
+# per-version usage stats). That mechanism is a NETWORK READ on the request
+# path -- this codebase has never had one at generation time, and adding it
+# is a real architectural decision (prompt authority moves from this file
+# to Langfuse) that deserves its own review, not a silent addition here.
+# This registry keeps `templates.py` as the sole source of truth; Langfuse
+# only ever receives a name and a version string as metadata.
+#
+# MAINTENANCE CONTRACT: bump the version string by hand whenever a
+# builder's PROMPT TEXT changes in a way that could affect model behavior
+# (wording, structure, instructions) -- not for docstring or comment edits.
+# A missed bump doesn't lose data, it just makes two behaviorally-different
+# prompt revisions look like one in the Langfuse UI, which is a mildly
+# confusing dashboard, not a bug -- keep that asymmetry in mind if you're
+# ever unsure whether an edit warrants a bump.
+PROMPT_VERSIONS = {
+    "classify":        ("classify", "v1"),
+    "goal_manager":     ("compose_goals", "v1"),
+    "task_expander":    ("expand_tasks", "v1"),
+    "gap_generator":    ("generate_gaps", "v1"),
+    "compiler":         ("compile_report", "v1"),
+    "critic":           ("critique", "v1"),
+    # detect_contradictions runs inside the "merger" node but is called
+    # conditionally, not on every merger execution -- so merger's
+    # generations are a MIX of that prompt and none at all. Deliberately
+    # left out of this table rather than mis-tagging every merger call as
+    # detect_contradictions; see llm/client.py's lookup for how an absent
+    # node name is handled (no prompt metadata, not a crash).
+}
+
+
 # A single, shared system message reused by EVERY prompt builder below (see
 # each function's return statement, which always starts its list with
 # _SYSTEM). Defining it once here means every LLM call in this codebase

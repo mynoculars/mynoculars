@@ -287,6 +287,30 @@ def _extract_json(text: str) -> Dict[str, Any]:
         raise ValueError("model returned JSON that is not an object")
     return obj
 
+def _prompt_tag_for_node(node: Optional[str]) -> dict:
+    """Which prompt template/version produced this node's calls, as
+    Langfuse generation metadata -- pulled out of complete() as a plain
+    function so it is testable without a live or mocked HTTP call.
+
+    See PROMPT_VERSIONS in prompts/templates.py for the full rationale
+    (this is the metadata-only variant of prompt linking, deliberately
+    not the network-reading get_prompt()-based one). Imported inside the
+    function, not at module level, to avoid a prompts->llm.client->prompts
+    import cycle: templates.py imports Message from this module.
+
+    A node absent from the table (StubClient runs, "merger", or any
+    future node not driven by one fixed builder) returns an empty dict --
+    no prompt_name/prompt_version keys at all, not placeholder values, so
+    grouping by those fields in the Langfuse UI cleanly separates "tagged"
+    from "untagged" rather than inventing a fake bucket for the latter.
+    """
+    from research_agent.prompts.templates import PROMPT_VERSIONS
+    tagged = PROMPT_VERSIONS.get(node)
+    if tagged is None:
+        return {}
+    name, version = tagged
+    return {"prompt_name": name, "prompt_version": version}
+
 
 class OpenAICompatibleClient:
     """Chat client for any /v1/chat/completions endpoint."""
@@ -412,16 +436,15 @@ class OpenAICompatibleClient:
         # log_event itself reads (see logging_setup.py) -- reusing it
         # here means this class still knows nothing about the graph or
         # about cli.py's thread_id, exactly as its own docstring says.
+        meta = {"label": self._label, "temperature": temperature}
+        meta.update(_prompt_tag_for_node(self._trace_node))
         lf.generation(
             run_id_var.get(), self._trace_node or "llm",
             provider=self.name, model=self._model,
             input=messages, output=text,
             prompt_tokens=pt or 0, completion_tokens=ct or 0,
             start_time=wall_start, end_time=wall_start + latency,
-            # temperature is already this method's own parameter --
-            # was computed and available here all along, just never
-            # threaded into the metadata dict.
-            metadata={"label": self._label, "temperature": temperature},
+            metadata=meta,
         )
         if self._tracer is not None:
             self._tracer.record_llm(self._label, self._trace_node, messages,
