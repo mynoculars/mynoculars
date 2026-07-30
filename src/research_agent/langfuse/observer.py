@@ -98,12 +98,18 @@ not do.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Generator, Optional
 
-from research_agent.langfuse.pricing import TokenUsage, calculate_cost
+from research_agent.langfuse.pricing import (
+    COST_MODE_INFER,
+    TokenUsage,
+    calculate_cost,
+    resolve_cost_mode,
+)
 
 logger = logging.getLogger("research_agent.langfuse")
 
@@ -184,9 +190,35 @@ class Observer:
 
         `nest=False` exists for exactly one caller: start_trace(), whose
         own root must never be parented under a previous, still-open root
-        it is in the middle of replacing."""
+        it is in the middle of replacing.
+
+        Returns None -- meaning "no explicit trace context, inherit from
+        OTel" -- when a span of THIS run's trace is already current, which
+        is exactly the situation inside a span_ctx() block. That is what
+        gives real DEPTH rather than a two-level tree: an explicit
+        parent_span_id always wins over OTel's current span, so a
+        generation created inside `node:compiler` would otherwise still
+        attach to the root instead of to the node. Verified against the
+        real SDK with an in-memory exporter: with an explicit
+        parent_span_id the child parents to the root, with no trace
+        context at all it parents to the enclosing span.
+
+        The trace_id equality check is the safety rail -- deference only
+        happens when the current span genuinely belongs to this run, so an
+        unrelated span left current on the thread by other OTel activity
+        can never capture this run's observations."""
         from langfuse.types import TraceContext
-        ctx = TraceContext(trace_id=self._trace_id(thread_id))
+        trace_id = self._trace_id(thread_id)
+        if nest:
+            try:
+                from opentelemetry import trace as otel_trace
+                current = otel_trace.get_current_span().get_span_context()
+                if (current.is_valid
+                        and format(current.trace_id, "032x") == trace_id):
+                    return None
+            except Exception:  # noqa: BLE001 -- introspection must not raise
+                pass
+        ctx = TraceContext(trace_id=trace_id)
         if not nest:
             return ctx
         with self._lock:
@@ -355,6 +387,78 @@ class Observer:
             obs.end()
         self._safe("span", _do, thread_id)
 
+    @contextlib.contextmanager
+    def span_ctx(self, thread_id: str, name: str, *,
+                 input: Any = None, metadata: Optional[dict] = None,
+                 level: str = "DEFAULT") -> Generator[Any, None, None]:
+        """Span the work as it HAPPENS, rather than recording it after
+        the fact like span() does. Yields the observation handle (or None
+        when observability is off/degraded, so callers must tolerate it).
+
+        Why this exists alongside span(): span() is called once the work
+        has already finished, so the observation's own OTel start time is
+        "now" and its duration is ~0 -- the real figure has to ride along
+        as a `duration_ms` metadata field. The SDK's `.end()` does accept
+        an `end_time`, but passing the true end time to a span that was
+        CREATED afterwards yields a NEGATIVE duration, so that is not a
+        fix. Opening the observation first is.
+
+        Two things follow from entering the SDK's own
+        `start_as_current_observation` rather than `start_observation`:
+        the timestamps and duration the Langfuse UI shows are real, and
+        the span becomes the OTel CURRENT span for the duration of the
+        block -- so everything created inside it nests underneath it (see
+        _trace_context's deference rule). span() is kept, unchanged, for
+        genuinely post-hoc records where there is no block to wrap.
+
+        On an exception the span is marked ERROR with the exception type
+        and message, and the exception is re-raised untouched -- this
+        wrapper never changes control flow."""
+        if self._client is None or not str(thread_id or "").strip():
+            yield None
+            return
+        cm = None
+        obs = None
+        try:
+            cm = self._client.start_as_current_observation(
+                name=name, as_type="span",
+                trace_context=self._trace_context(thread_id),
+                input=input, metadata=metadata, level=level,
+            )
+            obs = cm.__enter__()
+        except Exception as exc:  # noqa: BLE001 -- observability fails open
+            logger.warning(
+                "langfuse.call_failed",
+                extra={"op": "span_ctx", "reason": type(exc).__name__,
+                       "error": str(exc)[:300]},
+            )
+            yield None
+            return
+        try:
+            yield obs
+        except Exception as exc:
+            try:
+                obs.update(level="ERROR",
+                           status_message=f"{type(exc).__name__}: "
+                                          f"{str(exc)[:200]}")
+            except Exception:  # noqa: BLE001 -- best-effort annotation
+                pass
+            raise
+        finally:
+            # __exit__(None, None, None) unconditionally: the SDK's own
+            # context manager only needs to close the span and detach the
+            # OTel context, and the ERROR level was already recorded
+            # above. Letting an exception escape from here would replace
+            # the caller's real exception with an observability one.
+            try:
+                cm.__exit__(None, None, None)
+            except Exception as exc:  # noqa: BLE001 -- best-effort
+                logger.warning(
+                    "langfuse.span_ctx_exit_failed",
+                    extra={"thread_id": thread_id,
+                           "reason": type(exc).__name__},
+                )
+
     # ------------------------------------------------------------------
     # generations (LLM calls specifically -- carries usage + cost)
     # ------------------------------------------------------------------
@@ -388,11 +492,25 @@ class Observer:
             }
             cost_details = None
             if cost is not None:
-                cost_details = {
-                    "input": cost.input_cost_usd,
-                    "output": cost.output_cost_usd,
-                    "total": cost.total_usd,
-                }
+                # A zero total is ambiguous -- genuinely free local model,
+                # or a cloud provider whose rate was never configured --
+                # and sending it asserts "$0" hard enough to OVERRIDE
+                # Langfuse's own model pricing table. In "infer" mode omit
+                # the key entirely instead, so Langfuse prices from the
+                # `model=` already passed below. Note the honest cost of
+                # that choice: an unrecognized model string (a local .gguf
+                # filename, say) then shows NO cost rather than $0.
+                # See pricing.py::resolve_cost_mode for why this is a
+                # declared setting rather than something detected.
+                infer = (resolve_cost_mode(
+                    getattr(self._settings, "langfuse_cost_mode", None))
+                    == COST_MODE_INFER)
+                if not (infer and cost.total_usd == 0.0):
+                    cost_details = {
+                        "input": cost.input_cost_usd,
+                        "output": cost.output_cost_usd,
+                        "total": cost.total_usd,
+                    }
             obs = self._client.start_observation(
                 name=name, as_type="generation", model=model,
                 trace_context=self._trace_context(thread_id),

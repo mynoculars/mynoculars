@@ -111,6 +111,17 @@ def generation(thread_id: str, name: str, *, provider: str, model: str,
         end_time=end_time, metadata=metadata)
 
 
+def span_ctx(thread_id: str, name: str, *, input: Any = None,
+             metadata: Optional[dict] = None, level: str = "DEFAULT"):
+    """Context-manager form of span(), for work that has not happened
+    yet: `with lf.span_ctx(tid, "step") as obs: ...`. Real start/end
+    timestamps, and everything recorded inside the block nests under it.
+    Yields None when observability is off, so bodies must tolerate that.
+    span() remains the right call for genuinely post-hoc records."""
+    return get_observer().span_ctx(thread_id, name, input=input,
+                                   metadata=metadata, level=level)
+
+
 def event(thread_id: str, name: str, *, input: Any = None,
           metadata: Optional[dict] = None, level: str = "DEFAULT") -> None:
     get_observer().event(thread_id, name, input=input, metadata=metadata, level=level)

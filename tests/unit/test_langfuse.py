@@ -33,7 +33,13 @@ from research_agent.langfuse.masking import (
     resolve_mode,
 )
 from research_agent.langfuse.observer import Observer
-from research_agent.langfuse.pricing import TokenUsage, calculate_cost
+from research_agent.langfuse.pricing import (
+    COST_MODE_EXPLICIT,
+    COST_MODE_INFER,
+    TokenUsage,
+    calculate_cost,
+    resolve_cost_mode,
+)
 
 
 def _settings(**overrides):
@@ -240,6 +246,65 @@ def test_cost_uses_configured_rates_not_hardcoded_ones():
     assert cost.total_usd == 8.0
 
 
+def test_cost_mode_defaults_to_explicit():
+    assert _settings().langfuse_cost_mode == "explicit"
+    assert resolve_cost_mode(_settings().langfuse_cost_mode) == COST_MODE_EXPLICIT
+
+
+def test_unrecognized_cost_mode_keeps_the_pre_existing_behavior():
+    """A typo must not silently change how every generation is priced."""
+    assert resolve_cost_mode("nonsense") == COST_MODE_EXPLICIT
+    assert resolve_cost_mode("") == COST_MODE_EXPLICIT
+    assert resolve_cost_mode(None) == COST_MODE_EXPLICIT
+    assert resolve_cost_mode("  Infer ") == COST_MODE_INFER
+
+
+def _generation_kwargs(settings, **gen):
+    """Run one Observer.generation() against a fake client and return the
+    kwargs it handed to start_observation."""
+    seen = {}
+
+    class _Obs:
+        def end(self, **kwargs):
+            pass
+
+    class _Client:
+        def create_trace_id(self, *, seed):
+            return f"trace-{seed}"
+
+        def start_observation(self, **kwargs):
+            seen.update(kwargs)
+            return _Obs()
+
+    Observer(client=_Client(), settings=settings).generation(
+        "t1", "llm", provider="primary", model="local.gguf", **gen)
+    return seen
+
+
+def test_explicit_mode_still_asserts_a_zero_cost():
+    kwargs = _generation_kwargs(_settings(langfuse_cost_mode="explicit"),
+                                prompt_tokens=100, completion_tokens=50)
+    assert kwargs["cost_details"] == {"input": 0.0, "output": 0.0, "total": 0.0}
+
+
+def test_infer_mode_omits_a_zero_cost_so_langfuse_can_price_it():
+    kwargs = _generation_kwargs(_settings(langfuse_cost_mode="infer"),
+                                prompt_tokens=100, completion_tokens=50)
+    assert kwargs["cost_details"] is None
+    # model must still be sent -- it is what Langfuse prices from.
+    assert kwargs["model"] == "local.gguf"
+
+
+def test_infer_mode_still_sends_a_nonzero_cost():
+    """infer only suppresses the ambiguous zero, never a real figure."""
+    kwargs = _generation_kwargs(
+        _settings(langfuse_cost_mode="infer",
+                  langfuse_price_primary_in_per_1m=2.0),
+        prompt_tokens=1_000_000, completion_tokens=0)
+    assert kwargs["cost_details"]["input"] == 2.0
+    assert kwargs["cost_details"]["total"] == 2.0
+
+
 def test_cost_is_none_for_an_unrecognized_provider():
     assert calculate_cost(_settings(), "some_new_provider", TokenUsage()) is None
 
@@ -404,6 +469,117 @@ def test_observer_nesting_degrades_when_the_root_handle_has_no_id():
     obs.span("t1", "x")
 
     assert "parent_span_id" not in calls[-1]["trace_context"]
+
+
+def test_span_ctx_is_a_safe_noop_without_a_client():
+    obs = Observer(client=None, settings=_settings())
+    with obs.span_ctx("t1", "step") as handle:
+        assert handle is None
+
+
+def test_span_ctx_is_a_safe_noop_for_a_blank_thread_id():
+    class _Client:
+        def start_as_current_observation(self, **kwargs):
+            raise AssertionError("must not be called for a blank thread_id")
+
+    obs = Observer(client=_Client(), settings=_settings())
+    with obs.span_ctx("   ", "step") as handle:
+        assert handle is None
+
+
+class _FakeCM:
+    """Mimics the SDK's start_as_current_observation return value."""
+
+    def __init__(self, handle, log):
+        self._handle, self._log = handle, log
+
+    def __enter__(self):
+        self._log.append("enter")
+        return self._handle
+
+    def __exit__(self, *exc):
+        self._log.append("exit")
+        return False
+
+
+def _span_ctx_client(log):
+    class _Handle:
+        id = "node-span-id"
+
+        def update(self, **kwargs):
+            log.append(("update", kwargs))
+
+    class _Client:
+        def create_trace_id(self, *, seed):
+            return f"trace-for-{seed}"
+
+        def start_as_current_observation(self, **kwargs):
+            log.append(("start_as_current_observation", kwargs))
+            return _FakeCM(_Handle(), log)
+
+    return _Client()
+
+
+def test_span_ctx_opens_before_the_body_and_closes_after():
+    """The whole point of span_ctx over span(): the observation exists
+    while the work runs, so its timestamps are the work's real ones."""
+    log = []
+    obs = Observer(client=_span_ctx_client(log), settings=_settings())
+    with obs.span_ctx("t1", "node:classify", input={"x": 1}) as handle:
+        log.append("body")
+        assert handle is not None
+
+    kinds = [e[0] if isinstance(e, tuple) else e for e in log]
+    assert kinds == ["start_as_current_observation", "enter", "body", "exit"]
+    assert log[0][1]["name"] == "node:classify"
+    assert log[0][1]["input"] == {"x": 1}
+
+
+def test_span_ctx_marks_error_and_reraises_untouched():
+    log = []
+    obs = Observer(client=_span_ctx_client(log), settings=_settings())
+    with pytest.raises(ValueError, match="boom"):
+        with obs.span_ctx("t1", "node:failing"):
+            raise ValueError("boom")
+
+    updates = [e for e in log if isinstance(e, tuple) and e[0] == "update"]
+    assert updates[0][1]["level"] == "ERROR"
+    assert "boom" in updates[0][1]["status_message"]
+    # The span must still be closed even on the exception path.
+    assert log[-1] == "exit"
+
+
+def test_span_ctx_degrades_when_the_sdk_call_itself_raises():
+    class _Client:
+        def create_trace_id(self, *, seed):
+            return f"trace-{seed}"
+
+        def start_as_current_observation(self, **kwargs):
+            raise RuntimeError("sdk down")
+
+    obs = Observer(client=_Client(), settings=_settings())
+    with obs.span_ctx("t1", "step") as handle:   # must not raise
+        assert handle is None
+
+
+def test_traced_node_prefers_span_ctx_when_the_observer_has_it():
+    log = []
+
+    class _Observer:
+        def span_ctx(self, thread_id, name, **kwargs):
+            log.append((thread_id, name))
+            import contextlib as _c
+            return _c.nullcontext(None)
+
+        def span(self, *a, **kw):
+            raise AssertionError("post-hoc span() must not be used")
+
+    def node(state):
+        return {"ok": True}
+
+    wrapped = traced_node(lambda: _Observer(), "classify", node)
+    assert wrapped({"x": 1}, config={"configurable": {"thread_id": "t9"}}) == {"ok": True}
+    assert log == [("t9", "node:classify")]
 
 
 def test_observer_generation_computes_cost_and_usage(monkeypatch):

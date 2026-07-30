@@ -18,7 +18,10 @@ looking number that happens to be wrong.
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple, Optional
+
+logger = logging.getLogger("research_agent.langfuse")
 
 
 class TokenUsage(NamedTuple):
@@ -48,6 +51,38 @@ _PROVIDER_RATE_FIELDS = {
     "mistral": ("langfuse_price_mistral_in_per_1m", "langfuse_price_mistral_out_per_1m"),
     "gemini": ("langfuse_price_gemini_in_per_1m", "langfuse_price_gemini_out_per_1m"),
 }
+
+
+COST_MODE_EXPLICIT = "explicit"
+COST_MODE_INFER = "infer"
+_VALID_COST_MODES = (COST_MODE_EXPLICIT, COST_MODE_INFER)
+
+
+def resolve_cost_mode(raw) -> str:
+    """Normalize `settings.langfuse_cost_mode`.
+
+    WHY A MODE EXISTS AT ALL: a computed cost of exactly $0 is ambiguous.
+    It means "this model is free" for the local primary, and "nobody ever
+    set LANGFUSE_PRICE_<provider>_*_PER_1M" for a cloud provider -- and
+    the two produce byte-identical inputs here. Reading the difference off
+    Settings is not possible either: pydantic-settings passes every
+    resolved value into the model, so `model_fields_set` reports even
+    untouched defaults as set (verified, not assumed). So the distinction
+    has to be declared, not detected.
+
+    Unrecognized values resolve to COST_MODE_EXPLICIT -- the behavior that
+    predates this setting, so a typo changes nothing rather than silently
+    switching how every generation is priced.
+    """
+    mode = str(raw or "").strip().lower()
+    if mode in _VALID_COST_MODES:
+        return mode
+    logger.warning(
+        "langfuse.cost_mode_unrecognized",
+        extra={"configured": str(raw)[:60], "using": COST_MODE_EXPLICIT,
+               "valid": ",".join(_VALID_COST_MODES)},
+    )
+    return COST_MODE_EXPLICIT
 
 
 def calculate_cost(settings, provider: str, usage: TokenUsage) -> Optional[CostBreakdown]:

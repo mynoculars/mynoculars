@@ -95,6 +95,36 @@ def traced_node(observer_getter: Callable[[], Any], node_name: str,
     def wrapper(state, config=None):
         thread_id = thread_id_from_config(config)
         observer = observer_getter()
+        # span_ctx, not span: the node span now OPENS before the node runs
+        # and closes after it returns, so the timestamps and duration the
+        # Langfuse UI shows are the node's real wall-clock ones instead of
+        # a ~0ms observation created after the fact with the true figure
+        # buried in a `duration_ms` metadata field. It also makes the node
+        # the OTel CURRENT span for its whole execution, so every
+        # generation, retrieval span and event the node produces nests
+        # underneath the node rather than flat under the run root --
+        # including on LangGraph's parallel fan-out threads, which inherit
+        # the OTel context through `contextvars.copy_context()`.
+        #
+        # The hasattr guard is not defensive padding: `observer_getter` is
+        # deliberately a callable so callers (tests, and anything injecting
+        # its own recorder) can supply a stub, and a stub written against
+        # the older post-hoc contract only has `span`. Those keep working
+        # on the original code path below, unchanged.
+        if hasattr(observer, "span_ctx"):
+            with observer.span_ctx(thread_id, f"node:{node_name}",
+                                   input=state) as obs:
+                result = fn(state, config=config) if forward_config else fn(state)
+                # Output on success only. On failure span_ctx has already
+                # marked the span ERROR with the exception type and
+                # message and re-raised it, and there is no partial result
+                # worth recording.
+                if obs is not None:
+                    try:
+                        obs.update(output=result)
+                    except Exception:  # noqa: BLE001 -- best-effort
+                        pass
+                return result
         start = time.time()
         error: Optional[str] = None
         result = None

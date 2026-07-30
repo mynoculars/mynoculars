@@ -261,6 +261,14 @@ class Settings(BaseSettings):
     # that ships inert is the same mistake min_evidence_score=0.0 was.
     # The redaction itself lives in langfuse/masking.py.
     langfuse_mask_mode: str = "patterns"
+    # What to send Langfuse as the cost of a generation whose configured
+    # rates work out to exactly $0. "explicit" (the default) asserts the
+    # zero, which is correct for a genuinely free local model but also
+    # OVERRIDES Langfuse's own model pricing table for a cloud provider
+    # whose rate was simply never set. "infer" omits the cost instead and
+    # lets Langfuse price it from the model name. Code cannot tell those
+    # two cases apart -- see langfuse/pricing.py::resolve_cost_mode.
+    langfuse_cost_mode: str = "explicit"
     # Per-provider $ cost per 1M tokens, input/output. Never hardcoded in
     # the SDK-facing code (see langfuse/pricing.py) -- a provider with no
     # entry here costs $0, which is the correct default for a local model
