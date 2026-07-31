@@ -14,6 +14,10 @@ state machines, provider fallback chains, structured observability, and
 exhaustive regression testing—not a hosted SaaS, but a demonstration of how 
 to build agentic systems that degrade gracefully and improve with oversight.
 
+> **The three banners below are HISTORY, kept for auditability.** For the
+> current state of any decision, `DECISIONS.md` (D-1…D-37) is the
+> authoritative log; to just run something, jump to [Setup](#setup).
+
 > **CORRECTED THIS PASS** (post-Tier-3 session, 4 further live-tested
 > patches applied on top of everything below): `api/server.py`'s
 > `AppBundle` unpack crashed the whole API at import — fixed. MCP
@@ -142,20 +146,37 @@ below for continuity); Tier 2's table follows it.
 | **P2-06** — validate LLM producer output | New `RawTask` (`agents/task_utils.py`) and `RawGoal` (`agents/planning.py`) Pydantic models validate every raw goal/task dict *before* any key is indexed. A malformed entry is dropped and counted (`counters["producer_rejects"]`) instead of raising `KeyError` and aborting the whole run. `cap_and_filter`'s signature changed to `(tasks, rejected_count)` | Unit tests for the rejection/count behavior on malformed input; three separate live runs against a real model all show `producer_rejects: 0` — the well-formed path is provably unaffected |
 | **P2-07** — boundary-scoped telemetry (router half) | `llm/router.py::FallbackRouter` gained `drain_counters()` — a `threading`-free accumulator (single-threaded by nature; the router isn't shared across parallel workers the way retrieval is) tracking real attempts (`llm_provider_calls`), real fallback hops (`llm_fallback_hops`), and real self-scoring calls (`llm_quality_calls`). Every LLM-calling node merges these into its own returned counters. `llm_calls` renamed `llm_node_calls` (no alias — an honest rename) | Unit tests on the router directly; three live traces with different fallback/timeout/escalation shapes, every number in the final telemetry traced back by hand to a specific log line each time |
 | **P2-07** — boundary-scoped telemetry (retrieval half) | `retrieval/hybrid.py::HybridRetriever` gained `threading.local()`-backed counters (`retrieval_dense_calls`, `retrieval_keyword_calls`, `retrieval_leg_unavailable`), bumped as the *first* statement in `search()` so an attempt that raises partway through (e.g. a Qdrant `NotFoundError` on a missing collection) still counts as attempted. Exposed via an optional `drain_retrieval_counts` attribute on the `corpus_search` tool closure — deliberately not part of `ToolFn`'s return type, so no existing fake-tool test fixture needed to change shape | A dedicated concurrency test (`ThreadPoolExecutor`, 8 concurrent callers, each asserted to see only its own count — not a leaked or lost one); a live trace showing `retrieval_dense_calls: 6, retrieval_keyword_calls: 6` matching 6 real `search_worker` invocations exactly |
-| **P2-08** — Postgres lifecycle + API run-history parity | New `close_checkpointer()` in `storage/postgres.py` (reads the real `PostgresSaver.conn` attribute — verified against actual langgraph source, not guessed). `cli.py::build_app_and_settings` now returns a named `AppBundle(app, settings, durable, checkpointer)` instead of a bare 2-tuple that silently dropped `durable`. `api/server.py` surfaces `durable` in `/health`, closes the checkpointer on FastAPI shutdown, and calls `record_run` on completed `/research`/`/resume` calls | A live run shows `checkpointer.closed` logged on CLI exit against a real Postgres connection; `/health`'s `durable` field confirmed via a degraded-storage smoke test |
+| **P2-08** — Postgres lifecycle + API run-history parity | New `close_checkpointer()` in `storage/postgres.py` (reads the real `PostgresSaver.conn` attribute — verified against actual langgraph source, not guessed). `build_app_and_settings` now returns a named `AppBundle(app, settings, durable, checkpointer)` instead of a bare 2-tuple that silently dropped `durable` (this function has since moved from `cli.py` to `assembly.py` — see Architecture; `cli.py` re-exports it). `api/server.py` surfaces `durable` in `/health`, closes the checkpointer on FastAPI shutdown, and calls `record_run` on completed `/research`/`/resume` calls | A live run shows `checkpointer.closed` logged on CLI exit against a real Postgres connection; `/health`'s `durable` field confirmed via a degraded-storage smoke test |
 | **P2-09** — config strictness + populated `DECISIONS.md` | `config.py::warn_on_likely_env_typos()` logs a WARNING for a fixed list of plausible env-key typos (`HITL` vs `HITL_ENABLED`, etc.) — chosen over `extra="forbid"` outright, which risked rejecting legitimate stray env vars. E2/E3's trigger condition in `agents/gathering.py` is now evaluated regardless of `hitl_enabled`, so an `escalation.stub` WARNING fires when HITL is off, matching E1/E4's existing parity. `DECISIONS.md` populated: D-1 through D-32, sourced only from code comments and this document's own decision citations — gaps (D-7/9/10/11) flagged as such, not invented | Unit tests for the typo warning firing/not-firing and for the E2/E3 stub-log parity; a live HITL-disabled run confirmed the `escalation.stub` line actually appears |
 | **Incidental — opensearch-py 3.x compatibility** | `storage/opensearch_store.py`'s `indices.exists`/`.create`/`.index`/`indices.refresh` calls passed the index/document name **positionally**; the installed `opensearch-py` 3.x client makes this a hard `TypeError` (`index=` must be a keyword). Fixed at all four call sites — `search()` already used the keyword form and was unaffected | Live: `python scripts/ingest_sample_data.py` failed with exactly this `TypeError` before the fix and completed cleanly (`OpenSearch: indexed 10`) after it |
 | **P2-03 follow-up — ingest script now actually idempotent** | `scripts/ingest_sample_data.py` was still calling `QdrantStore.upsert_texts(docs)` with no `id_fn` — the mechanism P2-03 added existed but nothing used it, so every re-ingest still duplicated the dense leg. New `content_id()` helper (`uuid.uuid5` of each document's content — deterministic, and a valid Qdrant point-id shape, unlike a raw hash digest) is now passed as `id_fn` | Three new unit tests (determinism, distinctness, valid-UUID shape); **your own Qdrant collection still has the ~20 duplicate points from ingest runs before this fix landed** — this only stops future re-ingests from adding more, it doesn't retroactively clean up what's already there (a `reset_stores.py --yes` + re-ingest gets you back to a clean 10) |
 
 **Full test suite: 157/157 passing.**
 
-**A calibration caveat, stated plainly rather than buried:** `0.5` and
-`0.35` are starting points anchored to a real debug trace, not values
-independently measured against every corpus this build might run over.
-Before trusting them on your own data, run a `--debug` query you know is
-on-topic and one you know is off-topic, and compare the actual `similarity`
-and `score` values in the trace/log output — see
-[Debugging a live run](#debugging-a-live-run) below for exactly how.
+**A calibration caveat, stated plainly rather than buried:** `min_similarity`
+ships with a code default of `0.35`, which predates any real measurement and
+is **too low for the sample corpus and embedding model this repo actually
+uses**. Measured against `sample_data/corpus.jsonl` with fastembed's default
+`BAAI/bge-small-en-v1.5`, by running one query the corpus genuinely answers
+and one it cannot:
+
+```text
+  0.40 ───── NOISE ─────► 0.527                    0.737 ◄──── SIGNAL ──── 0.843
+                                └──── empty ────┘
+                                      ▲
+                                     0.60
+```
+
+Unrelated text scores **0.40–0.53** with this model, not near zero — so
+`0.35` sits *below the floor of pure noise* and cannot filter anything. Set
+`MIN_SIMILARITY=0.60` in `.env` for this corpus. `min_evidence_score=0.5`
+stays as-is; it is a strict `>` against an RRF rank artefact, not a
+similarity, and it still does real work on the single-leg path.
+
+**Re-derive both for your own corpus rather than copying these numbers** —
+OPERATIONS.md's [Fine-Tuning the System](OPERATIONS.md#fine-tuning-the-system)
+section is the step-by-step procedure, with the exact commands and the
+expected output at each step.
 
 **Also new since the last revision, unrelated to the fixes above:**
 
@@ -213,10 +234,18 @@ and `score` values in the trace/log output — see
 
 ### Overall architecture
 
-Everything is assembled in exactly one place — `cli.py::build_app_and_settings`
-— and the API imports that same function. Nodes never construct their own
-dependencies, which is why the whole system can be rewired with fakes in a
-single test fixture.
+Everything is assembled in exactly one place —
+`assembly.py::build_app_and_settings` — and both the CLI and the API import
+that same function. Nodes never construct their own dependencies, which is
+why the whole system can be rewired with fakes in a single test fixture.
+
+**The assembly function used to live in `cli.py`.** It moved to its own
+module because `api/server.py` — a long-running HTTP service — was importing
+its entire startup path from a module named "cli". That was merely odd while
+the API was a demonstration of the seam; it becomes actively wrong once the
+API is packaged and consumed by a separate project. `cli.py` still re-exports
+both `build_app_and_settings` and `AppBundle`, so every existing
+`from research_agent.cli import ...` call site keeps working unchanged.
 
 ```text
             ┌─────────────────────────────────────────────────────┐
@@ -813,12 +842,35 @@ rates — an unconfigured provider costs `$0` (correct for a free local model,
 honest "unknown" for cloud), and a misconfigured negative rate clamps to
 zero rather than reporting negative dollars.
 
-**Known limitation, by decision:** every span/generation is a flat child of
-the trace root — there is no `parent_span_id` tracking, so the Langfuse UI
-renders a flat list per trace, not a tree following
-`classify → goal_manager → search_worker×N → merger → ...`. Threading real
-parent-span state through every call site was judged a bigger design change
-than this phase's remit; not fixed. See `DECISIONS.md` D-35.
+**Traces are nested, and the API path is traced too — both were listed here
+as deferred limitations in earlier revisions and are now closed.**
+
+`TraceContext` accepts an optional `parent_span_id`, and `Observer` already
+held the run's open root span for `end_trace`'s sake — so nesting needed no
+new state and no call-site changes. Node spans additionally open *before*
+the node runs (`Observer.span_ctx`, wrapping the SDK's
+`start_as_current_observation`), which makes their timestamps and durations
+real rather than ~0, and makes everything a node produces nest underneath
+it. The UI now renders `research_run → node:compiler → llm` rather than a
+flat list.
+
+`api/server.py` opens and closes a root trace per request, emits the same
+four scores the CLI does, and calls `lf.shutdown()` in its lifespan hook.
+The pairing is deliberately per-REQUEST rather than per-run: `Observer`'s
+`propagate_attributes` context is sync-only and attaches to the calling
+thread's OTel context, and FastAPI runs these `def` endpoints in a REUSED
+threadpool — so a context entered serving `/research` and exited serving
+`/resume` would leak one caller's session onto the next request that worker
+picks up. A HITL run therefore produces two root spans on one trace, which
+is an honest record of two HTTP requests and is the version that cannot
+leak.
+
+**What is still a limitation:** `span()` (the post-hoc form, still used by
+`retrieval/hybrid.py`) carries its duration as a `duration_ms` metadata
+field rather than as real span timestamps — the observation is created after
+the work finished, so a true end time would produce a negative duration.
+`span_ctx()` is the fix where a block exists to wrap. `flush()` and
+`is_enabled()` remain exported with no caller.
 
 ## Storage Contracts
 
@@ -1238,6 +1290,8 @@ describe is now closed, on both the LLM side and the retrieval side:
 | `memory_hits` / `memory_writes` | items in / points out | node |
 | `revision_cycles` | critic passes | node |
 | `escalations` *(new this session)* | `[{"trigger":..., "action":...}]` — every entry from `state.escalation_history`, previously written and never read anywhere | `agents/compilation.py::telemetry_node` |
+| `goals_without_evidence` | the goal ids that reached the compiler with **zero** evidence attached — counted from `state.evidence`'s own `goal_id` field, never parsed out of the report | same |
+| `grounding_ratio` | `(goals − goals_without_evidence) / goals`, rounded to 3dp; `0.0` when a run produced no goals at all. **Deliberately distinct from `recall`**: recall asks "did enough evidence clear the coverage threshold" and is score-derived, so threshold tuning moves it; `grounding_ratio` asks the cruder prior question "did this goal get ANY evidence", which no threshold can affect. `recall: 1.0` with `grounding_ratio: 0.5` means the coverage rule is passing goals the retriever never fed | same |
 
 A real live trace showed this working correctly under genuinely messy
 conditions — two provider timeouts, a low-quality rejection, and a 429 —
@@ -1272,6 +1326,11 @@ telemetry block itself, without needing the trace.
 
 ## Design
 
+- **Assembly** (`assembly.py`): the whole dependency graph, in one place —
+  `AppBundle` and `build_app_and_settings`. Deliberately a neutral module
+  rather than part of `cli.py`, so the HTTP surface does not import its
+  startup path from a command-line module. `cli.py` re-exports both names
+  for backward compatibility.
 - **Orchestration** (`orchestration/`): the graph topology and routing live in
   `graph.py`; the worker return contract (`contracts.py`) turns a
   non-deterministic concurrency bug into a deterministic unit-test failure.
@@ -1308,6 +1367,9 @@ telemetry block itself, without needing the trace.
 ```text
 research-agent-dmp/
 ├── src/research_agent/
+│   ├── assembly.py          # AppBundle + build_app_and_settings — the whole
+│   │                        # dependency graph; imported by BOTH cli.py and
+│   │                        # api/server.py (cli.py re-exports it)
 │   ├── config.py            # all tunables, validated, from .env
 │   ├── state.py             # entities, graph state, reducers (read first)
 │   ├── logging_setup.py     # JSON-lines structured logging + run_id
@@ -1348,6 +1410,8 @@ research-agent-dmp/
 ├── design/Research_Agent_Design.md
 ├── OPERATIONS.md   internal/LEARNING_GUIDE.md   internal/PHASE-2_PLAN.md
 ├── docker-compose.yml       # optional: Postgres + Qdrant + OpenSearch
+├── pyproject.toml           # packaging: extras, console script, public API
+│                              and versioning policy — see Packaging below
 ├── requirements.txt  .env.example  run.bat  reset.bat
 └── DECISIONS.md             # populated: D-1..D-32, sourced from code comments
 ```
@@ -1365,8 +1429,23 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 190 passed
+python -m pytest tests/ -q    # expect: 232 passed
 ```
+
+**Or install it as a package** (`pyproject.toml`, new) — which is what
+another project consuming this over HTTP would do, and which removes the
+need for `PYTHONPATH=src` and gives you a `research-agent` console script:
+
+```bash
+pip install -e .            # core only: no FastAPI, no MCP, no Langfuse
+pip install -e ".[api]"     # + the HTTP surface
+pip install -e ".[all]"     # everything requirements.txt installs
+
+research-agent "Compare Redis and Memcached for session caching"
+```
+
+See [Packaging](#packaging) for the extras, the public API, and the
+versioning policy.
 
 Windows: `run.bat` does the venv, install, and a stub run in one command.
 
@@ -1379,10 +1458,72 @@ Defaults are `LLM_MODE=stub` with every store unreachable, so the first run
 reports `evidence_items: 0`. **That is success for L1** — the graph is proven,
 there is simply nothing to search yet. `OPERATIONS.md` walks you up from there.
 
+## Packaging
+
+`pyproject.toml` makes this repo an installable artifact. Until it existed,
+the only way to run this code was `PYTHONPATH=src` from inside a checkout,
+which gives a *separate* project nothing to depend on.
+
+**Extras.** Each is optional because its code path is off by default *and*
+its import is lazy — checked against the source, not assumed:
+
+| Install | Adds | Why it can be optional |
+|---|---|---|
+| `pip install research-agent` | core: langgraph, pydantic, httpx, qdrant-client, fastembed, opensearch-py, psycopg | `assembly.py` imports every storage client at module level, so a core install must have them; they degrade at *runtime* when a server is unreachable, not at import |
+| `[api]` | fastapi, uvicorn | nothing outside `api/server.py` imports either |
+| `[mcp]` | mcp | `MCP_ENABLED=false` by default; `tools/mcp_client.py` has no module-level `import mcp` |
+| `[langfuse]` | langfuse | `LANGFUSE_ENABLED=false` by default; `langfuse/client.py` returns `None` before importing the SDK |
+| `[viz]` | grandalf | `--print-graph` falls back to Mermaid text without it |
+| `[dev]` | pytest | — |
+| `[all]` | everything above | matches what `requirements.txt` installs today |
+
+**Console script.** `research-agent = research_agent.cli:main`, so an
+installed package exposes the CLI without `python -m`.
+
+**Public API — what a MAJOR version bump is owed for.** Stated explicitly
+because "it's all importable" stops being an answer once another project
+depends on you:
+
+```text
+  research_agent.assembly     build_app_and_settings(), AppBundle
+  research_agent.api.server   /research, /resume, /health request+response shapes
+  the `research-agent` console script's arguments
+  the .env setting NAMES in config.py
+```
+
+Everything else — `agents/`, `orchestration/`, `retrieval/`, `prompts/`, and
+the internals of `langfuse/` — is internal and may change in a MINOR release.
+
+**Versioning.** Manual SemVer in `pyproject.toml`'s `version` field, bumped
+in the same commit as the change it describes, and tagged. Deliberately not
+derived from git: that adds a build-time dependency and hides the version
+from anyone reading the file. PATCH = bug fix, MINOR = new capability with
+existing callers unaffected, MAJOR = a consumer must change code.
+
+**Releasing / consuming.** Until this is published to an index, a consuming
+project pins a tag:
+
+```bash
+pip install "research-agent[api] @ git+ssh://...@v0.3.0"
+```
+
+Pin the tag, never a branch.
+
+**`requirements.txt` still works and is unchanged** — it is now the
+development pin-set, while `pyproject.toml` is what a consumer resolves
+against. Add a dependency to both, or they drift.
+
+`requires-python = ">=3.11"` because that is what this project is actually
+tested on. The source needs 3.10 at minimum (`api/server.py` uses PEP 604
+`str | None` with no `from __future__ import annotations`), but claiming
+3.10 support without running the suite on 3.10 would be an untested
+assertion.
+
 ## Walkthrough
 
-1. **A request arrives** (CLI or API) → `build_app_and_settings()` wires every
-   dependency, each storage module probing its service and degrading if absent.
+1. **A request arrives** (CLI or API) → `build_app_and_settings()`
+   (`assembly.py`) wires every dependency, each storage module probing its
+   service and degrading if absent.
 2. **Plan**: `classify` labels the intent → `memory_retrieve` recalls related
    past evidence (decay-reranked, goal_id namespaced) → `goal_manager`
    composes goals (memory hints included) → `task_expander` emits a ranked
@@ -1631,11 +1772,24 @@ visible rather than deleted, so the history stays auditable.
 **Still broken, in rough order of consequence**
 
 1. Self-critique can pass a report whose claims appear in no retrieved
-   evidence. P2-11 fixed the same-model-optimism half of this (the judge
-   is now always a different provider than the writer); there is still no
-   programmatic, claim-by-claim grounding check — a confident hallucination
-   can still slip past a different model just as it slipped past the same
-   one.
+   evidence. Three things have chipped at this and none of them closes it:
+   P2-11 made the judge a different provider than the writer; the compiler
+   prompt now states per-goal evidence coverage explicitly (count, best
+   score, and a `WEAK` flag when the best score sits at or below the
+   single-leg RRF ceiling of 0.5) and forbids filling gaps from model
+   knowledge; and telemetry now reports `grounding_ratio`.
+   **What remains open, precisely:** there is still no programmatic,
+   claim-by-claim check, and `grounding_ratio` measures evidence
+   **presence, not relevance** — a run can report `grounding_ratio: 1.0`
+   while every attached item is semantically irrelevant, which is exactly
+   what happened on a live off-topic query before `MIN_SIMILARITY` was
+   calibrated. The prompt-level rule is still an LLM following an
+   instruction; it helps and it is not a guarantee.
+   *A report-parsing check was considered and rejected: across four live
+   runs the model cited goal ids four different ways and in one run used no
+   bracket citations at all, so a regex would have been silent on the least
+   grounded report of the set. That is why the measurement reads
+   `state.evidence` instead.*
 2. RRF joins the two legs on `title`, not on any store id — silently wrong for
    a corpus with duplicate or missing titles. This codebase already has the
    right primitive to fix it (`content_id()`, the same UUID5-of-content
@@ -1673,8 +1827,10 @@ auditable rather than invisible.
 | OPERATIONS §L1: "add two `logging.getLogger(...)` lines" | Already present in `logging_setup.py::configure_logging` |
 | This README's own citations of "`PHASE2_PLAN.md`" | The actual tracked file is `internal/PHASE-2_PLAN.md` (hyphenated, under `internal/`) |
 | **Limitations, "Exit code is always 0"** *(this pass)* | **Fixed.** `main()` now returns 2 on `GraphRecursionError`, 1 when telemetry never populated. See Limitations item 27 above. |
+| Any doc citing `cli.py::build_app_and_settings` as the wiring point *(this pass)* | It moved to `assembly.py`. `api/server.py` imports it from there; `cli.py` re-exports both it and `AppBundle`, so older call sites still work. |
+| "the repo is run via `PYTHONPATH=src`" as the only option *(this pass)* | `pyproject.toml` now exists — `pip install -e .` (plus extras) and a `research-agent` console script. See [Packaging](#packaging). |
 
-## Future Improvements
+## P Improvements
 
 `internal/PHASE-2_PLAN.md` has the full 15-item plan — every item scoped to an existing
 seam, with complexity, dependencies, and the D-xx tag it extends or replaces.

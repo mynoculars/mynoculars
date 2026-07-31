@@ -6,6 +6,10 @@ shown.
 
 **Mismatch** means stop and debug.
 
+> **The banners below are HISTORY.** Skip them on a first read. New since
+> they were written: **Fine-Tuning the System** (below) is the procedure for
+> calibrating retrieval thresholds against your own corpus.
+
 > **CORRECTED THIS PASS** (post-Tier-3 session, 4 further live-tested
 > patches applied on top of everything below): test suite reached
 > **157** at this point (was 57, then 135 across Tier 2/3 — see the
@@ -114,6 +118,17 @@ export PYTHONPATH=src
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
 ```
 
+> **Alternative, since `pyproject.toml` landed:** `pip install -e ".[all]"`
+> installs the package itself instead of just its dependencies — which drops
+> the `PYTHONPATH=src` step entirely and gives you a `research-agent`
+> console script, so `research-agent "your question"` works from anywhere in
+> the venv. `pip install -e .` (no extras) deliberately omits FastAPI,
+> uvicorn, MCP and Langfuse; use `[api]`, `[mcp]`, `[langfuse]` or `[all]`
+> to add them back. Everything below works identically either way — the
+> `PYTHONPATH=src` form is kept throughout this manual because it is what a
+> checkout without an install still needs. See README.md's Packaging
+> section for the full extras table and the versioning policy.
+
 **What you should see** (this is L1 — note the zeros, they are EXPECTED here):
 ```json
 {
@@ -151,10 +166,10 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 190 passed
+# expect: 232 passed
 ```
 
-If L1 runs and 190 tests pass, your code is fine. Everything from here is about
+If L1 runs and 232 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -566,6 +581,14 @@ $env:PYTHONPATH = "src"
 uvicorn research_agent.api.server:app --reload
 ```
 
+The command is unchanged, but what it imports is not: `api/server.py` now
+takes `build_app_and_settings` from `research_agent.assembly`, not from
+`research_agent.cli`. Nothing you type differs; it matters only if you are
+reading the startup path or patching it in a test (`tests/unit/
+test_api_server.py` patches `research_agent.assembly.build_app_and_settings`
+accordingly). If you installed with `pip install -e ".[api]"`, drop the
+`PYTHONPATH` line.
+
 **Health-check it** (also covered by `scripts/check_services.py`'s
 `--api-url`/`--skip-api` flags — see "The 60-Second Is Everything Up?
 Check" below):
@@ -615,7 +638,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 190 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 232 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -750,7 +773,7 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **190 tests**, fully offline — no services, no API keys, no
+The suite is **232 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -1127,6 +1150,223 @@ doesn't cover, like exact latencies):
 if they don't, that's worth investigating as a real discrepancy, not an
 expected gap the way it used to be.
 
+
+---
+
+## Fine-Tuning the System
+
+Everything above gets the agent *running*. This section is about making it
+*correct* for your corpus — which is a different problem, and one the rest
+of this manual was silent on.
+
+**Why this needs its own section.** Every retrieval threshold in this
+codebase ships with a default anchored to one historical debug trace, not
+measured against your data. Two of them (`MIN_SIMILARITY`,
+`MIN_EVIDENCE_SCORE`) decide what counts as evidence at all, and a wrong
+value does not produce an error — it produces a confident report. The agent
+will tell you `recall: 1.0` while answering from documents that have nothing
+to do with the question. That failure is invisible unless you go looking, so
+this section is the going-looking procedure.
+
+### The one measurement everything else depends on
+
+`MIN_SIMILARITY` is the only threshold you can measure directly, and it is
+the one that matters most. The method is two queries and a comparison.
+
+**Step 1 — a query your corpus genuinely answers.** This is your SIGNAL.
+
+```powershell
+python -m research_agent.cli "Compare Redis and Memcached for session caching" --debug --thread-id sig-01
+findstr /C:"similarity" logs\trace-sig-01.txt
+```
+
+**Step 2 — a query your corpus cannot possibly answer.** This is your NOISE.
+Pick something with zero genuine overlap; the point is that every hit it
+returns is by definition irrelevant.
+
+```powershell
+python -m research_agent.cli "Compare Indian and Chinese army on battlefield" --debug --thread-id noise-01
+findstr /C:"similarity" logs\trace-noise-01.txt
+```
+
+**Step 3 — compare the two populations.**
+
+```powershell
+function Get-Sims($path) {
+  (Select-String -Path $path -Pattern '"similarity":\s*([0-9.]+)' -AllMatches).Matches |
+    ForEach-Object { [double]$_.Groups[1].Value }
+}
+"SIGNAL:"; Get-Sims logs\trace-sig-01.txt   | Measure-Object -Minimum -Maximum -Average
+"NOISE :"; Get-Sims logs\trace-noise-01.txt | Measure-Object -Minimum -Maximum -Average
+```
+
+**Step 4 — set the floor between them.** Run against this repo's own
+`sample_data/corpus.jsonl` with fastembed's default
+`BAAI/bge-small-en-v1.5`, the two populations came out cleanly separated:
+
+```text
+
+0 ◄───────────────────────────── MIN_SIMILARITY (0.60) ─────────────────────► 1
+├──────────────────────────────────────────────┼──────────────────────────────┤
+
+
+0.40                              0.527    0.60     0.737          0.843
+ │──────────────────────────────────│────────▲──────────│────────────│
+              NOISE                        EMPTY            SIGNAL                                         
+
+```
+
+46 off-topic hits spanned **0.402–0.527**. 22 on-topic hits spanned
+**0.737 to 0.843**. Nothing landed in the 0.21-wide band between them.
+
+```ini
+MIN_SIMILARITY=0.60
+```
+
+Two things about that number are worth internalising rather than copying:
+
+- **Unrelated text does not score near zero.** With this embedding model it
+  clusters at **0.40–0.53**. Whatever "0.35 similarity" means in your head
+  from a different model, it does not mean that here — and `0.35`, the
+  shipped code default, sits *below the floor of pure noise*, which is why
+  it filters nothing. If you leave it there, every off-topic query still
+  returns three confident, irrelevant documents.
+- **Do not pick the midpoint.** The midpoint here is 0.632. `0.60` is
+  better, because the two errors are not symmetric. Too low lets noise
+  through — visible in the report, recoverable. Too high silently drops real
+  evidence and is indistinguishable from "the corpus doesn't cover this."
+  Leave the wider margin below the signal floor, not above the noise
+  ceiling.
+
+**If the two populations OVERLAP**, stop tuning. That is a real finding, not
+a threshold problem: your embedding model cannot separate on-topic from
+off-topic for this corpus, and no floor will fix it. The answer is a bigger
+or better-written corpus, or a different embedding model.
+
+**Watch your lowest signal hit.** In the measurement above it was `Redis
+data structures` at **0.737**, noticeably below its neighbours. If a future
+on-topic query drops under ~0.65, back the floor off to 0.55. That single
+hit is your early-warning marker.
+
+### Verifying the floor took effect
+
+```powershell
+python -m research_agent.cli "Compare Indian and Chinese army on battlefield" --debug --thread-id floor-check
+```
+
+| What to look for | Expected after the fix | What it means if you don't see it |
+|---|---|---|
+| `retrieval.below_floor` log lines with `"floor": 0.60` | present, several per run | the setting didn't load — check `.env` parses, and that no shell variable overrides it (`echo $env:MIN_SIMILARITY`) |
+| `"dense": 0` on most `retrieval.hybrid` lines | yes, for a genuinely off-topic query | your "off-topic" query overlaps the corpus more than you thought |
+| `retrieval.no_backends` WARNING on some queries | yes — both legs returned nothing | — |
+| `recall` at depth 1 | **below** 1.0 | see "Why recall still reads 1.0" below |
+| `escalations` | may contain `E3` | correct, not a failure — the corpus genuinely can't answer |
+| the report itself | says "no evidence retrieved" per goal, rather than answering from model knowledge | the compiler's grounding rule isn't firing; check the prompt reached it |
+
+Then re-run the SIGNAL query and confirm you have not cut into it:
+
+```powershell
+python -m research_agent.cli "Compare Redis and Memcached for session caching" --debug --thread-id sig-02
+```
+
+Expect `evidence_items` roughly unchanged from your `sig-01` run and
+`recall: 1.0`. If this run collapses too, the floor is too high — drop to
+0.55 and repeat.
+
+### Why `recall` can still read 1.0 — and which knob actually moves it
+
+This trips people up, so it is worth stating directly. `MIN_EVIDENCE_SCORE`
+does **not** gate relevance, and cannot. It is applied to `Evidence.score`,
+which is `min(1.0, fused_score × RRF_SQUASH)` — an RRF *rank* artefact, not
+a similarity. With `RRF_K=60` and `RRF_SQUASH=30`:
+
+```text
+  BOTH legs answered              ONE leg only
+    rank 0: 1.000                   rank 0: 0.500   ← exactly, always
+    rank 1: 0.984                   rank 1: 0.492
+    rank 2: 0.968                   rank 2: 0.484
+```
+
+When both legs are healthy, **every hit scores 0.968 or above**, no matter
+how irrelevant. `MIN_EVIDENCE_SCORE=0.5` cannot touch it. The rank-0
+single-leg value of exactly `0.500` is why the coverage comparison in
+`progress_checker_node` is a strict `>` and not `>=`.
+
+So: **`MIN_SIMILARITY` is the relevance gate. `MIN_EVIDENCE_SCORE` is the
+single-leg-fallback gate.** They are not two dials on the same thing, and
+raising the second will not fix a relevance problem.
+
+### The other knobs, and what each one actually moves
+
+Change one at a time and re-run the same query — that is the whole
+discipline. Every value below lives in `.env`.
+
+| Setting | Default | Raise it when | Lower it when | Watch |
+|---|---|---|---|---|
+| `MIN_SIMILARITY` | `0.35` (too low — measure it) | off-topic queries still return evidence | genuinely on-topic goals come back uncovered | `retrieval.below_floor`, `dense` counts |
+| `MIN_EVIDENCE_SCORE` | `0.5` | rarely — it is pinned to the RRF single-leg ceiling | never below 0.5 without reading the RRF table above | `recall` when one leg is down |
+| `RECALL_TARGET` | `0.85` | you want the loop to work harder before compiling | runs escalate too eagerly | `iterations`, `escalations` |
+| `MAX_DEPTH` | `3` | gap-filling is converging but running out of cycles | runs are slow and later cycles add nothing | `iterations` vs `evidence_items` |
+| `MAX_FANOUT` | `6` | goals are under-served by too few queries | you are rate-limited or the pool is saturated | `search_calls`, checkpointer pool warnings |
+| `MAX_REVISIONS` | `2` | the critic keeps finding real problems | rewrites are cosmetic and cost money | `revision_cycles`, `critique_passed` |
+| `LLM_PRIMARY_TIMEOUT_SECONDS` | `120` | the local model times out on large prompts | — | `llm.fallback` with `ReadTimeout` |
+| `MEMORY_TOP_K` | see `.env.example` | memory rarely contributes | memory outranks fresh retrieval | `memory_hits` vs `evidence_by_source` |
+
+### Reading the telemetry block as a tuning instrument
+
+Every run prints one. These are the fields that tell you a threshold is
+wrong, and what they mean together:
+
+| Pattern | Diagnosis |
+|---|---|
+| `recall: 1.0` on **every** query, including nonsense ones | `MIN_SIMILARITY` too low — the retriever is feeding irrelevant documents and the coverage rule is accepting them |
+| `grounding_ratio: 1.0` but the report is visibly ungrounded | the audit counts evidence **presence**, not relevance. Same root cause; same fix |
+| `grounding_ratio` < 1.0 | some goal reached the compiler with nothing at all. The `goals_without_evidence` list names which |
+| `iterations: 1` always | the loop never runs — recall is clearing `RECALL_TARGET` on the first pass. Usually the same too-low floor |
+| `llm_fallback_hops` high every run | the primary is failing, not the thresholds — check its context length before touching retrieval |
+| `llm_quality_calls_failed` == `llm_quality_calls` | the cross-provider judge is erroring and failing open at 1.0; quality gating is effectively off |
+| `retrieval_leg_unavailable` > 0 | a store is down; every score you measure this run is single-leg and will read ~0.5 |
+| `memory_writes` growing run over run under one `--thread-id` | reducer accumulation, not a threshold — see **Thread IDs** above |
+
+### A worked tuning session, start to finish
+
+```powershell
+# 0. Baseline. Note evidence_items, recall, iterations.
+python -m research_agent.cli "<a query your corpus answers>" --debug --thread-id tune-00
+
+# 1. Measure. Two populations, as above.
+python -m research_agent.cli "<on-topic>"  --debug --thread-id tune-sig
+python -m research_agent.cli "<off-topic>" --debug --thread-id tune-noise
+findstr /C:"similarity" logs\trace-tune-sig.txt
+findstr /C:"similarity" logs\trace-tune-noise.txt
+
+# 2. Set MIN_SIMILARITY between the populations, closer to the noise side.
+
+# 3. Confirm the off-topic query now fails honestly.
+python -m research_agent.cli "<off-topic>" --debug --thread-id tune-01
+#    expect: dense 0, recall < 1.0, possibly E3, report says no evidence
+
+# 4. Confirm the on-topic query did NOT collapse.
+python -m research_agent.cli "<on-topic>" --debug --thread-id tune-02
+#    expect: evidence_items ~unchanged from step 0, recall 1.0
+
+# 5. Only now touch RECALL_TARGET / MAX_DEPTH, one at a time.
+```
+
+**Always use a fresh `--thread-id` for each tuning run.** Reusing one merges
+the previous run's evidence into the next (see **Thread IDs** above), which
+will make a threshold change look like it did nothing.
+
+### One thing to fix before you tune anything
+
+If `llm_fallback_hops` is non-zero on every run and the fallbacks are
+`HTTPStatusError` on the `compiler`/`critic` nodes but not on `classify`,
+that is a context-window ceiling on the local model, not a retrieval
+problem. Raise the context length in your model server (see **Step 3a**
+above) before you spend time on thresholds — otherwise you are tuning
+retrieval while a different subsystem is quietly failing over every run,
+and the two effects are hard to separate in the telemetry.
+
 ---
 
 ## Thread IDs — Usage, Lifecycle, and Reuse Considerations
@@ -1323,13 +1563,18 @@ Raising either makes the agent harder to satisfy (more likely to escalate
 or keep searching); lowering either makes it easier to satisfy (more likely
 to converge, possibly on thin evidence).
 
-**Calibrate them for your own corpus** rather than trusting the defaults —
-run one query you know is on-topic and one you know is off-topic, both with
-`--debug`, and compare the actual `similarity` (dense leg, pre-fusion) and
-`score` (post-fusion) values that show up in `logs\trace-<run_id>.txt` and
-in the `retrieval.hybrid` log lines. See **Debugging a Workflow Execution**
-above for the exact commands. README.md's "Debugging a live run" section
-has the same guidance in more detail.
+⚠ **`MIN_SIMILARITY=0.35` is too low for this repo's own sample corpus.**
+Measured against `sample_data/corpus.jsonl` with fastembed's default
+embedding model, unrelated text scores **0.40–0.53** — so the shipped
+default sits below the floor of pure noise and filters nothing at all. Set
+`MIN_SIMILARITY=0.60` for this corpus.
+
+**Calibrate both for your own corpus** rather than trusting the defaults.
+The full procedure — the two queries, the comparison, the expected output at
+each step, and what to do if the two populations overlap — is
+**[Fine-Tuning the System](#fine-tuning-the-system)** above. That section
+also explains why raising `MIN_EVIDENCE_SCORE` will *not* fix a relevance
+problem, which is the most common wrong turn here.
 
 ### Tuning the LLM Timeouts
 
