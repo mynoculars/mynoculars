@@ -320,7 +320,7 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     g.add_node("gap_generator", _tn("gap_generator", build_gap_generator_node(router, settings, debug)))
     g.add_node("compiler", _tn("compiler", build_compiler_node(router, debug)))
     g.add_node("critic", _tn("critic", build_critic_node(router, settings, debug)))
-    g.add_node("memory_writer", _tn("memory_writer", build_memory_writer_node(memory, debug)))
+    g.add_node("memory_writer", _tn("memory_writer", build_memory_writer_node(memory, settings, debug)))
     g.add_node("telemetry", _tn("telemetry", build_telemetry_node(debug)))
     # D-23/D-28: single parametrized escalation node. It returns Command
     # (goto inferred from its type hint), so no static edges are added.

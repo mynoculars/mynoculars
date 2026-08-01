@@ -12,7 +12,11 @@ graph runs in tests/integration/test_graph_end_to_end.py.
 
 import logging
 
-from research_agent.agents.gathering import build_merger_node
+from research_agent.agents.gathering import (
+    _uncovered_goal_has_strong_evidence,
+    build_gap_generator_node,
+    build_merger_node,
+)
 from research_agent.config import Settings
 from research_agent.state import Evidence, Goal, ResearchState, Volatility
 
@@ -148,3 +152,264 @@ def test_gate_on_fails_open_when_detector_errors(caplog):
     goals_by_id = {g.goal_id: g for g in result["goals"]}
     assert goals_by_id["g1"].contested is False  # fails open -> nothing contested
     assert any("merger.contradiction_detection_failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _uncovered_goal_has_strong_evidence / gap_generator's no-strong-evidence skip
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: found live. BM25 has no relevance floor (MIN_SIMILARITY
+# only gates the dense leg -- see retrieval/hybrid.py's own docstring), so a
+# generic word in an off-topic query can still keyword-match an unrelated
+# corpus. Every such hit is single-leg and scores at or below the exact RRF
+# rank-0 single-leg value (SINGLE_LEG_SCORE_CEILING, imported from
+# prompts/templates.py -- the same constant Item 11's compile_report
+# grounding rule uses, not a new threshold). gap_generator used to hand that
+# evidence to the model as context regardless of relevance, and the model
+# would write new queries themed on whatever subject the tail evidence was
+# actually about -- e.g. asked to compare India and the US, it wrote "Redis
+# and Memcached licensing models" because that was the only text in the
+# tail evidence. Those new queries then matched the (irrelevant) corpus at
+# HIGH confidence and the run reported recall: 1.0 / grounding_ratio: 1.0 on
+# a topic the corpus never covered.
+
+def _fake_router_that_must_not_be_called():
+    class _Router:
+        def set_node(self, name):
+            pass
+
+        def complete_json(self, messages):
+            raise AssertionError(
+                "gap_generator must not call the LLM when no uncovered "
+                "goal has strong evidence -- that is the whole point of "
+                "this guard")
+
+        def drain_counters(self):
+            return {}
+
+    return _Router()
+
+
+def _fake_router_returning(tasks):
+    class _Router:
+        def set_node(self, name):
+            pass
+
+        def complete_json(self, messages):
+            return {"tasks": tasks}
+
+        def drain_counters(self):
+            return {}
+
+    return _Router()
+
+
+def test_uncovered_goal_has_strong_evidence_is_a_pure_score_check():
+    ev_weak = [Evidence(task_key="a", goal_id="g1", source="corpus",
+                        content="x", score=0.5)]
+    ev_strong = [Evidence(task_key="b", goal_id="g1", source="corpus",
+                          content="y", score=0.501)]
+    assert _uncovered_goal_has_strong_evidence("g1", ev_weak) is False
+    assert _uncovered_goal_has_strong_evidence("g1", ev_strong) is True
+    # A goal with no evidence at all behaves the same as one with only weak
+    # evidence -- both mean "nothing the coverage rule can trust."
+    assert _uncovered_goal_has_strong_evidence("g1", []) is False
+    # Evidence for a DIFFERENT goal must not count.
+    assert _uncovered_goal_has_strong_evidence(
+        "g2", [Evidence(task_key="c", goal_id="g1", source="corpus",
+                        content="z", score=0.9)]) is False
+
+
+def test_gap_generator_skips_the_llm_call_when_every_uncovered_goal_is_weak():
+    """The exact live shape: uncovered goals whose only surviving evidence
+    is single-leg (BM25-only) and therefore <= 0.5. The fake router raises
+    if complete_json is ever invoked, so this proves the call is skipped,
+    not merely that its OUTPUT is discarded afterward."""
+    settings = Settings(_env_file=None, hitl_enabled=False,
+                        recall_target=0.85, max_fanout=6,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="macro", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated keyword-only hit", score=0.48)],
+        recall_score=0.667, iteration_depth=2,
+    )
+    node = build_gap_generator_node(_fake_router_that_must_not_be_called(),
+                                    settings, debug=False)
+    result = node(state)
+    assert result["pending_tasks"] == []
+
+
+def test_gap_generator_raises_e3_when_hitl_enabled_and_evidence_is_weak():
+    settings = Settings(_env_file=None, hitl_enabled=True,
+                        recall_target=0.85, max_fanout=6,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="macro", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated", score=0.48)],
+        recall_score=0.667, iteration_depth=2,
+    )
+    node = build_gap_generator_node(_fake_router_that_must_not_be_called(),
+                                    settings, debug=False)
+    result = node(state)
+    assert result["escalation_trigger"] == "E3"
+
+
+def test_gap_generator_still_calls_the_llm_when_some_uncovered_goal_is_strong():
+    """The guard must not fire just because ONE goal among several is weak
+    -- only when EVERY uncovered goal lacks strong evidence. A single
+    genuinely-covered-by-both-legs goal is enough reason to keep looping."""
+    settings = Settings(_env_file=None, hitl_enabled=False,
+                        recall_target=0.85, max_fanout=6,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="q",
+        goals=[Goal(goal_id="g1", description="a", covered=False),
+               Goal(goal_id="g2", description="b", covered=False)],
+        evidence=[
+            Evidence(task_key="t1", goal_id="g1", source="corpus",
+                     content="weak", score=0.48),
+            Evidence(task_key="t2", goal_id="g2", source="corpus",
+                     content="strong, both legs agreed", score=0.9),
+        ],
+        recall_score=0.5, iteration_depth=1,
+    )
+    node = build_gap_generator_node(
+        _fake_router_returning([{"query": "q2", "goal_id": "g1", "priority": 1}]),
+        settings, debug=False)
+    result = node(state)
+    assert len(result["pending_tasks"]) == 1
+
+
+def test_gap_generator_still_calls_the_llm_when_no_goals_are_uncovered():
+    """An empty uncovered list must not trip the guard -- `any([])` is
+    False, so the guard's `uncovered and not any(...)` condition correctly
+    requires uncovered to be non-empty first."""
+    settings = Settings(_env_file=None, hitl_enabled=False,
+                        recall_target=0.85, max_fanout=6,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="q",
+        goals=[Goal(goal_id="g1", description="a", covered=True)],
+        evidence=[], recall_score=1.0, iteration_depth=1,
+    )
+    node = build_gap_generator_node(
+        _fake_router_returning([]), settings, debug=False)
+    result = node(state)   # must not raise
+    assert result["pending_tasks"] == []
+
+
+# ---------------------------------------------------------------------------
+# The no-strong-evidence guard must defer to a human redirect
+# ---------------------------------------------------------------------------
+def test_guard_is_bypassed_when_human_guidance_is_set():
+    settings = Settings(_env_file=None, hitl_enabled=False,
+                        recall_target=0.85, max_fanout=6,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="macro", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated keyword-only hit", score=0.48)],
+        recall_score=0.667, iteration_depth=1,
+        human_guidance="compare social and political aspects instead",
+    )
+    node = build_gap_generator_node(
+        _fake_router_returning([{"query": "q2", "goal_id": "g1", "priority": 1}]),
+        settings, debug=False)
+    result = node(state)
+    assert len(result["pending_tasks"]) == 1
+    assert result["human_guidance"] == ""
+
+
+def test_guard_still_fires_without_guidance_even_after_a_prior_redirect():
+    settings = Settings(_env_file=None, hitl_enabled=True,
+                        recall_target=0.85, max_fanout=6,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="macro", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated", score=0.48)],
+        recall_score=0.667, iteration_depth=2,
+        human_guidance="",
+    )
+    node = build_gap_generator_node(_fake_router_that_must_not_be_called(),
+                                    settings, debug=False)
+    result = node(state)
+    assert result["escalation_trigger"] == "E3"
+
+
+# ---------------------------------------------------------------------------
+# P205 regression: the guard must not pre-empt the depth budget
+# ---------------------------------------------------------------------------
+
+
+def test_guard_does_not_fire_on_the_first_gather_cycle():
+    """Runs p205.66/67/68-check all ended at iterations=1 with MAX_DEPTH
+    entirely unused, because this guard ran before the gap generator had
+    produced a single new query formulation. D-3/D-14 make depth the loop's
+    bound; the guard may confirm non-convergence, never pre-empt it."""
+    settings = Settings(_env_file=None, hitl_enabled=True,
+                        recall_target=0.85, max_fanout=6, max_depth=3)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="macro", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated keyword-only hit", score=0.48)],
+        recall_score=0.667, iteration_depth=1,
+    )
+    node = build_gap_generator_node(_fake_router_returning([{"query": "fresh q", "goal_id": "g1", "priority": 1}]), settings, debug=False)
+    result = node(state)
+    assert result.get("escalation_trigger") is None, (
+        "the guard must not escalate before the gap generator has had one "
+        "real attempt -- MAX_DEPTH is the bound, not cycle 1")
+    assert result["pending_tasks"], "cycle 1 must actually produce tasks"
+
+
+def test_guard_does_not_fire_when_an_uncovered_goal_retrieved_nothing():
+    """Run p205.68-check: g2 retrieved zero items, which made the
+    strong-evidence test vacuously False and fired the guard on the exact
+    case it was never written for. A goal with no evidence has no
+    misleading tail to free-associate off -- it is a retry candidate."""
+    settings = Settings(_env_file=None, hitl_enabled=True,
+                        recall_target=0.85, max_fanout=6, max_depth=3)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="weak", covered=False),
+               Goal(goal_id="g2", description="starving", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated", score=0.48)],
+        recall_score=0.5, iteration_depth=2,
+    )
+    node = build_gap_generator_node(_fake_router_returning([{"query": "fresh q", "goal_id": "g1", "priority": 1}]), settings, debug=False)
+    result = node(state)
+    assert result.get("escalation_trigger") is None
+    assert result["pending_tasks"]
+
+
+def test_escalation_budget_stops_the_guard_re_raising_forever():
+    """route_convergence and dispatch_tasks both test escalation_trigger
+    BEFORE their terminal exits, so a re-raised E2/E3 re-enters
+    human_escalation instead of terminating. Once the per-run review budget
+    is spent the node must fall through to the compiler path instead."""
+    settings = Settings(_env_file=None, hitl_enabled=True, recall_target=0.85,
+                        max_fanout=6, max_depth=3, max_escalations=1,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="weak", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="unrelated", score=0.48)],
+        recall_score=0.667, iteration_depth=2,
+        escalation_history=[{"trigger": "E3", "action": "redirect"}],
+    )
+    node = build_gap_generator_node(_fake_router_that_must_not_be_called(),
+                                    settings, debug=False)
+    result = node(state)
+    assert result["pending_tasks"] == []
+    assert result.get("escalation_trigger") is None, (
+        "budget spent -> empty backlog -> dispatch_tasks routes to compiler, "
+        "which writes an honest partial report instead of nagging again")

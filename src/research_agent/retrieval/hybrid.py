@@ -59,6 +59,23 @@ def rrf_fuse(rankings: List[List[str]], k: int = RRF_K) -> Dict[str, float]:
     """
     scores: Dict[str, float] = {}
     for ranking in rankings:
+        # A doc_id may legitimately appear in SEVERAL rankings (that is the
+        # whole point of fusion — agreement across legs is signal). It must
+        # never be credited twice WITHIN one ranking: that is not agreement,
+        # it is the same document counted twice.
+        #
+        # Found live (run p205.66-check): the corpus had accumulated
+        # duplicate rows, so one BM25 leg returned the same title at ranks 0
+        # and 2 — "keyword": 3, "fused": 2 in the retrieval.hybrid log line.
+        # Summed, that is 1/60 + 1/62 = 0.0328, which corpus_search's
+        # RRF_SQUASH turns into 0.98 — indistinguishable from a document
+        # BOTH legs ranked first. An off-topic Memcached document therefore
+        # scored above min_evidence_score and marked a goal about the Indian
+        # and Chinese armies "covered". Deduping per ranking caps a
+        # single-leg hit back at the SINGLE_LEG_SCORE_CEILING the rest of
+        # this codebase is built around (see prompts/templates.py).
+        seen: set = set()
+        ranking = [d for d in ranking if not (d in seen or seen.add(d))]
         # enumerate(ranking) gives us both the position (rank, starting at
         # 0 for the first/best-ranked item) and the doc_id at that
         # position, for every ranked list passed in.
@@ -284,7 +301,19 @@ class HybridRetriever:
         # into rrf_fuse for no benefit.
         rankings = [r for r in (dense_rank, kw_rank) if r]
         if not rankings:
-            log_event(logger, "retrieval.no_backends", level=logging.WARNING)
+            # NOT necessarily "the backends are down". Both legs returning
+            # nothing is the ordinary, correct answer for a query the corpus
+            # does not cover — and with a min_similarity floor set high
+            # enough (0.6 in the live run that exposed this) the dense leg is
+            # emptied HERE, by this class, after the store answered
+            # perfectly well. Logging that as a WARNING named
+            # "no_backends" sent a real off-corpus diagnosis chasing an
+            # infrastructure fault that did not exist. Report what actually
+            # happened: zero results, and whether a leg was genuinely
+            # unavailable is already carried by retrieval_leg_unavailable.
+            log_event(logger, "retrieval.no_results", query=query,
+                      dense_available=getattr(self.dense, "available", True),
+                      keyword_available=getattr(self.keyword, "available", True))
             lf.span(run_id_var.get(), "retrieval.hybrid_search",
                    input={"query": query}, output={"fused": 0},
                    metadata={"dense": 0, "keyword": 0, "degraded": True,

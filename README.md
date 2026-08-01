@@ -1158,11 +1158,11 @@ goal_manager → task_expander → 6 workers → compiler → critic → END` �
 ```text
   ┌──────────────────────────────────────────────────────────────────────┐
   │ 1. MIN_EVIDENCE_SCORE defaulted to 0.0            [FIXED — now 0.5]  │
-  │    the coverage predicate WAS  e.score >= min_evidence_score          │
+  │    the coverage predicate WAS  e.score >= min_evidence_score         │
   │    at 0.0 that was TRUE for every item — even one scored exactly 0.0 │
   │    (the predicate is now the STRICT  e.score > min_evidence_score,   │
-  │     which additionally closes a separate exact-boundary collision   │
-  │     — see the P2-01 follow-up row in Recent Fixes)                  │
+  │     which additionally closes a separate exact-boundary collision    │
+  │     — see the P2-01 follow-up row in Recent Fixes)                   │
   └───────────────────────────────┬──────────────────────────────────────┘
                                   ▼
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -1219,8 +1219,8 @@ stored that fact**. Goal ids are `g1, g2, g3…` in every single run, so:
 ```text
   run 1: "Compare Redis and Memcached for session caching"
          goals g1…g5  ─►  memory_writer stores evidence tagged goal_id=g3
-                                                                    │
-                                                                    ▼
+                                        │
+                                        ▼
   run 2: "Compare Redis vs Cassandra vs DynamoDB at petabyte scale"
          goals g1…g5  ◄── memory_retrieve returns it
          BEFORE (bug):  still tagged bare "g3" ─► FALSELY matches current g3
@@ -1419,8 +1419,8 @@ research-agent-dmp/
 ## Setup
 
 `OPERATIONS.md` is the real manual — it owns the L1/L2/L3 ladder, native
-Windows service startup, DBeaver setup, and the llama-server invocations. The
-30-second version:
+Windows service startup, DBeaver setup, and the llama-server invocations. 
+The 30-second version:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate

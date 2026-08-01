@@ -81,19 +81,56 @@ def test_compile_report_states_per_goal_evidence_coverage():
     assert "WEAK" not in g1_block
 
 
-def test_compile_report_forbids_filling_gaps_from_model_knowledge():
-    """The instruction has to be specific about WHAT must not be invented.
-    'State clearly when evidence is thin' was the previous wording and the
-    model satisfied it while still naming equipment, doctrines and dates
-    absent from the corpus."""
+def test_compile_report_permits_model_evidence_but_demands_attribution():
+    """D-38 replaces the old GROUNDING RULE, which forbade the model from
+    using its own knowledge at all. That rule was correct when the corpus
+    was the only retrieval tier -- and became the direct cause of "the
+    retrieved evidence does not cover it" reports once a model tier
+    existed to answer those goals. The rule now has to do three jobs at
+    once: permit `model` evidence, force it to be attributed, and still
+    forbid inventing specifics no evidence item of ANY source supplied."""
     from research_agent.prompts.templates import compile_report
     from research_agent.state import Goal
 
     body = compile_report("q", [Goal(goal_id="g1", description="d")], [], [])[-1]["content"]
-    assert "GROUNDING RULE" in body
+    assert "ATTRIBUTION RULE" in body
+    # permits
+    assert "Use BOTH" in body
+    assert "still answered, not skipped" in body.replace("\n", " ")
+    # but demands the label
+    assert "general knowledge" in body
+    assert "Never present a `model` claim as a retrieved finding" in body
+    # and still forbids manufacturing specifics
     for forbidden in ("model numbers", "doctrine names", "figures"):
         assert forbidden in body
-    assert "Do NOT fill the gap" in body
+    assert "must not appear in the report" in body
+
+
+def test_critique_does_not_fail_a_report_for_attributed_model_knowledge():
+    """The critic ran on the old assumption that anything not in the
+    corpus was unfaithful. Left unchanged it would reject every report
+    the new model tier makes possible."""
+    from research_agent.prompts.templates import critique
+    from research_agent.state import Goal
+
+    body = critique("q", "report", [Goal(goal_id="g1", description="d")], [])[-1]["content"]
+    assert "is FAITHFUL provided the report attributes it" in body
+    assert "do not fail a report merely for using it" in body
+
+
+def test_model_knowledge_prompt_demands_atomic_claims_and_confidence():
+    """Claims become individual Evidence items the compiler cites one by
+    one, so a paragraph-shaped answer here would be uncitable; and the
+    confidence field is load-bearing -- the caller drops anything under
+    0.5, because a shaky recollection that still marks a goal covered is
+    worse than no item at all."""
+    from research_agent.prompts.templates import model_knowledge
+
+    body = model_knowledge("Compare Indian and Chinese army", 4)[-1]["content"]
+    assert "TASK=recall" in body
+    assert "SEPARATE, self-contained factual" in body
+    assert "confidence" in body
+    assert "Return [] if you do not reliably know" in body.replace("\n", " ")
 
 
 def test_compile_report_coverage_block_handles_zero_evidence_overall():
@@ -104,3 +141,112 @@ def test_compile_report_coverage_block_handles_zero_evidence_overall():
     body = compile_report("q", [Goal(goal_id="g1", description="d")], [], [])[-1]["content"]
     assert "NO EVIDENCE RETRIEVED" in body
     assert "(no evidence gathered)" in body
+
+
+def test_compose_goals_forbids_background_memory_from_reframing_the_query():
+    """D-42 (runs p205.96/.97-check). goal_manager is handed recalled memory
+    BEFORE any retrieval happens, so a previous run on an unrelated topic can
+    silently re-frame an open question. "Compare India and US" became an
+    entirely military goal set because the run before it was about armies."""
+    from research_agent.prompts.templates import compose_goals
+
+    body = compose_goals("Comparison", "Compare India and US",
+                         ["PLA doctrine prioritises forward deployment"])[-1]["content"]
+    assert "UNRELATED" in body
+    assert "must not narrow or re-frame the question" in body
+    assert "ignore it completely" in body
+    assert "AS ASKED" in body
+
+
+def test_critique_demands_a_check_on_unsupported_specifics():
+    """D-43's semantic half. Live (run p205.98-check): with
+    model_sourced_items 0 and a ten-document Redis corpus, the report still
+    asserted "Netflix operates Cassandra clusters exceeding 1 PB ... ~1
+    million writes per second [g5]" and the critic passed it. Deterministic
+    code cannot judge whether cited evidence supports a sentence; the critic
+    has to be asked."""
+    from research_agent.prompts.templates import critique
+    from research_agent.state import Goal
+
+    body = critique("q", "r", [Goal(goal_id="g1", description="d")], [])[-1]["content"]
+    assert "NAMED ENTITY" in body and "FIGURE" in body
+    assert "appears in no evidence item of any source" in body
+    assert "check that it does, rather than trusting the marker" in body
+
+
+def test_generate_gaps_demands_coverage_of_every_uncovered_goal():
+    """Live (run p205.100-check): all six tasks in one cycle were tagged g1
+    and all six in the next were tagged g5, so most uncovered goals got no
+    new query and the extra gather cycles were wasted."""
+    from research_agent.prompts.templates import generate_gaps
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="a", covered=False),
+             Goal(goal_id="g2", description="b", covered=False)]
+    body = generate_gaps(goals, [], 1, 6)[-1]["content"]
+    assert "SPREAD them across the uncovered goals" in body
+    assert "at least one query before giving any goal a second" in body
+
+
+def test_no_prompt_carries_a_concrete_worked_example():
+    """P205 regression (run p205.107-check). The critique prompt contained
+    a worked example -- a report citing [g5] for "Netflix operates
+    Cassandra clusters exceeding 1 PB ... ~1 million writes per second" --
+    and the critic reported that as something it had FOUND, in a Redis vs
+    Memcached run. The compiler then wrote a section denying it. Rationale
+    for a rule belongs in the code comment beside it, never in the prompt
+    text, because anything in the prompt can surface in the output."""
+    from research_agent.prompts import templates
+    from research_agent.state import Evidence, Goal
+
+    goals = [Goal(goal_id="g1", description="d", covered=False)]
+    ev = [Evidence(task_key="t", goal_id="g1", source="corpus",
+                   content="x" * 50, score=0.9)]
+    rendered = " ".join(
+        m["content"] for fn in (
+            lambda: templates.compose_goals("Comparison", "q", ["hint"]),
+            lambda: templates.generate_gaps(goals, ev, 1, 6),
+            lambda: templates.compile_report("q", goals, ev, []),
+            lambda: templates.model_knowledge("q", 4),
+            lambda: templates.critique("q", "r", goals, ev),
+        ) for m in fn())
+
+    for leaked in ("Netflix", "Balakot", "blobRedis", "score=0.60",
+                   "Compare India and US", "Cassandra clusters"):
+        assert leaked not in rendered, (
+            f"{leaked!r} is a worked example and can surface in output")
+        
+def test_critique_is_shown_the_evidence_it_must_verify_against():
+    """P205 regression (runs p205.111/.112-check). The critic is instructed
+    to fail any named entity, figure or date that appears in no evidence
+    item -- and critique() was never passed the evidence, so the check was
+    unanswerable. Both runs failed with "not supported by any evidence
+    item" for figures that WERE supplied by model-tier items the critic
+    could not see, costing two revisions and an E4 escalation each."""
+    from research_agent.prompts.templates import critique
+    from research_agent.state import Evidence, Goal
+
+
+    ev = [Evidence(task_key="t", goal_id="g1", source="model", score=0.6,
+                   content="India's median age is about 28 years")]
+    body = critique("q", "r", [Goal(goal_id="g1", description="d")], ev)[-1]["content"]
+    assert "<evidence>" in body
+    assert "median age is about 28" in body
+    assert "| model]" in body, "the source tag must be visible to the critic"
+    assert "items tagged `model` are evidence too" in body  
+    
+def test_critique_forbids_the_query_vs_report_standard_for_named_entities():
+    """P205 regression (run p205.117-check). With the critic finally shown
+    the evidence (D-46), a live run flagged SLOWLOG, AOF, Sentinel,
+    Memcached and 20+ other terms as "unsupported named entities... not
+    part of the question" -- checking the report against the QUERY's
+    wording instead of the EVIDENCE block, exactly the standard D-46 was
+    supposed to replace. Every one of those terms was present in the
+    evidence; the critic used the wrong document to judge against."""
+    from research_agent.prompts.templates import critique
+    from research_agent.state import Goal
+
+    body = critique("q", "r", [Goal(goal_id="g1", description="d")], [])[-1]["content"]
+    assert "never QUERY vs REPORT" in body
+    assert 'not part of the question' in body
+    assert "evidence legitimately introduces vocabulary the query itself never used" in body      

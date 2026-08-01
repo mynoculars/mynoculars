@@ -15,7 +15,7 @@ kept alongside the HITL scenario it was written to explain).
 
 import concurrent.futures
 
-from research_agent.retrieval.hybrid import HybridRetriever
+from research_agent.retrieval.hybrid import HybridRetriever, rrf_fuse
 
 
 class _FakeLeg:
@@ -70,3 +70,30 @@ def test_hybrid_retriever_counts_are_thread_local():
     for counts in results:
         assert counts["retrieval_dense_calls"] == 1
         assert counts["retrieval_keyword_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# P205 regression: same-leg duplicate credit (run p205.70-check)
+# ---------------------------------------------------------------------------
+
+
+def test_rrf_never_credits_the_same_doc_twice_within_one_ranking():
+    """A corpus with duplicate rows returns the same title at two ranks of
+    ONE leg. Summing both (1/60 + 1/62 = 0.0328) makes a single-leg hit
+    score like a document BOTH legs ranked first -- 0.98 after
+    corpus_search's RRF_SQUASH, which is how an irrelevant Memcached
+    document marked a goal about India and the US 'covered' at recall 1.0.
+    Cross-leg agreement must still count; same-leg repetition must not.
+    """
+    dup = rrf_fuse([["docA", "docB", "docA"]])
+    solo = rrf_fuse([["docA", "docB"]])
+    assert dup["docA"] == solo["docA"], (
+        "a doc repeated inside one ranking must score exactly as it would "
+        "appear once -- otherwise duplicate corpus rows manufacture coverage")
+    # The real invariant the rest of the codebase depends on: a single-leg
+    # rank-0 hit stays at the SINGLE_LEG_SCORE_CEILING after squashing.
+    assert dup["docA"] * 30.0 == 0.5
+
+    # Cross-leg agreement is still rewarded -- that is the point of fusion.
+    both = rrf_fuse([["docA"], ["docA"]])
+    assert both["docA"] > dup["docA"]

@@ -265,7 +265,8 @@ class SemanticMemory:
                 input={"query": query}, metadata={"count": len(out)})
         return out
 
-    def store_run(self, query: str, evidence: List[Evidence]) -> int:
+    def store_run(self, query: str, evidence: List[Evidence],
+                  min_score: float = 0.0) -> int:
         """Persist fresh evidence from a passed run. Returns items written.
 
         CALLED BY   agents/compilation.py::memory_writer_node — reachable
@@ -326,7 +327,44 @@ class SemanticMemory:
         which of this batch's computed ids Qdrant already has), and logs
         both numbers instead of one.
         """
-        fresh = [e for e in evidence if e.source != "memory"]
+        # D-42: model recollection is NOT a research finding and must not
+        # enter durable memory. Live (runs p205.96/.97-check): the army
+        # run stored 28 items of which 24 were source="model"; the very
+        # next, unrelated run ("Compare India and US") recalled five of
+        # them and goal_manager -- which is handed memory as "relevant
+        # facts from earlier research" -- composed an entirely MILITARY
+        # goal set for an open question, inheriting PLA doctrine prose
+        # verbatim into an India-vs-US report.
+        #
+        # Two independent reasons this must not happen:
+        #  1. It gains nothing. The model can regenerate its own
+        #     recollection on demand -- storing it caches a lookup that
+        #     was never expensive.
+        #  2. It launders guesses into facts. An unverified claim written
+        #     here comes back on a later run tagged source="memory",
+        #     indistinguishable from something a DOCUMENT supported, and
+        #     steers that run before any retrieval happens. That is a
+        #     self-reinforcing loop, and the one place a single
+        #     fabrication can become permanent.
+        # Memory is for what RETRIEVAL found (D-24). Recollection is not.
+        fresh = [e for e in evidence
+                 if e.source not in ("memory", "model")]
+        # D-24 quality gate. A passed critique says the REPORT is
+        # acceptable; it says nothing about whether the evidence behind
+        # it ever cleared the coverage bar. Live (run p205.71-check):
+        # recall 0.0, every goal reported "no reliable data", and 16
+        # sub-threshold items were still written to long-term memory.
+        # Those return next run as source="memory" at raw cosine
+        # similarity (~0.75), which OUTRANKS anything fresh retrieval
+        # produces under RRF -- so junk that failed the bar once comes
+        # back permanently promoted. Default 0.0 preserves the old
+        # behaviour for any caller that does not opt in.
+        if min_score > 0.0:
+            kept = [e for e in fresh if e.score > min_score]
+            if len(kept) != len(fresh):
+                log_event(logger, "memory.below_quality_floor",
+                          dropped=len(fresh) - len(kept), floor=min_score)
+            fresh = kept
         items = [{
             "content": e.content,
             "goal_id": e.goal_id,

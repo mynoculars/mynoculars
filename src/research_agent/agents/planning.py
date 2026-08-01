@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict
 
 from pydantic import BaseModel, Field, ValidationError
 
+from research_agent.agents.escalation import escalation_allowed
 from research_agent.agents.task_utils import cap_and_filter
 from research_agent.config import Settings
 from research_agent.llm.router import FallbackRouter
@@ -229,10 +230,18 @@ def build_goal_manager_node(router: FallbackRouter, settings: Settings,
             # for an explicit error report. (Human escalation is the full
             # design's response; stubbed to a log line in this core build.)
             update["planning_error"] = "Goal composition produced zero goals."
-            if settings.hitl_enabled:
+            # D-23 bound: escalation_allowed() folds in hitl_enabled AND
+            # the per-run review budget (agents/escalation.py). An E1
+            # redirect re-enters goal_manager, which can compose zero
+            # goals again and re-raise — same unbounded shape E2/E3 has.
+            if escalation_allowed(state, settings):
                 # D-23: the CHECK sets the trigger — routing functions are
                 # read-only in LangGraph and cannot write state.
                 update["escalation_trigger"] = "E1"
+            elif settings.hitl_enabled:
+                log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                          trigger="E1", reason="max_escalations_reached",
+                          reviews=len(state.escalation_history))
             else:
                 log_event(logger, "escalation.stub", level=logging.WARNING,
                           trigger="E1", reason="zero_goals")

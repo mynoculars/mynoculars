@@ -73,6 +73,36 @@ logger = logging.getLogger(__name__)
 Destination = Literal["compiler", "gap_generator", "goal_manager", "telemetry"]
 
 
+def escalation_allowed(state: ResearchState, settings) -> bool:
+    """True if this run may pause for a human ONE more time (D-23 bound).
+
+    CALLED BY   every node that can set state.escalation_trigger --
+                planning.py (E1), gathering.py (E2/E3, two sites),
+                compilation.py (E4). One helper, four call sites, so the
+                bound cannot drift between triggers.
+    READS       settings.hitl_enabled, settings.max_escalations,
+                state.escalation_history (appended once per COMPLETED
+                human decision, in human_escalation's resume update --
+                see D-28, which is exactly what makes it a safe counter:
+                a pause that is still waiting for an answer has not been
+                counted yet, and re-execution on resume cannot
+                double-count it).
+
+    WHY THIS EXISTS: hitl_enabled alone is not a bound. graph.py's
+    route_convergence and dispatch_tasks both test escalation_trigger
+    BEFORE their terminal exits, so a check that re-raises the same
+    trigger routes back into this node forever -- the depth budget
+    (D-3/D-14) and the empty-backlog fallthrough (D-1) become
+    unreachable, and the only remaining stop is recursion_limit, which
+    ends the process with no report at all. A redirect that cannot
+    change the condition that raised the trigger must eventually stop
+    asking; this is where that stops.
+    """
+    if not settings.hitl_enabled:
+        return False
+    return len(state.escalation_history) < settings.max_escalations
+
+
 def _payload_for(state: ResearchState) -> Dict[str, Any]:
     """The state slice a human needs to decide. Read-only — safe pre-interrupt."""
     trigger = state.escalation_trigger or "E?"
@@ -188,10 +218,36 @@ def build_escalation_node(settings, debug: bool = False):
                     **base, "abort_reason": f"Aborted at convergence review. {guidance}".strip()})
             return Command(goto="compiler", update=base)  # approve: ship partial
 
+        if trigger not in ("E1", "E2", "E3", "E4"):
+            # Defensive: an unrecognised trigger (including the "E?"
+            # placeholder above, i.e. escalation_trigger was empty by the
+            # time this node ran) used to fall through into the E4 block
+            # below and, for approve/abort, return goto="telemetry" --
+            # ending the run at END with final_report still "", which the
+            # CLI prints as "(no report was produced)" and scores as exit
+            # code 1. Route to the compiler instead: every escalation
+            # path owes the caller a report, and compiler_node already
+            # knows how to write an honest one from partial evidence.
+            log_event(logger, "escalation.unknown_trigger", level=logging.WARNING,
+                      trigger=trigger, action=action)
+            return Command(goto="compiler", update=base)
+
         # E4
         if action == "redirect":
-            return Command(goto="compiler", update={
-                **base, "critique_notes": [f"HUMAN REVIEWER: {guidance}"]})
+            # Route to gap_generator, NOT straight back to the compiler.
+            # Live (run p205.103-check): the reviewer's guidance was "ask
+            # for inputs from global watchdogs, UN reports of press
+            # freedom, human rights abuses, democracy index" -- a request
+            # for NEW EVIDENCE. Recompiling the same evidence block cannot
+            # serve that, so revision 3 failed on exactly the same missing
+            # support and re-raised E4. Guidance that asks for more
+            # research has to reach retrieval. human_guidance is what
+            # gap_generator reads (D-38); critique_notes still carries it
+            # so the next compile sees the instruction too.
+            return Command(goto="gap_generator", update={
+                **base,
+                "human_guidance": guidance,
+                "critique_notes": [f"HUMAN REVIEWER: {guidance}"]})
         # approve and abort both ship without feeding memory (route decided
         # this before we got here); abort is distinguishable in history.
         return Command(goto="telemetry", update=base)

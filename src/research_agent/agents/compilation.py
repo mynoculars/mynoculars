@@ -24,12 +24,14 @@ from collections import Counter
 from typing import Any, Dict
 
 from research_agent import langfuse as lf
+from research_agent.agents.escalation import escalation_allowed
 from research_agent.config import Settings
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
+from research_agent.tools.retrieval_chain import _distinctive_terms
 from research_agent.state import ResearchState
 
 logger = logging.getLogger(__name__)
@@ -102,11 +104,18 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # llm/client.py::strip_code_fence for why this exists and what it
         # deliberately does NOT attempt to fix.
         report = strip_code_fence(report)
+        # D-43: deterministic citation repair. The ATTRIBUTION RULE (D-40)
+        # asks the model for correct citations; compliance across live runs
+        # was roughly two in three. This enforces the half that can be
+        # enforced without reading meaning.
+        report, citation_counters = _clean_citations(
+            report, state.goals, state.evidence)
         # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
         # complete() (not complete_json) is the only free-text path, so this
         # is the one node whose drained counters can include
         # llm_quality_calls (the self-scoring gate only runs on free text).
-        counters = {"llm_node_calls": 1, **router.drain_counters()}
+        counters = {"llm_node_calls": 1, **router.drain_counters(),
+                    **citation_counters}
         return {"final_report": report, "counters": counters}
 
     return compiler_node
@@ -160,7 +169,8 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             return {"critique_passed": True}
         router.set_node("critic")
         result = router.complete_json(templates.critique(
-            state.raw_query, state.final_report, state.goals))
+            state.raw_query, state.final_report, state.goals,
+            state.evidence))
         passed = bool(result.get("passed", False))
         notes = [str(n) for n in result.get("notes", [])]
         revision = state.revision_count + 1
@@ -173,11 +183,22 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         if not passed:
             update["critique_notes"] = notes  # accumulates via reducer
             if revision >= settings.max_revisions:
-                if settings.hitl_enabled:
+                # D-23 bound: an E4 redirect routes back to compiler ->
+                # critic, and revision_count only ever grows, so this
+                # branch is true on every subsequent pass — the same
+                # unbounded re-raise E2/E3 has. escalation_allowed()
+                # (agents/escalation.py) folds hitl_enabled in with the
+                # per-run review budget.
+                if escalation_allowed(state, settings):
                     # D-23: raise E4 — the graph will interrupt for a human.
                     update["escalation_trigger"] = "E4"
                     log_event(logger, "escalation.raised", trigger="E4",
                               revisions=revision)
+                elif settings.hitl_enabled:
+                    log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                              trigger="E4", revisions=revision,
+                              reason="max_escalations_reached",
+                              reviews=len(state.escalation_history))
                 else:
                     # Stub path (HITL disabled): log loudly and ship the
                     # report marked unreviewed — never silently as "good".
@@ -199,7 +220,83 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
     return critic_node
 
 
-def build_memory_writer_node(memory: SemanticMemory, debug: bool = False):
+def _clean_citations(report: str, goals, evidence) -> tuple:
+    """Deterministically repair two citation failures the prompt alone
+    does not reliably prevent (D-40 asks for correct behaviour; this
+    enforces what can be enforced without judging meaning).
+
+    1. PASTED EVIDENCE TEXT. Live (run p205.95-check) the compiler ran the
+       source sentence straight into the claim -- "...whole session
+       blobRedis is an in-memory data store..." -- unreadable and
+       unattributable. Any verbatim run of an evidence item's own content
+       appearing in the prose is removed.
+    2. CITATIONS TO GOALS WITH NO EVIDENCE. A [gN] marker asserts that goal
+       N's retrieved evidence supports the sentence. If goal N retrieved
+       nothing at all, that assertion is false on its face and the marker
+       is dropped.
+
+    What this deliberately does NOT do: judge whether an evidence-BACKED
+    goal's evidence actually supports a given sentence. Live (run
+    p205.98-check) the report cited [g5] for "Netflix operates Cassandra
+    clusters exceeding 1 PB ... ~1 million writes per second" while g5's
+    evidence was Redis session-caching text. Detecting that requires
+    reading meaning, which is the critic's job -- see templates.critique,
+    which now asks for it explicitly. This function is the deterministic
+    half; it is not a substitute for the semantic half.
+
+    Returns (cleaned_report, {counter_name: count}).
+    """
+    counters = {}
+    cleaned = report
+
+    pasted = 0
+    for e in evidence:
+        body = (e.content or "").strip()
+        # Short fragments produce false positives against ordinary prose;
+        # a pasted citation is always a whole retrieved sentence.
+        if len(body) < 40:
+            continue
+        # Only strip a match that is GLUED to the preceding word. Removing
+        # every verbatim occurrence was far too blunt: on an in-corpus
+        # query the compiler legitimately states corpus sentences almost
+        # word for word, which is what a grounded report is supposed to do.
+        # Live (run p205.107-check, "Compare Redis vs Memcached for
+        # production systems"): retrieval was perfect -- corpus_recall 1.0,
+        # 36 corpus items -- and this function deleted six whole sections
+        # of the finished report, shipping "### Scalability" and "###
+        # Security" as empty headings. The defect this guards against was
+        # never quoting; it was the MISSING DELIMITER, e.g. "...rewriting
+        # the whole session blobRedis is an in-memory data store...", where
+        # the source sentence runs into the claim with no boundary. That
+        # signature is exactly detectable: a preceding alphanumeric
+        # character. Properly separated evidence text is left alone.
+        start = cleaned.find(body)
+        while start != -1:
+            glued = start > 0 and cleaned[start - 1].isalnum()
+            if not glued:
+                start = cleaned.find(body, start + len(body))
+                continue
+            cleaned = cleaned[:start] + cleaned[start + len(body):]
+            pasted += 1
+            start = cleaned.find(body)
+    if pasted:
+        counters["citations_pasted_evidence_removed"] = float(pasted)
+
+    evidenced = {e.goal_id for e in evidence}
+    unevidenced = {g.goal_id for g in goals if g.goal_id not in evidenced}
+    dropped = 0
+    for goal_id in unevidenced:
+        marker = f"[{goal_id}]"
+        dropped += cleaned.count(marker)
+        cleaned = cleaned.replace(marker, "")
+    if dropped:
+        counters["citations_to_unevidenced_goals"] = float(dropped)
+
+    return cleaned, counters
+
+
+def build_memory_writer_node(memory: SemanticMemory, settings,
+                             debug: bool = False):
     """Build the memory write-back node (runs only after a passed critique)."""
 
     def memory_writer_node(state: ResearchState) -> Dict[str, Any]:
@@ -222,7 +319,11 @@ def build_memory_writer_node(memory: SemanticMemory, debug: bool = False):
         """
         if debug:
             log_event(logger, "node.enter", node="memory_writer")
-        written = memory.store_run(state.raw_query, state.evidence)
+        # D-24 quality gate -- see SemanticMemory.store_run. Evidence that
+        # never cleared the coverage bar must not become permanently
+        # promoted cross-run memory.
+        written = memory.store_run(state.raw_query, state.evidence,
+                                   min_score=settings.min_evidence_score)
         return {"counters": {"memory_writes": float(written)}}
 
     return memory_writer_node
@@ -340,6 +441,26 @@ def build_telemetry_node(debug: bool = False):
         #
         # D-12 holds: every figure below is counted from state, not judged.
         goal_ids = [g.goal_id for g in state.goals]
+        # corpus_recall must apply the SAME topical gate the retrieval
+        # ladder uses (D-39), not just the score floor. Live (runs
+        # p205.99/.100-check) this reported corpus_recall 1.0 against a
+        # ten-document Redis corpus for queries about armies and about
+        # India vs the US: off-topic hits still cleared score > 0.5 via
+        # cross-leg agreement, so the one metric added specifically as the
+        # honesty counterpart to recall was fooled exactly the way the
+        # chain's sufficiency test used to be. A goal counts here only if a
+        # DOCUMENT both scored above the floor and shares vocabulary with
+        # that goal's own description.
+        _doc_sources = {"corpus", "mcp"}
+        _goal_terms = {g.goal_id: _distinctive_terms(g.description)
+                       for g in state.goals}
+        _doc_covered = {
+            e.goal_id for e in state.evidence
+            if e.source in _doc_sources and e.score > 0.5
+            and (not _goal_terms.get(e.goal_id)
+                 or _goal_terms[e.goal_id] & _distinctive_terms(e.content))}
+        corpus_recall = (round(len([g for g in goal_ids if g in _doc_covered])
+                               / len(goal_ids), 3) if goal_ids else 0.0)
         evidenced = {e.goal_id for e in state.evidence}
         goals_without_evidence = [g for g in goal_ids if g not in evidenced]
         # Ratio, not just the list, so it is trendable across runs and
@@ -366,6 +487,14 @@ def build_telemetry_node(debug: bool = False):
             "goals_without_evidence": goals_without_evidence,
             "grounding_ratio": grounding_ratio,
             "recall": round(state.recall_score, 3),
+            # D-38 honesty counterpart to recall. recall now includes goals
+            # served by the model tier; corpus_recall counts ONLY goals a
+            # real DOCUMENT covered. A large gap between them means the
+            # answer came from recollection, not from the corpus -- which
+            # is legitimate and attributed in the report, but must never be
+            # invisible in telemetry.
+            "corpus_recall": corpus_recall,
+            "model_sourced_items": int(evidence_by_source.get("model", 0)),
             "llm_node_calls": int(c.get("llm_node_calls", 0)),
             "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
             "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),

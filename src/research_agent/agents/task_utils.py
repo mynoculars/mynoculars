@@ -131,6 +131,19 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
     """
     tasks: List[SearchTask] = []
     rejected = 0
+    # D-2, second half: dedup WITHIN this batch, not only against history.
+    # completed_task_keys answers "have we already run this query in an
+    # EARLIER cycle"; it says nothing about the model emitting the same
+    # query twice in the SAME response. Found live (run p205.70-check):
+    # gap_generator returned six tasks that were two distinct queries
+    # repeated three times each, all for g2 -- "produced": 6,
+    # "rejected": 0, then six search_worker invocations doing two distinct
+    # searches. Four of six MAX_FANOUT slots were wasted, and the goal's
+    # evidence list was multiplied 3x by identical items, which is half of
+    # what drove an uncovered goal to recall 1.0 on irrelevant documents
+    # (the other half was fusion double-credit -- see
+    # retrieval/hybrid.py::rrf_fuse).
+    batch_keys: set = set()
     for t in raw_tasks:
         try:
             raw = RawTask.model_validate(t)
@@ -148,6 +161,9 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
         # formatting text. Here it builds one unique identifier per
         # (goal, query) pair, e.g. "g1::key differences".
         key = f"{raw.goal_id}::{raw.query.strip().lower()}"
+        if key in batch_keys:
+            continue  # D-2: same key twice in one producer response
+        batch_keys.add(key)
         if key in state.completed_task_keys:
             # "continue" skips the rest of THIS loop iteration and moves on
             # to the next raw task — it does not exit the whole loop, just

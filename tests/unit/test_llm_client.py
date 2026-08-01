@@ -9,7 +9,7 @@ This file covers only _extract_json's own parsing robustness, which has
 no other natural home.
 """
 
-from research_agent.llm.client import _extract_json
+from research_agent.llm.client import OpenAICompatibleClient, _extract_json, _truncate_at_sentinel, _extract_json
 
 
 def test_prompt_tag_covers_every_node_that_calls_an_llm():
@@ -50,3 +50,76 @@ def test_prompt_tag_values_match_the_templates_registry_exactly():
 def test_stub_json_fence_tolerance():
     """Regression guard for _extract_json's fence stripping."""
     assert _extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# P205 regression: a LEADING sentinel must not annihilate the response
+# ---------------------------------------------------------------------------
+
+
+def test_leading_sentinel_does_not_destroy_the_whole_response():
+    """Live (runs p205.67/.70/.71-check): the critic node produced a
+    sentinel at index 0 followed by the real answer -- raw_chars 3898,
+    kept_chars 0. complete() returned "", complete_json() raised
+    JSONDecodeError, and EVERY structured critic call fell back to the
+    secondary provider despite the local model answering correctly."""
+    raw = '<|im_end|>{"passed": false, "score": 0.2, "notes": ["thin"]}'
+    kept = _truncate_at_sentinel(raw)
+    assert kept == '{"passed": false, "score": 0.2, "notes": ["thin"]}'
+    assert _extract_json(kept)["passed"] is False
+
+
+def test_trailing_sentinel_behaviour_is_unchanged():
+    """The overwhelmingly common case must stay byte-identical."""
+    assert _truncate_at_sentinel('{"intent": "Comparison"}<|im_end|>') == \
+        '{"intent": "Comparison"}'
+
+
+def test_leading_sentinel_then_answer_then_runaway_keeps_only_the_answer():
+    raw = '<|im_end|>{"passed": true}<|im_end|>\nsystem\nfake continuation'
+    assert _truncate_at_sentinel(raw) == '{"passed": true}'
+
+
+def test_response_of_nothing_but_sentinels_is_returned_raw_not_empty():
+    """Returning "" would look like a successful call that produced
+    nothing; the caller should see the real (useless) response instead."""
+    assert _truncate_at_sentinel("<|im_end|><|eot_id|>") != ""
+
+
+def test_json_path_recovers_the_answer_after_a_leading_fragment():
+    """P205 regression (runs p205.98/.100-check): the local model emitted a
+    short fragment, a sentinel, then the real JSON -- raw_chars 2895
+    kept_chars 21, raw_chars 1153 kept_chars 18. complete() keeps the first
+    segment (correct for prose), so every structured call raised
+    JSONDecodeError and paid a fallback hop despite a valid answer being
+    present."""
+    import threading
+
+    raw = 'Here is the answer:<|im_end|>{"goals": [{"goal_id": "g1"}]}'
+
+    class _Client(OpenAICompatibleClient):
+        def __init__(self):  # noqa: D107 - bypass HTTP setup entirely
+            self._raw = threading.local()
+
+        def complete(self, messages, temperature=0.2):
+            # Exactly what the real complete() does: stash the untruncated
+            # text, return the truncated one.
+            self._raw.text = raw
+            return _truncate_at_sentinel(raw)
+
+    client = _Client()
+    assert client.complete([]) == "Here is the answer:", "prose rule unchanged"
+    assert client.complete_json([]) == {"goals": [{"goal_id": "g1"}]}
+
+
+def test_free_text_path_still_kills_a_runaway_continuation():
+    """The JSON fix must not weaken the prose rule: everything after the
+    model's first end-of-turn is hallucinated continuation."""
+    assert _truncate_at_sentinel(
+        "the real report<|im_end|>\nsystem\nfake second conversation"
+    ) == "the real report"
+
+
+def test_sentinel_segments_returns_every_non_empty_run():
+    from research_agent.llm.client import sentinel_segments
+    assert sentinel_segments("a<|im_end|><|eot_id|>b") == ["a", "b"]

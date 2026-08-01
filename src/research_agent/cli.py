@@ -210,6 +210,27 @@ def _run(app, settings, args, thread_id, tracer) -> int:
     # shutdown()'s end-open-roots loop is the backstop for whatever
     # this doesn't catch.
     try:
+        # D-20 guard: a thread_id IDENTIFIES one run. Starting a FRESH
+        # query on a thread that already holds state does not replace that
+        # state -- `evidence` is Annotated[..., operator.add] and `counters`
+        # merges, so both ACCUMULATE, while reducerless fields like
+        # iteration_depth reset to 0. Found live (run p205.70-check, second
+        # invocation): search_calls 18 = 12 + 6, memory_writes 31 = 15 + 16,
+        # revision_cycles 3 = 1 + 2, and the previous run's E3 escalation
+        # still in telemetry. Worse, the previous run's evidence was still
+        # marking goals covered, so a run that retrieved ONE item reported
+        # recall 1.0 at depth 1. Refuse rather than silently blend two runs.
+        snapshot = app.get_state(config)
+        prior = getattr(snapshot, "values", None) or {}
+        if prior.get("raw_query"):
+            print(
+                f"[thread-id '{thread_id}' already holds a run for "
+                f"\"{prior['raw_query']}\". Re-invoking it with a new query "
+                f"ACCUMULATES the old run's evidence and counters instead of "
+                f"replacing them (D-20). Use a fresh --thread-id, or omit the "
+                f"flag to get a generated one.]",
+                file=sys.stderr)
+            return 3
         result = app.invoke(ResearchState(raw_query=args.query), config=config)
 
         # HITL loop (D-23): an interrupted run surfaces "__interrupt__" instead
@@ -248,7 +269,22 @@ def _run(app, settings, args, thread_id, tracer) -> int:
             # entirely) until the person at the keyboard presses Enter.
             while action not in ("approve", "redirect", "abort"):
                 action = input("action [approve/redirect/abort]: ").strip().lower()
+                if action not in ("approve", "redirect", "abort"):
+                    # Silence here cost two live runs (p205.80/.81-check):
+                    # the reviewer typed their GUIDANCE at this prompt --
+                    # a natural mistake, since the payload's own "hint"
+                    # field talks about guidance -- got no feedback at
+                    # all, and then typed "abort". The redirect they
+                    # intended never happened, in either run, and the
+                    # transcript gave no clue why.
+                    print(f"  '{action}' is not one of the three actions. "
+                          f"Type 'redirect' first -- you will be asked for "
+                          f"your guidance text on the NEXT line.")
             guidance = input("guidance: ").strip() if action == "redirect" else ""
+            if action == "redirect" and not guidance:
+                print("  [empty guidance -- gap generation will re-run with "
+                      "no new direction, which usually re-raises the same "
+                      "escalation]")
             lf.event(thread_id, "hitl.resumed",
                      metadata={"trigger": payload.get("trigger"), "action": action,
                                "resume_latency_s": round(time.time() - pause_started, 2)})

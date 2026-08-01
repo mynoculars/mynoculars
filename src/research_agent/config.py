@@ -163,9 +163,51 @@ class Settings(BaseSettings):
     # produce zero evidence rather than three confident wrong answers.
     min_similarity: float = Field(0.35, ge=0.0, le=1.0)
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound
+    # D-38: the retrieval escalation ladder. model_knowledge_enabled is ON
+    # by default -- a missing corpus document is a retrieval limitation,
+    # not an absence of knowledge, and reporting the former as the latter
+    # was this system's single worst failure mode. Set false to restore
+    # corpus-only behaviour.
+    model_knowledge_enabled: bool = True
+    # Must exceed min_evidence_score or model evidence can never mark a
+    # goal covered and the gather loop cannot converge; must stay well
+    # below the ~1.0 of a document both retrieval legs agreed on so a real
+    # document always outranks recollection.
+    model_knowledge_score: float = Field(0.6, ge=0.0, le=1.0)
+    query_reformulation_enabled: bool = True
     # D-23: human-in-the-loop escalation. Off by default — the graceful-
     # degradation posture: shipping inert, enabled deliberately.
     hitl_enabled: bool = False
+    # ---- P205: external retrieval tier -------------------------------
+    # The architectural gap that made every "corpus does not contain it"
+    # failure terminal: corpus_search, mcp_client and semantic memory all
+    # resolve to the SAME ingested documents, so there was nowhere else to
+    # look. Off by default (no surprise egress, no surprise cost), but
+    # once on, a barren corpus lookup escalates to a real search engine
+    # instead of ending the run.
+    # Rank-derived scores never fall below this, so a genuinely retrieved
+    # web result always clears min_evidence_score and can mark a goal
+    # covered. Set above min_evidence_score or the tier cannot contribute
+    # coverage at all -- validate_settings warns when it is not.
+    # How many times one query formulation may be retried across later
+    # gather cycles once every tier came back empty (D-16 depth gate still
+    # applies on top). 0 keeps the pre-P205 "one shot per formulation".
+    max_task_retries: int = Field(2, ge=0)
+    # D-23 (bound): the maximum number of times ONE run may pause for a
+    # human. Without this, HITL removes the loop bounds it is layered on
+    # top of: route_convergence and dispatch_tasks both test
+    # escalation_trigger BEFORE the "depth budget spent -> compiler" and
+    # "empty backlog -> compiler" exits, so a re-raised E2/E3 re-enters
+    # human_escalation instead of terminating. Every redirect then returns
+    # to the same check, whose condition is still true, and re-raises the
+    # identical trigger with the identical payload -- an unbounded
+    # human-nagging loop that ends only at recursion_limit (exit code 2,
+    # no report, no debug trace). Once this budget is spent, the raising
+    # nodes take their existing HITL-OFF branch instead: log loudly and
+    # fall through to the compiler, which produces an honest, grounded
+    # report from whatever WAS retrieved. 0 disables pausing entirely
+    # without needing to also flip hitl_enabled.
+    max_escalations: int = Field(2, ge=0)
     recursion_limit: int = Field(60, ge=10)   # D-8: invoke-time backstop
     # D-18/P2-12: LLM-based contradiction detection in merger_node. Off by
     # default — costs one extra LLM call per merger execution (i.e. once

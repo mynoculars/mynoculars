@@ -63,3 +63,38 @@ def test_cap_and_filter_default_call_with_no_allowed_tool_hints_arg_is_unchanged
     raw = [{"query": "q1", "goal_id": "g1", "priority": 1}]
     tasks, rejected = cap_and_filter(raw, ResearchState(raw_query="q"), depth=0, max_fanout=5)
     assert tasks[0].tool_hint == ""
+
+
+def test_cap_and_filter_dedups_identical_tasks_within_one_batch():
+    """P205 regression (run p205.70-check). The gap generator returned six
+    tasks that were two distinct queries repeated three times each, all for
+    g2. completed_task_keys could not catch it -- none of them had run yet
+    -- so all six dispatched, burning four of six MAX_FANOUT slots and
+    multiplying that goal's evidence 3x with identical items, which is half
+    of what pushed an uncovered goal to recall 1.0 on irrelevant documents.
+    """
+    state = ResearchState(raw_query="Compare India and US")
+    raw = [
+        {"query": "Analyze US and India economic systems", "goal_id": "g2", "priority": 1},
+        {"query": "Compare US and India economic systems", "goal_id": "g2", "priority": 1},
+        {"query": "Analyze US and India economic systems", "goal_id": "g2", "priority": 1},
+        {"query": "Compare US and India economic systems", "goal_id": "g2", "priority": 1},
+        {"query": "Analyze US and India economic systems", "goal_id": "g2", "priority": 1},
+        {"query": "Compare US and India economic systems", "goal_id": "g2", "priority": 1},
+    ]
+    tasks, rejected = cap_and_filter(raw, state, depth=1, max_fanout=6)
+    assert len(tasks) == 2, "six raw tasks were only two distinct queries"
+    assert len({t.key for t in tasks}) == 2
+    # Duplicates are not malformed input -- they must not inflate the
+    # producer_rejects counter, which means something different (D-13).
+    assert rejected == 0
+
+
+def test_cap_and_filter_keeps_same_query_under_different_goals():
+    """Dedup is on (goal_id, query), not query alone -- the same phrasing
+    genuinely serving two goals is not a duplicate."""
+    state = ResearchState(raw_query="q")
+    raw = [{"query": "same text", "goal_id": "g1", "priority": 1},
+           {"query": "same text", "goal_id": "g2", "priority": 1}]
+    tasks, _ = cap_and_filter(raw, state, depth=0, max_fanout=6)
+    assert len(tasks) == 2

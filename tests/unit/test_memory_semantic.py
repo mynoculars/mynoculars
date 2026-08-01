@@ -286,3 +286,83 @@ def test_content_id_still_filters_memory_sourced_evidence_before_dedup_even_appl
     items, _ = store.calls[0]
     assert len(items) == 1
     assert items[0]["content"] == "fresh fact"
+
+
+def test_store_run_drops_evidence_that_never_cleared_the_coverage_bar():
+    """P205 regression (run p205.71-check): recall 0.0, every goal reported
+    "no reliable data", and 16 sub-threshold items were still written to
+    long-term memory. They return next run as source="memory" at raw cosine
+    similarity (~0.75), which outranks anything fresh retrieval produces
+    under RRF -- junk that failed the bar once comes back promoted."""
+    class _Store:
+        def __init__(self):
+            self.written = []
+
+        def existing_point_ids(self, ids):
+            return set()
+
+        def upsert_texts(self, texts, payloads=None, *a, **k):
+            self.written = list(texts)
+            return len(texts)
+
+    store = _Store()
+    mem = SemanticMemory(store, 5, 90.0, 14.0)
+    evidence = [
+        Evidence(task_key="t1", goal_id="g1", source="corpus",
+                 content="single-leg junk", score=0.5),
+        Evidence(task_key="t2", goal_id="g1", source="corpus",
+                 content="genuinely fused, both legs agreed", score=0.99),
+    ]
+    written = mem.store_run("q", evidence, min_score=0.5)
+    assert written == 1, "only the item that beat the floor may be stored"
+    assert "genuinely fused" in str(store.written[0])
+
+
+def test_store_run_default_keeps_every_fresh_item():
+    """min_score defaults to 0.0 so existing callers are unchanged."""
+    class _Store:
+        def existing_point_ids(self, ids):
+            return set()
+
+        def upsert_texts(self, texts, payloads=None, *a, **k):
+            return len(texts)
+
+    mem = SemanticMemory(_Store(), 5, 90.0, 14.0)
+    evidence = [Evidence(task_key="t1", goal_id="g1", source="corpus",
+                         content="low", score=0.1)]
+    assert mem.store_run("q", evidence) == 1
+
+
+def test_store_run_never_writes_model_recollection_to_memory():
+    """D-42 regression (runs p205.96/.97-check). The army run stored 28
+    items of which 24 were source="model"; the next, unrelated run recalled
+    five and composed an entirely military goal set for "Compare India and
+    US", inheriting PLA doctrine prose into an India-vs-US report.
+
+    Memory is for what RETRIEVAL found. Recollection stored as memory comes
+    back tagged source="memory" -- indistinguishable from document-backed
+    evidence -- and steers a later run before any retrieval happens."""
+    class _Store:
+        def __init__(self):
+            self.written = []
+
+        def existing_point_ids(self, ids):
+            return set()
+
+        def upsert_texts(self, texts, payloads=None, *a, **k):
+            self.written = list(texts)
+            return len(texts)
+
+    store = _Store()
+    mem = SemanticMemory(store, 5, 90.0, 14.0)
+    written = mem.store_run("q", [
+        Evidence(task_key="t1", goal_id="g1", source="model",
+                 content="PLA doctrine prioritises forward deployment", score=0.6),
+        Evidence(task_key="t2", goal_id="g1", source="corpus",
+                 content="a real retrieved document", score=0.9),
+        Evidence(task_key="t3", goal_id="g1", source="mcp",
+                 content="a real specialist-tool hit", score=0.9),
+    ])
+    assert written == 2, "corpus and mcp are findings; model recollection is not"
+    blob = str(store.written)
+    assert "PLA doctrine" not in blob

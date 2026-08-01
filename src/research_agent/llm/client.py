@@ -79,6 +79,29 @@ Message = Dict[str, str]  # {"role": ..., "content": ...}
 # valid JSON. None of these strings can legally appear inside real JSON,
 # so removing them is always safe.
 _SENTINELS = ("<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>", "</s>")
+_SENTINEL_RE = re.compile("|".join(re.escape(s) for s in _SENTINELS))
+
+
+def sentinel_segments(text: str) -> List[str]:
+    """Every non-empty, stripped run of text between chat-template sentinels.
+
+    CALLED BY   _truncate_at_sentinel (free-text path, which takes the
+                FIRST -- anything after the model's first end-of-turn is a
+                runaway continuation, never report content) and
+                complete_json (structured path, which tries them ALL).
+
+    Why the two paths must differ: taking the first segment is right for
+    prose and wrong for JSON. Live (runs p205.98/.100-check) the local
+    model emitted a short fragment, then a sentinel, then the real answer
+    -- raw_chars 2895 kept_chars 21, and raw_chars 1153 kept_chars 18. The
+    free-text rule discarded the answer and every structured call fell back
+    to the secondary provider. Taking the LONGEST segment instead would be
+    just as wrong the other way: it would resurrect exactly the
+    hallucinated extra conversation the truncator exists to kill. Neither
+    position is reliably correct, so the JSON path stops guessing and tries
+    each segment until one parses.
+    """
+    return [seg.strip() for seg in _SENTINEL_RE.split(text) if seg.strip()]
 
 
 def _truncate_at_sentinel(text: str) -> str:
@@ -112,16 +135,24 @@ def _truncate_at_sentinel(text: str) -> str:
     Returns the text unchanged if no sentinel is found — the overwhelming
     majority of calls, where the model behaved.
     """
-    earliest = len(text)
-    found_any = False
-    for sentinel in _SENTINELS:
-        idx = text.find(sentinel)
-        if idx != -1:
-            found_any = True
-            earliest = min(earliest, idx)
-    if not found_any:
+    if not _SENTINEL_RE.search(text):
         return text
-    return text[:earliest].rstrip()
+    # Take the first NON-EMPTY segment between sentinels, not everything
+    # before the first one. The original truncate-at-first-index form
+    # assumed a sentinel is always TRAILING. Live (runs p205.67/.70/.71),
+    # the critic node repeatedly produced a sentinel at index 0 followed
+    # by the real answer -- raw_chars 3898, kept_chars 0 -- so complete()
+    # returned "", complete_json() then raised JSONDecodeError, and EVERY
+    # structured critic call fell back to the secondary provider despite
+    # the local model having answered correctly. Splitting keeps the
+    # trailing-sentinel case byte-identical (the first segment is the
+    # answer) while recovering the leading-sentinel case.
+    for segment in sentinel_segments(text):
+        return segment
+    # Nothing but sentinels: return the raw text rather than "" so the
+    # caller sees the real (useless) response instead of a silent empty
+    # string that looks like a successful call returning nothing.
+    return text.strip()
 
 
 class ChatClient(Protocol):
@@ -332,6 +363,12 @@ class OpenAICompatibleClient:
         self.name = name
         self._model = model
         self._tracer = tracer
+        # complete() truncates at the first chat-template sentinel, which
+        # is correct for prose and lossy for JSON. complete_json needs the
+        # untruncated text to try the other segments; threading.local keeps
+        # it per-worker, since one client is shared across the parallel
+        # search_worker fan-out.
+        self._raw = threading.local()
         self._label = display_label or model
         # A leading underscore (self._trace_node, self._http, etc.) is a
         # Python NAMING CONVENTION, not an enforced access restriction —
@@ -410,6 +447,7 @@ class OpenAICompatibleClient:
         data = resp.json()
         latency = time.perf_counter() - started
         raw_text: str = data["choices"][0]["message"]["content"]
+        self._raw.text = raw_text
         # See _truncate_at_sentinel's docstring above for exactly what
         # this guards against: a model that keeps generating past its own
         # end-of-turn, hallucinating an entire extra fake conversation.
@@ -458,7 +496,22 @@ class OpenAICompatibleClient:
         above to get the raw text, then hands that text to the module-level
         _extract_json() function to turn it into an actual dict.
         """
-        return _extract_json(self.complete(messages, temperature))
+        text = self.complete(messages, temperature)
+        try:
+            return _extract_json(text)
+        except ValueError:
+            # complete() kept the FIRST segment, which is right for prose
+            # and can be a stray fragment for JSON (see sentinel_segments).
+            # Re-split and try the rest before declaring the provider
+            # unusable and paying for a fallback hop -- live, this was
+            # every structured critic/gap call on the local model.
+            raw = getattr(self._raw, "text", text)
+            for segment in sentinel_segments(raw)[1:]:
+                try:
+                    return _extract_json(segment)
+                except ValueError:
+                    continue
+            raise
 
 
 class StubClient:

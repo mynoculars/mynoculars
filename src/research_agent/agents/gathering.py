@@ -46,12 +46,14 @@ import logging
 from typing import Any, Callable, Dict, List
 
 from research_agent import langfuse as lf
+from research_agent.agents.escalation import escalation_allowed
 from research_agent.agents.task_utils import cap_and_filter
 from research_agent.config import Settings
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.orchestration.contracts import validated_worker
 from research_agent.prompts import templates
+from research_agent.prompts.templates import SINGLE_LEG_SCORE_CEILING
 from research_agent.state import Evidence, ResearchState, SearchTask, WorkerPayload
 
 logger = logging.getLogger(__name__)
@@ -130,7 +132,13 @@ def build_search_worker(tool: ToolFn, debug: bool = False):
             # that got zero evidence has none to report, hence the
             # "none" fallback rather than indexing an empty list).
             log_event(logger, "worker.done", task=task.key, items=len(evidence),
-                      source=evidence[0].source if evidence else "none")
+                      # Every tier of the ladder (D-38) can contribute to one
+                      # task, so evidence[0] names whichever tier happened to
+                      # run FIRST -- live, that reported source="corpus" for
+                      # tasks the model tier actually answered. Report all of
+                      # them.
+                      source=",".join(sorted({e.source for e in evidence}))
+                      or "none")
             return {
                 "evidence": evidence,
                 "completed_task_keys": {task.key},
@@ -360,10 +368,21 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         # ever SET, which is the only thing route_convergence reads).
         if depth >= settings.max_depth and recall < settings.recall_target:
             trigger = "E2" if any(g.contested for g in goals) else "E3"
-            if settings.hitl_enabled:
+            # D-23 bound: this branch fires on EVERY cycle once the depth
+            # budget is spent, and a human redirect routes straight back
+            # here — so without escalation_allowed() the same trigger is
+            # re-raised with the same payload indefinitely and
+            # route_convergence's own "depth spent -> compiler" exit is
+            # never reachable. See agents/escalation.py.
+            if escalation_allowed(state, settings):
                 update["escalation_trigger"] = trigger
                 log_event(logger, "escalation.raised", trigger=trigger,
                           recall=round(recall, 3))
+            elif settings.hitl_enabled:
+                log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                          trigger=trigger, recall=round(recall, 3),
+                          reason="max_escalations_reached",
+                          reviews=len(state.escalation_history))
             else:
                 log_event(logger, "escalation.stub", level=logging.WARNING,
                           trigger=trigger, recall=round(recall, 3),
@@ -371,6 +390,31 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         return update
 
     return progress_checker_node
+
+
+def _uncovered_goal_has_strong_evidence(goal_id: str,
+                                        evidence: List[Evidence]) -> bool:
+    """True if this goal has at least one evidence item both retrieval
+    legs agreed on (score strictly above the single-leg RRF ceiling).
+    Pure and side-effect-free so it is trivially unit-testable without a
+    running graph -- see tests/unit/test_agents_gathering.py."""
+    return any(e.goal_id == goal_id and e.score > SINGLE_LEG_SCORE_CEILING
+               for e in evidence)
+
+
+def _goal_has_any_evidence(goal_id: str, evidence: List[Evidence]) -> bool:
+    """True if this goal retrieved ANYTHING at all, at any score.
+
+    A goal that retrieved NOTHING is the one case the strong-evidence guard
+    below must NOT fire on. The guard exists to stop the model theming new
+    queries on whatever irrelevant text happened to survive in the tail
+    (see gap_generator_node's docstring) -- a goal with an empty tail
+    presents no such risk, and a fresh query formulation is exactly the
+    remedy it needs. Live (run p205.68-check): goal g2 retrieved zero
+    items, which made `_uncovered_goal_has_strong_evidence` vacuously
+    False, which fired the guard and escalated the whole run at depth 1
+    -- the opposite of the intended behaviour."""
+    return any(e.goal_id == goal_id for e in evidence)
 
 
 def build_gap_generator_node(router: FallbackRouter, settings: Settings,
@@ -418,10 +462,106 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         becomes visible here, after cap_and_filter has actually filtered
         the model's output down to nothing. Both are "cannot converge
         below target," so both raise the same trigger codes.
+
+        A THIRD way a run fails to converge, found live and closed here:
+        every uncovered goal's evidence is real but SINGLE-LEG (BM25 has no
+        relevance floor -- MIN_SIMILARITY only gates the dense leg -- so a
+        generic word in an off-topic query can still keyword-match the
+        corpus). This node used to hand that evidence to the model as
+        context regardless, and the model would write new queries themed
+        on whatever subject that evidence happened to be about rather than
+        on the actual uncovered goal -- e.g. asked to compare India and the
+        US, it wrote "Redis and Memcached licensing models" because that
+        was the only text in the tail. Those new queries then matched the
+        (irrelevant) corpus at high confidence, recall cleared target, and
+        the run reported success on a topic the corpus never covered. Both
+        the compiler's grounding rule (Item 11) and the critic caught this
+        after the fact; this closes it before it costs an LLM call and a
+        gather cycle. See _uncovered_goal_has_strong_evidence below.
         """
         router.set_node("gap_generator")
         if debug:
             log_event(logger, "node.enter", node="gap_generator")
+
+        # Closes the third convergence-failure mode described in this
+        # node's own docstring above. SINGLE_LEG_SCORE_CEILING (0.5) is
+        # not a new threshold -- it is the exact score an RRF rank-0 hit
+        # gets when only ONE retrieval leg answered, imported from the
+        # same constant Item 11's compile_report grounding rule uses. A
+        # goal whose best evidence sits at or below it has no document
+        # that both legs agreed on, which is the cheapest available signal
+        # that the corpus may not genuinely cover it -- verified against a
+        # live trace where every surviving hit for an uncovered goal was
+        # exactly this shape (dense: 0, keyword-only, fused <= 1).
+        #
+        # Deliberately checked BEFORE the LLM call, not after: skipping the
+        # call entirely means an off-topic run escalates one gather cycle
+        # earlier, and never hands the model a prompt built to produce
+        # exactly the failure mode being guarded against.
+        #
+        # NOT applied when human_guidance is set. Found live: a human who
+        # redirects after exactly this guard raised E2/E3 is giving the
+        # system new information the retrieved evidence never had -- e.g.
+        # compare social and political aspects after an economic query
+        # came back weak. Applying the guard again after a redirect made it
+        # fire identically and silently ignore the guidance, re-raising the
+        # SAME escalation with the SAME reason -- a human explicit
+        # instruction to try something new was treated as more of the
+        # evidence that caused the original failure. The guard exists to
+        # stop the MODEL from free-associating off weak evidence; it was
+        # never meant to override a HUMAN telling it what to search for.
+        uncovered = [g for g in state.goals if not g.covered]
+        # A goal that retrieved NOTHING is a retry candidate, never a reason
+        # to give up: it has no misleading tail to free-associate off, and a
+        # different query formulation is the entire remedy. Live, run
+        # p205.68-check: g2 retrieved zero items, which made the strong-
+        # evidence test vacuously False and fired this guard on the exact
+        # case it was never written for.
+        weak_only = [g for g in uncovered
+                     if _goal_has_any_evidence(g.goal_id, state.evidence)]
+        starving = [g for g in uncovered if g not in weak_only]
+        # D-38: with the model tier wired, "no strong evidence" is never a
+        # reason to STOP -- there is always another tier that has not been
+        # tried for the goals still uncovered. Giving up here is what turned
+        # a retrieval limitation into "this cannot be answered".
+        ladder_exhausted = not settings.model_knowledge_enabled
+        if (ladder_exhausted and weak_only and not starving
+                and not state.human_guidance
+                # D-3/D-14: the depth budget is this loop's bound, and this
+                # guard must not pre-empt it on the FIRST cycle. Runs
+                # p205.66/67/68-check all ended at "iterations": 1 with
+                # MAX_DEPTH entirely unused, because this fired before the
+                # gap generator had produced a single new query. Give the
+                # loop one real gap cycle; if the evidence is STILL only
+                # single-leg afterwards, the corpus genuinely lacks the topic.
+                and state.iteration_depth > 1
+                and not any(_uncovered_goal_has_strong_evidence(g.goal_id, state.evidence)
+                            for g in weak_only)):
+            log_event(logger, "node.gaps_skipped_no_strong_evidence",
+                      uncovered_goals=[g.goal_id for g in weak_only],
+                      depth=state.iteration_depth)
+            update = {"pending_tasks": [], "human_guidance": ""}
+            if state.recall_score < settings.recall_target:
+                trigger = "E2" if any(g.contested for g in state.goals) else "E3"
+                # D-23 bound — see agents/escalation.py::escalation_allowed.
+                # Without it this guard is the single most reachable
+                # infinite-escalation source in the graph: it fires on the
+                # FIRST gather cycle for any query the corpus does not
+                # genuinely cover, and a human redirect that fails to
+                # produce tasks lands right back on it.
+                if escalation_allowed(state, settings):
+                    update["escalation_trigger"] = trigger
+                    log_event(logger, "escalation.raised", trigger=trigger,
+                              reason="no_strong_evidence_for_any_uncovered_goal")
+                elif settings.hitl_enabled:
+                    log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                              trigger=trigger, reason="max_escalations_reached",
+                              reviews=len(state.escalation_history))
+                else:
+                    log_event(logger, "escalation.stub", level=logging.WARNING,
+                              trigger=trigger,
+                              reason="no_strong_evidence_for_any_uncovered_goal")
+            return update
         # P2-14 (D-25): same reasoning as task_expander_node's identical
         # line -- settings.mcp_enabled IS the "is mcp available" signal,
         # reused directly rather than a second, separately-configured flag.
@@ -447,10 +587,26 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         # above — see that node's comment for why this branch exists.
         if not tasks and state.recall_score < settings.recall_target:
             trigger = "E2" if any(g.contested for g in state.goals) else "E3"
-            if settings.hitl_enabled:
+            if state.human_guidance:
+                # A human redirected INTO this call and the guidance they
+                # gave produced nothing that survived cap_and_filter (D-2
+                # dedup / D-16 depth gate). Re-raising here asks them the
+                # identical question, with the identical payload, having
+                # silently consumed the answer they already gave — which
+                # is what "redirect does nothing" looked like from
+                # outside. Fall through to the compiler instead: an empty
+                # backlog is D-1's own terminal exit, and the report will
+                # say honestly what was and was not retrieved.
+                log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                          trigger=trigger, reason="redirect_produced_no_tasks")
+            elif escalation_allowed(state, settings):
                 update["escalation_trigger"] = trigger
                 log_event(logger, "escalation.raised", trigger=trigger,
                           reason="task_supply_exhausted")
+            elif settings.hitl_enabled:
+                log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                          trigger=trigger, reason="max_escalations_reached",
+                          reviews=len(state.escalation_history))
             else:
                 log_event(logger, "escalation.stub", level=logging.WARNING,
                           trigger=trigger, reason="task_supply_exhausted")

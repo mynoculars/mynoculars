@@ -41,6 +41,8 @@ from research_agent.storage.opensearch_store import OpenSearchStore
 from research_agent.storage.postgres import get_checkpointer
 from research_agent.storage.qdrant_store import QdrantStore
 from research_agent.tools.corpus_search import make_corpus_tool
+from research_agent.tools.model_knowledge import make_model_knowledge_tool
+from research_agent.tools.retrieval_chain import make_retrieval_chain
 from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
 from research_agent.tracing import NullTracer
 
@@ -159,7 +161,7 @@ def build_app_and_settings(tracer=None):
     # is what allowed it in the first place). With mcp_enabled off (the
     # default), mcp_tool stays None and build_graph registers no extra
     # node at all -- behavior is unchanged from every run before this.
-    tool = make_corpus_tool(
+    corpus_tool = make_corpus_tool(
         HybridRetriever(dense, keyword, min_similarity=settings.min_similarity))
     mcp_bridge = None
     mcp_tool = None
@@ -195,6 +197,19 @@ def build_app_and_settings(tracer=None):
         # (print a banner, put it in /health) without re-deriving it.
         log_event(logging.getLogger(__name__), "app.degraded_checkpointing",
                   level=logging.WARNING)
+    # D-38: the DEFAULT tool every search_worker receives is no longer the
+    # bare corpus tool -- it is the escalation ladder
+    # corpus -> reformulated corpus -> mcp -> model knowledge. The graph,
+    # the worker contract (D-6/D-15) and the Send-fanout are untouched:
+    # this is still one ToolFn. mcp_tool is ALSO still passed separately,
+    # so an explicit tool_hint="mcp" (D-25) keeps routing straight to the
+    # specialist node, bypassing the ladder, exactly as before.
+    model_tool = (make_model_knowledge_tool(router, settings.model_knowledge_score)
+                  if settings.model_knowledge_enabled else None)
+    tool = make_retrieval_chain(
+        corpus_tool, settings.min_evidence_score,
+        mcp=mcp_tool, model=model_tool,
+        reformulate=settings.query_reformulation_enabled)
     app = build_graph(router, tool, memory, settings, checkpointer, debug=debug,
                      mcp_tool=mcp_tool)  # P2-14: None unless settings.mcp_enabled
     return AppBundle(app=app, settings=settings, durable=durable,

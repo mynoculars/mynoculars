@@ -248,3 +248,49 @@ def test_e3_stub_logs_when_hitl_disabled(off_memory, stub_router, settings, capl
     stub_lines = [r for r in caplog.records if "escalation.stub" in r.message]
     assert stub_lines, "expected an escalation.stub WARNING when HITL is off"
     assert stub_lines[0].event_fields["trigger"] in ("E2", "E3")
+
+
+class _RejectingCriticFreshGaps(RejectingCriticStub):
+    """Critic always rejects; gap generation emits genuinely NEW queries.
+
+    The plain stub returns the same canned task list for every producer
+    call, so cap_and_filter's dedup (D-2) removes them all as already
+    completed and the backlog is empty regardless of routing -- which would
+    make this test pass on the broken behaviour too.
+    """
+
+    _n = 0
+
+    def complete_json(self, messages, temperature=0.0):
+        if "TASK=gaps" in messages[-1]["content"]:
+            type(self)._n += 1
+            return {"tasks": [{"query": f"fresh gap query {self._n}",
+                               "goal_id": "g1", "priority": 1}]}
+        return super().complete_json(messages, temperature)
+
+
+def test_e4_redirect_reaches_retrieval_not_just_the_compiler(off_memory,
+                                                             fake_tool,
+                                                             hitl_settings):
+    """P205 regression (run p205.103-check). The reviewer's guidance was
+    "ask for inputs from global watchdogs, UN reports of press freedom,
+    human rights abuses, democracy index" -- a request for NEW EVIDENCE.
+    E4 redirect routed straight back to the compiler, which can only
+    rewrite the same evidence block, so revision 3 failed on exactly the
+    same missing support and re-raised E4."""
+    calls = []
+
+    def counting_tool(task):
+        calls.append(task.key)
+        return fake_tool(task)
+
+    router = FallbackRouter([_RejectingCriticFreshGaps()], 0.6)
+    graph = build_graph(router, counting_tool, off_memory, hitl_settings,
+                        MemorySaver())
+    cfg = _cfg(hitl_settings, "hitl-e4-regather")
+
+    graph.invoke(ResearchState(raw_query="q"), config=cfg)
+    before = len(calls)
+    graph.invoke(_resume("redirect", "consult the UN democracy index"), config=cfg)
+    assert len(calls) > before, (
+        "a redirect asking for new evidence must trigger new searches")
