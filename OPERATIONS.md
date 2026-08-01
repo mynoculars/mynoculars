@@ -38,7 +38,7 @@ shown.
 > command examples remain PowerShell, per how this environment actually
 > runs.
 
-> **Phase 3 note:** test suite is now **190** (157 + 33 new
+> **Phase 3/D-38–D-46 note:** test suite is now **294** (157 + 33 Phase 3 + 104 new
 > `test_langfuse.py` tests, still fully offline). Optional Langfuse
 > tracing is documented in **Observability — Langfuse (Phase 3)** below;
 > it is off by default (`LANGFUSE_ENABLED=false`) and every step above and
@@ -166,10 +166,10 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 232 passed
+# expect: 294 passed
 ```
 
-If L1 runs and 232 tests pass, your code is fine. Everything from here is about
+If L1 runs and 294 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -638,7 +638,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 232 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 294 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -671,6 +671,8 @@ The CLI will PAUSE and print a review payload, then prompt:
 `redirect` then give guidance to send it back for another pass, or `abort` to
 stop with an explicit aborted-report. This is the interrupt/resume machinery
 running live.
+
+**If you type anything other than those three words** — including typing your redirect guidance directly at this prompt, which the payload's own `hint` field can make look natural — the CLI now prints `'<input>' is not one of the three actions. Type 'redirect' first -- you will be asked for your guidance text on the NEXT line.` and re-prompts, rather than silently re-prompting with no explanation. Type `redirect`, press enter, and you'll be asked for the guidance text on the following line.
 
 **If it converges instead of escalating**, check `recall` in the printed
 telemetry — if it's `≥ 0.85`, the agent believes it found enough evidence
@@ -773,7 +775,7 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **232 tests**, fully offline — no services, no API keys, no
+The suite is **294 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -785,7 +787,7 @@ python -m pytest tests/ -q
 tests/unit/                   170 tests   one file per src/research_agent/ module
 tests/integration/             20 tests   full graph.invoke() runs, offline
                               --------
-                              190 tests
+                              294 tests
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -937,7 +939,7 @@ LANGFUSE_ENVIRONMENT=development
 
 ```powershell
 pip install langfuse
-python -m pytest -q                          # 190/190, fully offline, unaffected
+python -m pytest -q                          # 294/294, fully offline, unaffected
 python -m research_agent.cli "your question" --debug
 ```
 
@@ -1311,6 +1313,10 @@ discipline. Every value below lives in `.env`.
 | `MAX_REVISIONS` | `2` | the critic keeps finding real problems | rewrites are cosmetic and cost money | `revision_cycles`, `critique_passed` |
 | `LLM_PRIMARY_TIMEOUT_SECONDS` | `120` | the local model times out on large prompts | — | `llm.fallback` with `ReadTimeout` |
 | `MEMORY_TOP_K` | see `.env.example` | memory rarely contributes | memory outranks fresh retrieval | `memory_hits` vs `evidence_by_source` |
+| `MODEL_KNOWLEDGE_ENABLED` | `true` | never, unless reproducing pre-D-38 corpus-only behavior for comparison | you want retrieval to stop at MCP and escalate to a human instead of the model tier | `model_sourced_items`, `corpus_recall` vs `recall` |
+| `MODEL_KNOWLEDGE_SCORE` | `0.6` | rarely — must stay above `MIN_EVIDENCE_SCORE` (so the model tier can cover a goal) and below the ~1.0 a corpus/MCP hit with cross-leg agreement scores (so a real document always wins) | you want the model tier to win coverage races against weak corpus hits, which is rarely what you want | `model_sourced_items`, whether the ladder stops at `corpus` or falls through to `model` in `chain.answered` logs |
+| `QUERY_REFORMULATION_ENABLED` | `true` | rarely — the reformulated retry is a single, cheap, deterministic string simplification, not an LLM call | you need to isolate whether a miss is coming from the original query or the reformulated one, while debugging | `chain.answered` log lines with `tier: corpus_reformulated` |
+| `MAX_ESCALATIONS` | `2` | HITL runs are hitting the escalation budget and falling through to the compiler before you've had a chance to redirect | escalations are looping without making progress and you want the run to give up sooner | `escalations` list length in telemetry, `escalation.suppressed` log lines |
 
 ### Reading the telemetry block as a tuning instrument
 
@@ -1435,6 +1441,20 @@ history is now visible in the output, not only in Postgres.
 **The practical rule:** use a fresh thread-id (or none at all — let it
 auto-generate) for every new, independent question. Only ever reuse one
 when you are deliberately resuming a run that is genuinely still paused.
+
+**Corrected since the table above was captured (D-38 batch):** the CLI
+no longer lets this happen silently. Before invoking, it checks whether
+the thread already holds a run (`app.get_state(config)` has a
+`raw_query`) and, if so, refuses outright — prints
+`[thread-id '<id>' already holds a run for "<query>". Re-invoking it with
+a new query ACCUMULATES the old run's evidence and counters instead of
+replacing them (D-20). Use a fresh --thread-id, or omit the flag to get a
+generated one.]` to stderr, and exits with status `3` without touching
+the graph. The four-run table above is still an accurate demonstration of
+the underlying reducer-accumulation mechanism, and it is still LIVE for
+anyone driving the graph directly — the guard lives in `cli.py`'s `main()`
+only, not in `assembly.py` or the graph itself, so the API's `/research`
+endpoint has no equivalent check today.
 
 ---
 

@@ -47,8 +47,10 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > Disabled by default (`LANGFUSE_ENABLED=false`, zero SDK import, zero
 > network calls); enabling it changes no business logic, prompts, or graph
 > topology. See [Observability — Langfuse (Phase 3)](#observability--langfuse-phase-3)
-> below. **Test suite: 190/190** (157 carried forward + 33 new, fully
+> below. **Test suite: 294/294** (grown across D-38–D-46's regression coverage, fully
 > offline). D-35 logs the module-boundary decision in `DECISIONS.md`.
+
+> **Post-Phase-3 work (D-38–D-46, no separate phase number assigned):** retrieval was rebuilt as a 4-tier ladder ending in the model’s own knowledge, with anti-fabrication limits, deterministic citation repair, and a critic that now sees the evidence it verifies against. Not a phase/tier bump in name — `DECISIONS.md` is the source of truth for this range; see D-38 through D-46.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
@@ -498,6 +500,10 @@ reach `HybridRetriever`'s output, let alone become an `Evidence` object. The
 BM25 leg has no equivalent floor — BM25 scores are corpus-dependent and
 unbounded, so there's no principled fixed cutoff the way there is for a 0..1
 cosine similarity; this is a documented, deliberate gap, not an oversight.
+
+### Retrieval is now a ladder, not just this one hop (D-38–D-46)
+
+The diagram above is tier 1 of 4. If corpus search comes back below `min_evidence_score` — or scores high but shares no distinctive vocabulary with the query (D-39) — `tools/retrieval_chain.py` tries, in order: **one reformulated corpus retry** (shorter, stripped-down query), then **MCP**, then the **model’s own knowledge** (`tools/model_knowledge.py`), stopping at the first tier that clears the bar. Model-tier items always carry `source="model"`, are never relabelled as corpus hits, never persist to durable memory (D-42), and the compiler must attribute them as general knowledge rather than a retrieved finding (D-40). Telemetry’s `corpus_recall` and `model_sourced_items` fields exist specifically so a large gap between them and `recall` is visible — it means the answer is recollection, not retrieval. Full rationale and live evidence: `DECISIONS.md` D-38 through D-46.
 
 ### Storage interactions
 
@@ -1292,6 +1298,10 @@ describe is now closed, on both the LLM side and the retrieval side:
 | `escalations` *(new this session)* | `[{"trigger":..., "action":...}]` — every entry from `state.escalation_history`, previously written and never read anywhere | `agents/compilation.py::telemetry_node` |
 | `goals_without_evidence` | the goal ids that reached the compiler with **zero** evidence attached — counted from `state.evidence`'s own `goal_id` field, never parsed out of the report | same |
 | `grounding_ratio` | `(goals − goals_without_evidence) / goals`, rounded to 3dp; `0.0` when a run produced no goals at all. **Deliberately distinct from `recall`**: recall asks "did enough evidence clear the coverage threshold" and is score-derived, so threshold tuning moves it; `grounding_ratio` asks the cruder prior question "did this goal get ANY evidence", which no threshold can affect. `recall: 1.0` with `grounding_ratio: 0.5` means the coverage rule is passing goals the retriever never fed | same |
+| `corpus_recall` *(D-38/D-39)* | same shape as `recall`, but counts a goal covered only if a `corpus`/`mcp` item both cleared `min_evidence_score` AND passed the D-39 topical gate (shared distinctive terms with the goal description). Exists because `recall` alone can no longer tell you whether the CORPUS answered a goal or the model tier did — the two are frequently different, and a large gap between `recall` and `corpus_recall` means the answer is recollection, not retrieval | `agents/compilation.py::telemetry_node` |
+| `model_sourced_items` *(D-38)* | count of `state.evidence` entries with `source == "model"` — the LLM's own knowledge, retrieved deliberately because no document served that goal. Read together with `corpus_recall`: `corpus_recall: 0.0, model_sourced_items: 24` means the whole report rests on recollection, attributed as such in the prose (D-40) | same |
+| `citations_pasted_evidence_removed` *(D-45)* | count of verbatim evidence-text runs the compiler glued directly onto a claim with no delimiter (e.g. `"...the whole session blobRedis is an in-memory data store..."`), stripped deterministically before the report ships. Only present when nonzero — its absence is not a claim that pasting never happens, only that this run's draft didn't need repair | same |
+| `citations_to_unevidenced_goals` *(D-45)* | count of `[gN]` markers removed because goal N retrieved no evidence at all — a citation asserting support that goal's evidence block cannot back up. Also only present when nonzero | same |
 
 A real live trace showed this working correctly under genuinely messy
 conditions — two provider timeouts, a low-quality rejection, and a 429 —
@@ -1390,7 +1400,7 @@ research-agent-dmp/
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 190 tests, offline. Organized by module,
+├── tests/                   # 294 tests, offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
@@ -1429,7 +1439,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 232 passed
+python -m pytest tests/ -q    # expect: 294 passed
 ```
 
 **Or install it as a package** (`pyproject.toml`, new) — which is what
@@ -1579,9 +1589,20 @@ This table lists only decisions with code behind them here.
 | D-23/D-28 | Escalation via `interrupt()`; nothing non-idempotent precedes the interrupt | The node re-executes on resume — history is appended in the resume update only |
 | D-24 | Memory decay = rerank by volatility class, never an age filter | One TTL is wrong for both stable and volatile facts. Coverage-matching by goal_id is now namespaced away from this rerank (P2-02) — the two are independent axes |
 | D-29 | `ConfigDict(extra="forbid")` on all state models | Construction-time pollution and worker-return pollution are two failure modes; two layers |
-| D-31 *(proposed, P2-03)* | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script AND memory writes (P2-15). Evidence.task_key for memory items is the one identity-related thing NOT yet fixed this way (still `hash()`-based) |
-| D-32 *(proposed, P2-04)* | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks. This session extended the same principle to the compiler's free-text output (`strip_code_fence`) |
+| D-31 | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script AND memory writes (P2-15). Evidence.task_key for memory items is the one identity-related thing NOT yet fixed this way (still `hash()`-based) |
+| D-32 | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks. This session extended the same principle to the compiler's free-text output (`strip_code_fence`) |
 | D-35 *(Phase 3)* | All Langfuse SDK usage isolated in one package (`langfuse/`); every business module imports only thin, always-safe functions and never sees an SDK/trace/span object | Non-invasive observability must not leak a third-party SDK's shape into business logic, and must be safe to call even when disabled or misconfigured |
+| D-36 | External MCP tool inputs travel to the LLM inside an `<external_data>` fence, treated as data never instructions | Prompt-injection surface from third-party tool output must not be trusted at the same level as system/user turns |
+| D-37 | The repo is an installable artifact (`pyproject.toml`, optional dependency groups mirroring lazy-import code paths) | A core install genuinely omits FastAPI/MCP/Langfuse; `requirements.txt` stays the dev pin-set |
+| D-38 | Retrieval is a LADDER — corpus → reformulated retry → MCP → model’s own knowledge, stopping at the first tier clearing `min_evidence_score` | A corpus that doesn’t contain the subject was reporting a retrieval limitation as an absence of knowledge; the model tier is always last so a real document still wins |
+| D-39 | A tier only counts as "answered" if its evidence shares distinctive terms with the query, not merely a high RRF score | Fixed-k retrieval over a small corpus always returns k results — score alone can never signal "nothing relevant here" |
+| D-40 | Citations are goal ids only (`[g1]`) — never pasted evidence text, never internal scores | Live output was gluing source sentences onto claims with no delimiter and leaking `score=0.60`-style bookkeeping into the report |
+| D-41 | The model-knowledge tier has hard anti-fabrication limits (no invented named entities, confidence reflects the weakest part of a compound claim) | Self-reported confidence alone does not catch confabrication; this reduces but does not eliminate the failure rate, which is why `corpus_recall` stays in telemetry |
+| D-42 | Model recollection never enters durable memory; recalled memory can never re-frame a query | A prior run’s unverified recollection was being stored, then read back indistinguishable from retrieved evidence and silently re-framing an unrelated later query |
+| D-43 | Citation correctness enforced deterministically where possible (`_clean_citations`), and asked of the critic where it can’t be (evidence-support judgment) | Code can detect a pasted sentence or an uncited goal; it cannot judge whether cited evidence actually supports a claim — that needs the critic |
+| D-44 | Topical gate strictness scales with query specificity; E4 redirect routes to `gap_generator`, not straight back to the compiler | A long, specific query matching only its one broad subject word isn’t a topical match; a redirect asking for new evidence can’t be served by recompiling the same evidence block |
+| D-45 | Deterministic citation stripping only removes GLUED pastes (no delimiter before the match), never legitimately-repeated evidence text; prompts carry no concrete worked examples | Stripping every verbatim occurrence deleted whole report sections on in-corpus queries where restating corpus sentences is correct; worked examples in prompts were echoed back as if they were live findings |
+| D-46 | The critic is shown the evidence (`state.evidence`) it’s instructed to verify claims against | Asking it to check citations without showing it the evidence made the check unanswerable — it was failing correct, evidence-backed reports on every off-corpus run |
 | — | Graceful degradation everywhere | First run must succeed on a bare laptop |
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
@@ -1772,19 +1793,37 @@ visible rather than deleted, so the history stays auditable.
 **Still broken, in rough order of consequence**
 
 1. Self-critique can pass a report whose claims appear in no retrieved
-   evidence. Three things have chipped at this and none of them closes it:
-   P2-11 made the judge a different provider than the writer; the compiler
-   prompt now states per-goal evidence coverage explicitly (count, best
-   score, and a `WEAK` flag when the best score sits at or below the
-   single-leg RRF ceiling of 0.5) and forbids filling gaps from model
-   knowledge; and telemetry now reports `grounding_ratio`.
-   **What remains open, precisely:** there is still no programmatic,
-   claim-by-claim check, and `grounding_ratio` measures evidence
-   **presence, not relevance** — a run can report `grounding_ratio: 1.0`
-   while every attached item is semantically irrelevant, which is exactly
-   what happened on a live off-topic query before `MIN_SIMILARITY` was
-   calibrated. The prompt-level rule is still an LLM following an
-   instruction; it helps and it is not a guarantee.
+   evidence. Several things have chipped at this and none of them fully
+   closes it: P2-11 made the judge a different provider than the writer;
+   the compiler prompt states per-goal evidence coverage explicitly
+   (count, best score, and a `WEAK` flag when the best score sits at or
+   below the single-leg RRF ceiling of 0.5); and telemetry reports
+   `grounding_ratio`.
+   **Superseded (D-38/D-40):** the line above used to read "forbids
+   filling gaps from model knowledge" — that GROUNDING RULE was the
+   direct cause of a corpus miss being reported as an absence of
+   knowledge rather than a retrieval limitation, and D-38 replaced it
+   with an ATTRIBUTION RULE: model-tier claims are now permitted, but
+   must be marked as general knowledge, never presented as a retrieved
+   finding. D-43/D-46 also added a check the critic is now explicitly
+   asked to perform — failing any named entity, figure or date absent
+   from every evidence item, with the evidence block finally shown to it
+   (D-46; before that the check was unanswerable by construction) — plus
+   a deterministic pass (D-45) that strips citations glued directly onto
+   evidence text with no delimiter, and drops `[gN]` markers naming a
+   goal with zero evidence.
+   **What remains open, precisely:** none of this is a programmatic,
+   claim-by-claim relevance check. D-43/D-46's critic check is still an
+   LLM judging another LLM's output against evidence — it helps and it
+   is not a guarantee (D-41 says the same of the model tier's own
+   anti-fabrication limits: "reduces but does not eliminate"). And
+   `grounding_ratio` still measures evidence **presence, not
+   relevance** by design — a run can report `grounding_ratio: 1.0` while
+   every attached item is topically irrelevant. D-39's topical gate
+   closes this specific failure mode for `corpus_recall` (a topically
+   irrelevant document can no longer stop the retrieval ladder), but
+   does not touch `grounding_ratio` itself, which stays a coarser,
+   deliberately threshold-independent signal — see the Telemetry table.
    *A report-parsing check was considered and rejected: across four live
    runs the model cited goal ids four different ways and in one run used no
    bracket citations at all, so a regex would have been silent on the least
@@ -1814,8 +1853,8 @@ auditable rather than invisible.
 | Claim in older docs | Reality in code |
 |---|---|
 | README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and each hop tier uses a different timeout** |
-| README / OPERATIONS: "28 tests" | **190** tests collected and passing (grew across Tier 2/3 to 135, then to 157 post-Tier-3, then to **190** with Phase 3's 33 new `test_langfuse.py` tests) |
-| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~100 files in this distribution (Phase 3 added 5 source files + 1 test file, no other new source modules); **190** tests, **0 skipped** |
+| README / OPERATIONS: "28 tests" | **294** tests collected and passing (grew across Tier 2/3 to 135, then 157 post-Tier-3, 190 with Phase 3's 33 `test_langfuse.py` tests, then to **294** across D-38–D-46's retrieval-ladder and citation-repair regression coverage) |
+| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~100 files in this distribution; **294** tests. Skip count is environment-dependent (langfuse extras) — 0 skipped when installed, 5 when not |
 | README legend: with HITL off the checks "log and continue" | True for E1/E4 only; E2/E3 log nothing when HITL is off |
 | OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | True for both stores — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism is wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
 | OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and re-verified end-to-end against real live runs — both a genuine E3 escalation (via the D-16 failed-task path) and a clean convergence at `recall 1.0` with real evidence once the corpus was properly ingested. See The HITL Investigation |
@@ -1892,7 +1931,7 @@ The shape of it, updated with this revision's progress:
      Cost tracking from Settings-configured $/1M rates             ✅ DONE
      propagate_attributes session/environment grouping             ✅ DONE
      Crash-safe end_trace (try/except in cli.py::_run)              ✅ DONE
-     Test suite: 157 → 190
+     Test suite: 157 → 190 → 294
 ```
 
 **Status, updated**: Tiers 1, 2, and 3 are all closed, and a further,
