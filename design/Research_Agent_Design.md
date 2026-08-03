@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Document version | v3.1.2 |
-| Status | v3.1.2 — E3 semantics generalized; §2.1 topology corrected; HITL implemented |
+| Document version | v3.1.3 |
+| Status | v3.1.3 — logging unified onto one instrumentation path (§8); E3 semantics generalized; §2.1 topology corrected; HITL implemented |
 | Date | 17 July 2026 |
 | Framework | LangGraph (StateGraph, Send-based map-reduce, checkpointed, interrupt-capable) |
 
@@ -17,6 +17,7 @@
 | v3.1 | Second external-review disposition (Appendix C): D-27 … D-30 adopted; four corrected diagrams imported |
 | v3.1.1 | §2.1 topology corrected: convergence "compile" branch now drawn to the main compiler (was unroutable); all former dead-end sinks (error/empty compilers, three escalation boxes) reconnected to the mandatory-sink flow via legend connectors, restoring consistency with the termination proof; goals-decision diamond de-duplicated; 3× ModularCompiler legend added. §5 Qdrant pipeline: two junction glyphs corrected. No design changes. |
 | v3.1.2 | **E3 semantics generalized by implementation evidence** (core-build test): "cannot converge" now covers BOTH termination points of D-14 — depth exhaustion (raised at the convergence check) AND task-supply exhaustion (raised by the gap generator when it produces zero tasks below target; the dispatch route honors the trigger). The original E3 guarded only the depth exit, so a run dying via empty backlog below target bypassed escalation entirely. §6.8/E3 and §2.1 annotated. §12: HITL (D-23/D-28) now implemented in the core build. |
+| v3.1.3 | **Logging unified onto one instrumentation path, plus a human-readable narrative view** (core-build addition, no D-number assigned yet — see §8): `tracing.py`'s separate `record_llm()`/`record_retrieval()` recorder (a second call site duplicating what `log_event()` already recorded) was retired; every module now calls `log_event()` exactly once per event, read by two independent presentation layers (machine JSON, unchanged in shape, and a new per-run narrative file). No graph topology, routing behavior, or D-xx decision changed — this is instrumentation/presentation only. |
 
 > **Scope note.** v3.1.2 remains inside the **workflow** pattern (fixed graph topology; the LLM does not choose its own control flow). Tier B dynamic supervisor delegation remains out of scope by design — see the companion dynamic-agent piece.
 
@@ -412,6 +413,25 @@ condition the graph branches on. See `DECISIONS.md` D-35 and the
 implementation-level record in `internal/PHASE-3_LANG-FUSE-CHANGES.md` for
 the full account (module layout, SDK-version reality check, instrumentation
 coverage, cost calculation, and the known flat-span-tree limitation).
+
+**Core-build addition, logging (no D-number assigned yet):** the counters
+above and the Langfuse layer are both fed by `log_event()`, now the ONLY
+function any module calls to record anything — `tracing.py`'s Tracer
+previously had its own `record_llm()`/`record_retrieval()` methods, called
+SEPARATELY from (and duplicating) the `log_event()` call already describing
+the same event. That second path is retired; `Tracer` is now only the
+on/off switch and flush trigger for a second presentation layer
+(`logging_setup.py::NarrativeFormatter`), which renders the SAME event
+stream `JsonLineFormatter` sees as a human-readable execution story — one
+file per run (`logs/run-<run_id>.txt`, written only when `--debug`/
+`DEBUG_TRACE=true`), with a graph-construction summary, an execution-plan
+preview, per-node `INPUT`/`DECISION`/`NEXT` sections, parallel search tasks
+serialized into one block per task (correlated via each event's own `task`
+field, or query-string matching where the retrieval layer has no task
+concept at all), sectioned telemetry, and a final request summary with
+elapsed-time markers. This is presentation only — no graph topology,
+routing behavior, or D-xx decision changed; see `logging_setup.py`'s own
+module docstring for the full design rationale.
 
 ---
 

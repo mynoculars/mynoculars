@@ -1060,12 +1060,16 @@ you want a preview to tell you about.
 
 ## Debugging a live run
 
-Two independent output streams, both behind `--debug` (or `DEBUG_TRACE=true`):
+Two independent presentation layers, both fed by the SAME `log_event()`
+call at every site — not two separate recorders (see
+`logging_setup.py`'s own module docstring for the full "one
+instrumentation path" design) — both behind `--debug` (or
+`DEBUG_TRACE=true`):
 
 | Output | Where | What it answers |
 |---|---|---|
-| `"node.enter"` JSON lines | **stderr** — visible in a normal terminal by default | "What ran, in what order?" Includes `merger` and `progress_checker`, which touch neither an LLM nor a store and so never appear in the trace file below |
-| Exact prompt/response/hit detail | `logs/trace-<run_id>.txt` **only** — never printed to console, by design | "What exactly did a specific LLM call or retrieval call see and return?" |
+| JSON lines | **stderr** — visible in a normal terminal by default | "What ran, in what order?" Machine-parseable, unchanged in shape whether `--debug` is on or not. |
+| Human-readable execution narrative | `logs/run-<run_id>.txt` **only** — never printed to console, written once at the end of the run | The same event stream, rendered as a story: graph construction, an execution-plan preview, one section per node (`INPUT`/`DECISION`/`NEXT`), parallel search tasks serialized into one block per task, sectioned telemetry, and a final request summary with elapsed-time markers. |
 
 ```bash
 # one run, both streams captured separately
@@ -1082,7 +1086,8 @@ python -m research_agent.cli --print-graph
 This is also how to calibrate `min_evidence_score`/`min_similarity` for your
 own corpus rather than trusting the defaults blindly — run one on-topic and
 one off-topic query with `--debug`, and compare the `similarity` values that
-show up for each.
+show up for each (either in `run.log`'s JSON lines, or the corresponding
+`SEARCH TASK`/`SEARCH RESULTS` block in `logs/run-<run_id>.txt`).
 
 ## The HITL Investigation
 
@@ -1320,19 +1325,21 @@ rename, not a residual bug. If you need "how many nodes touched an LLM at
 all" that's still the right field; if you need real provider traffic or
 spend, use `llm_provider_calls`.
 
-**The trace is still the honest view for exact prompt/response detail, but
-it's not the only signal for volume.** `--debug` (or `DEBUG_TRACE=true`)
-records every LLM call and every retrieval call at the boundary it actually
-crosses, to `logs/trace-<run_id>.txt` — and also emits a `"node.enter"` line
-to stderr for every node, including `merger` and `progress_checker`, which
-touch neither an LLM nor a store and so still never appear in the trace file
-itself. See [Debugging a live run](#debugging-a-live-run) for exactly how to
-use both together. In one traced run, this combination revealed something
-telemetry alone never would: **OpenSearch never appeared at all**, because
-the keyword leg was down — the "hybrid" retriever was running single-legged,
-and nothing in the report or the (then node-scoped-only) telemetry said so.
-`retrieval_leg_unavailable` now surfaces that same fact directly in the
-telemetry block itself, without needing the trace.
+**The narrative log is still the honest view for exact prompt/response
+detail, but it's not the only signal for volume.** `--debug` (or
+`DEBUG_TRACE=true`) records every LLM call and every retrieval call at the
+boundary it actually crosses, to `logs/run-<run_id>.txt` — and every node
+now gets its own section there too, including `merger` and
+`progress_checker`, which touch neither an LLM nor a store but still get a
+plain `NODE:` heading with timing, not just a `"node.enter"` line to
+stderr. See [Debugging a live run](#debugging-a-live-run) for exactly how
+to use both together. In one traced run, this combination revealed
+something telemetry alone never would: **OpenSearch never appeared at
+all**, because the keyword leg was down — the "hybrid" retriever was
+running single-legged, and nothing in the report or the (then
+node-scoped-only) telemetry said so. `retrieval_leg_unavailable` now
+surfaces that same fact directly in the telemetry block itself, without
+needing the narrative log.
 
 ## Design
 

@@ -898,7 +898,7 @@ python -m research_agent.cli "your question" --debug --thread-id demo1
 | Stream | Where it goes | What it answers |
 |---|---|---|
 | `"node.enter"` + other JSON log lines | **stderr** — visible on screen by default | "What ran, in what order, and what happened at each step?" |
-| Exact prompt / raw response / retrieval hits | `logs\trace-<run_id>.txt` **only** — never printed to the console | "What exactly did one specific LLM call or retrieval call see and return?" |
+| Human-readable execution narrative | `logs\run-<run_id>.txt` **only** — never printed to the console | The full story of the run: graph construction, an execution-plan preview, one section per node (`INPUT`/`DECISION`/`NEXT`), parallel search tasks grouped one-block-per-task, sectioned telemetry, and a final request summary — including the exact prompt/response/hit detail that used to be all this file contained. |
 
 **Capture both streams separately, so you can search each on its own:**
 
@@ -909,16 +909,16 @@ python -m research_agent.cli "your question" --debug --thread-id demo1 `
 
 That splits into: `report.txt` (the final report + telemetry — what you'd
 normally see on screen), `run.log` (every structured log line, including
-`node.enter`), and `logs\trace-demo1.txt` (the deep detail, written once at
+`node.enter`), and `logs\run-demo1.txt` (the narrative, written once at
 the very end of the run — see **Understanding the Debug Logs** below for what
 to actually look for in each).
 
 **One correction worth internalizing up front:** setting `DEBUG_TRACE=true`
 does **not** print prompts and raw responses to your screen. That detail only
-ever goes into the trace file. What *does* print live to your screen (via
+ever goes into the narrative file. What *does* print live to your screen (via
 stderr) is the shorter JSON breadcrumb trail — provider names, node names,
 fallback decisions, timings. If you want the full prompt/response detail,
-open the trace file; it is never going to appear in your terminal directly.
+open the narrative file; it is never going to appear in your terminal directly.
 
 ---
 
@@ -1077,7 +1077,7 @@ including those two.
 **See exactly what one node's LLM call sent and received:**
 
 ```powershell
-Get-Content logs\trace-debug-run-1.txt
+Get-Content logs\run-debug-run-1.txt
 ```
 
 Search that file for the node name you care about (e.g. `node=goal_manager`)
@@ -1088,8 +1088,10 @@ to jump straight to its prompt and raw response.
 1. `Select-String '"msg": "node.enter"' run.log` — confirm the run reached
    the node you're investigating at all, and see what ran immediately before
    and after it.
-2. If that node calls an LLM or a store, open `logs\trace-<run_id>.txt` and
-   find its entry — see the exact prompt it sent and what came back.
+2. If that node calls an LLM or a store, open `logs\run-<run_id>.txt` and
+   find its entry — see the exact prompt it sent and what came back, now
+   inside that node's own `NODE:` section (with `INPUT`/`DECISION`/`NEXT`)
+   rather than a flat, separately-numbered entry.
 3. `Select-String '"msg": "llm.fallback"' run.log` — see whether the primary
    model failed for that call, and why (`ReadTimeout`, `JSONDecodeError`,
    etc. appear directly in the `reason` field).
@@ -1126,11 +1128,11 @@ what a *healthy* line looks like for each node, and what to actually check.
 | `human_escalation` | only with `HITL_ENABLED=true` and a trigger fired; **fires twice** on one escalation (once pausing, once resuming) — expected, not a duplicate | one `escalation_history` entry recorded despite the two log lines, now also visible in the final `telemetry["escalations"]` |
 
 **One thing to expect, not investigate, if you inspect a raw prompt in the
-trace file:** every prompt that inlines retrieved content wraps it in
+narrative file:** every prompt that inlines retrieved content wraps it in
 `<evidence>...</evidence>` tags, with a system-prompt clause telling the
 model that span is untrusted data, never instructions. This is deliberate
 prompt-injection fencing, not a formatting bug — if you see literal
-`<evidence>` tags around corpus/MCP text in `logs\trace-<run_id>.txt`,
+`<evidence>` tags around corpus/MCP text in `logs\run-<run_id>.txt`,
 that's the defense working as intended.
 
 **This used to be the single biggest gotcha in the telemetry block; as of
@@ -1179,7 +1181,7 @@ the one that matters most. The method is two queries and a comparison.
 
 ```powershell
 python -m research_agent.cli "Compare Redis and Memcached for session caching" --debug --thread-id sig-01
-findstr /C:"similarity" logs\trace-sig-01.txt
+findstr /C:"similarity" logs\run-sig-01.txt
 ```
 
 **Step 2 — a query your corpus cannot possibly answer.** This is your NOISE.
@@ -1188,7 +1190,7 @@ returns is by definition irrelevant.
 
 ```powershell
 python -m research_agent.cli "Compare Indian and Chinese army on battlefield" --debug --thread-id noise-01
-findstr /C:"similarity" logs\trace-noise-01.txt
+findstr /C:"similarity" logs\run-noise-01.txt
 ```
 
 **Step 3 — compare the two populations.**
@@ -1198,8 +1200,8 @@ function Get-Sims($path) {
   (Select-String -Path $path -Pattern '"similarity":\s*([0-9.]+)' -AllMatches).Matches |
     ForEach-Object { [double]$_.Groups[1].Value }
 }
-"SIGNAL:"; Get-Sims logs\trace-sig-01.txt   | Measure-Object -Minimum -Maximum -Average
-"NOISE :"; Get-Sims logs\trace-noise-01.txt | Measure-Object -Minimum -Maximum -Average
+"SIGNAL:"; Get-Sims logs\run-sig-01.txt   | Measure-Object -Minimum -Maximum -Average
+"NOISE :"; Get-Sims logs\run-noise-01.txt | Measure-Object -Minimum -Maximum -Average
 ```
 
 **Step 4 — set the floor between them.** Run against this repo's own
@@ -1343,8 +1345,8 @@ python -m research_agent.cli "<a query your corpus answers>" --debug --thread-id
 # 1. Measure. Two populations, as above.
 python -m research_agent.cli "<on-topic>"  --debug --thread-id tune-sig
 python -m research_agent.cli "<off-topic>" --debug --thread-id tune-noise
-findstr /C:"similarity" logs\trace-tune-sig.txt
-findstr /C:"similarity" logs\trace-tune-noise.txt
+findstr /C:"similarity" logs\run-tune-sig.txt
+findstr /C:"similarity" logs\run-tune-noise.txt
 
 # 2. Set MIN_SIMILARITY between the populations, closer to the noise side.
 

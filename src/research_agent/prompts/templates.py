@@ -140,10 +140,24 @@ def classify(query: str) -> List[Message]:
     RETURNS     a 2-message transcript: the shared system message, then a
                 user message containing the query and the exact JSON
                 schema the model must reply with.
+
+    The ten labels below are a fixed, closed set by convention only —
+    `state.classification` (state.py) types this as `Dict[str, Any]`, not
+    an enum, and the ONLY consumer of `intent` downstream
+    (agents/planning.py::goal_manager_node, via
+    templates.compose_goals) uses it purely as prose context for goal
+    composition — nothing in this codebase branches control flow or
+    picks a retrieval strategy based on which label comes back. Widening
+    this list (from the original five: Comparison, Survey, Explanation,
+    Diagnosis, Recommendation) is therefore a prompt-only change with no
+    schema or routing impact; a future retrieval-strategy-per-intent
+    feature would be a separate, larger change, not implied by this list
+    existing.
     """
     return [_SYSTEM, {"role": "user", "content":
             f"TASK=classify\nClassify the research intent of this query as one of: "
-            f"Comparison, Survey, Explanation, Diagnosis, Recommendation.\n"
+            f"Comparison, Survey, Explanation, Recommendation, Diagnosis, "
+            f"Troubleshooting, Fact Lookup, Decision Support, Planning, Evaluation.\n"
             f'Query: "{query}"\n'
             'JSON schema: {"intent": "<label>", "confidence": <0..1>}'}]
 
