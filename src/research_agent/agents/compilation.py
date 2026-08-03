@@ -20,6 +20,7 @@ Responsibilities:
 """
 
 import logging
+import re
 from collections import Counter
 from typing import Any, Dict
 
@@ -110,6 +111,16 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # enforced without reading meaning.
         report, citation_counters = _clean_citations(
             report, state.goals, state.evidence)
+        # New: compiler previously had no summary event of its own — only
+        # the raw "llm.call" line, which says nothing about the REPORT
+        # itself. sections/evidence_cited/output_chars are all cheap,
+        # already-computable facts about the report this node just
+        # produced; logging_setup.py::NarrativeFormatter renders this as
+        # this span's DECISION line (see _decision_text).
+        sections = len(re.findall(r"(?m)^#{1,6} ", report))
+        evidence_cited = len({g.group(1) for g in re.finditer(r"\[g(\d+)\]", report)})
+        log_event(logger, "node.compiled", sections=sections,
+                  evidence_cited=evidence_cited, output_chars=len(report))
         # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
         # complete() (not complete_json) is the only free-text path, so this
         # is the one node whose drained counters can include

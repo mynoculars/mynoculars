@@ -61,6 +61,24 @@ from research_agent.logging_setup import log_event
 logger = logging.getLogger(__name__)
 
 
+def _retrieval_trace_fields(tracer: Any, hits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The full-hits field a "retrieval.raw" log_event attaches ONLY when a
+    real Tracer is enabled — mirrors llm/client.py's trace_fields pattern
+    (see its docstring for the "one instrumentation call, not two" design
+    this replaces tracer.record_retrieval() with). Strips vector/embedding
+    payload keys, same as the old tracer.record_retrieval() did, so a raw
+    embedding never bloats a narrative file.
+
+    CALLED BY   both QdrantStore.search methods below, at their single
+                "retrieval.raw" log_event call site.
+    """
+    if tracer is None or not getattr(tracer, "enabled", False):
+        return {}
+    slim = [{k: v for k, v in h.items() if k not in ("vector", "embedding")}
+            for h in hits]
+    return {"hits": slim}
+
+
 def content_id(content: str) -> str:
     """Deterministic Qdrant point id derived from raw text content.
 
@@ -372,8 +390,8 @@ class QdrantStore:
             payload["similarity"] = float(h.score)
             payload["age_days"] = (now - float(payload.get("created_at", now))) / 86400.0
             out.append(payload)
-        if self._tracer is not None:
-            self._tracer.record_retrieval(self._label, query, out)
+        log_event(logger, "retrieval.raw", source=self._label, query=query,
+                  hit_count=len(out), **_retrieval_trace_fields(self._tracer, out))
         return out
 
     def search_with_decay(self, query: str, top_k: int, decay_field: str,
@@ -490,8 +508,8 @@ class QdrantStore:
             payload["similarity"] = float(h.score)
             payload["age_days"] = (now - float(payload.get("created_at", now))) / 86400.0
             out.append(payload)
-        if self._tracer is not None:
-            self._tracer.record_retrieval(self._label, query, out)
+        log_event(logger, "retrieval.raw", source=self._label, query=query,
+                  hit_count=len(out), **_retrieval_trace_fields(self._tracer, out))
         return out
 
     def scroll_all(self, batch_size: int = 256) -> List[Dict[str, Any]]:

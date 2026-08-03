@@ -463,10 +463,22 @@ class OpenAICompatibleClient:
             log_event(logger, "llm.truncated_runaway_generation", level=logging.WARNING,
                       provider=self.name, node=self._trace_node,
                       raw_chars=len(raw_text), kept_chars=len(text))
+        # ONE instrumentation call for this LLM call, not two: prompt_messages/
+        # response used to go to a SEPARATE recorder (self._tracer.record_llm,
+        # below this comment until this change) with its own file format.
+        # Now they're extra fields on the SAME log_event call the summary
+        # fields already needed — only attached when a real Tracer is
+        # enabled, so a non-debug run's JSON line is byte-identical in shape
+        # to before this existed (JsonLineFormatter drops these two keys
+        # from the JSON view regardless; NarrativeFormatter is what renders
+        # them, only when present). See tracing.py and logging_setup.py's
+        # module docstrings for the full "one instrumentation path" design.
+        trace_fields = ({"prompt_messages": messages, "response": raw_text}
+                        if self._tracer is not None and self._tracer.enabled else {})
         log_event(logger, "llm.call", provider=self.name, model=self._model,
                   label=self._label, node=self._trace_node,
                   latency_s=round(latency, 3),
-                  prompt_tokens=pt, completion_tokens=ct)
+                  prompt_tokens=pt, completion_tokens=ct, **trace_fields)
         # Phase 3: one Langfuse generation per real provider call -- the
         # SAME provider/model/latency/token figures the log line above
         # just recorded, so this can never drift from what's already
@@ -484,9 +496,6 @@ class OpenAICompatibleClient:
             start_time=wall_start, end_time=wall_start + latency,
             metadata=meta,
         )
-        if self._tracer is not None:
-            self._tracer.record_llm(self._label, self._trace_node, messages,
-                                    raw_text, pt, ct, latency)
         return text
 
     def complete_json(self, messages: List[Message], temperature: float = 0.0) -> Dict[str, Any]:
@@ -596,9 +605,20 @@ class StubClient:
             answer = ("# Research Report (stub mode)\n\n"
                       "This deterministic report proves the full graph executed "
                       "offline. Switch LLM_MODE=live for real model output.")
-        if self._tracer is not None:
-            self._tracer.record_llm("STUB (offline)", self._trace_node,
-                                    messages, answer, None, None, 0.0)
+        # Stub mode previously had NO log_event("llm.call", ...) at all —
+        # only the now-removed self._tracer.record_llm(...) captured
+        # anything about a stub call, and only when tracing was on. That
+        # meant stub runs produced zero JSON telemetry for LLM calls, a gap
+        # this single-call-site design closes as a direct consequence of
+        # having exactly one instrumentation path (see tracing.py's module
+        # docstring): every ChatClient implementation now emits the same
+        # "llm.call" event, live or stub.
+        trace_fields = ({"prompt_messages": messages, "response": answer}
+                        if self._tracer is not None and self._tracer.enabled else {})
+        log_event(logger, "llm.call", provider=self.name, model="stub",
+                  label="STUB (offline)", node=self._trace_node,
+                  latency_s=0.0, prompt_tokens=None, completion_tokens=None,
+                  **trace_fields)
         return answer
 
     def complete_json(self, messages: List[Message], temperature: float = 0.0) -> Dict[str, Any]:

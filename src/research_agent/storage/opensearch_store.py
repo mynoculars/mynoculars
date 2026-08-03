@@ -34,7 +34,7 @@ import logging
 from typing import Any, Dict, List
 
 from research_agent.logging_setup import log_event
-from research_agent.storage.qdrant_store import content_id
+from research_agent.storage.qdrant_store import _retrieval_trace_fields, content_id
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,6 @@ class OpenSearchStore:
             doc = dict(hit["_source"])
             doc["bm25_score"] = float(hit["_score"])
             out.append(doc)
-        if self._tracer is not None:
-            self._tracer.record_retrieval(self._label, query, out)
+        log_event(logger, "retrieval.raw", source=self._label, query=query,
+                  hit_count=len(out), **_retrieval_trace_fields(self._tracer, out))
         return out

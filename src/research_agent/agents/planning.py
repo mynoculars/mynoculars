@@ -104,7 +104,12 @@ def build_classify_node(router: FallbackRouter, debug: bool = False) -> NodeFn:
         consumed later.
         """
         if debug:
-            log_event(logger, "node.enter", node="classify")
+            # query= only reaches this line when debug is True (narrative
+            # capture on) — never attached to any unconditional log_event
+            # call, so the raw query text is never in the always-on JSON
+            # log, only in the opt-in narrative file (logging_setup.py's
+            # NarrativeFormatter uses it for classify's INPUT section).
+            log_event(logger, "node.enter", node="classify", query=state.raw_query)
         router.set_node("classify")
         result = router.complete_json(templates.classify(state.raw_query))
         log_event(logger, "node.classify", intent=result.get("intent"))

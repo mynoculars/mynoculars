@@ -178,6 +178,17 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
             short = _reformulate(task.query)
             if short and short.lower() != task.query.lower():
                 retry_task = task.model_copy(update={"query": short})
+                # Logged BEFORE the attempt, unconditionally — not only on
+                # success (see chain.answered below). The retrieval itself
+                # always happens here regardless of whether it later turns
+                # out sufficient; without this line, an insufficient
+                # reformulated attempt's retrieval.raw/retrieval.hybrid
+                # events (query=short) have no event anywhere logging that
+                # exact query string, so the narrative log's per-task
+                # grouping (logging_setup.py::NarrativeFormatter.
+                # _render_fanout) can't correlate them back to this task.
+                log_event(logger, "chain.attempt", tier="corpus_reformulated",
+                          task=task.key, query=short)
                 found = _try("corpus_reformulated", corpus, retry_task)
                 # Re-tag onto the ORIGINAL task key so dedup, coverage and
                 # the D-16 failure ledger all still see one task.

@@ -79,6 +79,7 @@ Python mechanics used in this file, if any of this is new to you:
 """
 
 from typing import Any, List, Literal, Optional, Union
+import logging
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
@@ -94,8 +95,11 @@ from research_agent.agents.planning import (build_classify_node, build_goal_mana
 from research_agent import langfuse as lf
 from research_agent.config import Settings
 from research_agent.llm.router import FallbackRouter
+from research_agent.logging_setup import log_event
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.state import ResearchState, WorkerPayload
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Routing functions (pure — they READ state, they never write it)
@@ -125,11 +129,18 @@ def route_after_goals(state: ResearchState
             otherwise "task_expander" — the normal, everyday path.
     """
     if state.escalation_trigger == "E1":
-        return "human_escalation"
-    return "compiler" if state.planning_error else "task_expander"
+        to_node, reason = "human_escalation", "E1 escalation trigger fired (zero goals, HITL on)"
+    elif state.planning_error:
+        to_node, reason = "compiler", "goal composition produced zero goals (no escalation)"
+    else:
+        to_node, reason = "task_expander", "goals present"
+    log_event(logger, "route.decision", from_node="goal_manager", to_node=to_node,
+              reason=reason, escalation_trigger=state.escalation_trigger,
+              goal_count=len(state.goals))
+    return to_node
 
 
-def dispatch_tasks(state: ResearchState, hint_to_node: dict
+def dispatch_tasks(state: ResearchState, hint_to_node: dict, from_node: str = "task_expander"
                    ) -> Union[List[Send], Literal["compiler", "human_escalation"]]:
     """Wired to TWO different conditional edges below — after
     task_expander (the first pass) and after gap_generator (every later
@@ -139,11 +150,15 @@ def dispatch_tasks(state: ResearchState, hint_to_node: dict
     READS   state.escalation_trigger, state.pending_tasks, each task's own
             .tool_hint (P2-14, D-25).
     CALLED  via a lambda in build_graph, below (`lambda s: dispatch_tasks(s,
-            hint_to_node)`) — same "pre-fill an extra argument LangGraph
-            itself never passes" pattern route_convergence's own call site
-            already uses, needed here because hint_to_node is a per-BUILD
-            value (which specialist nodes THIS graph actually has), not
-            something LangGraph could know to supply itself.
+            hint_to_node, from_node="task_expander")` /
+            `..., from_node="gap_generator")`) — same "pre-fill an extra
+            argument LangGraph itself never passes" pattern route_convergence's
+            own call site already uses. from_node exists ONLY so the
+            route.decision log line below can say which of the two call
+            sites fired (see logging_setup.py's NarrativeFormatter — a
+            "why did we go to search_worker" question should never need
+            the reader to check which edge led here); it plays no role in
+            the actual dispatch decision.
     RETURNS "human_escalation" if gap_generator just raised E2/E3 (it ran
             out of new tasks to try — see agents/gathering.py); otherwise
             "compiler" if the backlog is empty (D-1 — a graph with nothing
@@ -166,6 +181,15 @@ def dispatch_tasks(state: ResearchState, hint_to_node: dict
     Producers already capped/ranked the backlog (D-13), so dispatch is
     always total — no truncation decisions happen here by design.
     """
+    if state.escalation_trigger in ("E2", "E3"):
+        to_node, reason = "human_escalation", f"{state.escalation_trigger} raised (task supply exhausted)"
+    elif not state.pending_tasks:
+        to_node, reason = "compiler", "empty backlog (D-1)"
+    else:
+        to_node, reason = "search_worker (parallel)", f"{len(state.pending_tasks)} task(s) to dispatch"
+    log_event(logger, "route.decision", from_node=from_node, to_node=to_node,
+              reason=reason, escalation_trigger=state.escalation_trigger,
+              pending_tasks=len(state.pending_tasks))
     if state.escalation_trigger in ("E2", "E3"):
         return "human_escalation"  # gap generator exhausted its supply (D-23)
     if not state.pending_tasks:
@@ -193,12 +217,18 @@ def route_convergence(state: ResearchState, settings: Settings
     at dispatch time, on fresh data. Two termination points, two truths.
     """
     if state.escalation_trigger in ("E2", "E3"):
-        return "human_escalation"  # D-23; checker set the trigger
-    if state.recall_score >= settings.recall_target:
-        return "compiler"
-    if state.iteration_depth >= settings.max_depth:
-        return "compiler"
-    return "gap_generator"
+        to_node, reason = "human_escalation", f"{state.escalation_trigger} raised by progress_checker"
+    elif state.recall_score >= settings.recall_target:
+        to_node, reason = "compiler", f"recall {state.recall_score:.2f} reached target {settings.recall_target:.2f}"
+    elif state.iteration_depth >= settings.max_depth:
+        to_node, reason = "compiler", f"depth {state.iteration_depth}/{settings.max_depth} budget spent, recall {state.recall_score:.2f} still below target"
+    else:
+        to_node, reason = "gap_generator", f"recall {state.recall_score:.2f} below target {settings.recall_target:.2f}, depth {state.iteration_depth}/{settings.max_depth} remains"
+    log_event(logger, "route.decision", from_node="progress_checker", to_node=to_node,
+              reason=reason, escalation_trigger=state.escalation_trigger,
+              recall=round(state.recall_score, 3), depth=state.iteration_depth,
+              max_depth=settings.max_depth, recall_target=settings.recall_target)
+    return to_node
 
 
 def route_after_critique(state: ResearchState, settings: Settings
@@ -219,12 +249,18 @@ def route_after_critique(state: ResearchState, settings: Settings
             bar is never fed into long-term memory (D-24).
     """
     if state.escalation_trigger == "E4":
-        return "human_escalation"  # D-23; critic set the trigger
-    if state.critique_passed:
-        return "memory_writer"
-    if state.revision_count < settings.max_revisions:
-        return "compiler"
-    return "telemetry"
+        to_node, reason = "human_escalation", "E4 raised by critic"
+    elif state.critique_passed:
+        to_node, reason = "memory_writer", "critique passed"
+    elif state.revision_count < settings.max_revisions:
+        to_node, reason = "compiler", f"critique failed, revision {state.revision_count}/{settings.max_revisions} budget remains"
+    else:
+        to_node, reason = "telemetry", f"critique failed, revision budget {settings.max_revisions} exhausted (report NOT sent to memory_writer, D-24)"
+    log_event(logger, "route.decision", from_node="critic", to_node=to_node,
+              reason=reason, escalation_trigger=state.escalation_trigger,
+              critique_passed=state.critique_passed, revision_count=state.revision_count,
+              max_revisions=settings.max_revisions)
+    return to_node
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +322,7 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     # state.py), which reducer function to use if two parallel nodes both
     # write the same field in one superstep.
     g = StateGraph(ResearchState)
+    log_event(logger, "graph.state_created", state_model="ResearchState")
 
     # Each line below registers one node under a string name. The object
     # passed in (e.g. build_classify_node(router)) is the ACTUAL function
@@ -303,41 +340,69 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     def _tn(name, fn):
         return lf.traced_node(lf.get_observer, name, fn)
 
-    g.add_node("classify", _tn("classify", build_classify_node(router, debug)))
-    g.add_node("memory_retrieve", _tn("memory_retrieve", build_memory_retrieve_node(memory, debug)))
-    g.add_node("goal_manager", _tn("goal_manager", build_goal_manager_node(router, settings, debug)))
-    g.add_node("task_expander", _tn("task_expander", build_task_expander_node(router, settings, debug)))
-    g.add_node("search_worker", _tn("search_worker", build_search_worker(tool, debug)))
+    # Three tiny wrappers around g.add_node/g.add_edge/g.add_conditional_edges
+    # — this is the fix for the biggest gap the logging design identified:
+    # build_graph() previously had ZERO log_event calls of its own, so
+    # nothing ever recorded which nodes/edges a given build actually wired
+    # (13 vs 14 nodes depending on mcp_tool, worker_destinations varying the
+    # same way). One log_event call per registration, here, covers every
+    # g.add_node/g.add_edge/g.add_conditional_edges call below without
+    # repeating a log_event call at each of the ~20 individual call sites.
+    node_count = 0
+    edge_count = 0
+    conditional_count = 0
+
+    def _add_node(name, fn):
+        nonlocal node_count
+        g.add_node(name, _tn(name, fn))
+        node_count += 1
+        log_event(logger, "graph.node_registered", node=name)
+
+    def _edge(from_node, to_node):
+        nonlocal edge_count
+        g.add_edge(from_node, to_node)
+        edge_count += 1
+        log_event(logger, "graph.edge_registered", edge_type="fixed",
+                  from_node=str(from_node), to_node=str(to_node))
+
+    def _cedge(from_node, router_name, fn, destinations):
+        nonlocal edge_count, conditional_count
+        g.add_conditional_edges(from_node, fn, destinations)
+        edge_count += 1
+        conditional_count += 1
+        log_event(logger, "graph.edge_registered", edge_type="conditional",
+                  from_node=from_node, router=router_name, destinations=destinations)
+
+    _add_node("classify", build_classify_node(router, debug))
+    _add_node("memory_retrieve", build_memory_retrieve_node(memory, debug))
+    _add_node("goal_manager", build_goal_manager_node(router, settings, debug))
+    _add_node("task_expander", build_task_expander_node(router, settings, debug))
+    _add_node("search_worker", build_search_worker(tool, debug))
     # P2-14 (D-25): the ONE additional specialist this build can wire in,
     # registered ONLY when cli.py actually built one (mcp_tool is not
     # None) -- build_search_worker is already fully tool-agnostic (see
     # its own docstring), so this is just a second call to the SAME
     # function with a DIFFERENT tool closure, not new worker logic.
     if mcp_tool is not None:
-        g.add_node("mcp_search_worker", _tn("mcp_search_worker", build_search_worker(mcp_tool, debug)))
-    g.add_node("merger", _tn("merger", build_merger_node(router, settings, debug)))  # P2-12
-    g.add_node("progress_checker", _tn("progress_checker", build_progress_checker_node(settings, debug)))
-    g.add_node("gap_generator", _tn("gap_generator", build_gap_generator_node(router, settings, debug)))
-    g.add_node("compiler", _tn("compiler", build_compiler_node(router, debug)))
-    g.add_node("critic", _tn("critic", build_critic_node(router, settings, debug)))
-    g.add_node("memory_writer", _tn("memory_writer", build_memory_writer_node(memory, settings, debug)))
-    g.add_node("telemetry", _tn("telemetry", build_telemetry_node(debug)))
+        _add_node("mcp_search_worker", build_search_worker(mcp_tool, debug))
+    _add_node("merger", build_merger_node(router, settings, debug))  # P2-12
+    _add_node("progress_checker", build_progress_checker_node(settings, debug))
+    _add_node("gap_generator", build_gap_generator_node(router, settings, debug))
+    _add_node("compiler", build_compiler_node(router, debug))
+    _add_node("critic", build_critic_node(router, settings, debug))
+    _add_node("memory_writer", build_memory_writer_node(memory, settings, debug))
+    _add_node("telemetry", build_telemetry_node(debug))
     # D-23/D-28: single parametrized escalation node. It returns Command
     # (goto inferred from its type hint), so no static edges are added.
-    g.add_node("human_escalation", _tn("human_escalation", build_escalation_node(settings, debug)))
+    _add_node("human_escalation", build_escalation_node(settings, debug))
 
-    # g.add_edge(from_node, to_node) wires a FIXED, unconditional edge:
-    # whenever `from_node` finishes, always run `to_node` next, no decision
-    # involved. Contrast with g.add_conditional_edges further down, which
-    # is used wherever the diagram in the module docstring shows a fork.
-    g.add_edge(START, "classify")
-    g.add_edge("classify", "memory_retrieve")
-    g.add_edge("memory_retrieve", "goal_manager")
-    # See the module docstring for exactly what add_conditional_edges does:
-    # after "goal_manager" runs, call route_after_goals(state) and go to
-    # whichever of the three listed node names it returns.
-    g.add_conditional_edges("goal_manager", route_after_goals,
-                            ["task_expander", "compiler", "human_escalation"])
+    # _edge/_cedge wire the SAME topology the module docstring's ASCII
+    # diagram describes — see it for what a fixed vs conditional edge means.
+    _edge(START, "classify")
+    _edge("classify", "memory_retrieve")
+    _edge("memory_retrieve", "goal_manager")
+    _cedge("goal_manager", "route_after_goals", route_after_goals,
+          ["task_expander", "compiler", "human_escalation"])
     # P2-14 (D-25): hint_to_node and worker_destinations are both built
     # HERE, once, from whatever specialists this particular build_graph
     # call actually registered above -- never a fixed, hardcoded set.
@@ -345,40 +410,47 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     # with settings.mcp_enabled off), both are exactly what they always
     # were: hint_to_node={} and worker_destinations lists only
     # "search_worker" -- so dispatch_tasks and these two
-    # add_conditional_edges calls are BYTE-IDENTICAL in behavior to
-    # before P2-14 existed in that case.
+    # _cedge calls are BYTE-IDENTICAL in behavior to before P2-14 existed
+    # in that case.
     hint_to_node = {"mcp": "mcp_search_worker"} if mcp_tool is not None else {}
     worker_destinations = ["search_worker", "compiler", "human_escalation"]
     if mcp_tool is not None:
         worker_destinations.append("mcp_search_worker")
-    g.add_conditional_edges("task_expander", lambda s: dispatch_tasks(s, hint_to_node),
-                            worker_destinations)
-    g.add_edge("search_worker", "merger")
+    # from_node="task_expander"/"gap_generator" below exists ONLY so
+    # dispatch_tasks's own route.decision log line can say which of its two
+    # call sites fired — see dispatch_tasks's docstring.
+    _cedge("task_expander", "dispatch_tasks(task_expander)",
+          lambda s: dispatch_tasks(s, hint_to_node, from_node="task_expander"),
+          worker_destinations)
+    _edge("search_worker", "merger")
     if mcp_tool is not None:
-        g.add_edge("mcp_search_worker", "merger")
-    g.add_edge("merger", "progress_checker")
+        _edge("mcp_search_worker", "merger")
+    _edge("merger", "progress_checker")
     # route_convergence needs BOTH state and settings, but LangGraph only
     # ever passes ONE argument (state) to a routing function — the lambda
     # here "pre-fills" settings from this build_graph() call's own
     # argument, so LangGraph can call `lambda s: ...` with just `s` and get
     # the full two-argument call it actually needs underneath. See the
     # module docstring's lambda explanation for more detail.
-    g.add_conditional_edges("progress_checker",
-                            lambda s: route_convergence(s, settings),
-                            ["compiler", "gap_generator", "human_escalation"])
-    g.add_conditional_edges("gap_generator", lambda s: dispatch_tasks(s, hint_to_node),
-                            worker_destinations)
-    g.add_edge("compiler", "critic")
-    g.add_conditional_edges("critic",
-                            lambda s: route_after_critique(s, settings),
-                            ["compiler", "memory_writer", "telemetry",
-                             "human_escalation"])
-    g.add_edge("memory_writer", "telemetry")
-    g.add_edge("telemetry", END)
+    _cedge("progress_checker", "route_convergence",
+          lambda s: route_convergence(s, settings),
+          ["compiler", "gap_generator", "human_escalation"])
+    _cedge("gap_generator", "dispatch_tasks(gap_generator)",
+          lambda s: dispatch_tasks(s, hint_to_node, from_node="gap_generator"),
+          worker_destinations)
+    _edge("compiler", "critic")
+    _cedge("critic", "route_after_critique",
+          lambda s: route_after_critique(s, settings),
+          ["compiler", "memory_writer", "telemetry", "human_escalation"])
+    _edge("memory_writer", "telemetry")
+    _edge("telemetry", END)
 
     # g.compile(...) turns the builder (which has just been describing
     # nodes and edges so far) into an actual runnable app. `checkpointer`
     # is what makes state durable across invoke() calls under the same
     # thread_id — without it, a paused (interrupted) run would have
     # nowhere to save its progress and could never be resumed.
-    return g.compile(checkpointer=checkpointer)
+    app = g.compile(checkpointer=checkpointer)
+    log_event(logger, "graph.compiled", nodes=node_count, edges=edge_count,
+              conditional_edges=conditional_count)
+    return app
