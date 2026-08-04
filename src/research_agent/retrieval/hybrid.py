@@ -164,6 +164,18 @@ class HybridRetriever:
         counts[key] = counts.get(key, 0) + 1
         self._counts.data = counts
 
+    def _bump_by(self, key: str, n: int) -> None:
+        """Add an arbitrary amount to a single thread-local retrieval
+        counter (Guardrail G1). Same threading.local() storage as _bump
+        and _bump_retrieval_counts -- a no-op for n=0 so callers don't
+        need to guard the zero case themselves.
+        """
+        if n <= 0:
+            return
+        counts: Dict[str, float] = getattr(self._counts, "data", {})
+        counts[key] = counts.get(key, 0) + n
+        self._counts.data = counts
+
     def _safe_leg(self, leg: Any, name: str, query: str,
                   top_k: int) -> List[Dict[str, Any]]:
         """Call one retrieval leg, converting a MID-RUN failure into [].
@@ -258,6 +270,13 @@ class HybridRetriever:
         if self.min_similarity > 0.0:
             dropped = sum(1 for h in dense_hits
                          if not passes_similarity_floor(h.get("similarity", 0.0), self.min_similarity))
+            # Guardrail G1: count candidates BEFORE filtering (not just
+            # what's dropped) so drain_counts() can report a per-run
+            # DROP RATIO, not just a raw count -- a raw count alone can't
+            # distinguish "3 dropped out of 3" (floor is starving this
+            # run) from "3 dropped out of 300" (floor is doing its job).
+            self._bump_by("retrieval_dense_candidates", len(dense_hits))
+            self._bump_by("retrieval_dropped_by_floor", dropped)
             dense_hits = [h for h in dense_hits
                           if passes_similarity_floor(h.get("similarity", 0.0), self.min_similarity)]
             if dropped:

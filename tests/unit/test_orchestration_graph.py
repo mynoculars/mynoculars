@@ -91,6 +91,28 @@ def test_convergence_expands_otherwise():
     assert route_convergence(_state(recall_score=0.1, iteration_depth=1), _S) == "gap_generator"
 
 
+def test_convergence_g2_reloops_when_recall_met_but_ungrounded():
+    """Guardrail G2: recall alone must not be enough to declare
+    convergence when grounded_score is below settings.grounded_recall_target
+    and depth budget remains -- this is the exact combination run
+    p205.131-check hit (recall=1.0, corpus_recall=0.0)."""
+    state = _state(recall_score=1.0, grounded_score=0.0, iteration_depth=0)
+    assert route_convergence(state, _S) == "gap_generator"
+
+
+def test_convergence_g2_still_compiles_once_depth_is_spent():
+    """Even fully ungrounded, once max_depth is reached there is no
+    budget left to spend chasing grounding further -- falls through to
+    compiler exactly like the ungrounded-recall path always did."""
+    state = _state(recall_score=1.0, grounded_score=0.0, iteration_depth=2)
+    assert route_convergence(state, _S) == "compiler"
+
+
+def test_convergence_g2_compiles_when_recall_and_grounding_both_met():
+    state = _state(recall_score=1.0, grounded_score=1.0, iteration_depth=0)
+    assert route_convergence(state, _S) == "compiler"
+
+
 # ---------------------------------------------------------------------------
 # route_after_critique (D-22)
 # ---------------------------------------------------------------------------

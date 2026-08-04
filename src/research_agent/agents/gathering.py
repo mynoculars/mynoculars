@@ -335,6 +335,7 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         if debug:
             log_event(logger, "node.enter", node="progress_checker")
         goals = []
+        grounded_flags: List[bool] = []  # Guardrail G2 accumulator, see below
         for g in state.goals:
             # Strict `>`, not `>=` — see the docstring above. A score that
             # lands EXACTLY on min_evidence_score is, under single-leg RRF
@@ -346,15 +347,37 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
                 e.goal_id == g.goal_id and passes_evidence_gate(e.score, settings.min_evidence_score)
                 for e in state.evidence)
             covered = has_quality_evidence and not g.contested
+            # Guardrail G2: a SEPARATE verdict from has_quality_evidence
+            # above -- that one asks "is any item strong enough to cover
+            # this goal", this one asks "is at least one of those items a
+            # real document, not the model's own recollection". A goal
+            # can be `covered` (recall counts it) while being ungrounded
+            # (grounded_score does not) -- that gap is exactly what run
+            # p205.131-check's recall=1.0 / corpus_recall=0.0 outcome was.
+            has_grounded_evidence = any(
+                e.goal_id == g.goal_id and e.source in ("corpus", "mcp")
+                and passes_evidence_gate(e.score, settings.min_evidence_score)
+                for e in state.evidence)
+            grounded_covered = covered and has_grounded_evidence
             goals.append(g.model_copy(update={"covered": covered}))
+            # grounded_covered is accumulated here and folded into
+            # grounded_score once ALL goals have been walked -- not
+            # stored on the Goal model itself, to avoid a schema change
+            # for a value only route_convergence (next node) needs in
+            # aggregate.
+            grounded_flags.append(grounded_covered)
 
         recall = (sum(g.covered for g in goals) / len(goals)) if goals else 1.0
+        grounded = (sum(grounded_flags) / len(goals)) if goals else 1.0
         depth = state.iteration_depth + 1  # D-3: exactly one tick per cycle
-        log_event(logger, "node.progress", recall=round(recall, 3), depth=depth)
+        log_event(logger, "node.progress", recall=round(recall, 3),
+                  grounded=round(grounded, 3), depth=depth)
         lf.score(run_id_var.get(), "recall", recall, comment=f"depth={depth}")
         lf.score(run_id_var.get(), "coverage",
                 sum(g.covered for g in goals) / len(goals) if goals else 1.0)
-        update = {"goals": goals, "recall_score": recall, "iteration_depth": depth}
+        lf.score(run_id_var.get(), "grounded", grounded, comment=f"depth={depth}")
+        update = {"goals": goals, "recall_score": recall,
+                  "grounded_score": grounded, "iteration_depth": depth}
         # D-23: at terminal non-convergence the CHECK raises the trigger
         # (E2 if a contradiction blocks a goal, else E3). Routing reads it.
         # P2-09: the non-convergence CONDITION is evaluated regardless of

@@ -219,8 +219,9 @@ def test_corpus_recall_ignores_off_topic_documents():
     to recall was fooled exactly the way the ladder's sufficiency test used
     to be. It must apply the same topical gate (D-39)."""
     from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
 
-    node = build_telemetry_node()
+    node = build_telemetry_node(Settings(_env_file=None))
     state = ResearchState(
         raw_query="Compare Indian and Chinese army on battlefield",
         goals=[Goal(goal_id="g1",
@@ -239,10 +240,69 @@ def test_corpus_recall_ignores_off_topic_documents():
     assert telemetry["model_sourced_items"] == 1
 
 
+def test_telemetry_reports_grounded_score_and_hedge_specific_count():
+    """Guardrail G2/G3 surface in telemetry: grounded_score is whatever
+    progress_checker_node last wrote to state (this node just reads it
+    back, D-12), and hedge_specific_items is counted fresh from
+    state.evidence, same pattern evidence_by_source already uses."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(
+        raw_query="q", goals=[Goal(goal_id="g1", description="d")],
+        evidence=[
+            Evidence(task_key="t1", goal_id="g1", source="model", score=0.6,
+                     content="fabricated", hedge_specific=True),
+            Evidence(task_key="t2", goal_id="g1", source="model", score=0.6,
+                     content="hedged already", hedge_specific=False),
+        ],
+        grounded_score=0.25)
+    telemetry = node(state)["telemetry"]
+    assert telemetry["grounded_score"] == 0.25
+    assert telemetry["hedge_specific_items"] == 1
+
+
+def test_telemetry_warns_on_floor_starvation(caplog):
+    """Guardrail G1: telemetry_node must WARN when the run-level dense
+    candidate drop ratio clears settings.retrieval_floor_warn_ratio --
+    the exact silent-starvation shape run p205.131-check hit."""
+    import logging as _logging
+
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(
+        Settings(_env_file=None, retrieval_floor_warn_ratio=0.8))
+    state = ResearchState(
+        raw_query="q", goals=[],
+        counters={"retrieval_dense_candidates": 10.0,
+                 "retrieval_dropped_by_floor": 10.0})
+    with caplog.at_level(_logging.WARNING):
+        telemetry = node(state)["telemetry"]
+    assert telemetry["retrieval_floor_drop_ratio"] == 1.0
+    assert any("retrieval.floor_starvation" in r.message for r in caplog.records)
+
+
+def test_telemetry_does_not_warn_when_floor_is_doing_its_job():
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(
+        Settings(_env_file=None, retrieval_floor_warn_ratio=0.8))
+    state = ResearchState(
+        raw_query="q", goals=[],
+        counters={"retrieval_dense_candidates": 100.0,
+                 "retrieval_dropped_by_floor": 5.0})
+    telemetry = node(state)["telemetry"]
+    assert telemetry["retrieval_floor_drop_ratio"] == 0.05
+
+
 def test_corpus_recall_counts_a_genuinely_on_topic_document():
     from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
 
-    node = build_telemetry_node()
+    node = build_telemetry_node(Settings(_env_file=None))
     state = ResearchState(
         raw_query="Compare Redis and Memcached",
         goals=[Goal(goal_id="g1", description="Compare Redis throughput")],

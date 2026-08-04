@@ -162,7 +162,30 @@ class Settings(BaseSettings):
     # adds a second, earlier one so an out-of-domain query can actually
     # produce zero evidence rather than three confident wrong answers.
     min_similarity: float = Field(0.35, ge=0.0, le=1.0)
+    # Guardrail G1: fraction of dense-leg candidates dropped by
+    # min_similarity, per run, above which telemetry_node logs a WARNING
+    # (retrieval.floor_starvation). Purely observational -- does not
+    # change routing or filtering -- catches a miscalibrated floor
+    # silently zeroing the dense leg for a whole run (see run
+    # p205.131-check: floor=0.55 dropped every single dense hit and
+    # nothing surfaced it outside the raw debug log).
+    retrieval_floor_warn_ratio: float = Field(0.8, ge=0.0, le=1.0)
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound
+    # Guardrail G2: the OTHER half of convergence, alongside recall_target.
+    # recall_target alone answers "is every goal covered by SOMETHING";
+    # this answers "how much of that coverage is a real document, not the
+    # model's own recollection". route_convergence only accepts recall
+    # reaching target as full convergence when grounded_score also clears
+    # this floor; otherwise it spends remaining depth budget trying for
+    # better grounding first. Live evidence for why this floor exists:
+    # run p205.131-check reached recall=1.0 with corpus_recall=0.0 (every
+    # goal covered by MCP/model, zero by the ingested corpus) and shipped
+    # a report the critic then rejected twice on fabricated figures --
+    # two full compile+critique cycles spent on a failure this check
+    # would have caught BEFORE compiling even started. 0.5 is a starting
+    # point (at least half of covered goals should have a real document
+    # backing them) -- tune against your own corpus like min_evidence_score.
+    grounded_recall_target: float = Field(0.5, ge=0.0, le=1.0)
     # D-38: the retrieval escalation ladder. model_knowledge_enabled is ON
     # by default -- a missing corpus document is a retrieval limitation,
     # not an absence of knowledge, and reporting the former as the latter

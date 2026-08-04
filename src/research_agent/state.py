@@ -257,6 +257,12 @@ class Evidence(BaseModel):
     score: float = 0.0            # relevance; consumed by coverage rule (D-17)
     volatility: Volatility = Volatility.SEMI_STABLE
     contradicts: Optional[str] = None  # task_key of conflicting evidence (D-18)
+    # Guardrail G3: set only by tools/model_knowledge.py, when the claim's
+    # OWN text carries false-precision markers (exact years, percentages,
+    # per-unit figures) the model cannot actually verify. Deterministic
+    # flag, not a judgment call — see model_knowledge.py::_looks_overspecific.
+    # False for every corpus/mcp/memory item; those are never flagged.
+    hedge_specific: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +316,15 @@ class ResearchState(BaseModel):
     # Loop control — the gather loop's clock and its measured progress.
     iteration_depth: int = 0                  # D-3: checker increments
     recall_score: float = 0.0
+    # Guardrail G2: fraction of COVERED goals whose covering evidence
+    # includes at least one corpus/mcp item (not model-only). Written by
+    # progress_checker_node alongside recall_score every cycle; read by
+    # route_convergence so "recall reached target" and "grounded in a
+    # real document" stay two separate truths, the same way D-14 already
+    # keeps recall and depth separate. 1.0 default (not 0.0) so a run
+    # with zero goals — same edge case recall_score already handles —
+    # never looks falsely ungrounded.
+    grounded_score: float = 1.0
 
     # Human-in-the-loop escalation (D-23/D-28)
     escalation_trigger: Optional[str] = None      # E1/E2/E3/E4; set by the

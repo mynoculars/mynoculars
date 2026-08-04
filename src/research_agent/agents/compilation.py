@@ -266,8 +266,15 @@ def build_memory_writer_node(memory: SemanticMemory, settings,
     return memory_writer_node
 
 
-def build_telemetry_node(debug: bool = False):
-    """Build the telemetry aggregator — pure aggregation, no invention."""
+def build_telemetry_node(settings: Settings, debug: bool = False):
+    """Build the telemetry aggregator — pure aggregation, no invention.
+
+    `settings` is new here (Guardrail G1): the only thing it's used for
+    is settings.retrieval_floor_warn_ratio, an observational threshold —
+    nothing else in this node's behaviour changes, and every OTHER
+    figure below is still counted straight from state.counters exactly
+    as D-12 already requires.
+    """
 
     def telemetry_node(state: ResearchState) -> Dict[str, Any]:
         """The mandatory final node — every single path through this graph
@@ -283,6 +290,9 @@ def build_telemetry_node(debug: bool = False):
         WRITES  state.telemetry = {intent, goals, iterations,
                     evidence_items, evidence_by_source,
                     goals_without_evidence, grounding_ratio, recall,
+                    grounded_score, hedge_specific_items,
+                    retrieval_dense_candidates, retrieval_dropped_by_floor,
+                    retrieval_floor_drop_ratio,
                     llm_node_calls, llm_provider_calls, llm_fallback_hops,
                     llm_quality_calls, llm_quality_calls_failed,
                     retrieval_dense_calls, retrieval_keyword_calls,
@@ -408,6 +418,30 @@ def build_telemetry_node(debug: bool = False):
             round((len(goal_ids) - len(goals_without_evidence)) / len(goal_ids), 3)
             if goal_ids else 0.0
         )
+        # Guardrail G1: aggregate, run-level view of retrieval/hybrid.py's
+        # per-query "retrieval.below_floor" log lines. A single dropped
+        # query is normal (that's the floor doing its job); a run where
+        # NEARLY EVERY dense candidate is dropped means min_similarity is
+        # starving the dense leg outright — live evidence (run
+        # p205.131-check) showed floor=0.55 dropping literally 100% of
+        # dense candidates all run, invisible outside raw debug logs.
+        # candidates=0 (no dense leg ever ran, or min_similarity=0.0 so
+        # this counter was never bumped) means "nothing to report", not
+        # "starved" — ratio stays 0.0 rather than a misleading 0/0.
+        retrieval_dense_candidates = int(c.get("retrieval_dense_candidates", 0))
+        retrieval_dropped_by_floor = int(c.get("retrieval_dropped_by_floor", 0))
+        retrieval_floor_drop_ratio = (
+            round(retrieval_dropped_by_floor / retrieval_dense_candidates, 3)
+            if retrieval_dense_candidates else 0.0
+        )
+        if (retrieval_dense_candidates > 0
+                and retrieval_floor_drop_ratio >= settings.retrieval_floor_warn_ratio):
+            log_event(logger, "retrieval.floor_starvation", level=logging.WARNING,
+                      dropped=retrieval_dropped_by_floor,
+                      candidates=retrieval_dense_candidates,
+                      ratio=retrieval_floor_drop_ratio,
+                      floor=settings.min_similarity,
+                      warn_ratio=settings.retrieval_floor_warn_ratio)
         telemetry = {
             "intent": state.classification.get("intent"),
             "goals": len(state.goals),
@@ -431,7 +465,20 @@ def build_telemetry_node(debug: bool = False):
             # is legitimate and attributed in the report, but must never be
             # invisible in telemetry.
             "corpus_recall": corpus_recall,
+            # Guardrail G2. Written by progress_checker_node every gather
+            # cycle (agents/gathering.py); this is just its last value,
+            # same pattern as "recall" above.
+            "grounded_score": round(state.grounded_score, 3),
             "model_sourced_items": int(evidence_by_source.get("model", 0)),
+            # Guardrail G3: model-tier items whose own text paired a
+            # specific year with a specific quantity — flagged, not
+            # dropped (see tools/model_knowledge.py::_looks_overspecific).
+            "hedge_specific_items": sum(
+                1 for e in state.evidence if e.hedge_specific),
+            # Guardrail G1.
+            "retrieval_dense_candidates": retrieval_dense_candidates,
+            "retrieval_dropped_by_floor": retrieval_dropped_by_floor,
+            "retrieval_floor_drop_ratio": retrieval_floor_drop_ratio,
             "llm_node_calls": int(c.get("llm_node_calls", 0)),
             "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
             "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),

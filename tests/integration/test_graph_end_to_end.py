@@ -274,6 +274,7 @@ def test_grounding_ratio_is_computed_from_state_not_from_the_report():
     no evidence -- the graph fixture always covers every goal, so the
     uncovered case has to be constructed."""
     from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
     from research_agent.state import Goal
 
     state = ResearchState(
@@ -283,7 +284,7 @@ def test_grounding_ratio_is_computed_from_state_not_from_the_report():
         evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
                            content="something", score=0.9)],
     )
-    node = build_telemetry_node(debug=False)
+    node = build_telemetry_node(Settings(_env_file=None), debug=False)
     tele = node(state)["telemetry"]
 
     assert tele["goals_without_evidence"] == ["g2"]
@@ -297,8 +298,9 @@ def test_grounding_ratio_is_computed_from_state_not_from_the_report():
 def test_grounding_ratio_survives_a_run_with_no_goals_at_all():
     """A planning failure produces zero goals; 0/0 must not raise."""
     from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
 
     state = ResearchState(raw_query="q", goals=[], evidence=[])
-    tele = build_telemetry_node(debug=False)(state)["telemetry"]
+    tele = build_telemetry_node(Settings(_env_file=None), debug=False)(state)["telemetry"]
     assert tele["grounding_ratio"] == 0.0
     assert tele["goals_without_evidence"] == []

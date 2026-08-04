@@ -53,6 +53,52 @@ def test_hybrid_retriever_counts_unavailable_legs_not_empty_results():
     assert counts["retrieval_leg_unavailable"] == 1  # only dense, not keyword
 
 
+# ---------------------------------------------------------------------------
+# Guardrail G1: run-level relevance-floor drop-ratio telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_g1_counts_dense_candidates_and_floor_drops():
+    """Regression target: run p205.131-check, where min_similarity=0.55
+    dropped EVERY dense hit, every query, all run -- invisible outside
+    raw debug logs because nothing aggregated it. drain_counts() must
+    expose both the raw drop count and the total candidate count, so a
+    caller can compute the ratio rather than just a bare (uninformative
+    on its own) number."""
+    dense_hits = [{"id": "d1", "content": "x", "similarity": 0.4},
+                  {"id": "d2", "content": "y", "similarity": 0.3}]
+    retriever = HybridRetriever(_FakeLeg(hits=dense_hits),
+                                _FakeLeg(hits=[]), min_similarity=0.55)
+    retriever.search("q", top_k=3)
+    counts = retriever.drain_counts()
+    assert counts["retrieval_dense_candidates"] == 2
+    assert counts["retrieval_dropped_by_floor"] == 2  # both below 0.55
+
+
+def test_g1_reports_zero_drops_when_hits_clear_the_floor():
+    dense_hits = [{"id": "d1", "content": "x", "similarity": 0.9}]
+    retriever = HybridRetriever(_FakeLeg(hits=dense_hits),
+                                _FakeLeg(hits=[]), min_similarity=0.55)
+    retriever.search("q", top_k=3)
+    counts = retriever.drain_counts()
+    assert counts["retrieval_dense_candidates"] == 1
+    assert counts.get("retrieval_dropped_by_floor", 0) == 0
+
+
+def test_g1_contributes_no_floor_counters_when_floor_disabled():
+    """min_similarity=0.0 keeps the pre-P2-01 no-floor behaviour and,
+    with it, must not even bump these counters -- a caller aggregating
+    retrieval_dense_candidates across many runs should never see a
+    misleading 0/0 masquerading as a real ratio."""
+    retriever = HybridRetriever(_FakeLeg(hits=[{"id": "d1", "content": "x",
+                                                "similarity": 0.1}]),
+                                _FakeLeg(hits=[]), min_similarity=0.0)
+    retriever.search("q", top_k=3)
+    counts = retriever.drain_counts()
+    assert "retrieval_dense_candidates" not in counts
+    assert "retrieval_dropped_by_floor" not in counts
+
+
 def test_hybrid_retriever_counts_are_thread_local():
     """Direct verification of the thread-safety claim: N threads, each
     doing exactly one search()+drain() pair, must each see ONLY their own

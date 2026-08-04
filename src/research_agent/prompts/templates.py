@@ -281,7 +281,14 @@ def compile_report(query: str, goals: List[Goal], evidence: List[Evidence],
     one line of text and inlined below, with no truncation or re-ranking —
     everything gathered goes into the prompt.
     """
-    ev = "\n".join(f"- [{e.goal_id} | {e.source} | score={e.score:.2f}] {fence_untrusted(e.content)}"
+    # Guardrail G3: an UNVERIFIED-SPECIFIC tag on model-tier items whose
+    # own text pairs a specific year with a specific quantity (see
+    # tools/model_knowledge.py::_looks_overspecific) -- the deterministic
+    # half of this guardrail; the ATTRIBUTION RULE instruction below is
+    # the half that tells the compiler what to DO about the tag.
+    ev = "\n".join(f"- [{e.goal_id} | {e.source} | score={e.score:.2f}"
+                   f"{' | UNVERIFIED-SPECIFIC' if e.hedge_specific else ''}] "
+                   f"{fence_untrusted(e.content)}"
                    for e in evidence) or "(no evidence gathered)"
     # A generator expression with an inline conditional inside the f-string
     # itself: for each goal, append the extra "[CONTESTED ...]" marker text
@@ -352,6 +359,12 @@ def compile_report(query: str, goals: List[Goal], evidence: List[Evidence],
             f"enough (e.g. \"no document in the corpus covers this; from "
             f"general knowledge, ...\"). Never present a `model` claim as "
             f"a retrieved finding.\n"
+            f"- Any evidence item tagged UNVERIFIED-SPECIFIC pairs a "
+            f"precise date with a precise figure that this system "
+            f"cannot verify. Do not restate it with that same false "
+            f"precision. Either round/qualify it (\"roughly\", "
+            f"\"on the order of\") or drop the specific number and keep "
+            f"only the general trend it describes.\n"
             f"- Do NOT invent beyond the evidence block. Named products, "
             f"model numbers, doctrine names, dates and figures that appear "
             f"in NO evidence item of any source must not appear in the "

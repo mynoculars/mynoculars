@@ -204,10 +204,12 @@ def route_convergence(state: ResearchState, settings: Settings
     cycle. This is the fork that decides whether the loop continues.
 
     READS   state.escalation_trigger, state.recall_score,
-            state.iteration_depth, settings.recall_target,
+            state.grounded_score, state.iteration_depth,
+            settings.recall_target, settings.grounded_recall_target,
             settings.max_depth.
     RETURNS "human_escalation" if progress_checker just raised E2/E3;
-            otherwise "compiler" if recall has reached target OR the depth
+            otherwise "compiler" if recall has reached target AND that
+            coverage is adequately grounded (Guardrail G2) OR the depth
             budget is spent (either way, there's nothing more useful to
             gain by looping again); otherwise "gap_generator" — go round
             again.
@@ -215,19 +217,40 @@ def route_convergence(state: ResearchState, settings: Settings
     D-14 point 1: recall/depth only — NEVER the backlog, which is stale
     here (it still holds the just-dispatched tasks). The backlog is judged
     at dispatch time, on fresh data. Two termination points, two truths.
+
+    Guardrail G2 (grounded convergence): recall alone answers "is every
+    goal covered by SOMETHING"; it does not distinguish a real document
+    from the model's own recollection (source="model"). Live evidence
+    (run p205.131-check) shows recall reaching 1.0 with corpus_recall at
+    0.0 — every goal "covered" by MCP/model tiers, nothing from the
+    ingested corpus — which then shipped straight to the compiler and
+    was rejected twice by the critic on fabricated figures, burning the
+    full revision budget before escalating. This adds a THIRD truth
+    alongside recall/depth: if recall has reached target but
+    grounded_score has not, and depth budget still remains, spend it on
+    another gather cycle before compiling — same as the "recall below
+    target" branch below, just gated on a different signal. Once depth
+    IS spent, this still falls through to "compiler" regardless of
+    grounding — there is no budget left to spend chasing it further, and
+    an ungrounded-but-complete draft is still better data for the critic
+    (and, if it fails, for a human at E4) than no draft at all.
     """
     if state.escalation_trigger in ("E2", "E3"):
         to_node, reason = "human_escalation", f"{state.escalation_trigger} raised by progress_checker"
-    elif state.recall_score >= settings.recall_target:
-        to_node, reason = "compiler", f"recall {state.recall_score:.2f} reached target {settings.recall_target:.2f}"
     elif state.iteration_depth >= settings.max_depth:
-        to_node, reason = "compiler", f"depth {state.iteration_depth}/{settings.max_depth} budget spent, recall {state.recall_score:.2f} still below target"
+        to_node, reason = "compiler", f"depth {state.iteration_depth}/{settings.max_depth} budget spent, recall {state.recall_score:.2f} (grounded {state.grounded_score:.2f})"
+    elif state.recall_score >= settings.recall_target and state.grounded_score < settings.grounded_recall_target:
+        to_node, reason = "gap_generator", f"recall {state.recall_score:.2f} reached target but grounded {state.grounded_score:.2f} below {settings.grounded_recall_target:.2f}, depth {state.iteration_depth}/{settings.max_depth} remains"
+    elif state.recall_score >= settings.recall_target:
+        to_node, reason = "compiler", f"recall {state.recall_score:.2f} reached target {settings.recall_target:.2f}, grounded {state.grounded_score:.2f}"
     else:
         to_node, reason = "gap_generator", f"recall {state.recall_score:.2f} below target {settings.recall_target:.2f}, depth {state.iteration_depth}/{settings.max_depth} remains"
     log_event(logger, "route.decision", from_node="progress_checker", to_node=to_node,
               reason=reason, escalation_trigger=state.escalation_trigger,
-              recall=round(state.recall_score, 3), depth=state.iteration_depth,
-              max_depth=settings.max_depth, recall_target=settings.recall_target)
+              recall=round(state.recall_score, 3), grounded=round(state.grounded_score, 3),
+              depth=state.iteration_depth, max_depth=settings.max_depth,
+              recall_target=settings.recall_target,
+              grounded_recall_target=settings.grounded_recall_target)
     return to_node
 
 
@@ -391,7 +414,7 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     _add_node("compiler", build_compiler_node(router, debug))
     _add_node("critic", build_critic_node(router, settings, debug))
     _add_node("memory_writer", build_memory_writer_node(memory, settings, debug))
-    _add_node("telemetry", build_telemetry_node(debug))
+    _add_node("telemetry", build_telemetry_node(settings, debug))
     # D-23/D-28: single parametrized escalation node. It returns Command
     # (goto inferred from its type hint), so no static edges are added.
     _add_node("human_escalation", build_escalation_node(settings, debug))

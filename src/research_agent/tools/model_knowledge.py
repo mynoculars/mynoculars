@@ -34,6 +34,7 @@ Honesty invariants — this tier is additive, never disguised:
 """
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from research_agent.logging_setup import log_event
@@ -41,6 +42,44 @@ from research_agent.prompts import templates
 from research_agent.state import Evidence, SearchTask, Volatility
 
 logger = logging.getLogger(__name__)
+
+# Guardrail G3: a claim's own self-reported `confidence` field does not
+# catch false precision -- live evidence (run p205.131-check) shows the
+# model reporting confidence>=0.5 on fabricated figures the critic later
+# rejected, e.g. "India's population grew from approximately 900 million
+# in 1970 to over 1.4 billion in 2020" -- a precise quantity pinned to a
+# precise date, stated as fact, present in no evidence item. This is a
+# cheap, deterministic pre-flag -- not a filter, not a rewrite -- so the
+# compiler prompt (prompts/templates.py::compile_report) can be told
+# explicitly which model-tier claims carry that risk and hedge them,
+# rather than relying on the compiler to remember on every single claim.
+# Deliberately narrow: a bare date ("in 1979") or a bare rounded figure
+# ("about 35%") alone is common and unremarkable; it is specifically the
+# PAIRING of the two that reads as verified fact while being
+# unverifiable recollection. A claim naming a specific year with no
+# accompanying quantity (e.g. "the policy was introduced in 1979") is
+# NOT caught by this heuristic -- catching that class reliably would
+# need real date/event extraction, which is exactly the kind of
+# judgment call this codebase's philosophy reserves for an LLM (the
+# critic), not a regex.
+_SPECIFIC_YEAR = re.compile(r"\b(?:18|19|20)\d{2}\b")
+_SPECIFIC_NUMBER = re.compile(
+    r"\b\d[\d,]*(?:\.\d+)?\s*(?:%|percent|million|billion|trillion|"
+    r"per\s+(?:square\s+)?(?:km|kilometer|mile|capita|year))\b",
+    re.IGNORECASE)
+
+
+def _looks_overspecific(text: str) -> bool:
+    """True if `text` states a specific year AND a specific quantity --
+    the exact combination (a precise figure pinned to a precise date)
+    that reads as verified fact but, for the model-knowledge tier, is
+    unverifiable recollection. Either alone is common and unremarkable
+    (a year on its own, a rounded percentage on its own); it's the pair
+    that carries false precision. Pure string check, no LLM call --
+    consistent with this codebase's "deterministic where possible"
+    guardrail philosophy (see guardrails/__init__.py).
+    """
+    return bool(_SPECIFIC_YEAR.search(text) and _SPECIFIC_NUMBER.search(text))
 
 # Model-sourced evidence must clear settings.min_evidence_score (0.5) so it
 # can actually mark a goal covered -- otherwise this tier would produce
@@ -100,9 +139,15 @@ def make_model_knowledge_tool(router: Any, score: float = DEFAULT_MODEL_SCORE,
                 # Scale within a narrow band so a confident recollection
                 # still cannot outrank a document both legs agreed on.
                 score=round(min(score, score * confidence + 0.05), 4),
-                volatility=Volatility.SEMI_STABLE))
+                volatility=Volatility.SEMI_STABLE,
+                # Guardrail G3 -- deterministic, evaluated on the same
+                # text the model just produced, independent of (and not
+                # replacing) the confidence gate above.
+                hedge_specific=_looks_overspecific(text)))
+        flagged = sum(1 for e in evidence if e.hedge_specific)
         log_event(logger, "tool.model_knowledge", task=task.key,
-                  claims=len(evidence), asked=len(claims))
+                  claims=len(evidence), asked=len(claims),
+                  hedge_specific=flagged)
         return evidence
 
     return model_knowledge
