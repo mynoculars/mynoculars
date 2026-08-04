@@ -75,3 +75,70 @@ def test_model_knowledge_tool_never_flags_a_low_confidence_dropped_claim():
     ]})
     tool = make_model_knowledge_tool(router, score=0.6)
     assert tool(_task()) == []
+
+
+# ---------------------------------------------------------------------------
+# P205.134 follow-up: wider unit vocabulary + the "%" boundary bug fix
+# ---------------------------------------------------------------------------
+
+
+def test_looks_overspecific_flags_energy_mass_and_area_units():
+    """Regression target: run p205.134-check. The critic rejected five
+    fabricated claims as unsupported; three used the exact year+quantity
+    pairing this guard targets, but in units the original list didn't
+    cover at all (only %/million/billion/trillion/per-X)."""
+    assert _looks_overspecific(
+        "India's National Solar Mission targets 500 GW of non-fossil "
+        "capacity by 2030.")
+    assert _looks_overspecific(
+        "India's CO2 emissions per capita in 2022 were about 1.9 "
+        "metric tons.")
+    assert _looks_overspecific(
+        "The United States had a per capita ecological footprint of "
+        "about 8.0 global hectares as of 2021.")
+
+
+def test_looks_overspecific_flags_bare_percent_sign_with_a_year():
+    """Regression for a bug found while widening the unit list: `%\\b`
+    only matches when a WORD character immediately follows the sign
+    (e.g. "50%increase") -- ordinary prose always has a space after
+    "%", and space is itself non-word, so no \\b boundary ever existed
+    there. This means the ORIGINAL percentage branch effectively never
+    matched real text before this fix, silently making every bare-%
+    year+quantity claim (a common shape -- "grew 6.7% in 2022") invisible
+    to this guard from day one."""
+    assert _looks_overspecific(
+        "The United States reduced total CO2 emissions by about 14% "
+        "between 2010 and 2020.")
+    assert _looks_overspecific("India's GDP grew 6.7% in 2022.")
+
+
+def test_looks_overspecific_still_ignores_plain_counts():
+    """The widened unit list must not start flagging ordinary numbers
+    that carry no false-precision risk -- a bare count with a year
+    nearby but no recognized unit stays unflagged."""
+    assert not _looks_overspecific(
+        "India fielded 3 goals in the 2020 review cycle.")
+
+
+def test_looks_overspecific_flags_air_quality_units():
+    """Regression target: run p205.136-check. A shipped report stated
+    "Delhi's annual average exceeding 100 µg/m³ in multiple years"
+    unflagged -- the concentration-unit class this domain (environmental
+    /air-quality goals) keeps producing wasn't covered yet, same pattern
+    as the GW/tonnes/hectares additions before it."""
+    assert _looks_overspecific(
+        "Delhi's PM2.5 concentration exceeded 100 \u00b5g/m\u00b3 in 2022.")
+    assert _looks_overspecific(
+        "Beijing recorded PM2.5 levels of 45 \u03bcg/m3 in 2021.")
+    assert _looks_overspecific(
+        "Ozone levels hit 70 ppb in 2020.")
+
+
+def test_looks_overspecific_does_not_flag_air_quality_unit_without_a_year():
+    """The same year+quantity pairing rule applies here as everywhere
+    else in this guard -- a concentration figure with no specific year
+    attached (e.g. "exceeding 100 µg/m³ in multiple years") is not
+    flagged, by design."""
+    assert not _looks_overspecific(
+        "Delhi's annual average exceeding 100 \u00b5g/m\u00b3 in multiple years.")

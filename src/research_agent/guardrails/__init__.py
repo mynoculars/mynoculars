@@ -23,6 +23,18 @@ What lives here today:
                    changes where it lives, not what it does.
     fencing.py     the prompt-injection fence for retrieved evidence text
                    (D-18's mitigation), moved from prompts/templates.py.
+    hedging.py     Guardrail G3's enforcement half (P205.135 follow-up).
+                   UNLIKE every other file above, this is NOT a relocation
+                   of existing code -- it is new. Recorded here anyway,
+                   deliberately, rather than left undocumented: it is the
+                   exact same SHAPE of check as citations.py (deterministic
+                   post-processing of the compiled report against
+                   state.evidence, called from the same compiler_node call
+                   site, right next to clean_citations), so it belongs in
+                   this package on architectural grounds even though the
+                   package docstring's "only moved code" rule doesn't
+                   technically cover it. See hedging.py's own docstring
+                   for why it exists and what it does.
 
 What deliberately does NOT live here, and why:
     State reducers (state.py) — LangGraph requires these as Annotated[...]

@@ -28,6 +28,7 @@ from research_agent import langfuse as lf
 from research_agent.agents.escalation import escalation_allowed
 from research_agent.config import Settings
 from research_agent.guardrails.citations import clean_citations
+from research_agent.guardrails.hedging import enforce_hedging
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
@@ -112,6 +113,12 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # enforced without reading meaning.
         report, citation_counters = clean_citations(
             report, state.goals, state.evidence)
+        # Guardrail G3 enforcement half (P205.135 follow-up): same call
+        # site, same shape of check as clean_citations above -- see
+        # guardrails/hedging.py for why this exists (the compiler
+        # instruction to hedge UNVERIFIED-SPECIFIC claims is not
+        # reliably followed on its own).
+        report, hedge_counters = enforce_hedging(report, state.evidence)
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,
@@ -121,13 +128,15 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         sections = len(re.findall(r"(?m)^#{1,6} ", report))
         evidence_cited = len({g.group(1) for g in re.finditer(r"\[g(\d+)\]", report)})
         log_event(logger, "node.compiled", sections=sections,
-                  evidence_cited=evidence_cited, output_chars=len(report))
+                  evidence_cited=evidence_cited, output_chars=len(report),
+                  hedge_markers_inserted=int(hedge_counters.get(
+                      "hedge_markers_inserted", 0)))
         # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
         # complete() (not complete_json) is the only free-text path, so this
         # is the one node whose drained counters can include
         # llm_quality_calls (the self-scoring gate only runs on free text).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
-                    **citation_counters}
+                    **citation_counters, **hedge_counters}
         return {"final_report": report, "counters": counters}
 
     return compiler_node

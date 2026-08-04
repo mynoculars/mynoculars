@@ -48,6 +48,7 @@ from typing import Any, Callable, Dict, List
 from research_agent import langfuse as lf
 from research_agent.agents.escalation import escalation_allowed
 from research_agent.agents.task_utils import cap_and_filter
+from research_agent.tools.retrieval_chain import _distinctive_terms
 from research_agent.config import Settings
 from research_agent.guardrails.retrieval import passes_evidence_gate
 from research_agent.llm.router import FallbackRouter
@@ -336,6 +337,11 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
             log_event(logger, "node.enter", node="progress_checker")
         goals = []
         grounded_flags: List[bool] = []  # Guardrail G2 accumulator, see below
+        # Same topical gate telemetry_node's corpus_recall already applies
+        # (D-39) -- precomputed once, outside the per-goal loop, since
+        # every goal's description is fixed for this whole node call.
+        goal_terms = {g.goal_id: _distinctive_terms(g.description)
+                     for g in state.goals}
         for g in state.goals:
             # Strict `>`, not `>=` — see the docstring above. A score that
             # lands EXACTLY on min_evidence_score is, under single-leg RRF
@@ -350,13 +356,31 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
             # Guardrail G2: a SEPARATE verdict from has_quality_evidence
             # above -- that one asks "is any item strong enough to cover
             # this goal", this one asks "is at least one of those items a
-            # real document, not the model's own recollection". A goal
-            # can be `covered` (recall counts it) while being ungrounded
-            # (grounded_score does not) -- that gap is exactly what run
-            # p205.131-check's recall=1.0 / corpus_recall=0.0 outcome was.
+            # real document, not the model's own recollection, that is
+            # ACTUALLY ABOUT this goal". A goal can be `covered` (recall
+            # counts it) while being ungrounded (grounded_score does not)
+            # -- that gap is exactly what run p205.131-check's
+            # recall=1.0 / corpus_recall=0.0 outcome was.
+            #
+            # P205.132 follow-up: the FIRST version of this check tested
+            # only source+score, no topic -- and a live run showed it
+            # fooled the same way corpus_recall itself was once fooled
+            # (see telemetry_node's own D-39 note): gap_generator emitted
+            # a task tagged g1 that was actually about Redis vs Memcached
+            # (the sample corpus's real content, not this run's actual
+            # economic-comparison goal), it scored well over the floor,
+            # and source="corpus" let it count as "grounded" for a goal
+            # it has nothing to do with. grounded_score moved 0.0 -> 0.2
+            # that cycle while corpus_recall correctly stayed 0.0 the
+            # whole run, because ONLY corpus_recall applied the topical
+            # overlap gate. Reusing that exact gate here closes the gap
+            # between the two numbers instead of leaving G2 as a second,
+            # weaker grounding metric that disagrees with the first.
             has_grounded_evidence = any(
                 e.goal_id == g.goal_id and e.source in ("corpus", "mcp")
                 and passes_evidence_gate(e.score, settings.min_evidence_score)
+                and (not goal_terms.get(g.goal_id)
+                     or goal_terms[g.goal_id] & _distinctive_terms(e.content))
                 for e in state.evidence)
             grounded_covered = covered and has_grounded_evidence
             goals.append(g.model_copy(update={"covered": covered}))

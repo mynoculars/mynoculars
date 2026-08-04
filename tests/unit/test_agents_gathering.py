@@ -16,6 +16,7 @@ from research_agent.agents.gathering import (
     _uncovered_goal_has_strong_evidence,
     build_gap_generator_node,
     build_merger_node,
+    build_progress_checker_node,
 )
 from research_agent.config import Settings
 from research_agent.state import Evidence, Goal, ResearchState, Volatility
@@ -413,3 +414,74 @@ def test_escalation_budget_stops_the_guard_re_raising_forever():
     assert result.get("escalation_trigger") is None, (
         "budget spent -> empty backlog -> dispatch_tasks routes to compiler, "
         "which writes an honest partial report instead of nagging again")
+
+
+# ---------------------------------------------------------------------------
+# Guardrail G2: progress_checker_node's topical grounding gate
+# ---------------------------------------------------------------------------
+
+
+def test_g2_topical_gate_rejects_on_topic_score_off_topic_content():
+    """Regression target: run p205.132-check. gap_generator emitted a task
+    tagged g1 (this run's actual goal: GDP/inflation/unemployment) whose
+    query drifted onto the sample corpus's real content (Redis vs
+    Memcached). That corpus hit scored well above the floor and, before
+    this fix, counted as "grounded" for g1 purely on source+score --
+    exactly the failure mode telemetry_node's corpus_recall already
+    guards against via a topical overlap check. This proves
+    progress_checker_node now applies the SAME gate, so the two grounding
+    signals cannot disagree the way they did in that run
+    (grounded_score moved 0.0 -> 0.2 while corpus_recall correctly held
+    at 0.0)."""
+    settings = Settings(_env_file=None, min_evidence_score=0.5,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="GDP growth rate comparison "
+                                              "between India and US")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="Redis and Memcached both support "
+                                   "session caching with different "
+                                   "eviction policies.", score=0.9)],
+    )
+    node = build_progress_checker_node(settings, debug=False)
+    result = node(state)
+    assert result["recall_score"] == 1.0, "covered -- score alone clears the floor"
+    assert result["grounded_score"] == 0.0, (
+        "off-topic despite clearing the floor -- must not count as grounded")
+
+
+def test_g2_topical_gate_accepts_genuinely_on_topic_evidence():
+    settings = Settings(_env_file=None, min_evidence_score=0.5,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="GDP growth rate comparison "
+                                              "between India and US")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="India's GDP growth rate rebounded to "
+                                   "8.9 percent.", score=0.9)],
+    )
+    node = build_progress_checker_node(settings, debug=False)
+    result = node(state)
+    assert result["grounded_score"] == 1.0
+
+
+def test_g2_model_sourced_evidence_never_counts_as_grounded_even_on_topic():
+    """source="model" is excluded from grounding regardless of topical
+    overlap -- topicality only narrows what corpus/mcp items count; it
+    does not promote a model-tier recollection into a real document."""
+    settings = Settings(_env_file=None, min_evidence_score=0.5,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="GDP growth rate comparison "
+                                              "between India and US")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="model",
+                           content="India's GDP growth rate rebounded to "
+                                   "8.9 percent.", score=0.6)],
+    )
+    node = build_progress_checker_node(settings, debug=False)
+    result = node(state)
+    assert result["recall_score"] == 1.0
+    assert result["grounded_score"] == 0.0

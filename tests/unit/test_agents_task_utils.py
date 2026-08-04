@@ -9,7 +9,7 @@ silently reset to the default, not treated as a validation failure.
 """
 
 from research_agent.agents.task_utils import cap_and_filter
-from research_agent.state import ResearchState
+from research_agent.state import Goal, ResearchState
 
 
 def test_cap_and_filter_drops_malformed_tasks_and_counts_them(settings):
@@ -98,3 +98,58 @@ def test_cap_and_filter_keeps_same_query_under_different_goals():
            {"query": "same text", "goal_id": "g2", "priority": 1}]
     tasks, _ = cap_and_filter(raw, state, depth=0, max_fanout=6)
     assert len(tasks) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unknown-goal-id guard (P205.133 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_cap_and_filter_drops_a_task_for_a_goal_id_that_does_not_exist():
+    """Regression target: run p205.133-check. gap_generator emitted a
+    task tagged g6 at iteration_depth 3, but goal_manager only ever
+    produced five goals (g1-g5) at the start of the run -- g6 was never
+    a real goal. Before this fix that task was retrieved, scored, and
+    merged into state.evidence anyway, permanently orphaned: no
+    Goal(goal_id="g6") exists for progress_checker to ever mark covered,
+    so it was pure wasted retrieval work."""
+    state = ResearchState(
+        raw_query="q",
+        goals=[Goal(goal_id="g1", description="d1"),
+               Goal(goal_id="g2", description="d2")])
+    raw = [
+        {"query": "on topic", "goal_id": "g1", "priority": 1},
+        {"query": "orphaned", "goal_id": "g6", "priority": 1},
+    ]
+    tasks, rejected = cap_and_filter(raw, state, depth=1, max_fanout=6)
+    assert [t.goal_id for t in tasks] == ["g1"]
+    assert rejected == 1
+
+
+def test_cap_and_filter_skips_the_goal_id_check_when_state_has_no_goals():
+    """Empty state.goals means "nothing to validate against", not
+    "reject everything" -- every existing caller that constructs a bare
+    ResearchState(raw_query=...) without setting goals (most of this
+    file's other tests, and every real caller passes goals by the time
+    cap_and_filter runs anyway -- see route_after_goals) must keep
+    working unchanged."""
+    state = ResearchState(raw_query="q")
+    raw = [{"query": "q1", "goal_id": "g1", "priority": 1}]
+    tasks, rejected = cap_and_filter(raw, state, depth=0, max_fanout=6)
+    assert len(tasks) == 1
+    assert rejected == 0
+
+
+def test_cap_and_filter_counts_unknown_goal_id_into_the_same_rejected_total():
+    """Malformed-shape rejects and unknown-goal-id rejects fold into ONE
+    counter (state.counters["producer_rejects"] downstream) -- callers
+    don't need a second field to see either kind."""
+    state = ResearchState(raw_query="q",
+                          goals=[Goal(goal_id="g1", description="d1")])
+    raw = [
+        {"goal_id": "g1"},                       # missing query -> malformed
+        {"query": "q2", "goal_id": "g9"},        # unknown goal -> rejected
+    ]
+    tasks, rejected = cap_and_filter(raw, state, depth=0, max_fanout=6)
+    assert tasks == []
+    assert rejected == 2

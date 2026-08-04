@@ -35,7 +35,7 @@ Honesty invariants — this tier is additive, never disguised:
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from research_agent.logging_setup import log_event
 from research_agent.prompts import templates
@@ -62,10 +62,54 @@ logger = logging.getLogger(__name__)
 # need real date/event extraction, which is exactly the kind of
 # judgment call this codebase's philosophy reserves for an LLM (the
 # critic), not a regex.
+#
+# P205.134 follow-up: three of five claims the critic rejected as
+# fabricated in that run slipped past the ORIGINAL unit list --
+# "500 GW of non-fossil capacity by 2030", "1.9 metric tons" CO2 per
+# capita in 2022, "8.0 global hectares" per capita as of 2021. Same
+# year+quantity pairing this guard already targets, just units the
+# original list didn't cover (%/million/billion/trillion/per-X only --
+# no energy, mass, or area units at all). Added here rather than
+# widening to a catch-all "any unit word" pattern, which would start
+# flagging ordinary counts ("3 goals", "12 states") that carry no false
+# precision risk -- these are specifically the units this system's own
+# domains (economic, demographic, environmental/energy) actually use.
 _SPECIFIC_YEAR = re.compile(r"\b(?:18|19|20)\d{2}\b")
+# `%` is matched bare, with NO trailing \b: \b checks for a transition
+# between a word char and a non-word char, and "%" is itself a non-word
+# char -- so `%\b` only succeeds when a word character immediately
+# follows the "%" (e.g. "50%increase"), which real prose essentially
+# never does ("50% increase" has a space, and space is ALSO non-word,
+# so no boundary transition exists there either). This bug predates the
+# P205.134 unit additions below -- rechecked here while widening the
+# rest of the pattern, since it means the ORIGINAL percentage branch
+# had effectively never matched normal text with a space after the
+# sign. Every other alternative below ends in a word character, so it
+# keeps the trailing \b (needed to stop "million" matching inside
+# "billionaire", etc.) -- only the symbol gets the exemption.
 _SPECIFIC_NUMBER = re.compile(
-    r"\b\d[\d,]*(?:\.\d+)?\s*(?:%|percent|million|billion|trillion|"
-    r"per\s+(?:square\s+)?(?:km|kilometer|mile|capita|year))\b",
+    r"\b\d[\d,]*(?:\.\d+)?\s*(?:%|(?:"
+    r"percent|million|billion|trillion|"
+    r"per\s+(?:square\s+)?(?:km|kilometer|mile|capita|year)|"
+    # Energy: GW/MW/kW and their -h (watt-hour) variants, spelled out or
+    # abbreviated -- "500 GW", "3.2 megawatts", "40 kWh".
+    r"[gmk]w(?:h)?s?|gigawatts?|megawatts?|kilowatts?|"
+    # Mass: metric tons/tonnes -- "1.9 metric tons", "40 tonnes".
+    r"(?:metric\s+)?tonnes?|(?:metric\s+)?tons?|"
+    # Area: hectares, including "global hectares" (the ecological-
+    # footprint unit) -- the "global" is optional so both match.
+    r"(?:global\s+)?hectares?|"
+    # Air quality / concentration: micrograms or milligrams per cubic
+    # metre (both the proper micro sign U+00B5 and the Greek mu U+03BC
+    # show up in the wild, plus a plain ASCII "u" fallback some sources
+    # use instead of either), and ppm/ppb -- "100 \u00b5g/m\u00b3", "45 ppm".
+    # P205.136 follow-up: "Delhi's annual average exceeding 100 "
+    # "\u00b5g/m\u00b3 in multiple years" reached a shipped report unflagged --
+    # same year+quantity pairing this guard already targets, just yet
+    # another domain-specific unit (environmental/air-quality, following
+    # the same pattern that added energy/mass/area units above) that the
+    # list didn't cover yet.
+    r"(?:[\u00b5\u03bcu]g|mg)\s*/\s*m(?:\u00b3|3)|ppm|ppb)\b)",
     re.IGNORECASE)
 
 
@@ -79,7 +123,25 @@ def _looks_overspecific(text: str) -> bool:
     consistent with this codebase's "deterministic where possible"
     guardrail philosophy (see guardrails/__init__.py).
     """
-    return bool(_SPECIFIC_YEAR.search(text) and _SPECIFIC_NUMBER.search(text))
+    return overspecific_span(text) is not None
+
+
+def overspecific_span(text: str) -> Optional[str]:
+    """Return the exact quantity substring _looks_overspecific matched
+    (e.g. "500 GW", "6.7%", "1.9 metric tons"), or None if `text` isn't
+    overspecific. Not private (no leading underscore, unlike this
+    module's other helpers): guardrails/hedging.py -- Guardrail G3's
+    enforcement half (P205.135 follow-up) -- needs the literal matched
+    text, not just the boolean _looks_overspecific gives, so it can
+    search the COMPILED REPORT for that same substring and hedge it if
+    the compiler ignored the ATTRIBUTION RULE instruction and stated it
+    as flat fact anyway. Kept here rather than duplicated in hedging.py
+    so the two guardrails can never define "overspecific" differently.
+    """
+    if not _SPECIFIC_YEAR.search(text):
+        return None
+    m = _SPECIFIC_NUMBER.search(text)
+    return m.group(0) if m else None
 
 # Model-sourced evidence must clear settings.min_evidence_score (0.5) so it
 # can actually mark a goal covered -- otherwise this tier would produce

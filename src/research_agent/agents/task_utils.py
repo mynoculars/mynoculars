@@ -101,6 +101,12 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
                       sends everything it is given; it is not allowed to
                       make a ranking judgement it has no way to make well.
 
+        UNKNOWN-GOAL GUARD — drop any well-formed task whose goal_id is
+                      not one of state.goals' actual ids (see the guard's
+                      own comment below for the live run that found this).
+                      Not one of the three D-numbered rules above; added
+                      later, after those, as its own separate check.
+
     Parameters:
         raw_tasks: model output — dicts that SHOULD look like
             {"query": ..., "goal_id": ..., "priority": ...}. P2-06: each
@@ -125,12 +131,29 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
 
     Returns:
         (tasks, rejected_count) — rejected_count is how many raw_tasks
-        entries failed RawTask validation, so callers can fold it into
+        entries either failed RawTask validation OR named a goal_id not
+        present in state.goals, so callers can fold it into
         state.counters["producer_rejects"] (D-13 hygiene extended to cover
         malformed input, not just dedup/depth/cap).
     """
     tasks: List[SearchTask] = []
     rejected = 0
+    # Guardrail (P205.133 follow-up): a task naming a goal_id that ISN'T
+    # one of THIS run's actual goals. Live (run p205.133-check): at
+    # iteration_depth 3, gap_generator emitted six tasks tagged g1-g6 --
+    # but goal_manager only ever produced five goals (g1-g5). The g6 task
+    # was retrieved, scored, merged into state.evidence, and could then
+    # never be "covered" by anything -- no Goal(goal_id="g6") exists for
+    # progress_checker to mark covered -- pure wasted retrieval work that
+    # nothing before this caught. Same "validate shape before trust"
+    # posture as RawTask itself (P2-06), just checked against the ACTUAL
+    # goal set rather than the dict's own field types. Empty state.goals
+    # is treated as "nothing to validate against" (skip the check) rather
+    # than rejecting everything -- the callers that could ever run with
+    # zero goals already routed elsewhere before reaching here (D-14/
+    # route_after_goals), so this only ever fires when goals genuinely
+    # exist and a task's goal_id genuinely isn't among them.
+    known_goal_ids = {g.goal_id for g in state.goals}
     # D-2, second half: dedup WITHIN this batch, not only against history.
     # completed_task_keys answers "have we already run this query in an
     # EARLIER cycle"; it says nothing about the model emitting the same
@@ -155,6 +178,20 @@ def cap_and_filter(raw_tasks: list, state: ResearchState, depth: int,
             rejected += 1
             log_event(logger, "producer.reject", level=logging.WARNING,
                       depth=depth, errors=str(exc.errors()))
+            continue
+        if known_goal_ids and raw.goal_id not in known_goal_ids:
+            # Same "data, not a crash" handling as the ValidationError
+            # branch above, counted into the same rejected total (so
+            # existing telemetry -- state.counters["producer_rejects"] --
+            # needs no new field to see this) but logged under its own
+            # event name, since the failure shape is different: this task
+            # was perfectly well-FORMED, it just referred to a goal that
+            # does not exist in this run.
+            rejected += 1
+            log_event(logger, "producer.reject_unknown_goal_id",
+                      level=logging.WARNING, depth=depth,
+                      goal_id=raw.goal_id,
+                      known_goal_ids=sorted(known_goal_ids))
             continue
         # f"{...}::{...}" builds a plain string by substituting variables
         # into the {} placeholders — this is an f-string, Python's way of
