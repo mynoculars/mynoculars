@@ -159,7 +159,7 @@ def test_compiler_node_abort_path_is_unaffected_by_fence_stripping():
 # D-43: deterministic citation repair
 # ---------------------------------------------------------------------------
 
-from research_agent.agents.compilation import _clean_citations  # noqa: E402
+from research_agent.guardrails.citations import clean_citations  # noqa: E402
 
 
 def _g(goal_id):
@@ -178,7 +178,7 @@ def test_pasted_evidence_text_is_stripped_from_the_prose():
     body = ("Redis is an in-memory data store supporting rich data "
             "structures: strings, hashes, lists, sets.")
     report = f"Sessions map naturally to hashes{body} and update partially."
-    cleaned, counters = _clean_citations(report, [_g("g1")], [_e("g1", body)])
+    cleaned, counters = clean_citations(report, [_g("g1")], [_e("g1", body)])
     assert body not in cleaned
     assert counters["citations_pasted_evidence_removed"] == 1.0
 
@@ -187,7 +187,7 @@ def test_citations_to_goals_with_no_evidence_are_dropped():
     """A [gN] marker asserts goal N's retrieved evidence supports the
     sentence. If goal N retrieved nothing, that is false on its face."""
     report = "Cassandra scales linearly [g2]. Redis is in-memory [g1]."
-    cleaned, counters = _clean_citations(
+    cleaned, counters = clean_citations(
         report, [_g("g1"), _g("g2")], [_e("g1", "x" * 50)])
     assert "[g2]" not in cleaned
     assert "[g1]" in cleaned, "an evidenced goal keeps its citation"
@@ -198,14 +198,14 @@ def test_short_evidence_is_never_stripped_as_a_pasted_citation():
     """Short fragments collide with ordinary prose; a pasted citation is
     always a whole retrieved sentence."""
     report = "Redis is fast and reliable."
-    cleaned, counters = _clean_citations(report, [_g("g1")], [_e("g1", "fast")])
+    cleaned, counters = clean_citations(report, [_g("g1")], [_e("g1", "fast")])
     assert cleaned == report
     assert counters == {}
 
 
 def test_a_clean_report_is_returned_untouched():
     report = "Redis is in-memory [g1]. It shards via clustering [g1]."
-    cleaned, counters = _clean_citations(
+    cleaned, counters = clean_citations(
         report, [_g("g1")], [_e("g1", "y" * 60)])
     assert cleaned == report
     assert counters == {}
@@ -265,7 +265,7 @@ def test_properly_separated_evidence_text_is_never_stripped():
     body = ("Redis supports primary-replica replication, Sentinel failover, "
             "and Redis Cluster sharding out of the box.")
     report = f"### Failover\n{body} Memcached has none."
-    cleaned, counters = _clean_citations(
+    cleaned, counters = clean_citations(
         report, [_g("g3")], [_e("g3", body)])
     assert cleaned == report
     assert counters == {}
@@ -276,7 +276,7 @@ def test_evidence_text_glued_to_a_claim_is_still_stripped():
     no boundary, e.g. "...the whole session blobRedis is an in-memory..."."""
     body = ("Redis is an in-memory data store supporting rich data "
             "structures: strings, hashes, lists, sets.")
-    cleaned, counters = _clean_citations(
+    cleaned, counters = clean_citations(
         f"Sessions map to hashes without rewriting the whole blob{body}",
         [_g("g1")], [_e("g1", body)])
     assert body not in cleaned

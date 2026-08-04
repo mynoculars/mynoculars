@@ -49,6 +49,7 @@ from research_agent import langfuse as lf
 from research_agent.agents.escalation import escalation_allowed
 from research_agent.agents.task_utils import cap_and_filter
 from research_agent.config import Settings
+from research_agent.guardrails.retrieval import passes_evidence_gate
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.orchestration.contracts import validated_worker
@@ -342,7 +343,7 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
             # relevance. Requiring it to exceed the floor, not merely meet
             # it, closes that specific loophole.
             has_quality_evidence = any(
-                e.goal_id == g.goal_id and e.score > settings.min_evidence_score
+                e.goal_id == g.goal_id and passes_evidence_gate(e.score, settings.min_evidence_score)
                 for e in state.evidence)
             covered = has_quality_evidence and not g.contested
             goals.append(g.model_copy(update={"covered": covered}))

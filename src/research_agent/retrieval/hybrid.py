@@ -27,6 +27,7 @@ import time
 from typing import Any, Dict, List
 
 from research_agent import langfuse as lf
+from research_agent.guardrails.retrieval import passes_similarity_floor
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.storage.opensearch_store import OpenSearchStore
 from research_agent.storage.qdrant_store import QdrantStore
@@ -255,8 +256,10 @@ class HybridRetriever:
         # produce zero evidence. This is a NEW filter step, not a change
         # to what dense.search() itself returns.
         if self.min_similarity > 0.0:
-            dropped = sum(1 for h in dense_hits if h.get("similarity", 0.0) < self.min_similarity)
-            dense_hits = [h for h in dense_hits if h.get("similarity", 0.0) >= self.min_similarity]
+            dropped = sum(1 for h in dense_hits
+                         if not passes_similarity_floor(h.get("similarity", 0.0), self.min_similarity))
+            dense_hits = [h for h in dense_hits
+                          if passes_similarity_floor(h.get("similarity", 0.0), self.min_similarity)]
             if dropped:
                 log_event(logger, "retrieval.below_floor", query=query,
                           dropped=dropped, floor=self.min_similarity)
