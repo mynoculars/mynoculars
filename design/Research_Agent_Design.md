@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Document version | v3.1.3 |
-| Status | v3.1.3 — logging unified onto one instrumentation path (§8); E3 semantics generalized; §2.1 topology corrected; HITL implemented |
+| Document version | v3.2 |
+| Status | v3.2 — Guardrails (Phases 1–3) added as a deterministic post-processing layer, D-47…D-54; logging unified onto one instrumentation path (§8); E3 semantics generalized; §2.1 topology corrected; HITL implemented |
 | Date | 17 July 2026 |
 | Framework | LangGraph (StateGraph, Send-based map-reduce, checkpointed, interrupt-capable) |
 
@@ -18,6 +18,7 @@
 | v3.1.1 | §2.1 topology corrected: convergence "compile" branch now drawn to the main compiler (was unroutable); all former dead-end sinks (error/empty compilers, three escalation boxes) reconnected to the mandatory-sink flow via legend connectors, restoring consistency with the termination proof; goals-decision diamond de-duplicated; 3× ModularCompiler legend added. §5 Qdrant pipeline: two junction glyphs corrected. No design changes. |
 | v3.1.2 | **E3 semantics generalized by implementation evidence** (core-build test): "cannot converge" now covers BOTH termination points of D-14 — depth exhaustion (raised at the convergence check) AND task-supply exhaustion (raised by the gap generator when it produces zero tasks below target; the dispatch route honors the trigger). The original E3 guarded only the depth exit, so a run dying via empty backlog below target bypassed escalation entirely. §6.8/E3 and §2.1 annotated. §12: HITL (D-23/D-28) now implemented in the core build. |
 | v3.1.3 | **Logging unified onto one instrumentation path, plus a human-readable narrative view** (core-build addition, no D-number assigned yet — see §8): `tracing.py`'s separate `record_llm()`/`record_retrieval()` recorder (a second call site duplicating what `log_event()` already recorded) was retired; every module now calls `log_event()` exactly once per event, read by two independent presentation layers (machine JSON, unchanged in shape, and a new per-run narrative file). No graph topology, routing behavior, or D-xx decision changed — this is instrumentation/presentation only. |
+| v3.2 | **Guardrails, Phases 1–3 (D-47…D-54)** — see §13. A new `research_agent/guardrails/` package plus checks in `agents/gathering.py`, `agents/task_utils.py`, and `agents/compilation.py::telemetry_node` close a false-convergence gap (grounded evidence must be topically relevant, not merely score above the floor), flag and then enforce hedging on model-tier claims pairing a specific year with a specific quantity, reject `gap_generator` tasks naming a nonexistent goal, and add three run-level WARNING telemetry lines (a starved retrieval floor, a failing quality judge, a high LLM call count) — deliberately observational, none are a circuit breaker. Like the D-38…D-46 range immediately before it, this range is logged in full only in `DECISIONS.md`, which remains the authoritative source for both ranges; this document records the summary and the section pointer, not a duplicate of the rationale text. No graph topology, node inventory, or existing D-xx decision changed. |
 
 > **Scope note.** v3.1.2 remains inside the **workflow** pattern (fixed graph topology; the LLM does not choose its own control flow). Tier B dynamic supervisor delegation remains out of scope by design — see the companion dynamic-agent piece.
 
@@ -451,6 +452,12 @@ module docstring for the full design rationale.
 
 All v3.0 rows (MAX_REVISIONS, anomaly bounds, confidence floor, escalation timeout **unspecified**, collection scope assumption) carry forward unchanged.
 
+**v3.2 additions** (D-47…D-54; full parameter table in `DECISIONS.md` and
+`config.py`): `GROUNDED_RECALL_TARGET` (0.5), `RETRIEVAL_FLOOR_WARN_RATIO`
+(0.8), `QUALITY_JUDGE_WARN_RATIO` (0.5), `RUN_CALL_BUDGET_WARN` (40),
+`LLM_MAX_TOKENS` (4096), and the API's `query` length bound (1–2000
+chars) — see §13.
+
 ---
 
 ## 10. Design Decisions Log (D-27 … D-30)
@@ -474,7 +481,42 @@ New candidates recorded in v3.1, deliberately **not** adopted: (a) a dedup-mergi
 
 ## 12. Reference Implementation
 
-Status updated at v3.1.2: the core-build reference implementation (63 files, 28/32 tests passing [87.5%], covering D-1…D-24, D-28, and HITL. 4 tests skipped pending MCP integration [D-26/D-30].) covers D-1…D-24 together with D-28.t **plus HITL (D-23/D-28)**: a single parametrized escalation node with `interrupt()` as its first effectful statement, all four triggers (E1/E2/E3/E4, off by default via `HITL_ENABLED`), approve/redirect/abort resume under the run's thread_id, CLI stdin loop and API `/resume` endpoint. The timeout policy deferred since v3.0 is resolved per-interface: blocking stdin for the CLI; indefinite checkpointed persistence for the API. MCP (D-26/D-30), typed workers (D-25), and server-side fusion/decay (D-27) remain design-level by explicit scoping decision. The external review's code stubs remain **not** adoptable as-is (see Appendix C and the accompanying conversation).
+Status updated at v3.2: the reference implementation's test suite now
+collects **344 tests** (see `README.md`/`OPERATIONS.md` for the full
+growth history), 47 of which are the guardrails regression coverage
+added for D-47…D-54 (§13). The v3.1.2 status line below is otherwise
+unchanged and describes the same D-1…D-24/D-28 core. Status updated at v3.1.2: the core-build reference implementation (63 files, 28/32 tests passing [87.5%], covering D-1…D-24, D-28, and HITL. 4 tests skipped pending MCP integration [D-26/D-30].) covers D-1…D-24 together with D-28.t **plus HITL (D-23/D-28)**: a single parametrized escalation node with `interrupt()` as its first effectful statement, all four triggers (E1/E2/E3/E4, off by default via `HITL_ENABLED`), approve/redirect/abort resume under the run's thread_id, CLI stdin loop and API `/resume` endpoint. The timeout policy deferred since v3.0 is resolved per-interface: blocking stdin for the CLI; indefinite checkpointed persistence for the API. MCP (D-26/D-30), typed workers (D-25), and server-side fusion/decay (D-27) remain design-level by explicit scoping decision. The external review's code stubs remain **not** adoptable as-is (see Appendix C and the accompanying conversation).
+
+---
+
+## 13. Guardrails Architecture (v3.2, D-47…D-54)
+
+A new `research_agent/guardrails/` package holds deterministic
+post-processing checks — `citations.py` and `fencing.py` predate this
+revision; `hedging.py` is new. The package's own module docstring states
+the operating rule: check deterministically where possible, ask an LLM
+(the critic, §6) only where a mechanical check genuinely cannot judge.
+Every guardrail below is either a telemetry addition (a WARNING log line,
+never a routing change), a flag set on existing `Evidence`, or a
+rejection folded into the existing `producer_rejects` counter (D-13-
+adjacent) — none of them are a new LLM call, and none change the graph
+topology of §2.
+
+**Detail is intentionally not duplicated here.** As with D-38…D-46
+immediately preceding this range, full rationale, live evidence, and file
+references live in `DECISIONS.md` (D-47…D-54); this section is the
+summary a reader of this document needs, not a second copy of that log.
+
+| Guardrail | Summary | DECISIONS.md |
+|---|---|---|
+| Grounded convergence | `route_convergence` (§6) will not accept `recall_score` reaching target as full convergence unless a second measure, `grounded_score`, also clears a configured floor — a covered goal must have at least one corpus/mcp evidence item that is both above the score floor AND topically about the goal, reusing the same topical check `corpus_recall` already applies. | D-47 |
+| Retrieval-floor telemetry | A run-level WARNING when the fraction of dense retrieval candidates dropped by the relevance floor clears a configured ratio — the aggregate view of the per-query floor-drop signal that previously existed only in raw debug lines. | D-48 |
+| False-precision flag | A deterministic (regex, no LLM call) check flags a model-knowledge-tier claim that pairs a specific year with a specific quantity — the shape of claim self-reported confidence does not reliably catch. | D-49 |
+| Orphaned-task guard | A gap-generator task naming a goal id absent from the current run's goal set is rejected before retrieval, not after — closes a path where such evidence was retrieved, scored, and merged but could never be marked covered. | D-50 |
+| Hedge enforcement | The compiled report is searched for the exact quantity span a false-precision flag (above) identified; if it survived unhedged, a visible marker is appended in place. Detection and enforcement are two separate guardrails because a prompt instruction to hedge is not reliable enough alone. | D-51 |
+| API input validation | The API's `query` field gets a length bound, matching the `Field(...)`-constraint convention every other configuration value in this system already uses. | D-52 |
+| Quality-judge alerting | A run-level WARNING when the self-scoring quality judge (§6, S-6-adjacent) fails on every attempt in a run — its existing fail-open design is unchanged; this only makes a 100%-failure run visible. | D-53 |
+| Generation budget + call-budget observability | A token generation budget is now sent to every LLM provider on every call; a run-level WARNING (carrying revision-cycle and escalation-history counts) fires past a configured total-call threshold. Deliberately NOT an enforcement mechanism — the existing bounds (MAX_REVISIONS, escalation cap, `recursion_limit`, §9) already make an unbounded run structurally impossible. | D-54 |
 
 ---
 

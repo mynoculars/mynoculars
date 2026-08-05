@@ -14,9 +14,31 @@ state machines, provider fallback chains, structured observability, and
 exhaustive regression testing—not a hosted SaaS, but a demonstration of how 
 to build agentic systems that degrade gracefully and improve with oversight.
 
-> **The three banners below are HISTORY, kept for auditability.** For the
-> current state of any decision, `DECISIONS.md` (D-1…D-37) is the
+> **The four banners below are HISTORY, kept for auditability.** For the
+> current state of any decision, `DECISIONS.md` (D-1…D-54) is the
 > authoritative log; to just run something, jump to [Setup](#setup).
+
+> **Guardrails, Phases 1–3 — new since D-46.** A dedicated
+> `research_agent/guardrails/` package now exists (`citations.py`,
+> `fencing.py`, `hedging.py`) — deterministic post-processing checks
+> applied at fixed points in the graph, documented in full under
+> [Guardrails](#guardrails) below. Phase 1 closed the false-convergence
+> gap `grounded_score`/`grounded_recall_target` were built for (a topical
+> gate on top of the existing corpus-recall check), added run-level
+> WARNING telemetry for a starved retrieval floor, flagged model-tier
+> claims pairing a specific year with a specific quantity
+> (`hedge_specific`), and rejected `gap_generator` tasks naming a goal
+> that doesn't exist in the current run. Phase 2 added deterministic
+> enforcement for the Phase 1 flag (`(unverified figure)` markers
+> inserted into the compiled report, not just noted in evidence), a
+> length cap on `ResearchRequest.query` at the API boundary, and a
+> WARNING when the quality judge fails on every attempt in a run
+> (`llm_quality_calls_failed == llm_quality_calls`, observed on every
+> live run to date). Phase 3 added `run_call_budget_warn` — observability
+> only, no circuit breaker; see below. **Test suite: 344/344**, up from
+> 294 — every count below is corrected to match. Nothing else changed:
+> the architecture, D-xx decisions, and Tier 1/2/3 narrative are all
+> still accurate.
 
 > **CORRECTED THIS PASS** (post-Tier-3 session, 4 further live-tested
 > patches applied on top of everything below): `api/server.py`'s
@@ -192,6 +214,101 @@ expected output at each step.
   introspection — independent of any run. Usable alone (no query, exits
   after printing) or combined with a query (prints, then runs normally).
 
+## Guardrails
+
+*New since D-46. `Full test suite: 341/341 passing` (up from 294 — the 47
+new tests are entirely regression coverage for the items below).*
+
+A dedicated `research_agent/guardrails/` package holds deterministic
+post-processing checks — `citations.py` and `fencing.py` predate this work
+and were already documented above; `hedging.py` is new in Phase 1. The
+package's own module docstring (`guardrails/__init__.py`) states the rule
+this work followed: check deterministically where possible, ask an LLM
+(the critic) only where a mechanical check genuinely cannot judge — the
+same split Part 7 of `internal/LEARNING_GUIDE.md` documents for the four
+judges. Every guardrail below is a WARNING-level telemetry addition, a
+flag on existing evidence, or a routing check already present in
+`orchestration/graph.py` — none of them are a new LLM call, and none
+change the graph's topology.
+
+### Phase 1 — grounded convergence, retrieval-floor telemetry, false-precision flag, orphaned-task guard
+
+| Item | What changed | Verified how |
+|---|---|---|
+| **Grounded convergence** | `state.py::ResearchState.grounded_score` (new field) is computed every gather cycle in `agents/gathering.py::progress_checker_node`, alongside the existing `recall_score`: a goal only counts toward it if at least one covering evidence item is `source in ("corpus", "mcp")` **and** shares distinctive vocabulary with the goal's own description — the same topical-overlap check `telemetry_node` already applied for `corpus_recall`, reused here (`tools/retrieval_chain.py::_distinctive_terms`) so the two numbers can never disagree. `orchestration/graph.py::route_convergence` will not treat `recall_score` reaching target as full convergence unless `grounded_score` also clears `settings.grounded_recall_target` (new, default `0.5`); otherwise it spends remaining depth budget on another gather cycle instead of compiling on ungrounded evidence | Unit tests on `route_convergence` and `progress_checker_node` directly, including the exact live shape that motivated it (a corpus hit topically unrelated to the goal it was credited against, scoring above the floor); confirmed live across six consecutive real runs — `grounded_score` correctly stayed `0.0` while `recall_score` reached `1.0`, and the router correctly kept looping instead of compiling early |
+| **Retrieval-floor telemetry** | `retrieval/hybrid.py::HybridRetriever` now counts `retrieval_dense_candidates` / `retrieval_dropped_by_floor` (thread-local, same pattern as the existing P2-07 counters). `agents/compilation.py::telemetry_node` computes the drop ratio and logs a WARNING (`retrieval.floor_starvation`) once it clears `settings.retrieval_floor_warn_ratio` (new, default `0.8`) — purely observational, no routing change | Unit tests for both the counter and the WARNING threshold; confirmed live — a run with `retrieval_floor_drop_ratio: 0.902` correctly logged the WARNING, an earlier run at `0.75` correctly did not |
+| **False-precision flag** | `tools/model_knowledge.py::overspecific_span` (renamed from a private `_looks_overspecific` boolean check so `guardrails/hedging.py` — Phase 2 — can reuse the same definition) flags a model-tier claim pairing a specific year with a specific quantity — percentages, energy/mass/area/air-quality units — as `Evidence.hedge_specific=True`. Deliberately narrow: a bare year or a bare rounded figure alone is not flagged, only the pairing that reads as verified fact while being unverifiable model recollection | Unit tests covering every unit class added, plus a regression test for a real `%`-matching bug found while widening the unit list (a trailing `\b` that never matched real text with a space after the sign); confirmed live across every run this session — `hedge_specific_items` reliably nonzero whenever the model tier contributed evidence |
+| **Orphaned-task guard** | `agents/task_utils.py::cap_and_filter` now rejects a well-formed task whose `goal_id` isn't one of `state.goals`' actual ids — found live: `gap_generator` emitted a task tagged with a goal id that was never produced by `goal_manager`, and it was retrieved, scored, and merged into evidence anyway, permanently uncoverable. Folds into the existing `producer_rejects` counter; empty `state.goals` skips the check (nothing to validate against) rather than rejecting everything | Unit tests reproducing the exact live shape (a task tagged with a nonexistent goal id) plus the empty-goals safety case |
+
+### Phase 2 — hedge enforcement, input validation, quality-judge alerting
+
+| Item | What changed | Verified how |
+|---|---|---|
+| **Hedge enforcement** | New `guardrails/hedging.py::enforce_hedging`, called from `compiler_node` right after the existing `clean_citations` call. For every `hedge_specific=True` evidence item, finds its flagged quantity span (`tools/model_knowledge.py::overspecific_span`) and, if that exact text survived into the compiled report unhedged, appends a visible `(unverified figure)` marker after it — every occurrence, unless the surrounding text already carries an honest hedge word (`approximately`, `roughly`, etc.), in which case it's left alone. Closes the gap between "the flag exists on the evidence" and "the compiler actually followed the instruction to hedge it," found live: `hedge_specific_items: 29` on one run with zero visible hedging in the shipped report | Unit tests for tagging, non-double-tagging an already-hedged claim, ignoring non-flagged and corpus/mcp evidence, and a mixed case confirming one figure's hedge word doesn't suppress tagging an unrelated one; confirmed live — `hedge_markers_inserted: 10` (then `12`, `18`, `19` across later runs) matching visible `(unverified figure)` markers in the shipped report |
+| **Input validation** | `api/server.py::ResearchRequest.query` gets `Field(min_length=1, max_length=2000)` — previously unconstrained, confirmed absent by reading the class directly. Rejected at the FastAPI/pydantic layer (422) before the graph is ever invoked | Unit tests for empty, over-cap, and at-cap boundary cases |
+| **Quality-judge alerting** | Same shape as the retrieval-floor WARNING above: `agents/compilation.py::telemetry_node` computes `llm_quality_failure_ratio` and logs a WARNING (`quality.judge_unreliable`) once it clears `settings.quality_judge_warn_ratio` (new, default `0.5`). `evaluation/quality.py::score_answer`'s fail-open design (Part 7 of the learning guide) is correct and unchanged — this only makes a 100%-failure run visible instead of indistinguishable from a 100%-genuine-pass run | Unit tests for the threshold and the 0/0 no-calls-made guard; confirmed live — every run this session showed `llm_quality_calls_failed == llm_quality_calls` (2/2, 3/3), and the WARNING fired every time |
+
+### Phase 3 — LLM call budget observability
+
+| Item | What changed | Verified how |
+|---|---|---|
+| **Call budget observability** | Same WARNING shape a third time: `settings.run_call_budget_warn` (new, default `40`) and `agents/compilation.py::telemetry_node` logs `run.call_budget_high` if `llm_provider_calls` clears it — carrying `revision_cycles` and `len(state.escalation_history)` as context, so a high call count can be read alongside how many revision/escalation cycles produced it. **Deliberately observational only, not a circuit breaker**: `max_depth`, `max_revisions`, `max_escalations`, and LangGraph's own `recursion_limit` already bound every run's worst case together, and no run to date has come near the threshold (18 provider calls is the highest observed) — enforcing a hard stop here would be acting on a failure mode with no supporting evidence, the same reasoning `min_similarity`'s own calibration caveat elsewhere in this document argues against doing blind | Unit tests for the threshold, the escalation/revision context fields, and the 0-calls no-op case |
+
+**Guardrails config summary** (all in `config.py`, all `Field`-validated):
+
+| Setting | Default | Guards |
+|---|---|---|
+| `grounded_recall_target` | `0.5` | fraction of covered goals that must be topically-grounded corpus/mcp evidence before `route_convergence` accepts full convergence |
+| `retrieval_floor_warn_ratio` | `0.8` | dense-candidate drop ratio above which `retrieval.floor_starvation` WARNs |
+| `quality_judge_warn_ratio` | `0.5` | quality-judge failure ratio above which `quality.judge_unreliable` WARNs |
+| `run_call_budget_warn` | `40` | `llm_provider_calls` count above which `run.call_budget_high` WARNs |
+| `llm_max_tokens` | `4096` | generation budget sent to every LLM provider on every call (`llm/client.py::OpenAICompatibleClient`) — bounds a runaway generation at the request level, complementing (not replacing) the existing `_truncate_at_sentinel` cleanup on whatever comes back |
+| `ResearchRequest.query` length | `1`–`2000` chars | API-boundary input validation |
+
+**What guardrails are still open, stated plainly rather than rounded up:**
+the underlying reason `gap_generator` proposes off-topic tasks in the first
+place (confirmed recurring across at least three different query topics
+this session) is not fixed — the orphaned-task guard and the grounded-
+convergence gate both contain the *symptom*, neither fixes the *cause*.
+Semantic claim verification (a second LLM judge checking claims against
+evidence mechanically) was considered and deliberately not built: the
+critic already performs this function correctly on every run observed, and
+a second judge duplicating that role would violate this codebase's own
+"LLM judgment only where deterministic validation isn't feasible" rule for
+no measured benefit.
+
+**Corrected since — D-55, the topical gate's floor was still too weak.**
+The grounded-convergence gate above (D-47) contains the *symptom* of this
+drift; it doesn't stop off-topic content from being retrieved into
+evidence in the first place. Live trace (run p205.141-check):
+`retrieval_chain._sufficient`'s scaling formula
+(`need = min(3, max(1, len(terms)//4))`, from D-44) still floored `need`
+at 1 for any query with ≤7 distinctive terms — which is *every*
+`corpus_reformulated` retry by construction, since `_reformulate` caps
+its output at 6 words. A reformulated query about Indian Army size
+matched a completely unrelated Memcached document on the single
+accidental word "size" (from "chunk size classes"), which cleared the
+similarity floor at 0.57 and got merged into evidence under a real,
+correctly-tagged goal id — no orphaning, no mislabeling, just a
+legitimate citation to an irrelevant document, which then sat in
+`gap_generator`'s next-cycle prompt tail and nudged it further off-topic.
+Fixed by raising the floor from `max(1, ...)` to `max(2, ...)`, with a
+`min(..., len(terms), ...)` cap so the new floor can never demand more
+shared terms than a short query even has (a real edge case an existing
+integration test caught before this shipped). Test suite: 344/344, up
+from 341. See D-55 for the full account.
+
+**What this still doesn't fix, confirmed live on the very next run
+(p205.145-check) after the fix shipped**: `gap_generator` can still
+*generate* an off-topic query in the first place (two genuine
+Redis/Memcached tasks under an army-comparison goal at depth 2) — the
+fix stops noise from masquerading as signal via an accidental word
+match, it doesn't stop the generator from asking the wrong question.
+That run's drift cost real compute but never reached the report, since
+the compiler's own citation discipline had no reason to cite Redis
+content in an army report. The root cause — why `gap_generator` proposes
+this in the first place — remains open, same as stated above.
+
 ## Features
 
 **Capabilities**
@@ -224,6 +341,14 @@ expected output at each step.
   See [Observability — Langfuse (Phase 3)](#observability--langfuse-phase-3).
 - `--print-graph`: the compiled graph's static topology, independent of any
   run.
+- **Guardrails** (`research_agent/guardrails/`, new): grounded convergence
+  (a corpus/mcp evidence item must also be topically on-topic for the goal
+  it covers, not merely score above the floor); deterministic hedge
+  enforcement on model-tier claims pairing a specific year with a specific
+  quantity; run-level WARNING telemetry for a starved retrieval floor, a
+  failing quality judge, and a high LLM call count (observational only, no
+  circuit breaker); and API-boundary input length validation. See
+  [Guardrails](#guardrails).
 - Fully offline demo mode (`LLM_MODE=stub`) — the entire graph runs with zero
   services and zero API keys.
 
@@ -1407,7 +1532,7 @@ research-agent-dmp/
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 294 tests, offline. Organized by module,
+├── tests/                   # 344 tests, offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
@@ -1446,7 +1571,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 294 passed
+python -m pytest tests/ -q    # expect: 344 passed
 ```
 
 **Or install it as a package** (`pyproject.toml`, new) — which is what
@@ -1860,8 +1985,8 @@ auditable rather than invisible.
 | Claim in older docs | Reality in code |
 |---|---|
 | README: fallback is "local Qwen Cogito → Gemini Flash" | Three hops: primary → Mistral → Gemini, each fallback gated on its API key, **and each hop tier uses a different timeout** |
-| README / OPERATIONS: "28 tests" | **294** tests collected and passing (grew across Tier 2/3 to 135, then 157 post-Tier-3, 190 with Phase 3's 33 `test_langfuse.py` tests, then to **294** across D-38–D-46's retrieval-ladder and citation-repair regression coverage) |
-| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~100 files in this distribution; **294** tests. Skip count is environment-dependent (langfuse extras) — 0 skipped when installed, 5 when not |
+| README / OPERATIONS: "28 tests" | **344** tests collected and passing (grew across Tier 2/3 to 135, then 157 post-Tier-3, 190 with Phase 3's 33 `test_langfuse.py` tests, 294 across D-38–D-46's retrieval-ladder and citation-repair regression coverage, 341 across the Guardrails Phase 1–3 regression coverage, then to **344** with D-55's topical-gate floor correction) |
+| design §12: "63 files, 28/32 tests passing, 4 skipped" | ~100 files in this distribution; **344** tests. Skip count is environment-dependent (langfuse extras) — 0 skipped when installed, 9 when not (5 langfuse-extras, 4 MCP live-server) |
 | README legend: with HITL off the checks "log and continue" | True for E1/E4 only; E2/E3 log nothing when HITL is off |
 | OPERATIONS §"Writing Your Own Test Corpus": "re-run ingest (it upserts by id, so re-running overwrites)" | True for both stores — OpenSearch always was idempotent (`str(i)`); Qdrant's `id_fn` mechanism is wired into `scripts/ingest_sample_data.py` via a deterministic `uuid5(content)` id. Does not retroactively clean up a collection that already accumulated duplicates before this fix — see Ingest identity above |
 | OPERATIONS §"Test HITL": that query escalates | Previously converged at `recall 1.0` at depth 1 and never interrupted. Root causes fixed (P2-01, P2-02) and re-verified end-to-end against real live runs — both a genuine E3 escalation (via the D-16 failed-task path) and a clean convergence at `recall 1.0` with real evidence once the corpus was properly ingested. See The HITL Investigation |
@@ -1938,7 +2063,7 @@ The shape of it, updated with this revision's progress:
      Cost tracking from Settings-configured $/1M rates             ✅ DONE
      propagate_attributes session/environment grouping             ✅ DONE
      Crash-safe end_trace (try/except in cli.py::_run)              ✅ DONE
-     Test suite: 157 → 190 → 294
+     Test suite: 157 → 190 → 294 → 341 → 344
 ```
 
 **Status, updated**: Tiers 1, 2, and 3 are all closed, and a further,

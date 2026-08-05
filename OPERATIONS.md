@@ -44,6 +44,41 @@ shown.
 > it is off by default (`LANGFUSE_ENABLED=false`) and every step above and
 > below this note works identically whether it's on or off.
 
+> **Guardrails, Phases 1–3 note:** test suite is now **341** (294 + 47 new
+> guardrails regression tests, still fully offline). A new
+> `research_agent/guardrails/` package (`citations.py`, `fencing.py`,
+> `hedging.py`) plus new checks in `agents/gathering.py`,
+> `agents/task_utils.py`, and `agents/compilation.py::telemetry_node` add:
+> a grounded-convergence check (route_convergence won't accept full
+> convergence on evidence that scores well but isn't topically about the
+> goal it's credited against); a deterministic `(unverified figure)`
+> marker inserted into the compiled report for a model-tier claim that
+> pairs a specific year with a specific quantity and wasn't hedged by the
+> compiler; a rejection for `gap_generator` tasks naming a goal id that
+> doesn't exist in the current run; and three new run-level WARNING log
+> lines — `retrieval.floor_starvation`, `quality.judge_unreliable`, and
+> `run.call_budget_high` — all purely observational, none change routing
+> or abort a run. Full details, including the new config knobs and what
+> to expect in a debug trace, are under **Guardrails — What To Expect In
+> The Logs** below.
+
+> **D-55 note (test suite now 344):** the grounded-convergence gate above
+> catches ungrounded evidence at CONVERGENCE time; it never stopped
+> off-topic content from entering `state.evidence` at RETRIEVAL time in
+> the first place. Live trace (run p205.141-check) found the actual entry
+> point: `retrieval_chain._sufficient`'s topical-overlap requirement
+> floored at a single shared word for any query with ≤7 distinctive
+> terms — which is every `corpus_reformulated` retry by construction. A
+> reformulated army query matched an unrelated Memcached document on one
+> accidental shared word ("size"), and that legitimately-cited but
+> topically-wrong evidence went on to prime `gap_generator`'s next cycle
+> toward more off-topic queries. Fixed by raising the floor to 2 shared
+> terms (capped so it never exceeds the query's own term count). This
+> closes the entry point for one specific failure shape — an accidental
+> single-word match — not `gap_generator`'s tendency to propose off-topic
+> queries at all, which remains open; see **Guardrails** in `README.md`
+> for the follow-up run that confirmed both halves of that distinction.
+
 > **This is a hands-on manual, not the honesty audit.** `README.md`'s
 > [Limitations](../README.md#limitations) section is the authoritative,
 > itemized account of what's fixed vs. still broken (28 fixed items, plus
@@ -166,10 +201,10 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 294 passed
+# expect: 344 passed
 ```
 
-If L1 runs and 294 tests pass, your code is fine. Everything from here is about
+If L1 runs and 344 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -638,7 +673,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 294 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 344 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -775,7 +810,7 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **294 tests**, fully offline — no services, no API keys, no
+The suite is **344 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -787,7 +822,7 @@ python -m pytest tests/ -q
 tests/unit/                   170 tests   one file per src/research_agent/ module
 tests/integration/             20 tests   full graph.invoke() runs, offline
                               --------
-                              294 tests
+                              344 tests
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -939,7 +974,7 @@ LANGFUSE_ENVIRONMENT=development
 
 ```powershell
 pip install langfuse
-python -m pytest -q                          # 294/294, fully offline, unaffected
+python -m pytest -q                          # 344/344, fully offline, unaffected
 python -m research_agent.cli "your question" --debug
 ```
 
@@ -1374,6 +1409,84 @@ problem. Raise the context length in your model server (see **Step 3a**
 above) before you spend time on thresholds — otherwise you are tuning
 retrieval while a different subsystem is quietly failing over every run,
 and the two effects are hard to separate in the telemetry.
+
+---
+
+## Guardrails — What To Expect In The Logs
+
+*New since D-46. All three log lines below are WARNING-level, purely
+observational, and never change routing or abort a run — if you see one,
+nothing broke; it is telling you a threshold was crossed.*
+
+**`retrieval.floor_starvation`** — `agents/compilation.py::telemetry_node`,
+once per run, only if `retrieval_dropped_by_floor / retrieval_dense_candidates
+>= retrieval_floor_warn_ratio` (default `0.8`):
+
+```json
+{"msg": "retrieval.floor_starvation", "dropped": 119, "candidates": 132,
+ "ratio": 0.902, "floor": 0.55, "warn_ratio": 0.8}
+```
+
+This is the run-level aggregate of the per-query `retrieval.below_floor`
+lines you already know from **Fine-Tuning the System** above — it fires
+when nearly every dense candidate across the whole run got dropped by
+`min_similarity`, not just an individual query. If you see this on most
+runs, re-check your `MIN_SIMILARITY` calibration against the procedure
+above before assuming the corpus is simply thin.
+
+**`quality.judge_unreliable`** — same node, once per run, only if
+`llm_quality_calls_failed / llm_quality_calls >= quality_judge_warn_ratio`
+(default `0.5`):
+
+```json
+{"msg": "quality.judge_unreliable", "failed": 2, "attempted": 2,
+ "ratio": 1.0, "warn_ratio": 0.5}
+```
+
+`evaluation/quality.py::score_answer` fails **open** by design (a broken
+judge must never reject a good answer) — this WARNING doesn't change that,
+it only tells you the judge never actually scored anything on this run
+(a `2/2` or `3/3` failure ratio has been the norm rather than the
+exception across live testing), so a report reaching `memory_writer`
+wasn't necessarily quality-checked on the way there.
+
+**`run.call_budget_high`** — same node, once per run, only if
+`llm_provider_calls >= run_call_budget_warn` (default `40`):
+
+```json
+{"msg": "run.call_budget_high", "llm_provider_calls": 44,
+ "warn_threshold": 40, "revision_cycles": 3, "escalations": 2}
+```
+
+Purely observational — see [Guardrails](../README.md#guardrails) in
+`README.md` for why this is a WARNING and not a circuit breaker. No run
+observed to date has come close to the default threshold (18 calls is the
+highest seen); if this fires routinely for you, `revision_cycles` and
+`escalations` in the same log line tell you whether the cost is coming
+from repeated critique failures or from repeated human redirects, which
+is the first thing worth checking before raising the threshold.
+
+**Also worth knowing about, not a WARNING**: a compiled report may now
+contain a visible `(unverified figure)` marker after a specific number —
+e.g. `9.1% (unverified figure)`. This is `guardrails/hedging.py` doing its
+job: the number came from the model's own recollection (not retrieved
+evidence), paired a specific year with a specific quantity, and the
+compiler didn't hedge it itself despite the prompt asking it to. The
+figure isn't removed or corrected — only flagged — because guessing at a
+*different*, "corrected" number would be worse than being honest that this
+one is unverified.
+
+**Guardrails config knobs** (all in `.env`/`config.py`, same tuning
+philosophy as `MIN_SIMILARITY`/`MIN_EVIDENCE_SCORE` above — defaults are
+starting points, not universal constants):
+
+| Setting | Default | Guards |
+|---|---|---|
+| `GROUNDED_RECALL_TARGET` | `0.5` | fraction of covered goals that must be topically-grounded before convergence is accepted |
+| `RETRIEVAL_FLOOR_WARN_RATIO` | `0.8` | see `retrieval.floor_starvation` above |
+| `QUALITY_JUDGE_WARN_RATIO` | `0.5` | see `quality.judge_unreliable` above |
+| `RUN_CALL_BUDGET_WARN` | `40` | see `run.call_budget_high` above |
+| `LLM_MAX_TOKENS` | `4096` | generation budget sent to every provider on every call — set well above this session's observed legitimate compile completions (1400–1800 tokens); tune down only after checking your own report sizes |
 
 ---
 

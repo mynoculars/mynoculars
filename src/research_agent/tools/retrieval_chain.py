@@ -160,7 +160,33 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         # entering through a too-permissive gate. A long, specific query
         # matching on its ONE broad subject word is not a topical match:
         # scale the requirement with how specific the query was.
-        need = min(3, max(1, len(terms) // 4))
+        #
+        # A floor of 1 (this scaling formula's original value) reopened
+        # the SAME hole for any query with <=7 distinctive terms -- which
+        # is EVERY reformulated retry by construction, since _reformulate
+        # caps its output at 6 words. Live (run p205.141-check): the
+        # reformulated retry "Indian Army size composition Chinese PLA"
+        # (4 distinctive terms, need=1 under the old floor) matched a
+        # Memcached slab-allocator document on the single accidental word
+        # "size" -- an off-topic hit merged into evidence under a real,
+        # correctly-tagged goal_id, which later primed gap_generator's
+        # next cycle toward more Redis-flavored queries (the ladder never
+        # escalated past tier 1/2, so mcp/model never got a chance to
+        # answer the goal for real). Raising the floor to 2 means a
+        # single accidental word is never enough on its own, at any
+        # query length -- it still scales up to 3 for genuinely long,
+        # specific queries, same as before.
+        #
+        # need must never exceed len(terms) itself -- a query with only 1
+        # distinctive term (e.g. a short stub-generated query like "key
+        # differences", where "key" is filtered as too short) cannot
+        # possibly share 2 terms with anything, even a document
+        # constructed to be maximally relevant. Without this cap, the
+        # floor-raise above turns "insufficient information to judge"
+        # into "always insufficient" for the shortest queries -- confirmed
+        # by test_a_real_document_still_beats_recollection failing on
+        # exactly this shape before this line was added.
+        need = min(3, len(terms), max(2, len(terms) // 4))
         return any(len(terms & _distinctive_terms(e.content)) >= need
                    for e in on_floor)
 

@@ -231,3 +231,63 @@ def test_a_short_query_still_matches_on_a_single_term():
     doc = _ev("corpus", 0.99, "Redis memory overhead per key is higher")
     chain = make_retrieval_chain(doc, FLOOR, model=_model, reformulate=False)
     assert [e.source for e in chain(_task("Redis overhead", "g1"))] == ["corpus"]
+
+
+def test_need_never_exceeds_the_querys_own_term_count():
+    """A query with only ONE distinctive term (e.g. "key differences" --
+    "key" is filtered as too short, leaving just "differences") cannot be
+    held to a 2-term overlap bar -- that would make even a document
+    constructed to be maximally relevant (echoing the query verbatim)
+    fail the gate, which is worse than the bug being fixed. Regression
+    target: test_a_real_document_still_beats_recollection (a separate,
+    pre-existing integration test) broke on exactly this shape the first
+    time the floor was raised from 1 to 2, before this cap was added."""
+    def _model(task):
+        raise AssertionError("model tier must not be reached")
+    doc = _ev("corpus", 0.99, "A relevant document about key differences")
+    chain = make_retrieval_chain(doc, FLOOR, model=_model, reformulate=False)
+    assert [e.source for e in chain(_task("key differences", "g1"))] == ["corpus"]
+
+
+def test_one_accidental_shared_word_no_longer_satisfies_a_short_query():
+    """Regression target: run p205.141-check. The reformulated retry
+    "Indian Army size composition Chinese PLA" (4 distinctive terms,
+    need=1 under the pre-fix floor) matched a completely unrelated
+    Memcached slab-allocator document on the single accidental word
+    "size" -- an off-topic hit that got merged into evidence under a
+    real, correctly-tagged goal_id, and later primed gap_generator's next
+    cycle toward more off-topic queries. A floor of 1 reopened this hole
+    for any query <=7 distinctive terms, which is EVERY reformulated
+    retry by construction (_reformulate caps output at 6 words) -- this
+    is not a synthetic edge case, it is the ladder's own second tier's
+    normal operating range. With the floor raised to 2, a single
+    accidental word is never sufficient on its own, regardless of query
+    length."""
+    doc = _ev("corpus", 0.99,
+              "Memcached generally has lower per-key memory overhead for "
+              "small opaque values due to its slab allocator, whose chunk "
+              "size classes are fixed at startup.")
+    chain = make_retrieval_chain(doc, FLOOR, model=_ev("model", 0.6),
+                                 reformulate=False)
+    task = _task("Indian Army size composition Chinese PLA", "g1")
+    sources = [e.source for e in chain(task)]
+    # The insufficient corpus hit is still COLLECTED (kept as context for
+    # the compiler, per this module's own docstring) -- what matters is
+    # that it did NOT stop the ladder, so the model tier was also reached.
+    assert "model" in sources
+
+
+def test_two_genuinely_shared_terms_still_satisfies_a_short_query():
+    """The floor-raise (1 -> 2) must not make the gate impossible to
+    clear for a short query that is genuinely on topic -- two real
+    shared content words is still a strong enough signal."""
+    def _model(task):
+        raise AssertionError("model tier must not be reached")
+    doc = _ev("corpus", 0.99,
+              "The Indian Army's size and composition include roughly 1.4 "
+              "million active personnel across several commands.")
+    chain = make_retrieval_chain(doc, FLOOR, model=_model, reformulate=False)
+    task = _task("Indian Army size composition", "g1")
+    assert [e.source for e in chain(task)] == ["corpus"]
+
+
