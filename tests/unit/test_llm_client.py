@@ -9,6 +9,10 @@ This file covers only _extract_json's own parsing robustness, which has
 no other natural home.
 """
 
+import json
+
+import httpx
+
 from research_agent.llm.client import OpenAICompatibleClient, _extract_json, _truncate_at_sentinel, _extract_json
 
 
@@ -123,3 +127,48 @@ def test_free_text_path_still_kills_a_runaway_continuation():
 def test_sentinel_segments_returns_every_non_empty_run():
     from research_agent.llm.client import sentinel_segments
     assert sentinel_segments("a<|im_end|><|eot_id|>b") == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Guardrail G6 (P205 Phase 2): max_tokens generation budget
+# ---------------------------------------------------------------------------
+
+
+def _client_with_mock_transport(handler, **kwargs):
+    """Build a real OpenAICompatibleClient, then swap its httpx.Client
+    for one backed by a MockTransport -- this exercises the REAL
+    complete() request-construction path, not a reimplementation of it."""
+    client = OpenAICompatibleClient("primary", "http://x", "key",
+                                    "model-x", **kwargs)
+    client._http = httpx.Client(transport=httpx.MockTransport(handler),
+                                base_url="http://x")
+    return client
+
+
+def test_complete_sends_max_tokens_when_configured():
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "hi"}}]})
+
+    client = _client_with_mock_transport(handler, max_tokens=777)
+    client.complete([{"role": "user", "content": "hi"}])
+    assert captured["body"]["max_tokens"] == 777
+
+
+def test_complete_omits_max_tokens_when_not_configured():
+    """Backward compatibility: a caller that doesn't pass max_tokens at
+    all (the pre-G6 shape) must produce a byte-identical request body --
+    no max_tokens key at all, not max_tokens=None serialized in."""
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "hi"}}]})
+
+    client = _client_with_mock_transport(handler)
+    client.complete([{"role": "user", "content": "hi"}])
+    assert "max_tokens" not in captured["body"]

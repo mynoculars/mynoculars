@@ -347,7 +347,8 @@ class OpenAICompatibleClient:
     """Chat client for any /v1/chat/completions endpoint."""
 
     def __init__(self, name: str, base_url: str, api_key: str, model: str,
-                 timeout: float = 60.0, tracer: Any = None, display_label: str = ""):
+                 timeout: float = 60.0, tracer: Any = None, display_label: str = "",
+                 max_tokens: Optional[int] = None):
         """Parameters map directly to Settings fields; see config.py.
 
         `tracer` (a Tracer, optional) receives the exact prompt/response/tokens/
@@ -356,6 +357,20 @@ class OpenAICompatibleClient:
         falls back to the model id. `_trace_node` is set by the router before
         each call so the trace shows which graph node issued it.
 
+        `max_tokens` (Guardrail G6, P205 Phase 2): the generation budget
+        sent to the provider on every call, or None (the default) to omit
+        the field entirely and let the provider apply its own default --
+        preserves the exact pre-G6 request shape for any caller that
+        doesn't pass this. Before G6 the ONLY control on runaway
+        generation was _truncate_at_sentinel below, applied AFTER a full
+        response (and its full latency and token cost) already came
+        back -- confirmed live, repeatedly, across this whole session's
+        traces ("llm.truncated_runaway_generation" fired on classify,
+        goal_manager, task_expander, gap_generator, and both compiler
+        calls in nearly every run). This bounds the request itself; the
+        sentinel truncation still runs on whatever comes back, since a
+        capped response can still contain a sentinel mid-stream.
+
         CALLED BY   llm/router.py::FallbackRouter.from_settings, once per
                     configured provider (primary always; Mistral/Gemini
                     only if their API key is set).
@@ -363,6 +378,7 @@ class OpenAICompatibleClient:
         self.name = name
         self._model = model
         self._tracer = tracer
+        self._max_tokens = max_tokens
         # complete() truncates at the first chat-template sentinel, which
         # is correct for prose and lossy for JSON. complete_json needs the
         # untruncated text to try the other segments; threading.local keeps
@@ -436,10 +452,10 @@ class OpenAICompatibleClient:
         """
         started = time.perf_counter()
         wall_start = time.time()
-        resp = self._http.post(
-            "/chat/completions",
-            json={"model": self._model, "messages": messages, "temperature": temperature},
-        )
+        payload = {"model": self._model, "messages": messages, "temperature": temperature}
+        if self._max_tokens is not None:
+            payload["max_tokens"] = self._max_tokens
+        resp = self._http.post("/chat/completions", json=payload)
         # raise_for_status() raises an httpx.HTTPStatusError if the response
         # code is 4xx or 5xx (i.e. the server reported an error) — it does
         # nothing (returns None) for a normal 2xx success response.

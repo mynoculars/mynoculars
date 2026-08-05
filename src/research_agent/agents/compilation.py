@@ -304,6 +304,7 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                     retrieval_floor_drop_ratio,
                     llm_node_calls, llm_provider_calls, llm_fallback_hops,
                     llm_quality_calls, llm_quality_calls_failed,
+                    llm_quality_failure_ratio,
                     retrieval_dense_calls, retrieval_keyword_calls,
                     retrieval_leg_unavailable, producer_rejects,
                     search_calls, search_failures, memory_hits,
@@ -451,6 +452,29 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                       ratio=retrieval_floor_drop_ratio,
                       floor=settings.min_similarity,
                       warn_ratio=settings.retrieval_floor_warn_ratio)
+        # Guardrail G4 (P205 Phase 2): same shape as G1's check just
+        # above -- a run-level ratio, WARNed past a threshold, purely
+        # observational. evaluation/quality.py::score_answer is
+        # correctly designed to fail OPEN (a broken judge must never
+        # reject a perfectly good answer) -- but every live run in this
+        # session has shown llm_quality_calls_failed == llm_quality_calls
+        # (2/2, every single time): the judge has never once actually
+        # scored anything, and nothing before this distinguished that
+        # from "scored everything 1.0 on merit". A 100% failure rate
+        # means the quality gate has been silently inert this whole
+        # session, not merely lenient.
+        llm_quality_calls = int(c.get("llm_quality_calls", 0))
+        llm_quality_calls_failed = int(c.get("llm_quality_calls_failed", 0))
+        llm_quality_failure_ratio = (
+            round(llm_quality_calls_failed / llm_quality_calls, 3)
+            if llm_quality_calls else 0.0
+        )
+        if (llm_quality_calls > 0
+                and llm_quality_failure_ratio >= settings.quality_judge_warn_ratio):
+            log_event(logger, "quality.judge_unreliable", level=logging.WARNING,
+                      failed=llm_quality_calls_failed, attempted=llm_quality_calls,
+                      ratio=llm_quality_failure_ratio,
+                      warn_ratio=settings.quality_judge_warn_ratio)
         telemetry = {
             "intent": state.classification.get("intent"),
             "goals": len(state.goals),
@@ -493,6 +517,8 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),
             "llm_quality_calls": int(c.get("llm_quality_calls", 0)),
             "llm_quality_calls_failed": int(c.get("llm_quality_calls_failed", 0)),
+            # Guardrail G4.
+            "llm_quality_failure_ratio": llm_quality_failure_ratio,
             "retrieval_dense_calls": int(c.get("retrieval_dense_calls", 0)),
             "retrieval_keyword_calls": int(c.get("retrieval_keyword_calls", 0)),
             "retrieval_leg_unavailable": int(c.get("retrieval_leg_unavailable", 0)),

@@ -298,6 +298,57 @@ def test_telemetry_does_not_warn_when_floor_is_doing_its_job():
     assert telemetry["retrieval_floor_drop_ratio"] == 0.05
 
 
+# ---------------------------------------------------------------------------
+# Guardrail G4 (P205 Phase 2): quality-judge failure-rate telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_warns_when_the_quality_judge_never_actually_judges(caplog):
+    """Regression target: every live run this session showed
+    llm_quality_calls_failed == llm_quality_calls (2/2) -- the judge
+    fail-open path is correct, but a 100% failure rate had nothing
+    distinguishing it from a 100% genuine-1.0 run."""
+    import logging as _logging
+
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(
+        Settings(_env_file=None, quality_judge_warn_ratio=0.5))
+    state = ResearchState(
+        raw_query="q", goals=[],
+        counters={"llm_quality_calls": 2.0, "llm_quality_calls_failed": 2.0})
+    with caplog.at_level(_logging.WARNING):
+        telemetry = node(state)["telemetry"]
+    assert telemetry["llm_quality_failure_ratio"] == 1.0
+    assert any("quality.judge_unreliable" in r.message for r in caplog.records)
+
+
+def test_telemetry_does_not_warn_when_the_judge_is_mostly_working():
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(
+        Settings(_env_file=None, quality_judge_warn_ratio=0.5))
+    state = ResearchState(
+        raw_query="q", goals=[],
+        counters={"llm_quality_calls": 10.0, "llm_quality_calls_failed": 1.0})
+    telemetry = node(state)["telemetry"]
+    assert telemetry["llm_quality_failure_ratio"] == 0.1
+
+
+def test_telemetry_never_warns_when_the_judge_was_never_called():
+    """llm_quality_calls == 0 means "nothing to report", not "100%
+    failure" -- same 0/0 guard as G1's retrieval_floor_drop_ratio."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(raw_query="q", goals=[], counters={})
+    telemetry = node(state)["telemetry"]
+    assert telemetry["llm_quality_failure_ratio"] == 0.0
+
+
 def test_corpus_recall_counts_a_genuinely_on_topic_document():
     from research_agent.agents.compilation import build_telemetry_node
     from research_agent.config import Settings

@@ -39,7 +39,7 @@ from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI
 from langgraph.types import Command
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from research_agent import langfuse as lf
 from research_agent.assembly import build_app_and_settings
@@ -110,9 +110,22 @@ class ResearchRequest(BaseModel):
                  an id belonging to a run that already finished starts a
                  second, independent run under that same checkpoint key,
                  same as reusing --thread-id on the CLI.
+
+    Guardrail G5 (P205 Phase 2): `query` previously had no length
+    constraint at all -- confirmed absent in the codebase, not just
+    theorized, while reviewing this exact class. Every OTHER user-facing
+    numeric setting in this project (config.py's Field(..., ge=...)
+    entries) already carries a bound; this was the one place external
+    text enters the graph with none. min_length=1 rejects an empty
+    string outright (an empty query still reaches classify_node today
+    and produces a meaningless LLM call); max_length bounds how much
+    text a single request can push into goal_manager's prompt -- chosen
+    generously (a real research question is a sentence or two, not a
+    document) rather than tightly, since the failure mode being guarded
+    against is unbounded input, not merely long input.
     """
 
-    query: str
+    query: str = Field(min_length=1, max_length=2000)
     thread_id: str | None = None
 
 

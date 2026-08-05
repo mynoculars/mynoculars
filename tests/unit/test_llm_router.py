@@ -234,3 +234,29 @@ def test_router_never_bumps_llm_quality_calls_failed_on_a_genuine_score():
     drained = router.drain_counters()
     assert drained["llm_quality_calls"] == 1
     assert drained.get("llm_quality_calls_failed", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Guardrail G6 (P205 Phase 2): max_tokens threaded through from_settings
+# ---------------------------------------------------------------------------
+
+
+def test_from_settings_passes_llm_max_tokens_to_every_provider():
+    """Same cap on every provider in the chain, unlike the two DIFFERENT
+    timeouts primary/fallback get -- see from_settings' own docstring
+    for why max_tokens doesn't need that same split."""
+    from research_agent.config import Settings
+
+    settings = Settings(_env_file=None, llm_mode="live",
+                        llm_max_tokens=777,
+                        llm_mistral_api_key="fake-key")
+    router = FallbackRouter.from_settings(settings)
+    assert [p._max_tokens for p in router.providers] == [777, 777]
+
+
+def test_from_settings_uses_the_configured_default_when_unset():
+    from research_agent.config import Settings
+
+    settings = Settings(_env_file=None, llm_mode="live")
+    router = FallbackRouter.from_settings(settings)
+    assert router.providers[0]._max_tokens == settings.llm_max_tokens

@@ -122,6 +122,27 @@ class Settings(BaseSettings):
     # more room while keeping the cloud fallbacks quick to fail over.
     llm_primary_timeout_seconds: float = Field(120.0, gt=0.0)   # local Cogito
     llm_timeout_seconds: float = Field(90.0, gt=0.0)            # Mistral, Gemini
+    # Guardrail G6 (P205 Phase 2): the generation budget sent to every
+    # provider on every call (llm/client.py::OpenAICompatibleClient).
+    # Before this, the only control on a runaway generation was
+    # _truncate_at_sentinel -- applied AFTER a full response (and its
+    # full latency and token cost) already came back. Live evidence:
+    # "llm.truncated_runaway_generation" fired repeatedly across nearly
+    # every run this session, on classify, goal_manager, task_expander,
+    # gap_generator, and both compiler calls -- each one a request that
+    # ran to completion, at full cost, before anything trimmed it.
+    # 4096 is deliberately generous, not tight: this session's own
+    # traces show LEGITIMATE compile_report completions reaching
+    # 1400-1800+ completion_tokens on a normal five-goal report, so
+    # anything close to that would truncate real, wanted output.
+    # 4096 sits well above every observed legitimate call in this
+    # codebase while still bounding a truly pathological continuation
+    # (a runaway generation observed live ran to ~10,900 raw characters,
+    # several times any real answer's length) -- the goal is bounding
+    # UNBOUNDED generation, not rationing normal ones. Tune down only
+    # after checking your own compiled-report token sizes, the same way
+    # min_similarity/min_evidence_score ask you to check your own corpus.
+    llm_max_tokens: int = Field(4096, ge=1)
 
     # --- Storage endpoints -------------------------------------------------
     postgres_dsn: str = "postgresql://agent:agent@localhost:5432/agent"
@@ -170,6 +191,20 @@ class Settings(BaseSettings):
     # p205.131-check: floor=0.55 dropped every single dense hit and
     # nothing surfaced it outside the raw debug log).
     retrieval_floor_warn_ratio: float = Field(0.8, ge=0.0, le=1.0)
+    # Guardrail G4 (P205 Phase 2): fraction of quality-judge calls
+    # (evaluation/quality.py::score_answer, invoked from
+    # llm/router.py::FallbackRouter._passes_quality) that FAILED to
+    # score at all -- judge unreachable, bad JSON, non-numeric score --
+    # per run, above which telemetry_node logs a WARNING
+    # (quality.judge_unreliable). Purely observational, same shape as
+    # retrieval_floor_warn_ratio just above: score_answer's fail-open
+    # design is correct (a broken judge must never reject a good
+    # answer) and this does not change that -- it only makes a run
+    # where the judge NEVER actually judged anything (every live run
+    # this session showed llm_quality_calls_failed == llm_quality_calls)
+    # visible instead of looking identical to a run where every answer
+    # genuinely scored well.
+    quality_judge_warn_ratio: float = Field(0.5, ge=0.0, le=1.0)
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound
     # Guardrail G2: the OTHER half of convergence, alongside recall_target.
     # recall_target alone answers "is every goal covered by SOMETHING";

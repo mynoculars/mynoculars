@@ -212,6 +212,14 @@ class FallbackRouter:
         config.py's comment on those two fields for why they're split —
         in short, a local model can need much longer than a cloud API
         before a slow response is actually a problem worth failing over.
+
+        Guardrail G6 (P205 Phase 2): every provider in the chain gets the
+        SAME s.llm_max_tokens generation cap, unlike the two timeouts
+        above -- there's no equivalent reason to split it per-provider
+        (a runaway generation is a property of the MODEL's own behavior
+        continuing past its end-of-turn, not of network latency, so the
+        primary/cloud distinction that justifies split timeouts doesn't
+        apply here).
         """
         if s.llm_mode == "stub":
             return cls([StubClient(tracer=tracer)], s.llm_quality_threshold, tracer)
@@ -219,7 +227,8 @@ class FallbackRouter:
         chain: List[ChatClient] = [OpenAICompatibleClient(
             "primary", s.llm_primary_base_url, s.llm_primary_api_key,
             s.llm_primary_model, s.llm_primary_timeout_seconds, tracer,
-            display_label=f"LOCAL PRIMARY ({s.llm_primary_model})")]
+            display_label=f"LOCAL PRIMARY ({s.llm_primary_model})",
+            max_tokens=s.llm_max_tokens)]
 
         # See the module docstring for exactly what this tuple-of-tuples
         # loop with unpacking is doing. Each row here is one OPTIONAL
@@ -234,7 +243,7 @@ class FallbackRouter:
             if key:
                 chain.append(OpenAICompatibleClient(
                     name, base, key, model, s.llm_timeout_seconds, tracer,
-                    display_label=label))
+                    display_label=label, max_tokens=s.llm_max_tokens))
 
         log_event(logger, "llm.chain_built", providers=[p.name for p in chain])
         return cls(chain, s.llm_quality_threshold, tracer)

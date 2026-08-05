@@ -142,6 +142,42 @@ def test_health_reports_llm_mode_and_durability():
     assert body == {"status": "ok", "llm_mode": "stub", "durable": False}
 
 
+# ---------------------------------------------------------------------------
+# Guardrail G5 (P205 Phase 2): input length validation on ResearchRequest
+# ---------------------------------------------------------------------------
+
+
+def test_research_rejects_an_empty_query():
+    """min_length=1 -- an empty string previously reached classify_node
+    and produced a meaningless LLM call; now it never leaves the API
+    layer. Asserted as a 422 (FastAPI's own validation-error status),
+    not a graph invocation -- the fake graph in this test file raises
+    if invoked at all, so a passing test here already proves the graph
+    was never reached."""
+    server = _import_server(_bundle())
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": ""})
+    assert resp.status_code == 422
+
+
+def test_research_rejects_a_query_over_the_length_cap():
+    server = _import_server(_bundle())
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "x" * 2001})
+    assert resp.status_code == 422
+
+
+def test_research_accepts_a_query_at_the_length_cap():
+    """Boundary check: exactly max_length must still be accepted -- the
+    cap guards against UNBOUNDED input, not against ordinary long
+    queries."""
+    server = _import_server(_bundle(app=_ScriptedGraph(result={
+        "final_report": "ok", "telemetry": {}})))
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "x" * 2000})
+    assert resp.status_code == 200
+
+
 def test_shutdown_closes_the_mcp_bridge_as_well_as_the_checkpointer():
     """cli.py has always closed both; api/server.py closed only the
     checkpointer, leaving an MCP subprocess and its background thread
