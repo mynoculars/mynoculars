@@ -267,6 +267,22 @@ class Settings(BaseSettings):
     # without needing to also flip hitl_enabled.
     max_escalations: int = Field(2, ge=0)
     recursion_limit: int = Field(60, ge=10)   # D-8: invoke-time backstop
+    # Guardrail G7 (P205 Phase 3, observability half only): a run-level
+    # WARNING when total llm_provider_calls clears this threshold --
+    # same shape as retrieval_floor_warn_ratio/quality_judge_warn_ratio
+    # above, purely observational, no routing change. Deliberately NOT a
+    # circuit breaker: max_depth, max_revisions, and max_escalations
+    # above -- together with recursion_limit as a hard graph-level
+    # backstop -- already bound every run's worst case; a redirect
+    # requires a fresh human decision each time and max_escalations caps
+    # how many total redirects a run can have, so the "unbounded loop"
+    # scenario a circuit breaker would defend against cannot actually
+    # occur under the existing bounds. No run has come close to this
+    # threshold (18 provider calls is the highest observed, across a
+    # run with two escalations and three revision cycles) -- this
+    # exists to make a genuinely runaway run visible, the same
+    # measure-before-enforcing step that preceded G4's threshold.
+    run_call_budget_warn: int = Field(40, ge=1)
     # D-18/P2-12: LLM-based contradiction detection in merger_node. Off by
     # default — costs one extra LLM call per merger execution (i.e. once
     # per gather cycle, up to max_depth times per run) whenever any goal

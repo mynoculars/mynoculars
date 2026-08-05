@@ -475,6 +475,21 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                       failed=llm_quality_calls_failed, attempted=llm_quality_calls,
                       ratio=llm_quality_failure_ratio,
                       warn_ratio=settings.quality_judge_warn_ratio)
+        # Guardrail G7 (P205 Phase 3, observability half only): same
+        # shape again -- a run-level count, WARNed past a threshold,
+        # purely observational, checked here (once, at the very end of
+        # a completed run) rather than mid-run, since this is visibility
+        # into total cost after the fact, not a gate on continuing.
+        # Deliberately NOT a circuit breaker -- see
+        # settings.run_call_budget_warn's own comment for why a hard
+        # mid-run enforcement isn't justified by anything observed yet.
+        llm_provider_calls = int(c.get("llm_provider_calls", 0))
+        if llm_provider_calls >= settings.run_call_budget_warn:
+            log_event(logger, "run.call_budget_high", level=logging.WARNING,
+                      llm_provider_calls=llm_provider_calls,
+                      warn_threshold=settings.run_call_budget_warn,
+                      revision_cycles=int(c.get("revision_cycles", 0)),
+                      escalations=len(state.escalation_history))
         telemetry = {
             "intent": state.classification.get("intent"),
             "goals": len(state.goals),

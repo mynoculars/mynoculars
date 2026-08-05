@@ -349,6 +349,49 @@ def test_telemetry_never_warns_when_the_judge_was_never_called():
     assert telemetry["llm_quality_failure_ratio"] == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Guardrail G7 (P205 Phase 3, observability only): run-level call budget
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_warns_when_llm_provider_calls_clears_the_budget(caplog):
+    """Observational only -- this WARNs, it does not change routing or
+    abort the run. See settings.run_call_budget_warn's own comment for
+    why this is a WARNING and not a circuit breaker."""
+    import logging as _logging
+
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None, run_call_budget_warn=10))
+    state = ResearchState(raw_query="q", goals=[],
+                          counters={"llm_provider_calls": 10.0})
+    with caplog.at_level(_logging.WARNING):
+        node(state)
+    assert any("run.call_budget_high" in r.message for r in caplog.records)
+
+
+def test_telemetry_does_not_warn_below_the_call_budget():
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None, run_call_budget_warn=40))
+    state = ResearchState(raw_query="q", goals=[],
+                          counters={"llm_provider_calls": 18.0})
+    telemetry = node(state)["telemetry"]
+    assert telemetry["llm_provider_calls"] == 18
+
+
+def test_telemetry_never_warns_on_the_call_budget_when_no_calls_were_made():
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(raw_query="q", goals=[], counters={})
+    telemetry = node(state)["telemetry"]
+    assert telemetry["llm_provider_calls"] == 0
+
+
 def test_corpus_recall_counts_a_genuinely_on_topic_document():
     from research_agent.agents.compilation import build_telemetry_node
     from research_agent.config import Settings
