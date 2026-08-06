@@ -482,7 +482,7 @@ New candidates recorded in v3.1, deliberately **not** adopted: (a) a dedup-mergi
 ## 12. Reference Implementation
 
 Status updated at v3.2: the reference implementation's test suite now
-collects **344 tests** (see `README.md`/`OPERATIONS.md` for the full
+collects **348 tests** (see `README.md`/`OPERATIONS.md` for the full
 growth history), 47 of which are the guardrails regression coverage
 added for D-47…D-54 (§13). The v3.1.2 status line below is otherwise
 unchanged and describes the same D-1…D-24/D-28 core. Status updated at v3.1.2: the core-build reference implementation (63 files, 28/32 tests passing [87.5%], covering D-1…D-24, D-28, and HITL. 4 tests skipped pending MCP integration [D-26/D-30].) covers D-1…D-24 together with D-28.t **plus HITL (D-23/D-28)**: a single parametrized escalation node with `interrupt()` as its first effectful statement, all four triggers (E1/E2/E3/E4, off by default via `HITL_ENABLED`), approve/redirect/abort resume under the run's thread_id, CLI stdin loop and API `/resume` endpoint. The timeout policy deferred since v3.0 is resolved per-interface: blocking stdin for the CLI; indefinite checkpointed persistence for the API. MCP (D-26/D-30), typed workers (D-25), and server-side fusion/decay (D-27) remain design-level by explicit scoping decision. The external review's code stubs remain **not** adoptable as-is (see Appendix C and the accompanying conversation).

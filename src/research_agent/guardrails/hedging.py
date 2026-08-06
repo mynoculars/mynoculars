@@ -61,6 +61,18 @@ _HEDGE_WORDS = ("approximately", "roughly", "about", "around", "estimated",
                 "nearly", "on the order of", "some")
 _HEDGE_LOOKBACK = 30
 _MARKER = " (unverified figure)"
+# Characters that, immediately before a matched span, mean the match
+# landed INSIDE a larger number rather than on the flagged figure itself.
+# Live review finding: the flagged span "5.2%" matched inside "15.2%" in
+# a report reading "Growth was 15.2% ... not 5.2%", marking a DIFFERENT,
+# never-flagged figure as unverified. A marker on a number the detector
+# never flagged is worse than a missing marker: it asserts something
+# false about a figure that may be perfectly well-sourced.
+_NUMERIC_PREFIX = "0123456789.,"
+
+
+def _starts_inside_a_larger_number(report: str, start: int) -> bool:
+    return start > 0 and report[start - 1] in _NUMERIC_PREFIX
 
 
 def _already_hedged(report_lower: str, start: int) -> bool:
@@ -98,7 +110,9 @@ def enforce_hedging(report: str, evidence: List[Evidence]) -> Tuple[str, Dict[st
         while start != -1:
             end = start + len(span)
             already_marked = report[end:end + len(_MARKER)] == _MARKER
-            if not already_marked and not _already_hedged(lower_report, start):
+            if (not already_marked
+                    and not _already_hedged(lower_report, start)
+                    and not _starts_inside_a_larger_number(report, start)):
                 report = report[:end] + _MARKER + report[end:]
                 lower_report = report.lower()
                 tagged += 1

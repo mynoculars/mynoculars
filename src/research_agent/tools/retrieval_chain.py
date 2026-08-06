@@ -80,14 +80,39 @@ def _reformulate(query: str) -> str:
 
 
 def _distinctive_terms(text: str) -> set:
-    """Lower-cased content words of 4+ characters, minus scaffolding.
+    """Lower-cased content words carrying topical signal, minus scaffolding.
 
     Pure and cheap: this runs inside every parallel worker, on every tier,
     so it must not allocate much or call anything.
+
+    Three rules, each closing a live-observed hole in the gate that
+    consumes this (`_sufficient`, and `corpus_recall` in telemetry_node,
+    which deliberately reuses this same function so the two can never
+    disagree):
+
+    1. Words longer than three characters are kept, as before.
+    2. SHORT ALL-CAPS TOKENS ARE KEPT TOO. The old length-only rule threw
+       away exactly the tokens carrying the most topical signal in this
+       project's real traffic: "GDP growth India US 2020-2023" retained
+       neither GDP nor US, and "Indian Army ... Chinese PLA" dropped PLA
+       -- the single most distinctive word in the query. An acronym is
+       the opposite of filler, and length is the wrong proxy for it.
+    3. BARE NUMBERS ARE DROPPED. A standalone number is a weak topical
+       signal that travels in pairs: "2020-2023" contributed TWO terms,
+       so any off-topic document mentioning the same two years cleared a
+       two-term overlap bar on years alone. Mixed alphanumerics (pm10,
+       t90, 155mm) are real terms and are kept -- only all-digit tokens
+       go.
     """
-    return {w for w in (
-        "".join(c if c.isalnum() else " " for c in text.lower()).split())
-        if len(w) > 3 and w not in _FILLER}
+    out = set()
+    for word in "".join(
+            c if c.isalnum() else " " for c in text).split():
+        low = word.lower()
+        if low in _FILLER or low.isdigit():
+            continue
+        if len(low) > 3 or (len(low) >= 2 and word.isupper()):
+            out.add(low)
+    return out
 
 
 def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
@@ -129,19 +154,25 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         """A tier answered only if it returned something that clears the
         coverage floor AND is lexically ON TOPIC.
 
-        The score test alone is a RANKING signal, not a relevance one.
-        Live (run p205.90-check): asked for "GDP per capita India US
-        comparison 2023" against a corpus of ten Redis documents, both
-        retrieval legs returned the same three irrelevant documents,
-        cross-leg agreement pushed them to ~1.0, this function said
-        "answered", and the ladder never escalated -- so the report said
-        the evidence did not cover GDP per capita, which is precisely the
-        give-up this ladder exists to remove. A fixed-k search over a small
-        corpus ALWAYS returns k documents; without a topical check there is
-        no empty state and no tier can ever fail.
+        The score test alone is a RANKING signal, not a relevance one. A
+        fixed-k search over a small corpus ALWAYS returns k documents;
+        without a topical check there is no empty state, so no tier can
+        ever fail and the ladder can never escalate.
 
-        One shared distinctive term is a deliberately low bar -- this is a
-        floor against wholly off-topic matches, not a relevance ranker.
+        `need` scales with how specific the query was, with a floor of 2
+        and a cap at the query's own term count. Three live runs shaped
+        those bounds -- p205.90 (no topical test at all), p205.101 (one
+        broad subject word satisfying a nine-term query) and p205.141 (one
+        ACCIDENTAL word satisfying a short reformulated query, which is
+        every retry by construction, since _reformulate caps at 6 words).
+        The cap exists because a single-term query cannot share two terms
+        with anything, however relevant. Full accounts in DECISIONS.md
+        D-39, D-44 and D-55; the tests in
+        tests/unit/test_tools_retrieval_chain.py name the run each one
+        locks down.
+
+        One term is deliberately NOT enough, at any query length. This is
+        a floor against off-topic matches, not a relevance ranker.
         """
         on_floor = [e for e in evidence if e.score > min_evidence_score]
         if not on_floor:
@@ -149,43 +180,6 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         terms = _distinctive_terms(query)
         if not terms:
             return True  # nothing to test against; trust the score
-        # ONE shared term was too weak a bar. Live (run p205.101-check):
-        # "Comparative analysis Redis Cassandra DynamoDB petabyte scale
-        # performance scalability cost operational complexity" has NINE
-        # distinctive terms; a Redis session-caching document shares
-        # exactly one of them ("redis"), which passed the gate, stopped the
-        # ladder at tier 1, and left model_sourced_items at 0 -- so the
-        # report said "no retrieved evidence quantifies..." for all five
-        # goals. That is the give-up this ladder exists to remove, re-
-        # entering through a too-permissive gate. A long, specific query
-        # matching on its ONE broad subject word is not a topical match:
-        # scale the requirement with how specific the query was.
-        #
-        # A floor of 1 (this scaling formula's original value) reopened
-        # the SAME hole for any query with <=7 distinctive terms -- which
-        # is EVERY reformulated retry by construction, since _reformulate
-        # caps its output at 6 words. Live (run p205.141-check): the
-        # reformulated retry "Indian Army size composition Chinese PLA"
-        # (4 distinctive terms, need=1 under the old floor) matched a
-        # Memcached slab-allocator document on the single accidental word
-        # "size" -- an off-topic hit merged into evidence under a real,
-        # correctly-tagged goal_id, which later primed gap_generator's
-        # next cycle toward more Redis-flavored queries (the ladder never
-        # escalated past tier 1/2, so mcp/model never got a chance to
-        # answer the goal for real). Raising the floor to 2 means a
-        # single accidental word is never enough on its own, at any
-        # query length -- it still scales up to 3 for genuinely long,
-        # specific queries, same as before.
-        #
-        # need must never exceed len(terms) itself -- a query with only 1
-        # distinctive term (e.g. a short stub-generated query like "key
-        # differences", where "key" is filtered as too short) cannot
-        # possibly share 2 terms with anything, even a document
-        # constructed to be maximally relevant. Without this cap, the
-        # floor-raise above turns "insufficient information to judge"
-        # into "always insufficient" for the shortest queries -- confirmed
-        # by test_a_real_document_still_beats_recollection failing on
-        # exactly this shape before this line was added.
         need = min(3, len(terms), max(2, len(terms) // 4))
         return any(len(terms & _distinctive_terms(e.content)) >= need
                    for e in on_floor)

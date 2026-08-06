@@ -35,7 +35,7 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > WARNING when the quality judge fails on every attempt in a run
 > (`llm_quality_calls_failed == llm_quality_calls`, observed on every
 > live run to date). Phase 3 added `run_call_budget_warn` — observability
-> only, no circuit breaker; see below. **Test suite: 344/344**, up from
+> only, no circuit breaker; see below. **Test suite: 348/348**, up from
 > 294 — every count below is corrected to match. Nothing else changed:
 > the architecture, D-xx decisions, and Tier 1/2/3 narrative are all
 > still accurate.
@@ -295,8 +295,16 @@ legitimate citation to an irrelevant document, which then sat in
 Fixed by raising the floor from `max(1, ...)` to `max(2, ...)`, with a
 `min(..., len(terms), ...)` cap so the new floor can never demand more
 shared terms than a short query even has (a real edge case an existing
-integration test caught before this shipped). Test suite: 344/344, up
-from 341. See D-55 for the full account.
+integration test caught before this shipped). Test suite: 348/348, up
+from 341. See D-55 for the full account — and D-56, which corrects this
+paragraph's original claim: raising the floor closed the **single**
+accidental-word case, but bare years counted as distinctive terms and
+travel in pairs, so a date-ranged query like `2020-2023` handed any
+off-topic document mentioning those years a free two-term match. D-56
+drops bare numbers (and stops discarding short acronyms like GDP, US,
+PLA, which the term extractor had been throwing away all along), plus
+fixes a substring-boundary bug in the hedge marker found in the same
+review.
 
 **What this still doesn't fix, confirmed live on the very next run
 (p205.145-check) after the fix shipped**: `gap_generator` can still
@@ -1532,7 +1540,7 @@ research-agent-dmp/
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 344 tests, offline. Organized by module,
+├── tests/                   # 348 tests, offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
@@ -1571,7 +1579,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 344 passed
+python -m pytest tests/ -q    # expect: 348 passed
 ```
 
 **Or install it as a package** (`pyproject.toml`, new) — which is what
@@ -2063,7 +2071,7 @@ The shape of it, updated with this revision's progress:
      Cost tracking from Settings-configured $/1M rates             ✅ DONE
      propagate_attributes session/environment grouping             ✅ DONE
      Crash-safe end_trace (try/except in cli.py::_run)              ✅ DONE
-     Test suite: 157 → 190 → 294 → 341 → 344
+     Test suite: 157 → 190 → 294 → 341 → 344 → 348
 ```
 
 **Status, updated**: Tiers 1, 2, and 3 are all closed, and a further,

@@ -113,3 +113,18 @@ def test_a_hedge_word_on_one_figure_does_not_suppress_tagging_the_other():
     assert "500 GW (unverified figure)" in cleaned
     assert "14% (unverified figure)" not in cleaned
     assert counters["hedge_markers_inserted"] == 1.0
+
+
+def test_a_flagged_span_inside_a_larger_number_is_not_tagged():
+    """Code-review finding. The flagged span "5.2%" matched INSIDE
+    "15.2%" via plain substring search, putting an (unverified figure)
+    marker on a different, never-flagged number. A marker on a figure the
+    detector never flagged is worse than a missing marker: it asserts
+    something false about a number that may be perfectly well-sourced.
+    The genuine occurrence must still be tagged."""
+    evidence = [_model_evidence("Growth was 5.2% in 2021.")]
+    report = "Growth was 15.2% in 2021, not 5.2%."
+    cleaned, counters = enforce_hedging(report, evidence)
+    assert "15.2% (unverified figure)" not in cleaned
+    assert "not 5.2% (unverified figure)" in cleaned
+    assert counters["hedge_markers_inserted"] == 1.0

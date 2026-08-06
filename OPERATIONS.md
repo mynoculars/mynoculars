@@ -201,10 +201,10 @@ tests to confirm the logic:
 
 ```bash
 python -m pytest tests/ -q
-# expect: 344 passed
+# expect: 348 passed
 ```
 
-If L1 runs and 344 tests pass, your code is fine. Everything from here is about
+If L1 runs and 348 tests pass, your code is fine. Everything from here is about
 feeding it data.
 
 ---
@@ -673,7 +673,7 @@ the telemetry change, move on.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 344 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 348 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -810,7 +810,7 @@ knobs are safe to turn without surprising yourself. All commands here are
 
 ## Running and Interpreting the Test Suite
 
-The suite is **344 tests**, fully offline — no services, no API keys, no
+The suite is **348 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -822,7 +822,7 @@ python -m pytest tests/ -q
 tests/unit/                   170 tests   one file per src/research_agent/ module
 tests/integration/             20 tests   full graph.invoke() runs, offline
                               --------
-                              344 tests
+                              348 tests
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -974,7 +974,7 @@ LANGFUSE_ENVIRONMENT=development
 
 ```powershell
 pip install langfuse
-python -m pytest -q                          # 344/344, fully offline, unaffected
+python -m pytest -q                          # 348/348, fully offline, unaffected
 python -m research_agent.cli "your question" --debug
 ```
 

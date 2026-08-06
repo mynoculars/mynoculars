@@ -291,3 +291,41 @@ def test_two_genuinely_shared_terms_still_satisfies_a_short_query():
     assert [e.source for e in chain(task)] == ["corpus"]
 
 
+
+
+def test_short_all_caps_acronyms_survive_as_distinctive_terms():
+    """Code-review finding. The old length-only rule (len > 3) threw away
+    exactly the tokens carrying the most topical signal in this project's
+    real traffic: "GDP growth India US 2020-2023" retained neither GDP
+    nor US, and an Indian-vs-PLA query dropped PLA -- its single most
+    distinctive word."""
+    from research_agent.tools.retrieval_chain import _distinctive_terms
+    assert "pla" in _distinctive_terms("Indian Army size composition Chinese PLA")
+    gdp = _distinctive_terms("GDP growth India US 2020-2023")
+    assert {"gdp", "us"} <= gdp
+
+
+def test_bare_years_are_not_distinctive_terms():
+    """Code-review finding. A standalone number is a weak topical signal
+    that travels in PAIRS: "2020-2023" contributed two terms, so any
+    off-topic document mentioning the same two years cleared the two-term
+    overlap bar on years alone -- defeating the D-55 floor-raise for the
+    date-ranged queries this project issues constantly. Mixed
+    alphanumerics (pm10, 155mm) are real terms and must survive."""
+    from research_agent.tools.retrieval_chain import _distinctive_terms
+    terms = _distinctive_terms("GDP growth India US 2020-2023")
+    assert not {"2020", "2023"} & terms
+    assert "pm10" in _distinctive_terms("US air quality PM10 levels")
+
+
+def test_year_collision_alone_no_longer_satisfies_the_topical_gate():
+    """The end-to-end version of the two rules above: an off-topic Redis
+    document that happens to mention the same two years as a GDP query
+    must not stop the ladder."""
+    doc = _ev("corpus", 0.99,
+              "Redis 7.0 was released in 2022. Memcached benchmarks from "
+              "2020 through 2023 show slab allocator throughput.")
+    chain = make_retrieval_chain(doc, FLOOR, model=_ev("model", 0.6),
+                                 reformulate=False)
+    task = _task("GDP growth India US 2020-2023", "g1")
+    assert "model" in [e.source for e in chain(task)]
