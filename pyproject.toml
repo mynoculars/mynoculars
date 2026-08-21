@@ -87,13 +87,21 @@ dependencies = [
 #               in src/ references either.
 #   mcp      -- MCP_ENABLED=false by default; tools/mcp_client.py has no
 #               module-level `import mcp`.
+#   websearch-- WEB_SEARCH_ENABLED=false by default; ddgs is imported ONLY
+#               by scripts/mcp_web_search_server.py (a separate process)
+#               and lazily inside websearch/ddgs_provider.py, so a core
+#               install neither needs nor loads it. Verified by
+#               test_importing_the_package_does_not_require_ddgs.
 #   langfuse -- LANGFUSE_ENABLED=false by default; langfuse/client.py's
 #               build_client() returns None before importing the SDK.
 #   viz      -- cli.py --print-graph falls back to Mermaid text and prints
 #               a hint when grandalf is absent.
 [project.optional-dependencies]
 api = ["fastapi>=0.111", "uvicorn>=0.30"]
-mcp = ["mcp>=1.9"]
+mcp = ["mcp>=1.9,<2"]
+# websearch pulls mcp too: the web tier is reached THROUGH an MCP server,
+# so ddgs alone would install a server nothing can talk to.
+websearch = ["mcp>=1.9,<2", "ddgs>=9.0,<10"]
 langfuse = ["langfuse>=4.0"]
 viz = ["grandalf>=0.8"]
 dev = ["pytest>=8.0"]
@@ -102,7 +110,8 @@ dev = ["pytest>=8.0"]
 all = [
     "fastapi>=0.111",
     "uvicorn>=0.30",
-    "mcp>=1.9",
+    "mcp>=1.9,<2",
+    "ddgs>=9.0,<10",
     "langfuse>=4.0",
     "grandalf>=0.8",
 ]

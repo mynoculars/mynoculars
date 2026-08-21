@@ -29,6 +29,7 @@ from research_agent.agents.escalation import escalation_allowed
 from research_agent.config import Settings
 from research_agent.guardrails.citations import clean_citations
 from research_agent.guardrails.hedging import enforce_hedging
+from research_agent.guardrails.sources import append_web_sources
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
@@ -119,6 +120,23 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # instruction to hedge UNVERIFIED-SPECIFIC claims is not
         # reliably followed on its own).
         report, hedge_counters = enforce_hedging(report, state.evidence)
+        # D-57: deterministic attribution for web evidence. LAST, after
+        # both passes above -- each of them searches the report for literal
+        # spans of evidence content, and a Sources block full of titles and
+        # URLs is exactly what could be mistaken for a paste. Appending
+        # afterwards puts it out of their reach entirely.
+        #
+        # Deterministic rather than a prompt instruction, for D-51's reason
+        # verbatim: asking the compiler to carry URLs into prose is the same
+        # bet that produced hedge_specific_items 29 with zero visible
+        # hedging. This also leaves D-40's [gN]-only prose rule fully
+        # intact -- the section sits BELOW the report, so nothing above it
+        # changes.
+        #
+        # No-op returning the report byte-identical whenever there is no
+        # cited web evidence, which is every run with WEB_SEARCH_ENABLED
+        # false (the default).
+        report, source_counters = append_web_sources(report, state.evidence)
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,
@@ -136,7 +154,7 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # is the one node whose drained counters can include
         # llm_quality_calls (the self-scoring gate only runs on free text).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
-                    **citation_counters, **hedge_counters}
+                    **citation_counters, **hedge_counters, **source_counters}
         return {"final_report": report, "counters": counters}
 
     return compiler_node
@@ -518,6 +536,29 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # same pattern as "recall" above.
             "grounded_score": round(state.grounded_score, 3),
             "model_sourced_items": int(evidence_by_source.get("model", 0)),
+            # D-57. Deliberately reported ALONGSIDE corpus_recall and
+            # grounded_score rather than folded into either: web evidence
+            # covers goals but never grounds them, so a run reading
+            # recall 1.0 / grounded_score 0.0 / web_sourced_items 12 is
+            # telling you precisely and honestly where its answer came
+            # from. Without this number that same run is indistinguishable
+            # from one that found nothing at all.
+            "web_sourced_items": int(evidence_by_source.get("web", 0)),
+            # How many DISTINCT domains that evidence came from. A useful
+            # honesty check on its own: twelve items from one domain is one
+            # source repeated, not twelve agreeing -- which is what
+            # websearch/filtering.py::cap_by_domain limits at retrieval
+            # time and what this makes visible after the fact.
+            "web_source_domains": len({e.domain for e in state.evidence
+                                       if e.source == "web" and e.domain}),
+            # From compiler_node's append_web_sources pass: how many web
+            # pages the report actually attributed, and how many were
+            # retrieved but belonged to goals the compiler never cited.
+            # A high suppressed count against a low listed count is the
+            # signature of the web tier doing work that never reached the
+            # report.
+            "web_sources_listed": int(c.get("web_sources_listed", 0)),
+            "web_sources_suppressed": int(c.get("web_sources_suppressed", 0)),
             # Guardrail G3: model-tier items whose own text paired a
             # specific year with a specific quantity — flagged, not
             # dropped (see tools/model_knowledge.py::_looks_overspecific).

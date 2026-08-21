@@ -183,17 +183,26 @@ def check_mcp(settings) -> ServiceStatus:
         return ServiceStatus("MCP server", True, "MCP_ENABLED=false -- skipped, not checked",
                               skipped=True)
 
-    if not settings.mcp_server_command:
-        return ServiceStatus("MCP server", False,
-                              "MCP_ENABLED=true but MCP_SERVER_COMMAND is empty -- "
-                              "misconfigured, not a live-service failure")
-
+    # NO "command is empty" check, and its REMOVAL is the point (D-58).
+    # assembly.py resolves an empty MCP_SERVER_COMMAND to sys.executable, so
+    # empty is a WORKING configuration -- and the recommended one, for the
+    # same reasons it is recommended for WEB_MCP_SERVER_COMMAND. This check
+    # previously reported FAIL on a configuration the agent runs happily,
+    # which is worse than no check at all: it sends you hunting for a fault
+    # that is not there.
+    #
+    # Resolved through the SAME two helpers assembly.py uses, so this check
+    # exercises the real launch path rather than a lookalike that could pass
+    # while a real run fails, or vice versa.
+    from research_agent.config import resolve_repo_path, resolve_server_command
     from research_agent.tools.mcp_client import MCPBridge
+
+    command = resolve_server_command(settings.mcp_server_command)
+    args = [resolve_repo_path(a) for a in split_csv(settings.mcp_server_args)]
 
     t0 = time.time()
     bridge = MCPBridge(
-        command=settings.mcp_server_command,
-        args=split_csv(settings.mcp_server_args),
+        command=command, args=args,
         env_allowlist=split_csv(settings.mcp_server_env_allowlist),
     )
     try:
@@ -204,7 +213,7 @@ def check_mcp(settings) -> ServiceStatus:
         item_count = len(getattr(result, "content", []) or [])
         return ServiceStatus(
             "MCP server", True,
-            f"{settings.mcp_server_command} {settings.mcp_server_args} -- "
+            f"{command} {args} -- "
             f"tool '{settings.mcp_tool_name}' responded, {item_count} content item(s) "
             "(spawned fresh for this check -- MCP has no persistent server; "
             "this confirms the on-demand subprocess+stdio path works, not that "
@@ -213,13 +222,95 @@ def check_mcp(settings) -> ServiceStatus:
     except Exception as e:
         return ServiceStatus(
             "MCP server", False,
-            f"{settings.mcp_server_command} {settings.mcp_server_args} -- "
+            f"{command} {args} -- "
             f"{type(e).__name__}: {e} "
             "(this is a REAL failure -- the on-demand spawn mechanism itself is "
             "broken, e.g. a bad command/path or a crash in mcp_corpus_server.py; "
             "it is NOT a 'no server running' situation, since none is ever "
             "supposed to be running independently -- see this function's own "
             "docstring)",
+            time.time() - t0)
+    finally:
+        bridge.close()
+
+
+def check_web_search(settings) -> ServiceStatus:
+    """Phase 4 (D-57). Same spawn-a-throwaway-subprocess approach as
+    check_mcp above -- read that docstring first; everything it says about
+    MCP not being a standing service applies here identically.
+
+    THE ONE THING THIS CHECK CATCHES THAT NOTHING ELSE DOES: this subprocess
+    is the only part of the system that makes OUTBOUND INTERNET requests,
+    and tools/mcp_client.py::_build_subprocess_env forwards nothing from the
+    parent environment (D-30). Behind a corporate proxy with an empty
+    WEB_MCP_SERVER_ENV_ALLOWLIST, every search fails as an opaque timeout
+    and no unit test can tell you -- the entire suite is offline by design.
+    This is where that shows up, which is exactly what D-33 put this script
+    here for.
+
+    A PASS means a live query reached a real search engine and came back
+    scored. That makes this the ONLY verification of the live DDGS path in
+    the repo; the unit tests deliberately stop at a fake provider.
+    """
+    if not settings.web_search_enabled:
+        return ServiceStatus("Web search (MCP)", True,
+                              "WEB_SEARCH_ENABLED=false -- skipped, not checked",
+                              skipped=True)
+
+    # NO "command is empty" check here, deliberately, unlike check_mcp above:
+    # empty is the RECOMMENDED value for WEB_MCP_SERVER_COMMAND and means
+    # sys.executable (D-58). Resolved through the same two helpers
+    # assembly.py uses, so this check exercises the real launch path rather
+    # than a lookalike that could pass while a real run fails.
+    from research_agent.config import resolve_repo_path, resolve_server_command
+    from research_agent.tools.mcp_client import MCPBridge
+
+    command = resolve_server_command(settings.web_mcp_server_command)
+    args = [resolve_repo_path(a) for a in split_csv(settings.web_mcp_server_args)]
+
+    t0 = time.time()
+    bridge = MCPBridge(command=command, args=args,
+                        env_allowlist=split_csv(settings.web_mcp_server_env_allowlist))
+    try:
+        result = bridge.call_tool(
+            settings.web_mcp_tool_name,
+            {settings.web_mcp_query_arg_name: "site reliability engineering"},
+            timeout_seconds=settings.web_mcp_call_timeout_seconds)
+        # Read structuredContent, the channel make_web_search_tool reads --
+        # so this check exercises the same path a real run does rather than
+        # a lookalike.
+        structured = getattr(result, "structuredContent", None) or {}
+        items = structured.get("result") if isinstance(structured, dict) else None
+        items = items if isinstance(items, list) else []
+        domains = len({i.get("domain") for i in items if isinstance(i, dict)})
+        if not items:
+            return ServiceStatus(
+                "Web search (MCP)", False,
+                f"tool '{settings.web_mcp_tool_name}' responded but returned NO "
+                "results for a deliberately broad query. Most likely the engine "
+                "is throttling this host, or the subprocess has no network "
+                "route -- check WEB_MCP_SERVER_ENV_ALLOWLIST includes your "
+                "proxy variables, since _build_subprocess_env forwards nothing "
+                "by default (D-30)",
+                time.time() - t0)
+        return ServiceStatus(
+            "Web search (MCP)", True,
+            f"{command} {args} -- "
+            f"tool '{settings.web_mcp_tool_name}' returned {len(items)} scored "
+            f"result(s) across {domains} domain(s) via "
+            f"WEB_SEARCH_PROVIDER={settings.web_search_provider} "
+            "(spawned fresh for this check, and the ONLY live verification of "
+            "the search path in this repo -- the unit suite stops at a fake "
+            "provider by design)",
+            time.time() - t0)
+    except Exception as e:
+        return ServiceStatus(
+            "Web search (MCP)", False,
+            f"{command} {args} -- "
+            f"{type(e).__name__}: {e} "
+            "(a REAL failure of the on-demand spawn+search path: a bad "
+            "command/path, a missing 'ddgs' install in that interpreter, no "
+            "network route from the subprocess, or upstream throttling)",
             time.time() - t0)
     finally:
         bridge.close()
@@ -271,6 +362,7 @@ def main() -> int:
         check_postgres(settings.postgres_dsn),
         check_llm_primary(settings.llm_primary_base_url),
         check_mcp(settings),
+        check_web_search(settings),
     ]
     if not args.skip_api:
         results.append(check_api_server(args.api_url))

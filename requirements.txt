@@ -30,7 +30,23 @@ grandalf>=0.8
 # complexity risk factor before it was added. Verified against the actual
 # installed version's real API (ClientSession, StdioServerParameters,
 # stdio_client), not assumed from memory.
-mcp>=1.9
+mcp>=1.9,<2
+# UPPER BOUND ADDED, and it is not cosmetic: mcp 2.0.0 moved
+# mcp.server.fastmcp, which BREAKS scripts/mcp_corpus_server.py,
+# tests/fixtures/mcp_echo_server.py and 9 tests outright on a fresh
+# install. Reproduced directly: `pip install "mcp>=1.9"` resolves to 2.x
+# today and the suite goes 348 -> 339 with ModuleNotFoundError. Raise this
+# ceiling only after porting both servers to the 2.x layout and re-running
+# the full suite.
+
+# Phase 4: web search (research_agent/websearch/) is NOT installed by this
+# file. Its one extra dependency lives in requirements-websearch.txt:
+#
+#     pip install -r requirements-websearch.txt
+#
+# Kept separate because WEB_SEARCH_ENABLED defaults false and the agent
+# process never imports ddgs at all -- only the search server subprocess
+# does. A core install should not pull an optional scraping client.
 
 # Phase 3: Langfuse observability (research_agent/langfuse/). Optional --
 # LANGFUSE_ENABLED=false (the default) never imports this package at all

@@ -347,8 +347,17 @@ class SemanticMemory:
         #     self-reinforcing loop, and the one place a single
         #     fabrication can become permanent.
         # Memory is for what RETRIEVAL found (D-24). Recollection is not.
+        # "web" added by Phase 4 (D-57), for D-42's reason plus one more.
+        # D-42's reason: what enters durable memory comes back on a LATER
+        # run as source="memory" at raw cosine similarity, indistinguishable
+        # from something a document supported. The extra reason for web: a
+        # snippet is volatile by construction (make_web_search_tool stamps
+        # Volatility.VOLATILE on every one), so a stored copy of today's
+        # search result is simply a wrong answer next month, with nothing in
+        # the text marking it stale. Memory is for what RETRIEVAL of the
+        # CORPUS found; a live lookup should be repeated, not cached.
         fresh = [e for e in evidence
-                 if e.source not in ("memory", "model")]
+                 if e.source not in ("memory", "model", "web")]
         # D-24 quality gate. A passed critique says the REPORT is
         # acceptable; it says nothing about whether the evidence behind
         # it ever cleared the coverage bar. Live (run p205.71-check):

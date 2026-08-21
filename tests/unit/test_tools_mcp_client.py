@@ -305,3 +305,212 @@ def test_mcp_bridge_timeout_error_is_actually_informative():
             assert "1.0" in message  # the configured timeout, visible in the message
     finally:
         bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# make_web_search_tool (Phase 4 / D-57) -- parsing only, fully faked
+# ---------------------------------------------------------------------------
+
+
+class _FakeWebResult:
+    """A CallToolResult stand-in carrying structuredContent, text blocks, or
+    both -- so each test can pin down which channel the parser actually
+    used."""
+
+    def __init__(self, structuredContent=None, content=None, isError=False):
+        self.structuredContent = structuredContent
+        self.content = content or []
+        self.isError = isError
+
+
+def _payload(rank, score, url=None, title="T", snippet="s", domain=None):
+    return {"title": f"{title}{rank}", "url": url or f"https://s{rank}.com/p",
+            "snippet": f"{snippet}{rank}", "rank": rank, "engine": "ddg_text",
+            "domain": domain or f"s{rank}.com", "score": score}
+
+
+def _web_tool(result, **kwargs):
+    from research_agent.tools.mcp_client import make_web_search_tool
+
+    bridge = _FakeBridgeForToolParsing(result)
+    return make_web_search_tool(bridge, "web_search", **kwargs), bridge
+
+
+def test_web_tool_reads_structured_content_and_tags_source_web():
+    """source="web", NOT "mcp", even though this arrived over MCP. "mcp" is
+    tested for set-membership in progress_checker_node and telemetry_node as
+    a proxy for "a real DOCUMENT backed this"; tagging snippets "mcp" would
+    make every one of them inflate grounded_score and corpus_recall."""
+    result = _FakeWebResult(structuredContent={
+        "result": [_payload(1, 0.75), _payload(2, 0.60)]})
+    tool, bridge = _web_tool(result)
+
+    evidence = tool(_task(query="redis vs memcached", key="t1", goal_id="g1"))
+
+    assert [e.source for e in evidence] == ["web", "web"]
+    assert [e.score for e in evidence] == [0.75, 0.60]
+    assert all(e.task_key == "t1" and e.goal_id == "g1" for e in evidence)
+    assert bridge.calls == [("web_search", {"query": "redis vs memcached"}, 45.0)]
+
+
+def test_web_tool_carries_url_and_domain_onto_evidence():
+    result = _FakeWebResult(structuredContent={"result": [
+        _payload(1, 0.75, url="https://arxiv.org/abs/1", domain="arxiv.org")]})
+    tool, _ = _web_tool(result)
+
+    e = tool(_task())[0]
+    assert e.url == "https://arxiv.org/abs/1"
+    assert e.domain == "arxiv.org"
+
+
+def test_web_tool_marks_evidence_volatile():
+    """A live page today is a stale answer next month with nothing in the
+    text saying so. This also feeds D-51's hedging pass."""
+    from research_agent.state import Volatility
+
+    result = _FakeWebResult(structuredContent={"result": [_payload(1, 0.75)]})
+    tool, _ = _web_tool(result)
+    assert tool(_task())[0].volatility is Volatility.VOLATILE
+
+
+def test_web_tool_joins_title_and_snippet():
+    """Each alone loses something: the snippet is the substance, the title is
+    often the only place the subject is actually named."""
+    result = _FakeWebResult(structuredContent={"result": [{
+        "title": "PLA modernization", "url": "https://a.com/1",
+        "snippet": "The report finds...", "rank": 1, "engine": "e",
+        "domain": "a.com", "score": 0.75}]})
+    tool, _ = _web_tool(result)
+    assert tool(_task())[0].content == "PLA modernization — The report finds..."
+
+
+def test_web_tool_drops_an_item_with_no_usable_score(caplog):
+    """No default is safe. Too high silently defeats the D-17 coverage gate
+    (the hardcoded 1.0 this very module shipped once and had to fix); too low
+    makes a genuinely retrieved result unable to cover a goal while still
+    consuming a compile-prompt slot. Dropping is the smaller and, crucially,
+    the VISIBLE failure -- it is counted and logged."""
+    import logging
+
+    result = _FakeWebResult(structuredContent={"result": [
+        {"title": "no score", "url": "https://a.com/1", "snippet": "s",
+         "rank": 1, "engine": "e", "domain": "a.com"},
+        _payload(2, 0.70)]})
+    tool, _ = _web_tool(result)
+
+    with caplog.at_level(logging.WARNING):
+        evidence = tool(_task())
+
+    assert len(evidence) == 1 and evidence[0].score == 0.70
+    assert [r for r in caplog.records
+            if "web_search.dropped_unscored_items" in r.message]
+
+
+def test_web_tool_clamps_a_score_that_overshoots_one():
+    """Evidence.score is bounded [0,1] by its own Field constraint; a server
+    returning 1.0000001 through float round-tripping must not raise a
+    ValidationError inside a worker."""
+    result = _FakeWebResult(structuredContent={
+        "result": [_payload(1, 1.0000001)]})
+    tool, _ = _web_tool(result)
+    assert tool(_task())[0].score == 1.0
+
+
+def test_web_tool_skips_an_item_with_neither_title_nor_snippet():
+    result = _FakeWebResult(structuredContent={"result": [
+        {"title": "", "url": "https://a.com/1", "snippet": "", "rank": 1,
+         "engine": "e", "domain": "a.com", "score": 0.75},
+        _payload(2, 0.70)]})
+    tool, _ = _web_tool(result)
+    assert len(tool(_task())) == 1
+
+
+def test_web_tool_falls_back_to_json_text_blocks():
+    """Reached when an SDK version stops populating structuredContent, or a
+    differently-built server returns text only."""
+    import json
+
+    result = _FakeWebResult(content=[
+        _FakeContentBlock(text=json.dumps(_payload(1, 0.75))),
+        _FakeContentBlock(text=json.dumps(_payload(2, 0.60)))])
+    tool, _ = _web_tool(result)
+
+    evidence = tool(_task())
+    assert [e.score for e in evidence] == [0.75, 0.60]
+    assert evidence[0].url == "https://s1.com/p"
+
+
+def test_web_tool_prefers_structured_content_over_text_blocks():
+    """structuredContent is the only channel where score survives as a
+    NUMBER rather than as text to be re-parsed."""
+    import json
+
+    result = _FakeWebResult(
+        structuredContent={"result": [_payload(1, 0.75, title="STRUCTURED")]},
+        content=[_FakeContentBlock(text=json.dumps(_payload(9, 0.61, title="TEXT")))])
+    tool, _ = _web_tool(result)
+
+    evidence = tool(_task())
+    assert len(evidence) == 1
+    assert evidence[0].content.startswith("STRUCTURED")
+
+
+def test_web_tool_tolerates_a_non_json_text_block():
+    """A server that also emits a human-readable preamble block must not
+    break the whole call."""
+    import json
+
+    result = _FakeWebResult(content=[
+        _FakeContentBlock(text="Found 1 result:"),
+        _FakeContentBlock(text=json.dumps(_payload(1, 0.75)))])
+    tool, _ = _web_tool(result)
+    assert len(tool(_task())) == 1
+
+
+def test_web_tool_returns_empty_on_a_tool_reported_error():
+    """A TOOL-level error is data arriving cleanly to say "this did not
+    work", not a protocol failure -- so the ladder escalates rather than the
+    task failing under D-16."""
+    tool, _ = _web_tool(_FakeWebResult(isError=True))
+    assert tool(_task()) == []
+
+
+def test_web_tool_returns_empty_on_an_unrecognized_shape():
+    """A server sending neither channel yields [] -- which reads as "found
+    nothing" and lets the ladder escalate, rather than raising and burning
+    the task over a shape problem."""
+    tool, _ = _web_tool(_FakeWebResult(structuredContent={"unexpected": 1}))
+    assert tool(_task()) == []
+
+
+def test_web_tool_caps_content_at_800_chars():
+    """Same cap corpus_search.py and make_mcp_tool use, so no one tier can
+    crowd the compile prompt."""
+    result = _FakeWebResult(structuredContent={"result": [{
+        "title": "T", "url": "https://a.com/1", "snippet": "x" * 5000,
+        "rank": 1, "engine": "e", "domain": "a.com", "score": 0.75}]})
+    tool, _ = _web_tool(result)
+    assert len(tool(_task())[0].content) == 800
+
+
+def test_web_tool_uses_the_configured_query_arg_name_and_timeout():
+    result = _FakeWebResult(structuredContent={"result": []})
+    tool, bridge = _web_tool(result, query_arg_name="q",
+                            call_timeout_seconds=12.5)
+    tool(_task(query="hello"))
+    assert bridge.calls == [("web_search", {"q": "hello"}, 12.5)]
+
+
+def test_make_mcp_tool_is_unchanged_by_phase_4():
+    """Regression lock. make_web_search_tool is a SEPARATE factory precisely
+    so the proven Phase 1-3 corpus path cannot regress from this work. If
+    someone later merges the two, this is where it shows up."""
+    from research_agent.tools.mcp_client import make_mcp_tool
+
+    result = _FakeCallToolResult(content=[_FakeContentBlock(text="fact one")])
+    bridge = _FakeBridgeForToolParsing(result)
+    evidence = make_mcp_tool(bridge, "search")(_task())
+
+    assert len(evidence) == 1
+    assert evidence[0].source == "mcp"
+    assert evidence[0].url is None and evidence[0].domain is None

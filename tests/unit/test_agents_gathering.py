@@ -485,3 +485,44 @@ def test_g2_model_sourced_evidence_never_counts_as_grounded_even_on_topic():
     result = node(state)
     assert result["recall_score"] == 1.0
     assert result["grounded_score"] == 0.0
+
+
+def test_g2_web_sourced_evidence_covers_a_goal_but_never_grounds_it():
+    """THE Phase 4 grounding lock (D-57).
+
+    A web snippet is retrieval, not curation. It may COVER a goal -- it is
+    real, current, above the floor, and on topic -- but it must never GROUND
+    one, because grounded_score (Guardrail G2 / D-47) answers a different
+    question: "did a real DOCUMENT back this?"
+
+    The failure this prevents is silent and severe. make_mcp_tool hardcodes
+    source="mcp", and progress_checker_node tests `source in ("corpus",
+    "mcp")`. Had web search been exposed through the existing MCP client
+    unchanged, every snippet would have counted as a grounded document,
+    inflating grounded_score and re-creating precisely the recall=1.0 /
+    corpus_recall=0.0 blindness D-43 and D-47 exist to expose. The fix is
+    that make_web_search_tool tags source="web", and "web" is deliberately
+    absent from that tuple.
+
+    A run answered wholly from the web must therefore read recall 1.0 /
+    grounded_score 0.0 -- visible rather than flattering.
+    """
+    settings = Settings(_env_file=None, min_evidence_score=0.5,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="GDP growth rate comparison "
+                                              "between India and US")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="web",
+                           content="India's GDP growth rate rebounded to "
+                                   "8.9 percent.", score=0.75,
+                           url="https://example.org/gdp",
+                           domain="example.org")],
+    )
+    node = build_progress_checker_node(settings, debug=False)
+    result = node(state)
+    assert result["recall_score"] == 1.0, "a web hit must still cover a goal"
+    assert result["grounded_score"] == 0.0, (
+        "a web snippet must never count as a grounded document -- if this "
+        'fails, check whether "web" was added to the source tuple in '
+        "progress_checker_node")

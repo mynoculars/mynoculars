@@ -68,6 +68,7 @@ _settings = _bundle.settings
 _durable = _bundle.durable
 _checkpointer = _bundle.checkpointer
 _mcp_bridge = _bundle.mcp_bridge
+_web_mcp_bridge = _bundle.web_mcp_bridge
 
 
 @asynccontextmanager
@@ -75,8 +76,9 @@ async def _lifespan(_app: FastAPI):
     """Own the shutdown of everything build_app_and_settings opened.
 
     Replaces the deprecated @app.on_event("shutdown") hook. Closes BOTH
-    the checkpointer connection (P2-08) and, when MCP is enabled, the
-    MCPBridge -- which owns a real subprocess and a background thread
+    the checkpointer connection (P2-08) and, when MCP or web search is
+    enabled, BOTH MCPBridges -- each owning a real subprocess and a
+    background thread
     that were previously left running past shutdown here, even though
     cli.py has always closed them in its own finally block.
 
@@ -93,6 +95,8 @@ async def _lifespan(_app: FastAPI):
     close_checkpointer(_checkpointer)
     if _mcp_bridge is not None:
         _mcp_bridge.close()
+    if _web_mcp_bridge is not None:
+        _web_mcp_bridge.close()
     lf.shutdown()
 
 

@@ -13,7 +13,20 @@ above the quality floor:
     2. corpus, again  ONE reformulation of the query (a retrieval miss is
                       very often a phrasing miss -- see below)
     3. mcp            the external specialist tool, when one is wired
-    4. model          the answering model's own knowledge
+    4. web            a real search engine, when one is wired (D-57)
+    5. model          the answering model's own knowledge
+
+Why web sits AFTER mcp and not in its place:
+    In every deployment of this repo so far, the MCP server wired at tier 3
+    is scripts/mcp_corpus_server.py -- i.e. the corpus, reached a second
+    way. Tiers 1-3 therefore all resolve to the SAME ingested documents,
+    which is precisely why "the corpus does not contain it" used to fall
+    straight through to recollection. Web is the first tier that can return
+    something the corpus never held, so it belongs after every corpus route
+    is exhausted and before the model is asked to remember.
+
+    A run wiring a genuinely external tier-3 specialist keeps that ordering
+    too: a curated specialist source outranks an open web search.
 
 Why an ordered chain rather than a router decision:
     Cheapest and most authoritative first. A real document always beats a
@@ -117,6 +130,7 @@ def _distinctive_terms(text: str) -> set:
 
 def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
                          mcp: Optional[ToolFn] = None,
+                         web: Optional[ToolFn] = None,
                          model: Optional[ToolFn] = None,
                          reformulate: bool = True) -> ToolFn:
     """Build the escalating ToolFn.
@@ -132,7 +146,12 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
             the ladder -- pass settings.min_evidence_score so this can
             never drift from progress_checker's coverage rule (D-17).
         mcp: optional tier-3 specialist (tools/mcp_client.py), or None.
-        model: optional tier-4 parametric tier
+        web: optional tier-4 web search
+            (tools/mcp_client.py::make_web_search_tool), or None to
+            disable it. None whenever settings.web_search_enabled is
+            false, which is the default -- so the ladder is byte-identical
+            to every pre-Phase-4 run unless it is deliberately turned on.
+        model: optional tier-5 parametric tier
             (tools/model_knowledge.py), or None to disable it.
         reformulate: whether to spend tier 2 on a rephrased corpus retry.
 
@@ -227,6 +246,34 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
                 log_event(logger, "chain.answered", tier="mcp", task=task.key,
                           items=len(found))
                 return collected
+
+        if web is not None:
+            found = _try("web", web, task)
+            collected.extend(found)
+            # _sufficient's topical gate applies here exactly as it does to
+            # every other tier, deliberately, even though a search engine
+            # has ALREADY done its own relevance judgement. Two reasons:
+            # consistency (one rule for what "a tier answered" means), and
+            # the fact that an engine's relevance is judged against the
+            # query string, while this gate is judged against the query's
+            # distinctive terms -- which is the check that catches a
+            # plausible-looking result set about the wrong subject.
+            #
+            # The risk this creates is real and worth watching: web
+            # snippets are short (~150-250 chars), so a genuinely relevant
+            # result can fail a 2-distinctive-term overlap and drop the
+            # ladder to the model tier unnecessarily. That is why the miss
+            # is logged rather than silent -- measure before tuning, the
+            # same posture D-54 took toward the call budget.
+            if _sufficient(found, task.query):
+                log_event(logger, "chain.answered", tier="web", task=task.key,
+                          items=len(found))
+                return collected
+            if found:
+                log_event(logger, "chain.web_gate_rejected",
+                          task=task.key, items=len(found),
+                          reason="web returned results that missed the "
+                                 "score or topical gate")
 
         if model is not None:
             found = _try("model", model, task)

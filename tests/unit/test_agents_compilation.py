@@ -436,3 +436,31 @@ def test_evidence_text_glued_to_a_claim_is_still_stripped():
     assert body not in cleaned
     assert cleaned == "Sessions map to hashes without rewriting the whole blob"
     assert counters["citations_pasted_evidence_removed"] == 1.0
+
+
+def test_corpus_recall_does_not_count_a_web_sourced_item():
+    """The telemetry half of the Phase 4 grounding lock (D-57).
+
+    corpus_recall (D-43) measures how many goals a real DOCUMENT covered.
+    telemetry_node tests `source in ("corpus", "mcp")`; "web" is
+    deliberately absent, so a run answered entirely from the web reports
+    recall 1.0 alongside corpus_recall 0.0 -- exactly the honest split D-43
+    was built to surface. Tagging web results "mcp" instead would have made
+    that number silently meaningless.
+    """
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(
+        raw_query="Compare Redis and Memcached",
+        goals=[Goal(goal_id="g1", description="Compare Redis throughput")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="web",
+                           score=0.75, url="https://example.org/redis",
+                           domain="example.org",
+                           content="Redis throughput is limited per shard")],
+        recall_score=1.0, iteration_depth=1)
+    telemetry = node(state)["telemetry"]
+    assert telemetry["corpus_recall"] == 0.0, (
+        'if this fails, check whether "web" was added to _doc_sources in '
+        "telemetry_node")

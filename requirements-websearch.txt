@@ -1,0 +1,49 @@
+# requirements-websearch.txt -- Phase 4 web search (D-57)
+#
+# Install ONLY when you intend to run with WEB_SEARCH_ENABLED=true. The core
+# install neither needs nor loads anything here: research_agent/websearch/ is
+# imported exclusively by scripts/mcp_web_search_server.py, which runs in its
+# own subprocess, and websearch/ddgs_provider.py imports ddgs lazily inside
+# DDGSProvider.__init__ rather than at module level.
+#
+#     pip install -r requirements-websearch.txt
+#
+# Equivalent extras, if you prefer installing the package:
+#
+#     pip install -e ".[websearch]"
+#
+# INSTALL INTO THE SAME VIRTUALENV THAT RUNS THE AGENT. With
+# WEB_MCP_SERVER_COMMAND left empty (the recommended setting -- see D-58 and
+# config.py::resolve_server_command), the search server subprocess is launched
+# with sys.executable, i.e. exactly the interpreter running the agent. If ddgs
+# is missing from THAT environment the subprocess dies before the MCP
+# handshake completes, and the failure surfaces as an opaque "Connection
+# closed" rather than as a readable ImportError.
+#
+# Verify with:  python scripts/check_services.py
+# That is the only live verification of the search path in this repo -- the
+# unit suite is entirely offline by design and stops at a fake provider.
+
+# The MCP SDK. Pinned <2 for the SAME reason requirements.txt pins it: mcp
+# 2.0.0 moved mcp.server.fastmcp, which breaks both server scripts outright.
+# Repeated here rather than assumed, so this file is installable on its own.
+mcp>=1.9,<2
+
+# DuckDuckGo metasearch client. `ddgs` is the CURRENT name of the package
+# formerly published as `duckduckgo-search` -- do not install both, they
+# conflict.
+#
+# Chosen as the default because it needs no API key, no account and no
+# per-call cost, which makes it the right choice for a reference
+# implementation someone clones and runs. It is NOT a production search
+# dependency: it is an unofficial client against an endpoint that promises it
+# nothing, so throttling is expected rather than exceptional, and it has
+# broken across its own releases before. The upper bound is deliberate --
+# a major version bump of an unofficial scraping client is exactly where the
+# response shape changes.
+#
+# Swapping it for a keyed API (Tavily, Brave, SearXNG) is one new module in
+# research_agent/websearch/ plus one WEB_SEARCH_PROVIDER value, and touches
+# nothing in agents/, orchestration/ or tools/ -- see
+# websearch/provider.py::SearchProvider for the seam that makes that true.
+ddgs>=9.0,<10

@@ -72,7 +72,20 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > below. **Test suite: 294/294** (grown across D-38–D-46's regression coverage, fully
 > offline). D-35 logs the module-boundary decision in `DECISIONS.md`.
 
-> **Post-Phase-3 work (D-38–D-46, no separate phase number assigned):** retrieval was rebuilt as a 4-tier ladder ending in the model’s own knowledge, with anti-fabrication limits, deterministic citation repair, and a critic that now sees the evidence it verifies against. Not a phase/tier bump in name — `DECISIONS.md` is the source of truth for this range; see D-38 through D-46.
+> **Phase 4 — web search (D-57/D-58).** The retrieval ladder gains a real
+> search engine as tier 4, between the MCP tier and the model’s own
+> knowledge. It runs in its OWN MCP server subprocess
+> (`scripts/mcp_web_search_server.py`, `research_agent/websearch/`), so the
+> agent process never imports a search client — swapping DDGS for a keyed
+> API is one module plus one setting. Web evidence is tagged `source="web"`
+> and deliberately does NOT count toward `grounded_score` or
+> `corpus_recall`: a snippet is retrieval, not curation. Off by default
+> (`WEB_SEARCH_ENABLED=false`), and with it off the ladder is byte-identical
+> to every prior run. D-58 additionally fixes a latent path bug affecting
+> BOTH MCP servers: relative paths resolved against the launch directory,
+> not the repo. **Test suite: 476/476** (348 before Phase 4).
+
+> **Post-Phase-3 work (D-38–D-46, no separate phase number assigned):** retrieval was rebuilt as a multi-tier ladder ending in the model’s own knowledge (4 tiers then; 5 since Phase 4 added web search), with anti-fabrication limits, deterministic citation repair, and a critic that now sees the evidence it verifies against. Not a phase/tier bump in name — `DECISIONS.md` is the source of truth for this range; see D-38 through D-46.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
@@ -254,12 +267,23 @@ change the graph's topology.
 |---|---|---|
 | **Call budget observability** | Same WARNING shape a third time: `settings.run_call_budget_warn` (new, default `40`) and `agents/compilation.py::telemetry_node` logs `run.call_budget_high` if `llm_provider_calls` clears it — carrying `revision_cycles` and `len(state.escalation_history)` as context, so a high call count can be read alongside how many revision/escalation cycles produced it. **Deliberately observational only, not a circuit breaker**: `max_depth`, `max_revisions`, `max_escalations`, and LangGraph's own `recursion_limit` already bound every run's worst case together, and no run to date has come near the threshold (18 provider calls is the highest observed) — enforcing a hard stop here would be acting on a failure mode with no supporting evidence, the same reasoning `min_similarity`'s own calibration caveat elsewhere in this document argues against doing blind | Unit tests for the threshold, the escalation/revision context fields, and the 0-calls no-op case |
 
+### Phase 4 — deterministic web-source attribution (D-57)
+
+| Item | What changed | Verified how |
+|---|---|---|
+| **Deterministic `## Sources`** | `guardrails/sources.py::append_web_sources` runs LAST in `compiler_node`, after `clean_citations` and `enforce_hedging`, appending a Sources section built from `source="web"` evidence whose `goal_id` the report actually cites — deduplicated by URL, ordered by score. **Prompt-instructed inline attribution was considered and rejected**: D-51 exists precisely because a prompt instruction to hedge was followed unreliably enough that a shipped report reached `hedge_specific_items: 29` with zero visible hedging. Attribution is the same shape of problem and gets the same shape of answer. It also leaves D-40's `[gN]`-only prose rule fully intact — the section sits BELOW the report, so nothing above it changes, and `citations.py` / `hedging.py` / the critic prompt need to know nothing about a new inline form | 15 unit tests, including that a report with no cited web evidence comes back **byte-identical** (the path every run with `WEB_SEARCH_ENABLED=false` takes) |
+| **Web evidence cannot forge grounding** | `make_web_search_tool` tags `source="web"`, deliberately NOT `"mcp"`. Both `progress_checker_node` and `telemetry_node` test `source in ("corpus", "mcp")` as a proxy for "a real DOCUMENT backed this", so routing web results through the existing `make_mcp_tool` unchanged would have made every snippet inflate `grounded_score` and `corpus_recall` — silently restoring the exact `recall=1.0 / corpus_recall=0.0` blindness D-43 and D-47 exist to expose. `make_mcp_tool` itself is left byte-identical, so the proven Phase 1–3 corpus path cannot regress from this work | Two dedicated regression tests asserting a web item yields `recall_score 1.0` with `grounded_score 0.0` and `corpus_recall 0.0`; a third asserting `make_mcp_tool`'s output is unchanged |
+| **Web evidence never enters durable memory** | `semantic_memory.store_run` excludes `source="web"` alongside `"memory"`/`"model"`. D-42's reason applies unchanged (anything stored returns on a later run as `source="memory"`, indistinguishable from document-backed evidence), plus one more: a snippet is volatile by construction, so a cached copy of today's result is a wrong answer next month with nothing marking it stale | Unit test on a mixed corpus/web batch |
+| **Per-domain diversity cap** | `websearch/filtering.py::cap_by_domain` allows at most `WEB_SEARCH_MAX_PER_DOMAIN` (default `2`) hits per registrable domain, applied before scoring so the band interpolates across survivors. Not tidiness: five hits from one site read to the compiler as five independent sources agreeing, and the retrieved-item count looks identical either way | Unit tests for the cap, the `www.` collapse, order preservation, and the disable path (`0`) |
+
 **Guardrails config summary** (all in `config.py`, all `Field`-validated):
 
 | Setting | Default | Guards |
 |---|---|---|
 | `grounded_recall_target` | `0.5` | fraction of covered goals that must be topically-grounded corpus/mcp evidence before `route_convergence` accepts full convergence |
 | `retrieval_floor_warn_ratio` | `0.8` | dense-candidate drop ratio above which `retrieval.floor_starvation` WARNs |
+| `web_search_min_score` / `web_search_max_score` | `0.60` / `0.75` | the band a web result's RANK maps onto. The floor MUST exceed `min_evidence_score` or the whole tier is inert — it retrieves, costs real time, and can never cover a goal; `warn_on_web_search_band` WARNs when it does not. The ceiling must stay well under the ~1.0 a two-leg corpus hit reaches under RRF, or a snippet outranks a real document in the compiler's context |
+| `web_search_max_per_domain` | `2` | hits allowed from any one registrable domain before the rest are dropped |
 | `quality_judge_warn_ratio` | `0.5` | quality-judge failure ratio above which `quality.judge_unreliable` WARNs |
 | `run_call_budget_warn` | `40` | `llm_provider_calls` count above which `run.call_budget_high` WARNs |
 | `llm_max_tokens` | `4096` | generation budget sent to every LLM provider on every call (`llm/client.py::OpenAICompatibleClient`) — bounds a runaway generation at the request level, complementing (not replacing) the existing `_truncate_at_sentinel` cleanup on whatever comes back |
@@ -357,13 +381,23 @@ this in the first place — remains open, same as stated above.
   failing quality judge, and a high LLM call count (observational only, no
   circuit breaker); and API-boundary input length validation. See
   [Guardrails](#guardrails).
+- **Web search** (`WEB_SEARCH_ENABLED=true`, Phase 4 / D-57): a real search
+  engine as retrieval tier 4, reached over its OWN MCP server subprocess
+  (`scripts/mcp_web_search_server.py`) so the agent process never imports a
+  search client or makes an outbound request of its own. Results are
+  rank-scored onto a bounded band, deduplicated, capped per domain, and
+  tagged `source="web"` — which COVERS a goal but never GROUNDS one, so
+  `grounded_score`/`corpus_recall` stay honest. Cited pages are appended as
+  a deterministic `## Sources` section. Off by default; with it off the
+  ladder is byte-identical to every pre-Phase-4 run.
 - Fully offline demo mode (`LLM_MODE=stub`) — the entire graph runs with zero
   services and zero API keys.
 
 **Non-goals**
 - Production deployment, auth, multi-tenancy, horizontal scaling.
 - Dynamic (LLM-decided) control flow / supervisor agents.
-- Web search — retrieval is over the local sample corpus.
+- ~~Web search~~ — **no longer a non-goal.** Delivered in Phase 4 (D-57) as
+  retrieval tier 4, off by default. See Capabilities above.
 
 ## Architecture
 
@@ -396,9 +430,9 @@ both `build_app_and_settings` and `AppBundle`, so every existing
        │                  │                   │                   │
        ▼                  ▼                   ▼                   ▼
 ┌──────────────┐   ┌──────────────┐    ┌──────────────┐   ┌──────────────────┐
-│FallbackRouter│   │ Corpus tool  │    │SemanticMemory│   │   Checkpointer   │
-│ hop on error │   │ plain callab-│    │ decay rerank │   │   + run history  │
-│ OR on low    │   │ le (MCP seam)│    │ in Python    │   │                  │
+│FallbackRouter│   │Retrieval tool│    │SemanticMemory│   │   Checkpointer   │
+│ hop on error │   │ D-38 ladder: │    │ decay rerank │   │   + run history  │
+│ OR on low    │   │ 5 tiers, one │    │ in Python    │   │                  │
 │ quality      │   └──────┬───────┘    └─────────┬────┘   └───┬──────────┬───┘
 └─┬──────┬───┬─┘          │                      │   LangGraph│      app │
   │      │   │            ▼                      │     writes │    writes│
@@ -634,9 +668,46 @@ BM25 leg has no equivalent floor — BM25 scores are corpus-dependent and
 unbounded, so there's no principled fixed cutoff the way there is for a 0..1
 cosine similarity; this is a documented, deliberate gap, not an oversight.
 
-### Retrieval is now a ladder, not just this one hop (D-38–D-46)
+### Retrieval is now a ladder, not just this one hop (D-38–D-46, D-57)
 
-The diagram above is tier 1 of 4. If corpus search comes back below `min_evidence_score` — or scores high but shares no distinctive vocabulary with the query (D-39) — `tools/retrieval_chain.py` tries, in order: **one reformulated corpus retry** (shorter, stripped-down query), then **MCP**, then the **model’s own knowledge** (`tools/model_knowledge.py`), stopping at the first tier that clears the bar. Model-tier items always carry `source="model"`, are never relabelled as corpus hits, never persist to durable memory (D-42), and the compiler must attribute them as general knowledge rather than a retrieved finding (D-40). Telemetry’s `corpus_recall` and `model_sourced_items` fields exist specifically so a large gap between them and `recall` is visible — it means the answer is recollection, not retrieval. Full rationale and live evidence: `DECISIONS.md` D-38 through D-46.
+The diagram above is tier 1 of 5. If corpus search comes back below `min_evidence_score` — or scores high but shares no distinctive vocabulary with the query (D-39) — `tools/retrieval_chain.py` tries, in order: **one reformulated corpus retry** (shorter, stripped-down query), then **MCP**, then **web search** (Phase 4 / D-57, off by default), then the **model’s own knowledge** (`tools/model_knowledge.py`), stopping at the first tier that clears the bar. Model-tier items always carry `source="model"`, are never relabelled as corpus hits, never persist to durable memory (D-42), and the compiler must attribute them as general knowledge rather than a retrieved finding (D-40). Telemetry’s `corpus_recall` and `model_sourced_items` fields exist specifically so a large gap between them and `recall` is visible — it means the answer is recollection, not retrieval. Full rationale and live evidence: `DECISIONS.md` D-38 through D-46, and D-57 for the web tier.
+
+```text
+  tier                        runs in                 evidence      counts as
+                                                      source        a document?
+  ──────────────────────────────────────────────────────────────────────────────
+  1  corpus                   in-process              "corpus"      YES
+       dense + BM25, RRF-fused
+       │ miss
+  2  corpus, reformulated     in-process              "corpus"      YES
+       │ _reformulate(), ≤6 words
+       │ miss
+  3  mcp                      subprocess ──stdio──► scripts/mcp_corpus_server.py
+       MCPBridge #1                                   "mcp"         YES
+       │ ...but that is the SAME ingested corpus, reached a second way
+       │ miss
+  4  web    (Phase 4)         subprocess ──stdio──► scripts/mcp_web_search_server.py
+       MCPBridge #2                                 └──► THE INTERNET
+                                                      "web"         no
+       │ miss
+  5  model                    in-process (LLM)        "model"       no
+       the model's own recollection — no retrieval at all
+```
+
+**Tiers 1–3 all resolve to the SAME ingested documents.** That is exactly why
+"the corpus does not contain it" used to fall straight through to the
+model's own memory — there was nowhere else to look. Tier 4 is the first
+tier that can return something the corpus never held, which is why it sits
+where it does rather than replacing tier 3.
+
+**The right-hand column is the honesty rail.** `recall` counts a goal
+answered by any tier; `grounded_score` (G2/D-47) and `corpus_recall` (D-43)
+count it answered *by a real document* — and only tiers 1–3 qualify. So a
+run answered wholly from the web reads `recall 1.0 / grounded_score 0.0 /
+web_sourced_items 12`: visible rather than flattering. Tagging web results
+`source="mcp"` instead would have made every snippet inflate both metrics,
+silently restoring the exact blindness they exist to expose.
+
 
 ### Storage interactions
 
@@ -1437,6 +1508,9 @@ describe is now closed, on both the LLM side and the retrieval side:
 | `goals_without_evidence` | the goal ids that reached the compiler with **zero** evidence attached — counted from `state.evidence`'s own `goal_id` field, never parsed out of the report | same |
 | `grounding_ratio` | `(goals − goals_without_evidence) / goals`, rounded to 3dp; `0.0` when a run produced no goals at all. **Deliberately distinct from `recall`**: recall asks "did enough evidence clear the coverage threshold" and is score-derived, so threshold tuning moves it; `grounding_ratio` asks the cruder prior question "did this goal get ANY evidence", which no threshold can affect. `recall: 1.0` with `grounding_ratio: 0.5` means the coverage rule is passing goals the retriever never fed | same |
 | `corpus_recall` *(D-38/D-39)* | same shape as `recall`, but counts a goal covered only if a `corpus`/`mcp` item both cleared `min_evidence_score` AND passed the D-39 topical gate (shared distinctive terms with the goal description). Exists because `recall` alone can no longer tell you whether the CORPUS answered a goal or the model tier did — the two are frequently different, and a large gap between `recall` and `corpus_recall` means the answer is recollection, not retrieval | `agents/compilation.py::telemetry_node` |
+| `web_sourced_items` *(D-57)* | count of `state.evidence` entries with `source == "web"` — results from the Phase 4 search tier. Read together with `corpus_recall` and `grounded_score`: a run showing `recall: 1.0, grounded_score: 0.0, web_sourced_items: 12` is telling you precisely and honestly that the web answered it and the corpus did not. Web evidence deliberately does NOT count toward `corpus_recall` or `grounded_score` — a snippet is retrieval, not curation | `agents/compilation.py::telemetry_node` |
+| `web_source_domains` *(D-57)* | how many DISTINCT domains that evidence came from. Twelve items from one domain is one source repeated, not twelve agreeing — `websearch/filtering.py::cap_by_domain` limits this at retrieval time (`WEB_SEARCH_MAX_PER_DOMAIN`, default 2) and this field makes it visible after the fact | same |
+| `web_sources_listed` / `web_sources_suppressed` *(D-57)* | from `compiler_node`’s `append_web_sources` pass: how many web pages the report actually attributed in its `## Sources` section, versus how many were retrieved but belonged to goals the compiler never cited. A high suppressed count against a low listed count is the signature of the web tier doing work that never reached the report | `guardrails/sources.py` |
 | `model_sourced_items` *(D-38)* | count of `state.evidence` entries with `source == "model"` — the LLM's own knowledge, retrieved deliberately because no document served that goal. Read together with `corpus_recall`: `corpus_recall: 0.0, model_sourced_items: 24` means the whole report rests on recollection, attributed as such in the prose (D-40) | same |
 | `citations_pasted_evidence_removed` *(D-45)* | count of verbatim evidence-text runs the compiler glued directly onto a claim with no delimiter (e.g. `"...the whole session blobRedis is an in-memory data store..."`), stripped deterministically before the report ships. Only present when nonzero — its absence is not a claim that pasting never happens, only that this run's draft didn't need repair | same |
 | `citations_to_unevidenced_goals` *(D-45)* | count of `[gN]` markers removed because goal N retrieved no evidence at all — a citation asserting support that goal's evidence block cannot back up. Also only present when nonzero | same |
@@ -1534,13 +1608,26 @@ research-agent-dmp/
 │   ├── langfuse/             # Phase 3: optional Langfuse tracing, the only
 │   │                        package that imports the langfuse SDK — see
 │   │                        Observability — Langfuse (Phase 3) above
-│   ├── tools/                # the corpus-search tool workers invoke (MCP seam):
-│   │                        corpus_search.py (default) + mcp_client.py (P2-13,
-│   │                        stdio transport, opt-in via MCP_ENABLED)
+│   ├── tools/                # the retrieval tools workers invoke (D-38 ladder):
+│   │                        retrieval_chain.py (the 5-tier ladder itself),
+│   │                        corpus_search.py, model_knowledge.py, and
+│   │                        mcp_client.py — stdio transport shared by BOTH
+│   │                        MCP bridges: make_mcp_tool (corpus, P2-13,
+│   │                        MCP_ENABLED) and make_web_search_tool (Phase 4,
+│   │                        WEB_SEARCH_ENABLED)
+│   ├── websearch/            # Phase 4 (D-57): SearchProvider protocol, DDGS
+│   │                        provider, rank→score band, dedupe/domain-cap.
+│   │                        Imported ONLY by scripts/mcp_web_search_server.py
+│   │                        (a separate process) — the agent never imports a
+│   │                        search client, which is what keeps the rest of
+│   │                        the codebase uncoupled from the chosen engine
+│   ├── guardrails/           # grounded convergence, hedging, citation repair,
+│   │                        fencing, and sources.py (D-57: the deterministic
+│   │                        `## Sources` pass for cited web evidence)
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 348 tests, offline. Organized by module,
+├── tests/                   # 476 tests, offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
@@ -1555,15 +1642,23 @@ research-agent-dmp/
 ├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
 ├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool 
 │                                    (P2-13, off by default via MCP_ENABLED=false)
-├── scripts/check_services.py     # health check: Qdrant/OpenSearch/Postgres/LLM/MCP/API (D-33)
+├── scripts/mcp_web_search_server.py  # Phase 4 MCP server exposing web search
+│                                    (D-57, off by default via WEB_SEARCH_ENABLED=false)
+├── scripts/check_services.py     # health check: Qdrant/OpenSearch/Postgres/LLM/
+│                                 MCP/web-search/API (D-33). The web-search row is
+│                                 the ONLY live verification of that path — the
+│                                 test suite is entirely offline by design
 ├── sample_data/corpus.jsonl # 10 docs, Redis-vs-Memcached theme
 ├── design/Research_Agent_Design.md
 ├── OPERATIONS.md   internal/LEARNING_GUIDE.md   internal/PHASE-2_PLAN.md
 ├── docker-compose.yml       # optional: Postgres + Qdrant + OpenSearch
 ├── pyproject.toml           # packaging: extras, console script, public API
 │                              and versioning policy — see Packaging below
-├── requirements.txt  .env.example  run.bat  reset.bat
-└── DECISIONS.md             # populated: D-1..D-32, sourced from code comments
+├── requirements.txt          # core; does NOT install the web-search client
+├── requirements-websearch.txt  # Phase 4 only: ddgs + mcp. Install into the SAME
+│                              venv that runs the agent — see Setup
+├── .env.example  run.bat  reset.bat
+└── DECISIONS.md             # populated: D-1..D-58, sourced from code comments
 ```
 
 ## Setup
@@ -1579,7 +1674,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 348 passed
+python -m pytest tests/ -q    # expect: 476 passed
 ```
 
 **Or install it as a package** (`pyproject.toml`, new) — which is what
@@ -1589,6 +1684,7 @@ need for `PYTHONPATH=src` and gives you a `research-agent` console script:
 ```bash
 pip install -e .            # core only: no FastAPI, no MCP, no Langfuse
 pip install -e ".[api]"     # + the HTTP surface
+pip install -e ".[websearch]"  # + Phase 4 web search (mcp + ddgs)
 pip install -e ".[all]"     # everything requirements.txt installs
 
 research-agent "Compare Redis and Memcached for session caching"
@@ -1598,6 +1694,31 @@ See [Packaging](#packaging) for the extras, the public API, and the
 versioning policy.
 
 Windows: `run.bat` does the venv, install, and a stub run in one command.
+
+**Web search (Phase 4) is opt-in and does not affect the steps above.**
+`WEB_SEARCH_ENABLED=false` is the default, the `ddgs` client is not in
+`requirements.txt` at all, and the agent process never imports it. To turn
+it on:
+
+```bash
+pip install -r requirements-websearch.txt   # into the SAME venv as the agent
+
+# .env — these two lines are genuinely the whole minimum
+WEB_SEARCH_ENABLED=true
+WEB_MCP_SERVER_COMMAND=
+
+python scripts/check_services.py            # look for the 'Web search (MCP)' row
+```
+
+`WEB_MCP_SERVER_COMMAND` is deliberately left EMPTY: empty means
+`sys.executable`, the interpreter already running the agent (D-58). That is
+correct on every machine with no configuration, keeps machine-specific
+absolute paths out of a committed `.env`, and guarantees the server shares
+the agent's virtualenv — which matters because it imports `ddgs`, and a
+wrong interpreter dies before the MCP handshake and surfaces as an opaque
+`Connection closed` rather than a readable `ImportError`. Relative paths, if
+you set one, resolve against the REPO ROOT, not your working directory.
+Full walkthrough: `OPERATIONS.md` → *Enabling Web Search (Phase 4)*.
 
 Langfuse tracing is opt-in and does not affect the steps above: `langfuse` is
 an installed dependency (`requirements.txt`), but `LANGFUSE_ENABLED=false`
@@ -1735,6 +1856,8 @@ This table lists only decisions with code behind them here.
 | D-36 | External MCP tool inputs travel to the LLM inside an `<external_data>` fence, treated as data never instructions | Prompt-injection surface from third-party tool output must not be trusted at the same level as system/user turns |
 | D-37 | The repo is an installable artifact (`pyproject.toml`, optional dependency groups mirroring lazy-import code paths) | A core install genuinely omits FastAPI/MCP/Langfuse; `requirements.txt` stays the dev pin-set |
 | D-38 | Retrieval is a LADDER — corpus → reformulated retry → MCP → model’s own knowledge, stopping at the first tier clearing `min_evidence_score` | A corpus that doesn’t contain the subject was reporting a retrieval limitation as an absence of knowledge; the model tier is always last so a real document still wins |
+| D-57 | **Phase 4 — web search.** A real search engine as tier 4, reached over its OWN MCP server subprocess (`scripts/mcp_web_search_server.py`). `source="web"` evidence COVERS a goal but never GROUNDS one | Tiers 1–3 all resolve to the same ingested documents, so “the corpus does not contain it” fell straight through to recollection. Tagging web results `"mcp"` would have made every snippet inflate `grounded_score` and `corpus_recall` — the exact blindness D-43/D-47 exist to expose |
+| D-58 | MCP server paths resolve against the REPO ROOT, and an empty `WEB_MCP_SERVER_COMMAND` means `sys.executable` | `MCPBridge` never sets `StdioServerParameters.cwd`, so relative paths silently resolved against the launch directory — verified failing as an opaque “Connection closed” when run from anywhere but the repo root. Empty-means-`sys.executable` keeps machine-specific paths out of the committed `.env` and guarantees the server shares the agent’s virtualenv |
 | D-39 | A tier only counts as "answered" if its evidence shares distinctive terms with the query, not merely a high RRF score | Fixed-k retrieval over a small corpus always returns k results — score alone can never signal "nothing relevant here" |
 | D-40 | Citations are goal ids only (`[g1]`) — never pasted evidence text, never internal scores | Live output was gluing source sentences onto claims with no delimiter and leaking `score=0.60`-style bookkeeping into the report |
 | D-41 | The model-knowledge tier has hard anti-fabrication limits (no invented named entities, confidence reflects the weakest part of a compound claim) | Self-reported confidence alone does not catch confabrication; this reduces but does not eliminate the failure rate, which is why `corpus_recall` stays in telemetry |
@@ -2071,7 +2194,7 @@ The shape of it, updated with this revision's progress:
      Cost tracking from Settings-configured $/1M rates             ✅ DONE
      propagate_attributes session/environment grouping             ✅ DONE
      Crash-safe end_trace (try/except in cli.py::_run)              ✅ DONE
-     Test suite: 157 → 190 → 294 → 341 → 344 → 348
+     Test suite: 157 → 190 → 294 → 341 → 344 → 348 → 476 (Phase 4)
 ```
 
 **Status, updated**: Tiers 1, 2, and 3 are all closed, and a further,

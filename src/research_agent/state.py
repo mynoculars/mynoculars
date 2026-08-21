@@ -238,14 +238,39 @@ class Evidence(BaseModel):
     """One retrieved fact, from a live tool or from long-term memory.
 
     Producers create these with source="corpus" (tools/corpus_search.py,
-    the default retrieval tool), source="mcp" (tools/mcp_client.py, P2-13's
-    alternative tool -- cli.py wires in exactly one of the two, never
-    both), or source="memory" (memory/semantic_memory.py::retrieve,
-    recalled from a past run). Every downstream node that reads
-    state.evidence treats all of these identically — there is no separate
-    code path per source, except memory/semantic_memory.py::store_run's
-    own explicit source != "memory" check (never re-store what was itself
-    recalled FROM memory).
+    the default retrieval tool), source="mcp" (tools/mcp_client.py's
+    make_mcp_tool, P2-13), source="model" (tools/model_knowledge.py, D-38's
+    last tier), source="web" (tools/mcp_client.py's make_web_search_tool,
+    Phase 4 / D-57), or source="memory" (memory/semantic_memory.py::retrieve,
+    recalled from a past run).
+
+    WHERE `source` IS ACTUALLY BRANCHED ON — read this before adding a new
+    value, because the set membership tests below are load-bearing and are
+    NOT obvious from the field's plain `str` type:
+
+      agents/gathering.py::progress_checker_node   source in ("corpus","mcp")
+      agents/compilation.py::telemetry_node        source in ("corpus","mcp")
+          Both compute "is this goal backed by a real DOCUMENT" —
+          grounded_score (Guardrail G2 / D-47) and corpus_recall (D-43).
+          "web" is DELIBERATELY ABSENT from both. A web snippet is
+          retrieval, not curation: it can COVER a goal (it counts toward
+          recall) but it must not GROUND one. Keeping the two apart is the
+          entire point of D-47 — a run answered wholly from the web reads
+          recall 1.0 / grounded_score 0.0, which is visible rather than
+          flattering. Adding "web" to either tuple would silently restore
+          the recall=1.0 / corpus_recall=0.0 blindness those metrics exist
+          to expose.
+
+      memory/semantic_memory.py::store_run  source not in ("memory","model","web")
+          What may enter DURABLE memory. "model" was excluded by D-42
+          (recollection laundered into something a later run reads back as
+          document-backed evidence); "web" is excluded for the same reason
+          plus a second one — a snippet is volatile by nature, and a cached
+          copy of today's search result is a stale answer tomorrow with no
+          marker saying so.
+
+    Every OTHER downstream node treats all sources identically; there is no
+    per-source code path beyond the three above.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -263,6 +288,29 @@ class Evidence(BaseModel):
     # flag, not a judgment call — see model_knowledge.py::_looks_overspecific.
     # False for every corpus/mcp/memory item; those are never flagged.
     hedge_specific: bool = False
+    # Phase 4 (D-57): provenance for source="web" items, and ONLY those.
+    # None for every corpus/mcp/model/memory item, which is why both are
+    # Optional with a None default rather than "" -- an empty string would
+    # read as "this item has a URL and it is blank", which is a different
+    # and untrue claim.
+    #
+    # WHY THESE LIVE ON Evidence AT ALL, when D-40 forbids URLs in report
+    # prose: attribution is not citation. The compiler still cites [gN] and
+    # nothing else; these two fields exist so a DETERMINISTIC pass can build
+    # a Sources section from the evidence actually cited, rather than asking
+    # the model to carry URLs through the prose and hoping. D-51 is the
+    # precedent -- a prompt instruction to hedge was not sufficient, and a
+    # prompt instruction to attribute would not be either.
+    #
+    # `domain` is stored, not derived, DESPITE websearch/provider.py making
+    # the opposite choice on WebResult. The two are not inconsistent: there,
+    # url and domain live on one object in one process, so deriving avoids a
+    # second source of truth. Here the value has already crossed a process
+    # boundary as JSON, and re-deriving it agent-side would mean two
+    # different implementations of "what is this URL's domain" that can
+    # disagree -- so the server's answer is carried, not recomputed.
+    url: Optional[str] = None
+    domain: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

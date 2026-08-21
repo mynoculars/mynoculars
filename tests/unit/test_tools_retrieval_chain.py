@@ -329,3 +329,93 @@ def test_year_collision_alone_no_longer_satisfies_the_topical_gate():
                                  reformulate=False)
     task = _task("GDP growth India US 2020-2023", "g1")
     assert "model" in [e.source for e in chain(task)]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (D-57): the web tier
+# ---------------------------------------------------------------------------
+
+
+def test_web_is_tried_after_mcp_and_before_the_model_tier():
+    """The ordering that matters. In this repo the tier-3 MCP server is
+    scripts/mcp_corpus_server.py -- the corpus reached a second way -- so
+    web must come after it (nothing corpus-shaped is left to try) and before
+    the model (a live snippet beats recollection)."""
+    def _model(task):
+        raise AssertionError("model tier must not be reached when web answers")
+
+    chain = make_retrieval_chain(_ev("corpus", 0.2), FLOOR,
+                                 mcp=_ev("mcp", 0.2), web=_ev("web", 0.75),
+                                 model=_model, reformulate=False)
+    assert [e.source for e in chain(_task())] == ["corpus", "mcp", "web"]
+
+
+def test_an_answering_mcp_tier_never_reaches_web():
+    def _web(task):
+        raise AssertionError("web must not be reached when mcp answers")
+
+    chain = make_retrieval_chain(_ev("corpus", 0.2), FLOOR,
+                                 mcp=_ev("mcp", 0.9), web=_web,
+                                 model=_empty, reformulate=False)
+    assert [e.source for e in chain(_task())] == ["corpus", "mcp"]
+
+
+def test_web_none_leaves_the_ladder_byte_identical_to_before_phase_4():
+    """The default. WEB_SEARCH_ENABLED=false means assembly passes web=None,
+    and no pre-Phase-4 run may behave differently because of this work."""
+    with_web_absent = make_retrieval_chain(
+        _ev("corpus", 0.2), FLOOR, mcp=_ev("mcp", 0.2),
+        model=_ev("model", 0.6), reformulate=False)
+    explicit_none = make_retrieval_chain(
+        _ev("corpus", 0.2), FLOOR, mcp=_ev("mcp", 0.2), web=None,
+        model=_ev("model", 0.6), reformulate=False)
+    assert ([e.source for e in with_web_absent(_task())]
+            == [e.source for e in explicit_none(_task())]
+            == ["corpus", "mcp", "model"])
+
+
+def test_a_dead_web_tier_does_not_abort_a_task_the_model_can_answer():
+    """DDGS is an unofficial client that can be throttled at any time. A
+    ratelimited search must not cost the task -- the ladder logs and
+    continues."""
+    def _boom(task):
+        raise RuntimeError("ratelimited")
+
+    chain = make_retrieval_chain(_empty, FLOOR, web=_boom,
+                                 model=_ev("model", 0.6), reformulate=False)
+    assert [e.source for e in chain(_task())] == ["model"]
+
+
+def test_sub_threshold_web_evidence_is_kept_but_does_not_stop_the_ladder():
+    """Same rule every tier obeys: evidence that cannot cover a goal cannot
+    end the search for one. It is still handed to the compiler as context."""
+    chain = make_retrieval_chain(_empty, FLOOR, web=_ev("web", 0.4),
+                                 model=_ev("model", 0.6), reformulate=False)
+    assert [e.source for e in chain(_task())] == ["web", "model"]
+
+
+def test_an_off_topic_web_hit_does_not_stop_the_ladder():
+    """_sufficient's topical gate applies to web exactly as to every other
+    tier. A search engine judges relevance against the query STRING; this
+    gate judges it against the query's distinctive terms, which is what
+    catches a plausible-looking result set about the wrong subject."""
+    chain = make_retrieval_chain(
+        _empty, FLOOR,
+        web=_ev("web", 0.75, content="Recipe for sourdough bread starter"),
+        model=_ev("model", 0.6), reformulate=False)
+    assert [e.source for e in chain(_task())] == ["web", "model"]
+
+
+def test_web_evidence_reaching_the_compiler_carries_its_url(monkeypatch):
+    """url/domain must survive the ladder untouched -- the deterministic
+    Sources pass has nothing else to build from."""
+    def _web(task):
+        return [Evidence(task_key=task.key, goal_id=task.goal_id, source="web",
+                         content="Indian and Chinese army battlefield strength",
+                         score=0.75, volatility=Volatility.VOLATILE,
+                         url="https://example.org/report", domain="example.org")]
+
+    chain = make_retrieval_chain(_empty, FLOOR, web=_web, reformulate=False)
+    out = chain(_task())
+    assert out[0].url == "https://example.org/report"
+    assert out[0].domain == "example.org"

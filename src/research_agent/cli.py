@@ -154,6 +154,12 @@ def main(argv=None) -> int:
         # off (the default), so this is a no-op for every existing run.
         if bundle.mcp_bridge is not None:
             bundle.mcp_bridge.close()
+        # Phase 4 (D-57): the SECOND bridge, owning the web-search server
+        # subprocess. None unless WEB_SEARCH_ENABLED, so a no-op for every
+        # existing run. Closed separately rather than folded into the line
+        # above so a failure to close one is attributable to that one.
+        if bundle.web_mcp_bridge is not None:
+            bundle.web_mcp_bridge.close()
         # Same reasoning again for the LLM providers' httpx clients, one
         # per configured provider, none of which was ever closed.
         if bundle.router is not None:

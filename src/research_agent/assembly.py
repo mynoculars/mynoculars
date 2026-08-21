@@ -31,7 +31,12 @@ import logging
 from typing import NamedTuple
 
 from research_agent import langfuse as lf
-from research_agent.config import get_settings, split_csv
+from research_agent.config import (
+    get_settings,
+    resolve_repo_path,
+    resolve_server_command,
+    split_csv,
+)
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import configure_logging, log_event
 from research_agent.memory.semantic_memory import SemanticMemory
@@ -43,7 +48,11 @@ from research_agent.storage.qdrant_store import QdrantStore
 from research_agent.tools.corpus_search import make_corpus_tool
 from research_agent.tools.model_knowledge import make_model_knowledge_tool
 from research_agent.tools.retrieval_chain import make_retrieval_chain
-from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
+from research_agent.tools.mcp_client import (
+    MCPBridge,
+    make_mcp_tool,
+    make_web_search_tool,
+)
 from research_agent.tracing import NullTracer
 
 
@@ -73,6 +82,16 @@ class AppBundle(NamedTuple):
                                # main()'s finally block, which closes this
                                # exactly like close_checkpointer(checkpointer)
                                # does, when it's not None.
+    web_mcp_bridge: object = None  # Phase 4 (D-57): a SECOND MCPBridge, for
+                               # the web-search server, when
+                               # settings.web_search_enabled. Separate field
+                               # rather than a list, so every caller closes it
+                               # by NAME -- see api/server.py's comment about
+                               # the fifth field breaking tuple-unpacking at
+                               # import time and making the whole API
+                               # unstartable. A list would have avoided that
+                               # once and then hidden which bridge failed to
+                               # close, which is worse.
     router: object = None      # the FallbackRouter, so main()'s finally block
                                # can close its providers' httpx clients --
                                # previously unreachable from either caller,
@@ -166,9 +185,19 @@ def build_app_and_settings(tracer=None):
     mcp_bridge = None
     mcp_tool = None
     if settings.mcp_enabled:
+        # D-58: command and args resolved against the REPO ROOT, never the
+        # current working directory. MCPBridge does not set
+        # StdioServerParameters.cwd, so the subprocess inherits whatever
+        # directory the agent was launched from -- meaning the shipped
+        # `MCP_SERVER_ARGS=scripts\mcp_corpus_server.py` has always worked
+        # only because every documented invocation starts in the repo root.
+        # Verified by spawning real subprocesses: relative args with
+        # cwd=/tmp fail as an opaque "Connection closed", never as a
+        # file-not-found. Absolute paths and bare PATH names both pass
+        # through unchanged, so no working configuration changes meaning.
         mcp_bridge = MCPBridge(
-            command=settings.mcp_server_command,
-            args=split_csv(settings.mcp_server_args),
+            command=resolve_server_command(settings.mcp_server_command),
+            args=[resolve_repo_path(a) for a in split_csv(settings.mcp_server_args)],
             env_allowlist=split_csv(settings.mcp_server_env_allowlist),
         )
         mcp_tool = make_mcp_tool(
@@ -180,6 +209,41 @@ def build_app_and_settings(tracer=None):
             # gate on its own -- see make_mcp_tool's own docstring for what
             # the previous hardcoded 1.0 did to recall.
             unscored_score=settings.min_evidence_score)
+    # Phase 4 (D-57): a SECOND bridge, to a SECOND server. Deliberately not
+    # a reuse of the one above: in every deployment so far that one runs
+    # scripts/mcp_corpus_server.py, so the two servers speak different tool
+    # schemas, need different timeouts (local stores vs. outbound internet)
+    # and need different env allowlists. Both share the entire MCPBridge
+    # transport -- what differs is only configuration and parsing.
+    web_mcp_bridge = None
+    web_tool = None
+    if settings.web_search_enabled:
+        web_mcp_bridge = MCPBridge(
+            # D-58: empty command means sys.executable -- the interpreter
+            # already running the agent. That is the RECOMMENDED setting: it
+            # is correct on every machine with no configuration, and it
+            # guarantees the server runs in the SAME virtualenv, which
+            # matters because it imports ddgs. A wrong interpreter dies
+            # before the MCP handshake and surfaces as "Connection closed"
+            # rather than as a readable ImportError.
+            command=resolve_server_command(settings.web_mcp_server_command),
+            args=[resolve_repo_path(a)
+                  for a in split_csv(settings.web_mcp_server_args)],
+            # Defaults to HTTPS_PROXY,HTTP_PROXY,NO_PROXY -- unlike the
+            # corpus server, this subprocess makes outbound internet calls
+            # and _build_subprocess_env forwards nothing by default (D-30).
+            env_allowlist=split_csv(settings.web_mcp_server_env_allowlist),
+        )
+        # No unscored_score counterpart here, and its absence is the point:
+        # the web server computes a real per-result score from the engine's
+        # own ranking (websearch/scoring.py) and sends it on the wire, so
+        # there is nothing to substitute. make_web_search_tool DROPS an item
+        # that arrives without one rather than inventing a default -- see
+        # its docstring for why no default is safe.
+        web_tool = make_web_search_tool(
+            web_mcp_bridge, settings.web_mcp_tool_name,
+            query_arg_name=settings.web_mcp_query_arg_name,
+            call_timeout_seconds=settings.web_mcp_call_timeout_seconds)
     memory = SemanticMemory(
         QdrantStore(settings.qdrant_url, settings.memory_collection, tracer=tracer,
                     trace_label="QDRANT (semantic memory)"),
@@ -208,10 +272,10 @@ def build_app_and_settings(tracer=None):
                   if settings.model_knowledge_enabled else None)
     tool = make_retrieval_chain(
         corpus_tool, settings.min_evidence_score,
-        mcp=mcp_tool, model=model_tool,
+        mcp=mcp_tool, web=web_tool, model=model_tool,
         reformulate=settings.query_reformulation_enabled)
     app = build_graph(router, tool, memory, settings, checkpointer, debug=debug,
                      mcp_tool=mcp_tool)  # P2-14: None unless settings.mcp_enabled
     return AppBundle(app=app, settings=settings, durable=durable,
                      checkpointer=checkpointer, mcp_bridge=mcp_bridge,
-                     router=router)
+                     web_mcp_bridge=web_mcp_bridge, router=router)

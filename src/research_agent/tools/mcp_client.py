@@ -69,6 +69,7 @@ here):
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -530,3 +531,190 @@ def make_mcp_tool(bridge: MCPBridge, tool_name: str,
         return evidence
 
     return mcp_search
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (D-57): the web-search tool
+# ---------------------------------------------------------------------------
+
+
+def make_web_search_tool(
+    bridge: MCPBridge,
+    tool_name: str = "web_search",
+    query_arg_name: str = "query",
+    call_timeout_seconds: float = 45.0,
+) -> Any:
+    """Build the retrieval tool for the web-search MCP server.
+
+    CALLED BY   assembly.py::build_app_and_settings, once, when
+                settings.web_search_enabled is true.
+    RETURNS     a plain function with corpus_search's signature --
+                (SearchTask) -> List[Evidence] -- so the retrieval ladder
+                treats it identically to every other tier.
+
+    WHY THIS IS A SEPARATE FACTORY RATHER THAN A `source=` PARAMETER ON
+    make_mcp_tool ABOVE, which was the obvious alternative:
+
+      1. The two servers have genuinely DIFFERENT response schemas.
+         make_mcp_tool reads plain text content blocks, one Evidence per
+         block, and stamps a single flat score (unscored_score) because a
+         corpus server's text blocks carry no per-item score. This one reads
+         structuredContent, where every item carries its OWN score, url and
+         domain. Bending one function to do both would mean a runtime branch
+         on response shape inside the tool every search_worker calls.
+      2. make_mcp_tool is the proven Phase 1-3 path. Adding parameters to it
+         means every existing MCP run inherits whatever this Phase 4 work
+         gets wrong. Leaving it byte-identical means the corpus path cannot
+         regress from this change at all -- which is worth more than the
+         handful of shared lines a merged implementation would save.
+
+    Both factories still share the ENTIRE transport: one MCPBridge class,
+    one subprocess lifecycle, one timeout mechanism, one env allowlist. What
+    differs is only the parsing, which is exactly the part that genuinely
+    differs.
+
+    THE WIRE SHAPE THIS PARSES, verified against the installed FastMCP
+    rather than assumed (see tests/unit/test_mcp_web_search_server.py::
+    test_a_list_dict_tool_puts_results_under_structured_content_result,
+    which spawns a real server and asserts it):
+
+        result.structuredContent == {"result": [ {...}, {...} ]}
+
+    each item carrying title, url, snippet, rank, engine, domain, score --
+    the shape websearch/provider.py::as_payload defines. structuredContent
+    is read in preference to the text blocks because it is the only channel
+    where `score` survives as a NUMBER; the text blocks carry each item as
+    JSON text, which is a usable fallback and is handled below, but a value
+    re-parsed out of prettified JSON is a worse contract than one that was
+    never stringified.
+
+    RAISES whatever bridge.call_tool raises. Deliberately not caught, the
+    same contract corpus_search and mcp_search hold: agents/gathering.py::
+    search_worker owns turning an exception into a D-16 failure record.
+    """
+
+    def _items_from_result(result: Any) -> List[Dict[str, Any]]:
+        """Pull the result list out of whichever channel carried it.
+
+        Preference order is structuredContent, then JSON-decoded text
+        blocks. A server that sends neither yields [] -- which reads as
+        "found nothing" and lets the ladder escalate, rather than raising
+        and burning the task as a D-16 failure over a shape problem.
+        """
+        structured = getattr(result, "structuredContent", None)
+        if isinstance(structured, dict):
+            items = structured.get("result")
+            if isinstance(items, list):
+                return [i for i in items if isinstance(i, dict)]
+
+        # Fallback: one JSON-encoded item per text block. Reached when an
+        # SDK version stops populating structuredContent, or when a
+        # differently-built server returns text only. Silently tolerating a
+        # block that is not JSON matters here -- a server that also emits a
+        # human-readable preamble block should not break the whole call.
+        out: List[Dict[str, Any]] = []
+        for block in getattr(result, "content", None) or []:
+            text = getattr(block, "text", None)
+            if not text:
+                continue
+            try:
+                decoded = json.loads(text)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(decoded, dict):
+                out.append(decoded)
+            elif isinstance(decoded, list):
+                out.extend(i for i in decoded if isinstance(i, dict))
+        return out
+
+    def web_search(task: SearchTask) -> List[Evidence]:
+        """One web search for one SearchTask.
+
+        CALLED BY   agents/gathering.py::search_worker, exactly once per
+                    task, in that worker's own try/except.
+        """
+        result = bridge.call_tool(
+            tool_name, {query_arg_name: task.query},
+            timeout_seconds=call_timeout_seconds)
+
+        if getattr(result, "isError", False):
+            # Same distinction make_mcp_tool draws: a TOOL-level error is
+            # data arriving cleanly to say "this did not work", not a
+            # protocol failure. Treated as "nothing found" so the ladder
+            # escalates to the model tier rather than failing the task.
+            log_event(logger, "web_search.tool_reported_error", tool=tool_name)
+            return []
+
+        evidence: List[Evidence] = []
+        skipped_unscored = 0
+        for item in _items_from_result(result):
+            snippet = (item.get("snippet") or "").strip()
+            title = (item.get("title") or "").strip()
+            url = (item.get("url") or "").strip() or None
+            if not (snippet or title):
+                continue
+
+            # A missing or unparseable score is DROPPED, not defaulted.
+            # There is no defensible default: too high silently defeats the
+            # D-17 coverage gate (the hardcoded 1.0 this module already
+            # shipped once and had to fix -- see unscored_score in
+            # make_mcp_tool's docstring), and too low makes a genuinely
+            # retrieved result unable to cover a goal while still consuming
+            # a slot in the compile prompt. Losing an item is the smaller
+            # and, crucially, the VISIBLE failure: it is counted and logged
+            # below rather than quietly mis-weighted.
+            try:
+                score = float(item["score"])
+            except (KeyError, TypeError, ValueError):
+                skipped_unscored += 1
+                continue
+            # Clamp rather than reject: Evidence.score is bounded [0,1] by
+            # its own Field constraint, and a server returning 1.0000001
+            # through float round-tripping should not raise a
+            # ValidationError inside a worker.
+            score = min(max(score, 0.0), 1.0)
+
+            # Title and snippet joined, because each alone loses something:
+            # the snippet is the substance, the title is often the only
+            # place the actual subject is named. Same 800-char cap
+            # corpus_search.py and make_mcp_tool use, so no one tier can
+            # crowd the compile prompt.
+            content = f"{title} — {snippet}".strip(" —") if title else snippet
+
+            evidence.append(Evidence(
+                task_key=task.key,
+                goal_id=task.goal_id,
+                # NOT "mcp", even though this arrived over MCP. "mcp" is
+                # tested for set-membership in agents/gathering.py::
+                # progress_checker_node and agents/compilation.py::
+                # telemetry_node as a proxy for "a real DOCUMENT backed
+                # this" -- see state.py::Evidence's docstring. Tagging web
+                # results "mcp" would make every snippet count toward
+                # grounded_score and corpus_recall, restoring exactly the
+                # blindness D-43 and D-47 exist to expose.
+                source="web",
+                content=content[:800],
+                score=score,
+                # Web content is volatile by nature -- a live page today is
+                # a stale answer next month, with nothing in the text
+                # saying so. This also drives memory decay, though
+                # store_run excludes source="web" outright (D-57), so the
+                # value matters for D-51's hedging pass rather than for
+                # long-term storage.
+                volatility=Volatility.VOLATILE,
+                url=url,
+                domain=(item.get("domain") or "").strip() or None,
+            ))
+
+        if skipped_unscored:
+            log_event(logger, "web_search.dropped_unscored_items",
+                      level=logging.WARNING, count=skipped_unscored,
+                      tool=tool_name,
+                      reason="server returned an item with no usable 'score'; "
+                             "no default is safe, so the item was dropped")
+        log_event(logger, "web_search.evidence_built",
+                  count=len(evidence), task_key=task.key,
+                  domains=len({e.domain for e in evidence if e.domain}))
+        return evidence
+
+    return web_search

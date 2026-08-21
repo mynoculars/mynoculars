@@ -366,3 +366,41 @@ def test_store_run_never_writes_model_recollection_to_memory():
     assert written == 2, "corpus and mcp are findings; model recollection is not"
     blob = str(store.written)
     assert "PLA doctrine" not in blob
+
+
+def test_store_run_never_writes_web_snippets_to_memory():
+    """Phase 4 (D-57), extending D-42's exclusion by one source.
+
+    D-42's reason applies unchanged: anything written here comes back on a
+    LATER run tagged source="memory", indistinguishable from something a
+    document supported, and steers that run before any retrieval happens.
+
+    Web adds a second, independent reason. make_web_search_tool stamps every
+    snippet Volatility.VOLATILE because that is what it is -- a cached copy
+    of today's search result is simply a wrong answer next month, with
+    nothing in the text marking it stale. A live lookup should be repeated,
+    not remembered.
+    """
+    class _Store:
+        def __init__(self):
+            self.written = []
+
+        def existing_point_ids(self, ids):
+            return set()
+
+        def upsert_texts(self, texts, payloads=None, *a, **k):
+            self.written = list(texts)
+            return len(texts)
+
+    store = _Store()
+    mem = SemanticMemory(store, 5, 90.0, 14.0)
+    written = mem.store_run("q", [
+        Evidence(task_key="t1", goal_id="g1", source="web",
+                 content="Today's headline says the rate is 6.5 percent",
+                 score=0.75, url="https://example.org/rates",
+                 domain="example.org"),
+        Evidence(task_key="t2", goal_id="g1", source="corpus",
+                 content="a real retrieved document", score=0.9),
+    ])
+    assert written == 1, "corpus is a finding; a web snippet is a live lookup"
+    assert "Today's headline" not in str(store.written)

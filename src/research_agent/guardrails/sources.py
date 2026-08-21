@@ -1,0 +1,146 @@
+"""
+guardrails/sources.py -- the deterministic attribution pass for web evidence
+(Phase 4 / D-57).
+
+Purpose:
+    Append a "## Sources" section listing the web pages behind the report,
+    built from the evidence the compiler ACTUALLY CITED, without touching a
+    single character of the prose above it.
+
+Why deterministic rather than a prompt instruction:
+    The obvious alternative is to teach the compile prompt to write
+    "[g3] (arxiv.org)" inline. This codebase has already run that
+    experiment and lost. D-51 exists precisely because a prompt instruction
+    to hedge UNVERIFIED-SPECIFIC claims was followed unreliably enough that
+    one run reached hedge_specific_items: 29 with ZERO visible hedging in
+    the shipped report -- so guardrails/hedging.py was written to enforce
+    afterwards what the prompt had asked for beforehand. Attribution is the
+    same shape of problem and gets the same shape of answer.
+
+    The second reason is D-40. Its attribution rule is that report prose
+    carries [gN] markers and nothing else -- no URLs, no bare titles. A
+    Sources section appended BELOW the report does not relax that rule at
+    all: the prose stays exactly as clean_citations and enforce_hedging left
+    it, and the reader still gets somewhere to click. Relaxing D-40 would
+    also have meant teaching guardrails/citations.py, guardrails/hedging.py
+    and templates.critique about a new inline form that none of them
+    currently recognizes -- three more places to get it wrong, for no gain.
+
+CALLED BY   agents/compilation.py::compiler_node, LAST -- after
+            clean_citations and enforce_hedging. Order matters: both of
+            those search the report for literal spans of evidence content,
+            and a Sources block containing titles and URLs is exactly the
+            kind of text that could be mistaken for a paste. Appending after
+            they have run puts it out of their reach entirely.
+
+Scope, deliberately narrow:
+    ONLY source="web" evidence, and ONLY for goals the report actually
+    cites. Corpus and MCP evidence is not listed -- those are documents
+    already in the operator's own ingested corpus, addressable by their own
+    identifiers, not by a URL. Model-tier recollection has no source to
+    cite by definition, which is the whole reason D-49/D-51 hedge it
+    instead.
+"""
+
+import logging
+import re
+from typing import Dict, List, Tuple
+
+from research_agent.logging_setup import log_event
+from research_agent.state import Evidence
+
+logger = logging.getLogger(__name__)
+
+# Matches the [gN] markers D-40 requires in report prose -- the same pattern
+# agents/compilation.py::compiler_node already uses to count evidence_cited.
+# Shared shape rather than a second, subtly different definition of "what a
+# citation looks like", for the same reason D-47 reuses _distinctive_terms
+# instead of writing a second notion of "on topic".
+_CITATION_RE = re.compile(r"\[g(\d+)\]")
+
+SOURCES_HEADING = "## Sources"
+
+
+def _cited_goal_ids(report: str) -> set:
+    """Which goals the prose actually cites, as goal_id strings ("g3")."""
+    return {f"g{m.group(1)}" for m in _CITATION_RE.finditer(report)}
+
+
+def append_web_sources(report: str,
+                       evidence: List[Evidence]) -> Tuple[str, Dict[str, float]]:
+    """Append a Sources section for cited web evidence. Returns (report, counters).
+
+    RETURNS the report UNCHANGED, and zeroed counters, when there is nothing
+    to list -- no web evidence, or none of it attached to a goal the report
+    cited. That no-op path is the common one today (WEB_SEARCH_ENABLED
+    defaults false), so it must be exactly byte-identical, not merely
+    similar: a trailing newline difference would be a visible diff in every
+    existing report.
+
+    WHY FILTER BY CITED GOAL rather than listing every web result retrieved:
+    a Sources list is a claim about what backed THIS report. Listing pages
+    the compiler never drew on would be padding at best and misattribution
+    at worst -- the reader reasonably assumes a listed source supported
+    something they just read. The retrieval-side count lives in telemetry
+    (web_sourced_items), which is where "what did we fetch" belongs.
+
+    DEDUPLICATED BY URL, keeping the highest-scoring occurrence. The same
+    page can legitimately be returned under two different goals, and listing
+    it twice would imply two independent sources.
+
+    ORDERED BY SCORE, best first -- which, because
+    websearch/scoring.py::rank_to_score maps rank onto a band monotonically,
+    means the engine's own ranking survives all the way to the reader.
+    """
+    counters = {"web_sources_listed": 0.0, "web_sources_suppressed": 0.0}
+
+    web_items = [e for e in evidence
+                 if e.source == "web" and e.url and e.goal_id]
+    if not web_items:
+        return report, counters
+
+    cited = _cited_goal_ids(report)
+    listed = [e for e in web_items if e.goal_id in cited]
+    counters["web_sources_suppressed"] = float(len(web_items) - len(listed))
+    if not listed:
+        # Web evidence was retrieved but the compiler cited none of the goals
+        # it belonged to. Worth a log line rather than silence: it is the
+        # signature of the web tier doing work that never reached the report.
+        log_event(logger, "sources.no_cited_web_evidence",
+                  retrieved=len(web_items))
+        return report, counters
+
+    best_by_url: Dict[str, Evidence] = {}
+    for item in listed:
+        existing = best_by_url.get(item.url)
+        if existing is None or item.score > existing.score:
+            best_by_url[item.url] = item
+
+    ordered = sorted(best_by_url.values(), key=lambda e: -e.score)
+
+    lines = [SOURCES_HEADING, ""]
+    for i, item in enumerate(ordered, start=1):
+        # The evidence content is "Title — snippet" (see
+        # tools/mcp_client.py::make_web_search_tool). Only the title half is
+        # wanted as a link label; the snippet is the substance and already
+        # informed the prose above. Splitting on the same em-dash that
+        # joined them, once, from the left.
+        label = item.content.split(" — ", 1)[0].strip()
+        # Fall back to the domain when there is no usable title, rather than
+        # emitting an empty link label. Never falls back to the URL itself,
+        # which would be unreadable at typical search-result URL lengths.
+        if not label:
+            label = item.domain or "source"
+        domain = f" ({item.domain})" if item.domain else ""
+        lines.append(f"{i}. [{item.goal_id}] {label}{domain} — {item.url}")
+    block = "\n".join(lines)
+
+    counters["web_sources_listed"] = float(len(ordered))
+    log_event(logger, "sources.web_sources_appended",
+              listed=len(ordered),
+              suppressed=int(counters["web_sources_suppressed"]))
+    # rstrip then two newlines: the compiler's own output has inconsistent
+    # trailing whitespace across providers, and a Sources heading that lands
+    # one line below the last paragraph in one run and three in the next is
+    # a diff nobody wants to read.
+    return f"{report.rstrip()}\n\n{block}\n", counters

@@ -56,6 +56,8 @@ Python mechanics used in this file, if any of this is new to you:
 
 import logging
 import os
+import pathlib
+import sys
 from functools import lru_cache
 from typing import Literal
 
@@ -65,6 +67,115 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from research_agent.logging_setup import log_event
 
 logger = logging.getLogger(__name__)
+
+# The repository root, derived from THIS FILE's location and never from the
+# current working directory:
+#
+#     <repo>/src/research_agent/config.py  ->  parents[2] == <repo>
+#
+# Why this exists (Phase 4 / D-58), and why CWD is not good enough:
+# tools/mcp_client.py::MCPBridge builds an mcp.StdioServerParameters WITHOUT
+# setting its `cwd` field, so the server subprocess inherits the CWD of
+# whichever process launched the agent. Any relative path in MCP_SERVER_ARGS
+# or WEB_MCP_SERVER_COMMAND is therefore resolved against THAT directory,
+# not against the repo.
+#
+# Verified directly rather than assumed, by spawning real subprocesses:
+#
+#   command=<abs>  args=["scripts/x.py"]  cwd=<repo>  -> OK
+#   command=<abs>  args=["scripts/x.py"]  cwd=/tmp    -> FAIL, McpError
+#   command="./python"                    cwd=<repo>  -> OK
+#   command="./python"                    cwd=/tmp    -> FAIL, FileNotFoundError
+#
+# So the shipped `MCP_SERVER_ARGS=scripts\\mcp_corpus_server.py` has always
+# worked only because every documented invocation happens to start in the
+# repo root. Running the CLI from anywhere else, or under a service manager,
+# scheduled task or IDE that sets its own working directory, breaks it -- and
+# breaks it as an opaque "Connection closed", never as "file not found".
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def resolve_repo_path(value: str) -> str:
+    """Resolve a possibly-relative path against REPO_ROOT, not the CWD.
+
+    CALLED BY   assembly.py, for BOTH MCP bridges' command and args.
+
+    Rules, in order:
+
+    1. Empty stays empty. "is this configured at all" is the caller's
+       decision to make, not this function's.
+    2. Backslashes are normalized to forward slashes FIRST. The shipped
+       .env.example uses Windows separators, and pathlib on POSIX treats
+       "scripts\\x.py" as a single filename containing a backslash rather
+       than as a path -- so the same .env would silently behave differently
+       on the two platforms. Normalizing makes one .env portable across
+       both. Safe because no path this project references legitimately
+       contains a backslash in a filename.
+    3. An ABSOLUTE path is returned unchanged. Someone who wrote an
+       absolute path meant it.
+    4. A relative path is resolved against REPO_ROOT -- but ONLY IF the
+       result actually EXISTS. Otherwise the original string is returned
+       untouched.
+
+       That existence check is what keeps a BARE COMMAND NAME working.
+       "python3", "uvx" and "npx" are not paths at all; they are names the
+       OS resolves through PATH. <repo>/python3 does not exist, so the name
+       passes through unchanged and PATH lookup still happens. Blindly
+       prefixing REPO_ROOT would turn every bare command into a
+       guaranteed FileNotFoundError.
+
+    Deliberately does NOT raise on a path that resolves nowhere. A wrong
+    path is the caller's problem to report with its own context -- MCPBridge
+    already produces a clear error naming the command, and
+    scripts/check_services.py exists to surface exactly this before a real
+    run. Raising here would turn a configuration mistake into an import-time
+    crash of the whole application.
+    """
+    if not value:
+        return value
+    normalized = value.replace("\\", "/")
+    candidate = pathlib.Path(normalized)
+    if candidate.is_absolute():
+        return str(candidate)
+    resolved = REPO_ROOT / candidate
+    return str(resolved) if resolved.exists() else value
+
+
+def resolve_server_command(value: str) -> str:
+    """The command to launch an MCP server subprocess with.
+
+    CALLED BY   assembly.py, for both bridges.
+
+    AN EMPTY VALUE MEANS sys.executable -- the interpreter currently running
+    the agent -- and that is the RECOMMENDED configuration, not a fallback
+    for the careless.
+
+    Why empty-means-sys.executable is the most portable answer available:
+
+      - It is correct by construction on every machine. No absolute path to
+        get wrong, no path to update when a colleague clones to a different
+        drive, no CI runner needing its own override, no difference between
+        Windows and POSIX layouts (Scripts/python.exe vs bin/python).
+      - It GUARANTEES the server runs in the same virtualenv as the agent.
+        That matters concretely here: scripts/mcp_web_search_server.py
+        imports `ddgs`, and a bare "python" resolved through PATH can easily
+        be a system interpreter that has never seen this project's
+        dependencies -- failing as an opaque "Connection closed" rather than
+        as a readable ImportError, because the subprocess dies before the
+        MCP handshake completes.
+      - It keeps the checked-in .env.example free of machine-specific
+        absolute paths, which is the thing that makes a config file
+        non-portable in the first place.
+
+    A non-empty value is honoured and passed through resolve_repo_path, so
+    an absolute path, a repo-relative path (".venv/Scripts/python.exe") and
+    a bare PATH name ("python3") all work. Use one only when the server
+    genuinely must run under a DIFFERENT interpreter than the agent -- a
+    real case, just not the common one.
+    """
+    if not value or not value.strip():
+        return sys.executable
+    return resolve_repo_path(value.strip())
 
 
 class Settings(BaseSettings):
@@ -236,20 +347,19 @@ class Settings(BaseSettings):
     # D-23: human-in-the-loop escalation. Off by default — the graceful-
     # degradation posture: shipping inert, enabled deliberately.
     hitl_enabled: bool = False
-    # ---- P205: external retrieval tier -------------------------------
-    # The architectural gap that made every "corpus does not contain it"
-    # failure terminal: corpus_search, mcp_client and semantic memory all
-    # resolve to the SAME ingested documents, so there was nowhere else to
-    # look. Off by default (no surprise egress, no surprise cost), but
-    # once on, a barren corpus lookup escalates to a real search engine
-    # instead of ending the run.
-    # Rank-derived scores never fall below this, so a genuinely retrieved
-    # web result always clears min_evidence_score and can mark a goal
-    # covered. Set above min_evidence_score or the tier cannot contribute
-    # coverage at all -- validate_settings warns when it is not.
-    # How many times one query formulation may be retried across later
-    # gather cycles once every tier came back empty (D-16 depth gate still
-    # applies on top). 0 keeps the pre-P205 "one shot per formulation".
+    # CURRENTLY UNREAD -- kept, not deleted, and labelled rather than left
+    # looking live. Text-searching this field name across the repo returns
+    # this line and nothing else: no node, tool or producer consults it.
+    # It arrived as the surviving fragment of a partially-applied P205
+    # patch whose other fields never landed (the comment block that used to
+    # sit here described a web-search tier that did not exist in code --
+    # that block is now replaced by the real settings under "Phase 4: web
+    # search" below). The INTENT was: how many times one query formulation
+    # may be retried across later gather cycles once every tier came back
+    # empty, with D-16's depth gate still applying on top; 0 reproduces the
+    # current one-shot-per-formulation behaviour, which is what the code
+    # actually does today regardless of this value. Either wire it or drop
+    # it -- but not silently, and not as part of Phase 4.
     max_task_retries: int = Field(2, ge=0)
     # D-23 (bound): the maximum number of times ONE run may pause for a
     # human. Without this, HITL removes the loop bounds it is layered on
@@ -347,6 +457,136 @@ class Settings(BaseSettings):
     mcp_query_arg_name: str = "query"
     mcp_call_timeout_seconds: float = 30.0
     mcp_max_workers: int = Field(6, ge=1)
+
+    # --- Phase 4: web search (D-57) ---------------------------------------
+    # The gap this closes: corpus_search, mcp_client and semantic memory all
+    # resolve to the SAME ingested documents, so "the corpus does not
+    # contain it" had nowhere left to escalate except the model's own
+    # recollection (D-38 tier 4). Web search is a real retrieval tier
+    # between those two.
+    #
+    # EVERY SETTING IN THIS BLOCK IS READ BY THE SEARCH SERVER SUBPROCESS
+    # (scripts/mcp_web_search_server.py), not by the agent. The agent never
+    # imports research_agent.websearch and never issues a search request of
+    # its own -- it talks to the server over stdio through
+    # tools/mcp_client.py, exactly as it already does for the corpus MCP
+    # server. The settings that wire the AGENT side (WEB_MCP_*) are a
+    # separate block, added with that wiring.
+    #
+    # The server reads these from ITS OWN environment/.env at startup (same
+    # as scripts/mcp_corpus_server.py does with get_settings()), which is
+    # why WEB_MCP_SERVER_ENV_ALLOWLIST can stay minimal: the subprocess does
+    # not need these forwarded to it.
+    web_search_provider: str = "ddgs"
+    # How many results to ask the engine for per query. Modest on purpose:
+    # DDGS is an unofficial client against an endpoint that promises it
+    # nothing, and aggressive querying is what triggers throttling. Also
+    # bounds how much untrusted third-party text can enter one compile
+    # prompt at a time.
+    web_search_max_results: int = Field(5, ge=1, le=25)
+    # The score band a rank is mapped onto (websearch/scoring.py).
+    #
+    # FLOOR must EXCEED min_evidence_score, or the tier is inert: D-17's
+    # coverage predicate is a strict `>`, so a web hit scoring at or below
+    # the floor can never mark a goal covered, and the whole feature runs
+    # while contributing nothing -- the same silent-inertness failure
+    # MIN_EVIDENCE_SCORE=0.0 was, and that make_mcp_tool's `unscored_score`
+    # parameter exists to prevent from the other direction.
+    # warn_on_web_search_band below WARNs when it does not.
+    #
+    # CEILING must stay well below the ~1.0 a document both retrieval legs
+    # ranked first reaches after tools/corpus_search.py's RRF_SQUASH.
+    # D-38's ordering invariant is that a real document always beats weaker
+    # provenance; a snippet allowed to score 0.95 would sit above genuinely
+    # fused corpus evidence in the compiler's context and invert it. 0.75
+    # also sits above model_knowledge_score (0.60), which is the intended
+    # order: a live retrieved snippet is better provenance than
+    # recollection, worse than a curated document.
+    web_search_min_score: float = Field(0.60, ge=0.0, le=1.0)
+    web_search_max_score: float = Field(0.75, ge=0.0, le=1.0)
+    # At most this many hits from any one registrable domain
+    # (websearch/filtering.py). Not tidiness: five hits from one site read
+    # to the compiler as five independent sources agreeing -- corroboration
+    # that does not exist -- and telemetry's web_search_results count looks
+    # identical either way. 0 or less disables the cap, the documented way
+    # to reproduce uncapped behaviour deliberately (same posture as
+    # min_similarity=0.0 for pre-P2-01 retrieval).
+    web_search_max_per_domain: int = 2
+    # Engine-specific request shaping. Configurable rather than hardcoded
+    # for the same reason every other endpoint in this file is: a run from
+    # Bengaluru and a run from Frankfurt should not be forced to one result
+    # set. "wt-wt" is DDGS's own no-region default.
+    web_search_region: str = "wt-wt"
+    web_search_safesearch: str = "moderate"
+    # Per-HTTP-request timeout INSIDE the provider. Distinct from the MCP
+    # call timeout on the agent side: this one stops a single hung request
+    # from occupying a thread-pool slot in the server forever; that one
+    # stops the agent waiting on a wedged server subprocess. Both are
+    # needed -- neither substitutes for the other.
+    web_search_provider_timeout_seconds: float = Field(20.0, gt=0.0)
+    # The search server's own thread pool, mirroring mcp_max_workers for the
+    # corpus server. Separate field, not a reuse: these pools front totally
+    # different work (outbound internet vs. local Qdrant/OpenSearch) and
+    # sizing one should never silently resize the other.
+    web_search_max_workers: int = Field(6, ge=1)
+
+    # --- Phase 4: the AGENT side of web search (D-57) ---------------------
+    # Everything above is read by the search server subprocess. Everything
+    # HERE is read by assembly.py, in the agent process, to wire the second
+    # MCPBridge.
+    #
+    # A SECOND, SEPARATE NAMESPACE, not a reuse of MCP_*. The existing MCP_*
+    # block describes exactly one server, and in every deployment of this
+    # repo so far that server is scripts/mcp_corpus_server.py -- i.e. the
+    # corpus, reached a second way. Web search is a genuinely different
+    # server, with a different command, a different tool name, a different
+    # timeout profile (outbound internet, not local stores) and a different
+    # env allowlist. Overloading one namespace would force a choice between
+    # them; two namespaces let both run at once, which is the point.
+    #
+    # Off by default, same posture as MCP_ENABLED and HITL_ENABLED: no
+    # surprise egress and no surprise third-party text in a prompt. With
+    # this false, assembly.py builds no second bridge, make_web_search_tool
+    # is never called, and the retrieval ladder is byte-identical to every
+    # run before Phase 4.
+    web_search_enabled: bool = False
+    # EMPTY IS THE RECOMMENDED VALUE, not an unset one: resolve_server_command
+    # (above) turns it into sys.executable, the interpreter already running
+    # the agent. That is correct on every machine with no configuration at
+    # all, and it guarantees the server runs in the SAME virtualenv -- which
+    # matters because the server imports ddgs, and a wrong interpreter dies
+    # before the MCP handshake and surfaces as "Connection closed" rather
+    # than as a readable ImportError.
+    #
+    # Set this only when the server must genuinely run under a DIFFERENT
+    # interpreter than the agent. Absolute paths, repo-relative paths and
+    # bare PATH names are all accepted -- see resolve_server_command.
+    web_mcp_server_command: str = ""
+    # Relative to the REPO ROOT, resolved by resolve_repo_path -- NOT to the
+    # current working directory, which is what mcp.StdioServerParameters
+    # would otherwise use (D-58).
+    web_mcp_server_args: str = "scripts/mcp_web_search_server.py"
+    # THE ENTRY THAT MATTERS, and the reason this defaults NON-EMPTY while
+    # mcp_server_env_allowlist defaults empty: this subprocess makes
+    # OUTBOUND INTERNET requests. tools/mcp_client.py::_build_subprocess_env
+    # never forwards os.environ (D-30), so behind a corporate proxy the
+    # server would receive no HTTPS_PROXY/HTTP_PROXY/NO_PROXY and every
+    # search would fail as an opaque timeout with nothing in the log
+    # explaining why. The corpus server needs none of this because it talks
+    # only to Qdrant/OpenSearch on URLs it reads from its own .env.
+    #
+    # Naming a variable here does NOT leak it unless it is actually set in
+    # this process -- see _build_subprocess_env. On a machine with no proxy
+    # configured this default forwards nothing at all.
+    web_mcp_server_env_allowlist: str = "HTTPS_PROXY,HTTP_PROXY,NO_PROXY"
+    web_mcp_tool_name: str = "web_search"
+    web_mcp_query_arg_name: str = "query"
+    # Higher than mcp_call_timeout_seconds' 30.0 default: a corpus lookup
+    # is a local round trip, a web search is a third-party HTTP request that
+    # may be retried or throttled upstream. Still bounded -- the ladder must
+    # be able to give up on this tier and reach the model tier within a
+    # sensible wall-clock budget.
+    web_mcp_call_timeout_seconds: float = 45.0
     # Debug tracing: when true (or --debug on the CLI), dump the exact prompt,
     # raw response, provider, tokens and latency of every LLM call, plus every
     # retrieval engine's hits, to logs/trace-<run_id>.txt. Off by default.
@@ -425,6 +665,14 @@ _KNOWN_ENV_TYPOS = {
     "MCP_COMMAND": "MCP_SERVER_COMMAND",
     "MCP_ARGS": "MCP_SERVER_ARGS",
     "MCP_ENV_ALLOWLIST": "MCP_SERVER_ENV_ALLOWLIST",
+    "WEB_SEARCH": "WEB_SEARCH_ENABLED",
+    "WEB_SEARCH_SCORE": "WEB_SEARCH_MIN_SCORE",
+    "WEB_SEARCH_RESULTS": "WEB_SEARCH_MAX_RESULTS",
+    "WEB_SEARCH_TIMEOUT": "WEB_SEARCH_PROVIDER_TIMEOUT_SECONDS",
+    "WEB_MCP": "WEB_MCP_SERVER_COMMAND",
+    "WEB_MCP_COMMAND": "WEB_MCP_SERVER_COMMAND",
+    "WEB_MCP_ARGS": "WEB_MCP_SERVER_ARGS",
+    "WEB_MCP_ENV_ALLOWLIST": "WEB_MCP_SERVER_ENV_ALLOWLIST",
 }
 
 
@@ -495,6 +743,48 @@ def warn_on_inert_coverage_gate(s: "Settings") -> None:
                   effect="every dense hit enters fusion regardless of relevance")
 
 
+def warn_on_web_search_band(s: "Settings") -> None:
+    """Log a WARNING when the web-search score band is misconfigured.
+
+    CALLED BY   get_settings(), below, once per process -- alongside
+                warn_on_likely_env_typos and warn_on_inert_coverage_gate,
+                which this deliberately mirrors in both shape and posture.
+
+    Two distinct misconfigurations, two distinct silent failures:
+
+    1. FLOOR AT OR BELOW THE COVERAGE GATE. D-17's predicate
+       (agents/gathering.py::progress_checker_node) is a strict
+       `e.score > settings.min_evidence_score`. With
+       web_search_min_score <= min_evidence_score, not one web result can
+       ever mark a goal covered -- so the tier fires, spends real network
+       time, returns real evidence, and contributes nothing to convergence.
+       The run looks normal. This is the same class of config-undoing-code
+       defect warn_on_inert_coverage_gate exists for.
+
+    2. INVERTED BAND. floor > ceiling would mean the engine's BEST result
+       scores lowest. websearch/scoring.py::rank_to_score normalizes this
+       rather than running backwards, so it is not a correctness bug --
+       but it is certainly not what anyone meant, and silently doing the
+       right thing with the wrong config teaches nothing.
+
+    A warning, never a hard failure -- same reasoning as every other check
+    in this file: an unusual value stays legal, it just cannot happen
+    without anyone noticing.
+    """
+    if s.web_search_min_score <= s.min_evidence_score:
+        log_event(logger, "config.web_search_tier_inert", level=logging.WARNING,
+                  setting="WEB_SEARCH_MIN_SCORE", value=s.web_search_min_score,
+                  min_evidence_score=s.min_evidence_score,
+                  effect="no web result can clear the D-17 coverage gate; the "
+                         "web tier will retrieve evidence but never cover a goal")
+    if s.web_search_min_score > s.web_search_max_score:
+        log_event(logger, "config.web_search_band_inverted", level=logging.WARNING,
+                  min_score=s.web_search_min_score,
+                  max_score=s.web_search_max_score,
+                  effect="floor exceeds ceiling; rank_to_score normalizes the "
+                         "band, but the configured values are not what was meant")
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Return the process-wide Settings singleton (cached after first load).
@@ -512,4 +802,5 @@ def get_settings() -> Settings:
     warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     settings = Settings()
     warn_on_inert_coverage_gate(settings)
+    warn_on_web_search_band(settings)
     return settings
