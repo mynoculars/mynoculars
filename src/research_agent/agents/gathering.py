@@ -286,6 +286,33 @@ def build_merger_node(router: FallbackRouter, settings: Settings, debug: bool = 
     return merger_node
 
 
+def has_grounded_evidence(goal_id: str, goal_terms: set,
+                          evidence: List[Evidence], min_score: float) -> bool:
+    """True if a REAL DOCUMENT, actually about this goal, covers it (G2/D-47).
+
+    Three conjuncts, none of them redundant:
+      - source in ("corpus", "mcp") -- a document, not recollection and not
+        a web snippet (D-57: web COVERS but never GROUNDS).
+      - score above the coverage floor -- the same D-17 predicate
+        progress_checker uses, so the two can never disagree.
+      - shares distinctive vocabulary with the goal's own description --
+        the D-39 topical gate. Without it, an off-topic corpus hit that
+        cleared the floor by cross-leg agreement counted as grounding for
+        a goal it had nothing to do with (observed live, run p205.132).
+
+    Extracted to module level (D-59) because gap_generator_node now needs
+    the identical verdict to decide which goals a grounded-gate cycle
+    should actually target. Two inline copies of a three-part predicate is
+    exactly how progress_checker's and telemetry's grounding numbers drifted
+    apart the first time.
+    """
+    return any(
+        e.goal_id == goal_id and e.source in ("corpus", "mcp")
+        and passes_evidence_gate(e.score, min_score)
+        and (not goal_terms or goal_terms & _distinctive_terms(e.content))
+        for e in evidence)
+
+
 def build_progress_checker_node(settings: Settings, debug: bool = False):
     """Build the coverage/recall checker — the loop's clock (D-3)."""
 
@@ -376,13 +403,10 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
             # overlap gate. Reusing that exact gate here closes the gap
             # between the two numbers instead of leaving G2 as a second,
             # weaker grounding metric that disagrees with the first.
-            has_grounded_evidence = any(
-                e.goal_id == g.goal_id and e.source in ("corpus", "mcp")
-                and passes_evidence_gate(e.score, settings.min_evidence_score)
-                and (not goal_terms.get(g.goal_id)
-                     or goal_terms[g.goal_id] & _distinctive_terms(e.content))
-                for e in state.evidence)
-            grounded_covered = covered and has_grounded_evidence
+            grounded = has_grounded_evidence(
+                g.goal_id, goal_terms.get(g.goal_id, set()),
+                state.evidence, settings.min_evidence_score)
+            grounded_covered = covered and grounded
             goals.append(g.model_copy(update={"covered": covered}))
             # grounded_covered is accumulated here and folded into
             # grounded_score once ALL goals have been walked -- not
@@ -610,13 +634,54 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
                               trigger=trigger,
                               reason="no_strong_evidence_for_any_uncovered_goal")
             return update
+        # D-59: WHICH goals this cycle is actually for. Uncovered goals are
+        # the original and still the common case -- but they are not the
+        # only way this node is reached. D-47's grounded-convergence gate
+        # routes here with recall ALREADY at target and every goal
+        # `covered`, purely because the coverage came from web/model
+        # evidence rather than a real document. In that state `uncovered`
+        # is empty, and the prompt used to render "Uncovered goals: (none)"
+        # while still demanding queries for them.
+        #
+        # That is an unanswerable instruction, and the model answered it
+        # the only way it could: from the evidence tail, which is the
+        # longest and most topically coherent block left in the prompt.
+        # Live (run p205.203-check) the tail was dominated by off-topic
+        # Redis corpus hits under an India-vs-US query, and the gap
+        # generator returned six consecutive Redis/Memcached queries. The
+        # model was not free-associating; it was reading the only subject
+        # the prompt still showed it.
+        #
+        # Naming the ungrounded goals instead gives the cycle the job it
+        # was actually dispatched for: find a DOCUMENT for a goal currently
+        # propped up by weaker provenance.
+        goal_terms = {g.goal_id: _distinctive_terms(g.description)
+                      for g in state.goals}
+        if uncovered:
+            target_goals = uncovered
+        else:
+            target_goals = [
+                g for g in state.goals
+                if not has_grounded_evidence(g.goal_id,
+                                             goal_terms.get(g.goal_id, set()),
+                                             state.evidence,
+                                             settings.min_evidence_score)]
+        if not target_goals and not state.human_guidance:
+            # Nothing uncovered and nothing ungrounded: there is no gap for
+            # this node to close, so there is no prompt worth paying for.
+            # D-1's empty-backlog exit routes to the compiler, which is the
+            # correct terminal move for a run that has genuinely converged.
+            log_event(logger, "node.gaps_skipped_nothing_to_target",
+                      depth=state.iteration_depth)
+            return {"pending_tasks": [], "human_guidance": ""}
         # P2-14 (D-25): same reasoning as task_expander_node's identical
         # line -- settings.mcp_enabled IS the "is mcp available" signal,
         # reused directly rather than a second, separately-configured flag.
         available_tool_hints = frozenset({"mcp"}) if settings.mcp_enabled else frozenset()
         result = router.complete_json(templates.generate_gaps(
             state.goals, state.evidence, state.iteration_depth, settings.max_fanout,
-            guidance=state.human_guidance, available_tool_hints=available_tool_hints))
+            guidance=state.human_guidance, available_tool_hints=available_tool_hints,
+            query=state.raw_query, target_goals=target_goals))
         # P2-06: same validated cap_and_filter seam task_expander_node uses.
         tasks, rejected = cap_and_filter(result.get("tasks", []), state,
                                          depth=state.iteration_depth,

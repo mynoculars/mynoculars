@@ -163,3 +163,90 @@ def test_the_section_ends_with_exactly_one_trailing_newline():
     assert out.endswith("\n")
     assert not out.endswith("\n\n")
     assert "Body [g1].\n\n## Sources" in out
+
+# ---------------------------------------------------------------------------
+# D-59 — a listed source must actually be about the goal it is filed under
+#
+# Live regression: run p205.203-check. A drifted gather cycle retrieved web
+# results about Redis monitoring and tagged them g1 -- a real,
+# correctly-formed goal id. The report cited [g1] for its own (economic)
+# reasons, so every one of those pages was listed as a source of an
+# India-vs-US report. The prose was clean; the Sources section was not.
+# ---------------------------------------------------------------------------
+def _web_item(goal_id, content, url, score=0.7):
+    from research_agent.state import Evidence
+    return Evidence(task_key="t", goal_id=goal_id, source="web",
+                    content=content, score=score, url=url,
+                    domain=url.split("/")[2])
+
+
+def test_off_topic_web_evidence_is_not_listed_as_a_source():
+    from research_agent.guardrails.sources import append_web_sources
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1",
+                  description="GDP growth inflation unemployment India US")]
+    evidence = [
+        _web_item("g1", "India vs United States Economy Comparison — compare GDP, "
+                   "inflation and unemployment", "https://country-compare.com/x",
+             score=0.75),
+        _web_item("g1", "Redis Monitoring 101 — key metrics, alerts and "
+                   "observability", "https://signoz.io/blog/redis-monitoring/",
+             score=0.74),
+    ]
+    report = "Growth diverged over the period [g1].\n"
+    out, counters = append_web_sources(report, evidence, goals)
+    assert "country-compare.com" in out
+    assert "signoz.io" not in out, "an off-topic page must not claim support"
+    assert counters["web_sources_listed"] == 1
+    assert counters["web_sources_suppressed"] == 1
+
+
+def test_topical_gate_is_skipped_when_goals_are_not_supplied():
+    """The pre-D-59 signature stays byte-compatible: without goals there is
+    nothing to test topicality against, so cited-goal membership decides
+    alone, exactly as before."""
+    from research_agent.guardrails.sources import append_web_sources
+
+    evidence = [_web_item("g1", "Redis Monitoring 101 — metrics",
+                     "https://signoz.io/blog/redis-monitoring/")]
+    out, counters = append_web_sources("Claim [g1].\n", evidence)
+    assert "signoz.io" in out
+    assert counters["web_sources_listed"] == 1
+
+
+def test_a_goal_with_no_distinctive_terms_leaves_its_sources_alone():
+    """An untestable claim is left alone rather than resolved against the
+    item -- the same posture _sufficient takes when a query yields no
+    distinctive terms."""
+    from research_agent.guardrails.sources import append_web_sources
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="the of and")]  # all filler
+    evidence = [_web_item("g1", "Anything at all", "https://example.com/a")]
+    out, _ = append_web_sources("Claim [g1].\n", evidence, goals)
+    assert "example.com" in out
+
+
+# ---------------------------------------------------------------------------
+# D-59 — count_listed_sources reads the artifact, not the accumulator
+# ---------------------------------------------------------------------------
+def test_count_listed_sources_counts_entries_in_the_shipped_report():
+    from research_agent.guardrails.sources import (append_web_sources,
+                                                   count_listed_sources)
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="economy growth India US")]
+    evidence = [_web_item("g1", f"economy growth report {i}",
+                          f"https://example{i}.com/a", score=0.9 - i / 100)
+                for i in range(3)]
+    out, counters = append_web_sources("Claim [g1].\n", evidence, goals)
+    assert count_listed_sources(out) == 3 == counters["web_sources_listed"]
+
+
+def test_count_listed_sources_is_zero_without_a_sources_section():
+    """The path every WEB_SEARCH_ENABLED=false run takes."""
+    from research_agent.guardrails.sources import count_listed_sources
+    assert count_listed_sources("# Report\n\nJust prose [g1].\n") == 0
+    # A report that merely mentions the words must not be miscounted.
+    assert count_listed_sources("We list 1. [g1] nothing here\n") == 0

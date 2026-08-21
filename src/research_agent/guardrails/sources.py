@@ -44,10 +44,11 @@ Scope, deliberately narrow:
 
 import logging
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from research_agent.logging_setup import log_event
-from research_agent.state import Evidence
+from research_agent.state import Evidence, Goal
+from research_agent.tools.retrieval_chain import _distinctive_terms
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,32 @@ _CITATION_RE = re.compile(r"\[g(\d+)\]")
 
 SOURCES_HEADING = "## Sources"
 
+# One numbered entry in the block this module emits: "1. [g3] Title (dom) — url".
+_SOURCE_ENTRY_RE = re.compile(r"(?m)^\d+\. \[g\d+\] ")
+
+
+def count_listed_sources(report: str) -> int:
+    """How many sources the FINAL report actually lists (D-59).
+
+    Exists because compiler_node's counters are merged additively
+    (state.py::merge_counters) and compiler_node runs once per revision --
+    so `web_sources_listed` accumulated across every compile ATTEMPT while
+    telemetry documented it as a property of the report. Live (run
+    p205.203-check, two revision cycles): telemetry reported 44 listed and
+    25 suppressed against 35 web items total, while the shipped report
+    contained 34 entries. Every one of those numbers was arithmetically
+    correct and none of them described the artifact the reader received.
+
+    Counting the shipped text instead is pure, deterministic, and keeps
+    D-12 intact -- telemetry still only counts what happened, it just
+    counts the right thing. Returns 0 when no Sources section exists,
+    which is every run with WEB_SEARCH_ENABLED false.
+    """
+    head, marker, block = report.rpartition(f"\n{SOURCES_HEADING}\n")
+    if not marker:
+        return 0
+    return len(_SOURCE_ENTRY_RE.findall(block))
+
 
 def _cited_goal_ids(report: str) -> set:
     """Which goals the prose actually cites, as goal_id strings ("g3")."""
@@ -67,7 +94,9 @@ def _cited_goal_ids(report: str) -> set:
 
 
 def append_web_sources(report: str,
-                       evidence: List[Evidence]) -> Tuple[str, Dict[str, float]]:
+                       evidence: List[Evidence],
+                       goals: Optional[List[Goal]] = None,
+                       ) -> Tuple[str, Dict[str, float]]:
     """Append a Sources section for cited web evidence. Returns (report, counters).
 
     RETURNS the report UNCHANGED, and zeroed counters, when there is nothing
@@ -101,6 +130,32 @@ def append_web_sources(report: str,
 
     cited = _cited_goal_ids(report)
     listed = [e for e in web_items if e.goal_id in cited]
+    # D-59: cited-goal membership alone is NOT a claim of support. A
+    # drifted gather cycle can retrieve web results about an entirely
+    # different subject and tag them with a real, correctly-formed goal id;
+    # if the report then cites that goal for its OWN reasons, every one of
+    # those pages gets listed as a source. Live (run p205.203-check): nine
+    # Redis-monitoring URLs appeared under [g1] in an India-vs-US report.
+    # The prose was clean -- clean_citations and the compiler's citation
+    # discipline both held -- but the Sources section asserted support that
+    # did not exist, which is precisely the failure D-51 exists to prevent.
+    #
+    # Same topical gate as D-39/D-47, reused rather than reinvented so
+    # "on topic" cannot come to mean three different things in three files.
+    # Skipped entirely when goals are not supplied (the pre-D-59 signature)
+    # or when a goal's description yields no distinctive terms -- an
+    # untestable claim is left alone rather than resolved against the item.
+    if goals:
+        goal_terms = {g.goal_id: _distinctive_terms(g.description)
+                      for g in goals}
+        on_topic = [e for e in listed
+                    if not goal_terms.get(e.goal_id)
+                    or goal_terms[e.goal_id] & _distinctive_terms(e.content)]
+        if len(on_topic) != len(listed):
+            log_event(logger, "sources.off_topic_dropped",
+                      dropped=len(listed) - len(on_topic),
+                      kept=len(on_topic))
+        listed = on_topic
     counters["web_sources_suppressed"] = float(len(web_items) - len(listed))
     if not listed:
         # Web evidence was retrieved but the compiler cited none of the goals

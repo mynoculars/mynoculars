@@ -12,8 +12,11 @@ no other natural home.
 import json
 
 import httpx
+import pytest
 
-from research_agent.llm.client import OpenAICompatibleClient, _extract_json, _truncate_at_sentinel, _extract_json
+from research_agent.llm.client import (
+    OpenAICompatibleClient, TruncatedGenerationError, _extract_json,
+    _truncate_at_sentinel)
 
 
 def test_prompt_tag_covers_every_node_that_calls_an_llm():
@@ -172,3 +175,81 @@ def test_complete_omits_max_tokens_when_not_configured():
     client = _client_with_mock_transport(handler)
     client.complete([{"role": "user", "content": "hi"}])
     assert "max_tokens" not in captured["body"]
+
+
+
+# ---------------------------------------------------------------------------
+# FIX-2 — finish_reason == "length" is a failure, not an answer
+#
+# Diagnosed from run p205.211: gemini-3.5-flash returned 162 completion tokens
+# ending mid-number, and the client handed that fragment back as a finished
+# report because nothing ever looked at finish_reason.
+# ---------------------------------------------------------------------------
+
+
+def test_length_truncated_generation_raises_instead_of_returning_a_fragment():
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "India's growth moderates to around 6"},
+                         "finish_reason": "length"}]})
+
+    client = _client_with_mock_transport(handler, max_tokens=4096)
+    with pytest.raises(TruncatedGenerationError):
+        client.complete([{"role": "user", "content": "compile"}])
+
+
+def test_stop_finish_reason_is_returned_normally():
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "a complete answer"},
+                         "finish_reason": "stop"}]})
+
+    client = _client_with_mock_transport(handler)
+    assert client.complete([{"role": "user", "content": "x"}]) == "a complete answer"
+
+
+def test_absent_finish_reason_is_returned_normally():
+    """Providers that omit finish_reason entirely (and every existing test
+    fixture in this file) must behave exactly as before the check existed."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "hi"}}]})
+
+    client = _client_with_mock_transport(handler)
+    assert client.complete([{"role": "user", "content": "x"}]) == "hi"
+
+
+def test_length_after_a_sentinel_trim_is_kept_not_raised():
+    """A runaway generation that reached its own end-of-turn and was then cut
+    off at the token limit has a COMPLETE answer before the sentinel — the
+    `length` describes the discarded tail. _truncate_at_sentinel already
+    salvages it, so raising here would throw away a good answer."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "the real answer<|im_end|>then junk that ran"},
+                         "finish_reason": "length"}]})
+
+    client = _client_with_mock_transport(handler)
+    assert client.complete([{"role": "user", "content": "x"}]) == "the real answer"
+
+
+def test_truncated_generation_error_makes_the_router_fall_back():
+    """End-to-end intent: a length-truncated provider must behave exactly
+    like a transport error as far as FallbackRouter is concerned."""
+    from research_agent.llm.router import FallbackRouter
+
+    def truncating(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "cut off mid-"},
+                         "finish_reason": "length"}]})
+
+    class _Good:
+        name = "good"
+        def complete(self, messages, temperature=0.2):
+            return "complete answer"
+        def complete_json(self, messages, temperature=0.0):
+            return {"score": 0.9}
+
+    chain = FallbackRouter([_client_with_mock_transport(truncating), _Good()],
+                           quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "complete answer"

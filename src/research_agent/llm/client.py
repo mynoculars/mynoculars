@@ -73,6 +73,22 @@ logger = logging.getLogger(__name__)
 # {"role": "user", "content": "What is Redis?"}.
 Message = Dict[str, str]  # {"role": ..., "content": ...}
 
+
+class TruncatedGenerationError(RuntimeError):
+    """A provider reported its own generation was cut off at the token limit.
+
+    RAISED BY   OpenAICompatibleClient.complete, when the response carries
+                finish_reason == "length" and no chat-template sentinel was
+                trimmed (see FIX-2 there for why that second condition
+                matters).
+    CAUGHT BY   nobody specifically — llm/router.py's fallback handlers catch
+                Exception broadly, which is the whole point: a truncated
+                answer should behave exactly like a transport error and move
+                the router to the next provider. A distinct type exists so a
+                test, or a future retry-with-larger-budget policy, can tell
+                "the model was cut off" apart from "the network broke".
+    """
+
 # Chat-template end-of-turn markers some local models (llama.cpp / Llama-
 # family chat formats in particular) append after their actual answer —
 # confirmed by a live debug trace showing Cogito doing exactly this after
@@ -475,6 +491,34 @@ class OpenAICompatibleClient:
         text = _truncate_at_sentinel(raw_text)
         usage = data.get("usage", {})
         pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        # FIX-2 (run p205.211 root cause, third link in the chain). Nothing
+        # in this class ever looked at finish_reason, so a generation the
+        # PROVIDER itself reported as cut off was returned as a finished
+        # answer. Observed live: gemini-3.5-flash returned 162 completion
+        # tokens ending mid-number ("...moderate slightly to around 6") and
+        # 160 tokens ending mid-sentence, and both shipped as the final
+        # report because gemini is last in the chain and the last provider
+        # has no quality gate.
+        #
+        # Raising here is the correct layer: this class's contract is
+        # already "raise upward, the router owns fallback policy". A hard
+        # error makes the router hop, and — with FIX-3 — fall back to the
+        # best earlier answer instead of shipping a fragment.
+        #
+        # The `text == raw_text` guard matters: when _truncate_at_sentinel
+        # DID trim something, the model reached its own end-of-turn and
+        # then ran away, so `length` describes the discarded runaway tail,
+        # not the answer. Only an untrimmed response is genuinely cut off.
+        finish_reason = (data.get("choices") or [{}])[0].get("finish_reason")
+        if finish_reason == "length" and text == raw_text:
+            log_event(logger, "llm.truncated_by_token_limit", level=logging.WARNING,
+                      provider=self.name, node=self._trace_node,
+                      completion_tokens=ct, max_tokens=self._max_tokens,
+                      kept_chars=len(text))
+            raise TruncatedGenerationError(
+                f"{self.name}/{self._model} stopped at the token limit "
+                f"(finish_reason=length, completion_tokens={ct}); the answer is "
+                f"incomplete and must not be used")
         if text != raw_text:
             log_event(logger, "llm.truncated_runaway_generation", level=logging.WARNING,
                       provider=self.name, node=self._trace_node,

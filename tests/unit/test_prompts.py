@@ -184,8 +184,50 @@ def test_generate_gaps_demands_coverage_of_every_uncovered_goal():
     goals = [Goal(goal_id="g1", description="a", covered=False),
              Goal(goal_id="g2", description="b", covered=False)]
     body = generate_gaps(goals, [], 1, 6)[-1]["content"]
-    assert "SPREAD them across the uncovered goals" in body
+    assert "SPREAD them across the goals listed above" in body
     assert "at least one query before giving any goal a second" in body
+
+
+def test_generate_gaps_names_the_research_question(  # D-59
+):
+    """Live (run p205.203-check): this prompt contained the goal list and an
+    evidence tail and NOTHING naming the actual subject under research. The
+    tail was dominated by off-topic Redis corpus hits under an India-vs-US
+    query, and the gap generator returned six consecutive Redis/Memcached
+    queries -- reading the only subject the prompt still showed it. The
+    question must appear, and must appear BEFORE the tail."""
+    from research_agent.prompts.templates import generate_gaps
+    from research_agent.state import Evidence, Goal
+
+    goals = [Goal(goal_id="g1", description="economy", covered=False)]
+    tail = [Evidence(goal_id="g1", task_key="t", content="Redis SLOWLOG",
+                     source="corpus", score=0.9)]
+    body = generate_gaps(goals, tail, 1, 6,
+                         query="Compare India and US")[-1]["content"]
+    assert "Compare India and US" in body
+    assert body.index("Compare India and US") < body.index("<evidence>")
+    # The tail must be labelled as retrieval, not as a topic description.
+    assert "NOT a description of the topic" in body
+
+
+def test_generate_gaps_can_target_goals_that_are_covered_but_ungrounded(  # D-59
+):
+    """D-47's grounded gate routes to gap_generator with recall already at
+    target and every goal `covered`. The old wording rendered "Uncovered
+    goals: (none)" and still demanded queries for them -- unanswerable, so
+    the evidence tail became the only usable signal. target_goals lets the
+    caller name the goals the cycle is actually for."""
+    from research_agent.prompts.templates import generate_gaps
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="economy", covered=True),
+             Goal(goal_id="g2", description="climate", covered=True)]
+    body = generate_gaps(goals, [], 2, 6, target_goals=[goals[1]])[-1]["content"]
+    assert "g2: climate" in body
+    assert "g1: economy" not in body
+    # The GOAL list must be populated. ("(none)" still appears further down
+    # as the empty evidence tail, which is correct and unrelated.)
+    assert "Goals still needing evidence:\n- g2: climate" in body
 
 
 def test_no_prompt_carries_a_concrete_worked_example():

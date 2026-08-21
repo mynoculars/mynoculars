@@ -29,7 +29,8 @@ from research_agent.agents.escalation import escalation_allowed
 from research_agent.config import Settings
 from research_agent.guardrails.citations import clean_citations
 from research_agent.guardrails.hedging import enforce_hedging
-from research_agent.guardrails.sources import append_web_sources
+from research_agent.guardrails.sources import (append_web_sources,
+                                                count_listed_sources)
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
@@ -136,7 +137,8 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # No-op returning the report byte-identical whenever there is no
         # cited web evidence, which is every run with WEB_SEARCH_ENABLED
         # false (the default).
-        report, source_counters = append_web_sources(report, state.evidence)
+        report, source_counters = append_web_sources(
+            report, state.evidence, state.goals)
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,
@@ -416,6 +418,11 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         #
         # D-12 holds: every figure below is counted from state, not judged.
         goal_ids = [g.goal_id for g in state.goals]
+        # D-59: derived from the shipped report, not from the additive
+        # counter dict -- see the web_sources_listed entry below.
+        web_sources_listed = count_listed_sources(state.final_report)
+        web_sourced_items = sum(1 for e in state.evidence
+                                if e.source == "web")
         # corpus_recall must apply the SAME topical gate the retrieval
         # ladder uses (D-39), not just the score floor. Live (runs
         # p205.99/.100-check) this reported corpus_recall 1.0 against a
@@ -543,7 +550,7 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # telling you precisely and honestly where its answer came
             # from. Without this number that same run is indistinguishable
             # from one that found nothing at all.
-            "web_sourced_items": int(evidence_by_source.get("web", 0)),
+            "web_sourced_items": web_sourced_items,
             # How many DISTINCT domains that evidence came from. A useful
             # honesty check on its own: twelve items from one domain is one
             # source repeated, not twelve agreeing -- which is what
@@ -551,14 +558,23 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # time and what this makes visible after the fact.
             "web_source_domains": len({e.domain for e in state.evidence
                                        if e.source == "web" and e.domain}),
-            # From compiler_node's append_web_sources pass: how many web
-            # pages the report actually attributed, and how many were
-            # retrieved but belonged to goals the compiler never cited.
-            # A high suppressed count against a low listed count is the
-            # signature of the web tier doing work that never reached the
-            # report.
-            "web_sources_listed": int(c.get("web_sources_listed", 0)),
-            "web_sources_suppressed": int(c.get("web_sources_suppressed", 0)),
+            # How many web pages the SHIPPED report attributed, and how many
+            # were retrieved but never made it there -- either because the
+            # compiler cited none of their goals, or because they were not
+            # topically about the goal they were filed under (D-59). A high
+            # suppressed count against a low listed count is the signature
+            # of the web tier doing work that never reached the report.
+            #
+            # D-59: counted from state.final_report, NOT from c[...]. These
+            # two were previously read out of the additive counter dict,
+            # which compiler_node contributes to once per REVISION -- so a
+            # run with two rewrites reported the sum of three compile
+            # attempts as if it described one report. Live (p205.203-check):
+            # 44 listed / 25 suppressed against 35 web items, for a report
+            # containing 34 entries.
+            "web_sources_listed": web_sources_listed,
+            "web_sources_suppressed": max(
+                0, web_sourced_items - web_sources_listed),
             # Guardrail G3: model-tier items whose own text paired a
             # specific year with a specific quantity — flagged, not
             # dropped (see tools/model_knowledge.py::_looks_overspecific).

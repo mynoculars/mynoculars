@@ -16,7 +16,7 @@ History (P2-11):
     AND the critic pass a report whose Cassandra/DynamoDB sections cited no
     retrieved evidence at all. The scorer is now always a DIFFERENT
     provider — specifically the next one in FallbackRouter's chain (see
-    llm/router.py::FallbackRouter._passes_quality, the only caller, which
+    llm/router.py::FallbackRouter._score_quality, the only caller, which
     only invokes this when a next provider exists in the first place, so a
     judge is always available whenever this runs). Still no new external
     dependency — just a different existing provider doing the judging.
@@ -66,12 +66,56 @@ _SCORING_PROMPT = (
     '{"score": <float>}\n\nANSWER:\n'
 )
 
+# FIX-1 (run p205.211 root cause, first link in the chain). The judge used to
+# be handed `answer[:4000]` -- a raw character slice. A compiled report is
+# routinely 7,000-11,000 characters, so the judge saw a report that stopped
+# DEAD MID-WORD and correctly scored it as incomplete. Observed live: a
+# 10,103-char report scored 0.45, a 4,670-char one scored 0.35, both against a
+# 0.6 threshold, on consecutive runs. The gate was not measuring answer
+# quality, it was measuring how far past 4,000 characters the answer ran --
+# i.e. it penalised the compiler for being thorough, which is the opposite of
+# its purpose.
+#
+# Two changes, both needed:
+#   - a cap large enough that a normal compiled report is judged WHOLE
+#     (nothing observed across the p205 runs exceeds ~11k chars),
+#   - and when the cap IS hit, cut on a paragraph/line boundary and say so
+#     explicitly, so an excerpt never reads as a truncated answer.
+_MAX_ANSWER_CHARS = 16000
+_EXCERPT_NOTE = (
+    "\n\n[EXCERPT ENDS HERE. The answer above was shortened to fit this "
+    "scoring request; it is NOT the end of the answer. Judge only the "
+    "excerpt shown, and do NOT lower the score for appearing incomplete.]"
+)
+
+
+def _excerpt_for_judging(answer: str, max_chars: int = _MAX_ANSWER_CHARS) -> str:
+    """Return `answer` whole, or a boundary-cut excerpt that says it is one.
+
+    CALLED BY   score_answer below, on every scoring call.
+    WHY         see the _MAX_ANSWER_CHARS comment above: a silent mid-word
+                cut made the judge score length, not quality.
+    """
+    if len(answer) <= max_chars:
+        return answer
+    head = answer[:max_chars]
+    # Prefer a paragraph break, then any line break, then a sentence end --
+    # only accept one that lands in the last quarter of the excerpt, so a
+    # document with no breaks near the cap doesn't collapse to a stub.
+    floor = int(max_chars * 0.75)
+    for sep in ("\n\n", "\n", ". "):
+        idx = head.rfind(sep)
+        if idx >= floor:
+            head = head[:idx + len(sep)].rstrip()
+            break
+    return head + _EXCERPT_NOTE
+
 
 def score_answer(judge: ChatClient, request_messages: List[Message], answer: str,
                  on_score_failed: Optional[Callable[[], None]] = None) -> float:
     """Return a 0..1 quality score for `answer`, as judged by `judge`.
 
-    CALLED BY   llm/router.py::FallbackRouter._passes_quality, which in
+    CALLED BY   llm/router.py::FallbackRouter._score_quality, which in
                 turn is only called from complete() (never complete_json())
                 — see router.py for why only free-text calls go through
                 the quality gate.
@@ -108,12 +152,15 @@ def score_answer(judge: ChatClient, request_messages: List[Message], answer: str
         # this does not modify request_messages itself, it builds a fresh
         # list containing all of request_messages's items followed by the
         # one new scoring-prompt message.
-        # answer[:4000] is a SLICE taking only the first 4000 characters of
-        # `answer` — a cheap guard against sending an enormous answer back
-        # to the judge just to be scored, which would cost tokens for very
-        # little benefit once the answer is already long enough to judge.
+        # _excerpt_for_judging (FIX-1) replaces a bare answer[:4000] slice.
+        # The cap still exists — an enormous answer shouldn't be resent in
+        # full just to be scored — but it is now large enough to pass a
+        # normal report whole, and when it does bite it cuts on a boundary
+        # and TELLS the judge it is an excerpt. See the constant's comment
+        # above for the live traces that made this necessary.
         result = judge.complete_json(
-            request_messages + [{"role": "user", "content": _SCORING_PROMPT + answer[:4000]}]
+            request_messages
+            + [{"role": "user", "content": _SCORING_PROMPT + _excerpt_for_judging(answer)}]
         )
         # result.get("score", 1.0): read the "score" key if the judge's
         # JSON included one, otherwise default to 1.0 (treat a missing

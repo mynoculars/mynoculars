@@ -526,3 +526,114 @@ def test_g2_web_sourced_evidence_covers_a_goal_but_never_grounds_it():
         "a web snippet must never count as a grounded document -- if this "
         'fails, check whether "web" was added to the source tuple in '
         "progress_checker_node")
+
+
+# ---------------------------------------------------------------------------
+# D-59 — gap_generator's target selection and query anchoring
+#
+# Live regression: run p205.203-check. D-47's grounded-convergence gate
+# routed here with recall 1.0, every goal `covered`, and grounded_score 0.0.
+# `uncovered` was therefore EMPTY, the prompt rendered "Uncovered goals:
+# (none)" while still demanding queries for them, and the only remaining
+# topical signal was an evidence tail full of off-topic Redis corpus hits
+# under an India-vs-US query. The node returned six consecutive
+# Redis/Memcached queries. Both halves are covered below: which goals the
+# cycle targets, and whether the prompt names the actual research question.
+# ---------------------------------------------------------------------------
+class _CapturingRouter:
+    """Records the prompt it was handed, so a test can assert on what the
+    model would actually have seen rather than only on the node's return."""
+
+    def __init__(self, tasks=None):
+        self.tasks = tasks or []
+        self.messages = None
+
+    def set_node(self, name):
+        pass
+
+    def complete_json(self, messages):
+        self.messages = messages
+        return {"tasks": self.tasks}
+
+    def drain_counters(self):
+        return {}
+
+
+def _settings_for_gaps():
+    return Settings(_env_file=None, hitl_enabled=False, recall_target=0.85,
+                    max_fanout=6, model_knowledge_enabled=False,
+                    min_evidence_score=0.5)
+
+
+def test_gap_generator_targets_ungrounded_goals_when_none_are_uncovered():
+    """The grounded-gate re-entry path. g1 has a real, on-topic corpus
+    document; g2 is covered only by a web snippet. Both are `covered`, so
+    `uncovered` is empty -- the cycle must target g2 and only g2."""
+    settings = _settings_for_gaps()
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="economy growth", covered=True),
+               Goal(goal_id="g2", description="climate policy", covered=True)],
+        evidence=[
+            Evidence(task_key="t1", goal_id="g1", source="corpus",
+                     content="economy growth figures", score=0.9),
+            Evidence(task_key="t2", goal_id="g2", source="web",
+                     content="climate policy snippet", score=0.7),
+        ],
+        recall_score=1.0, iteration_depth=1,
+    )
+    router = _CapturingRouter()
+    build_gap_generator_node(router, settings, debug=False)(state)
+    body = router.messages[-1]["content"]
+    assert "g2: climate policy" in body
+    assert "g1: economy growth" not in body
+
+
+def test_gap_generator_prompt_names_the_original_question():
+    """Without this the prompt's only topical content is the evidence tail,
+    which is exactly how an India-vs-US run produced Redis queries."""
+    settings = _settings_for_gaps()
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="economy", covered=False)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="Redis SLOWLOG introspection", score=0.9)],
+        recall_score=0.0, iteration_depth=1,
+    )
+    router = _CapturingRouter()
+    build_gap_generator_node(router, settings, debug=False)(state)
+    assert "Compare India and US" in router.messages[-1]["content"]
+
+
+def test_gap_generator_skips_the_llm_when_nothing_is_uncovered_or_ungrounded():
+    """A genuinely converged run has no gap to close, so there is no prompt
+    worth paying for. D-1's empty backlog routes to the compiler."""
+    settings = _settings_for_gaps()
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="economy growth", covered=True)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="economy growth figures", score=0.9)],
+        recall_score=1.0, iteration_depth=1,
+    )
+    router = _CapturingRouter()
+    result = build_gap_generator_node(router, settings, debug=False)(state)
+    assert router.messages is None, "no uncovered and no ungrounded goal -> no call"
+    assert result["pending_tasks"] == []
+
+
+def test_gap_generator_still_calls_the_llm_for_a_human_redirect():
+    """A redirect is new information the evidence never had. Even a fully
+    grounded run must honour it rather than take the skip path above."""
+    settings = _settings_for_gaps()
+    state = ResearchState(
+        raw_query="Compare India and US",
+        goals=[Goal(goal_id="g1", description="economy growth", covered=True)],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           content="economy growth figures", score=0.9)],
+        recall_score=1.0, iteration_depth=1,
+        human_guidance="look at defence spending instead",
+    )
+    router = _CapturingRouter()
+    build_gap_generator_node(router, settings, debug=False)(state)
+    assert router.messages is not None

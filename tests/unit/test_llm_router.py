@@ -260,3 +260,109 @@ def test_from_settings_uses_the_configured_default_when_unset():
     settings = Settings(_env_file=None, llm_mode="live")
     router = FallbackRouter.from_settings(settings)
     assert router.providers[0]._max_tokens == settings.llm_max_tokens
+
+
+
+# ---------------------------------------------------------------------------
+# FIX-3 — "best answer wins", not "last answer wins"
+#
+# Regression coverage for the defect diagnosed from runs p205.211 (bad) and
+# p205.212 (good). Same code, same query; the ONLY difference was that the
+# last provider in the chain errored in one run and succeeded in the other.
+# The run where it succeeded shipped a 732-char fragment over a complete
+# 10,103-char report, because a rejected answer was discarded permanently and
+# the last provider was never judged. These tests pin both halves shut.
+# ---------------------------------------------------------------------------
+
+
+class _Fixed:
+    """Provider returning a fixed answer, and a fixed score when asked to judge.
+
+    Deliberately separate from _Named above: these tests need the answer text
+    and the judging score to vary INDEPENDENTLY (the whole defect is about a
+    provider that answers badly but is never scored), which _Named's single
+    `behavior` field cannot express.
+    """
+
+    def __init__(self, name, answer=None, judge_score=0.9, error=False):
+        self.name = name
+        self._answer = answer if answer is not None else f"answer from {name}"
+        self._judge_score = judge_score
+        self._error = error
+        self.judged = 0
+
+    def complete(self, messages, temperature=0.2):
+        if messages and "TASK=quality" in messages[-1]["content"]:
+            self.judged += 1
+            return json.dumps({"score": self._judge_score})
+        if self._error:
+            raise RuntimeError(f"{self.name} down")
+        return self._answer
+
+    def complete_json(self, messages, temperature=0.0):
+        return json.loads(self.complete(messages, temperature))
+
+
+def test_last_provider_answer_cannot_silently_replace_a_better_rejected_one():
+    # The p205.211 shape exactly. `judge_score` is the score a provider HANDS
+    # OUT when acting as judge, so: gemini scores mistral's report 0.45
+    # (rejected, below 0.6), and mistral then scores gemini's fragment 0.1.
+    # Under the old "last answer wins" policy gemini's fragment was never
+    # scored at all and shipped regardless. Now the 0.45 answer beats the 0.1
+    # one and the complete report survives.
+    mistral = _Fixed("mistral", answer="THE GOOD REPORT", judge_score=0.1)
+    gemini = _Fixed("gemini", answer="fragment", judge_score=0.45)
+    chain = FallbackRouter([mistral, gemini], quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "THE GOOD REPORT"
+    # And the last provider's answer WAS actually judged — the old code
+    # never asked, which is precisely why the fragment could win.
+    assert mistral.judged >= 1
+
+
+def test_last_provider_answer_still_wins_when_it_genuinely_scores_higher():
+    # The mirror case, so the fix is "keep the best", not "always keep the
+    # earlier one". Here gemini rejects mistral at 0.45, and mistral scores
+    # gemini's answer 0.9 — gemini's answer is genuinely better and wins.
+    mistral = _Fixed("mistral", answer="thin draft", judge_score=0.9)
+    gemini = _Fixed("gemini", answer="BETTER REPORT", judge_score=0.45)
+    chain = FallbackRouter([mistral, gemini], quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "BETTER REPORT"
+
+
+def test_last_provider_is_still_unjudged_when_nothing_was_rejected():
+    # The common path must cost no extra scoring call. Only provider is last,
+    # nothing was rejected before it, so its answer is accepted as-is.
+    solo = _Fixed("solo", answer="only answer")
+    chain = FallbackRouter([solo], quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "only answer"
+    assert solo.judged == 0
+
+
+def test_chain_exhausted_returns_the_best_scoring_answer_not_the_last():
+    # Three providers, every one rejected, scores 0.5 / 0.1 / (last, judged
+    # by the one before it). The best-scoring answer must come back.
+    a = _Fixed("a", answer="A", judge_score=0.1)   # judges b -> 0.1
+    b = _Fixed("b", answer="B", judge_score=0.5)   # judges a -> 0.5
+    c = _Fixed("c", answer="C", judge_score=0.2)   # judges b -> 0.2
+    chain = FallbackRouter([a, b, c], quality_threshold=0.6)
+    # a scored 0.5 by b (rejected), b scored 0.2 by c (rejected),
+    # c scored 0.5 by b (last provider, now judged, ties rather than beats).
+    # Best is a at 0.5 -- the FIRST answer, which the old code could never
+    # return once it had been rejected.
+    assert chain.complete([{"role": "user", "content": "x"}]) == "A"
+
+
+def test_all_providers_erroring_still_raises():
+    chain = FallbackRouter([_Fixed("a", error=True), _Fixed("b", error=True)],
+                           quality_threshold=0.6)
+    with pytest.raises(RuntimeError):
+        chain.complete([{"role": "user", "content": "x"}])
+
+
+def test_error_on_last_provider_falls_back_to_the_rejected_answer():
+    # This is what accidentally SAVED run p205.212. It must keep working —
+    # but now as the designed path, not as luck.
+    mistral = _Fixed("mistral", answer="THE GOOD REPORT", judge_score=0.9)
+    gemini = _Fixed("gemini", judge_score=0.35, error=True)
+    chain = FallbackRouter([mistral, gemini], quality_threshold=0.6)
+    assert chain.complete([{"role": "user", "content": "x"}]) == "THE GOOD REPORT"

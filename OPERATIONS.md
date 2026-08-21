@@ -27,7 +27,7 @@ shown.
 >    it on is one `.env` line plus one `pip install` — see *Enabling Web
 >    Search (Phase 4)*.
 >
-> Test suite: **476 tests**, fully offline. Every historical release note
+> Test suite: **492 tests**, fully offline. Every historical release note
 > that used to sit here has moved to *Appendix C — Version History* at the
 > end of this document; nothing there is needed to run the system.
 
@@ -226,10 +226,10 @@ start blaming a service for a problem.
 $env:PYTHONPATH = "src"
 python -m pytest tests/ -q
 
-# expect: 476 passed
+# expect: 492 passed
 ```
 
-**476 passed means the graph, the reducers, the guardrails and every tool seam
+**492 passed means the graph, the reducers, the guardrails and every tool seam
 are correct.** The suite is fully offline: no services, no API keys, no
 network, a few seconds to run. So a failure here is *never* an environment
 problem — it is a real regression in the code, and no amount of restarting
@@ -241,7 +241,7 @@ space: the problem is configuration, data, or a service — not logic.
 
 | Result | What it means | Do next |
 |---|---|---|
-| `476 passed` | Code is sound | Continue to Step 1b |
+| `492 passed` | Code is sound | Continue to Step 1b |
 | Some failures | A real regression | Stop. Read the failure. Do not proceed to L2 |
 | `ModuleNotFoundError: research_agent` | `PYTHONPATH` not set | `$env:PYTHONPATH = "src"` |
 | `ModuleNotFoundError: mcp` (9 failures) | You have `mcp` 2.x | `pip install "mcp>=1.9,<2"` — 2.0 moved `mcp.server.fastmcp` |
@@ -255,17 +255,12 @@ in Part 4.
 Zero services, zero API keys, zero network. If this works, your Python
 environment is correct and the whole graph is wired.
 
-### Edit local .env, make sure it is HTTP
-```
-OPENSEARCH_USE_SSL=false
-OPENSEARCH_VERIFY_CERTS=false
-OPENSEARCH_URL=http://localhost:9200
-```
-
-### Then quiet the library noise — one line in logging_setup.py's configure_logging():
-logging.getLogger("opensearch").setLevel(logging.ERROR)
-logging.getLogger("qdrant_client").setLevel(logging.ERROR)
-
+**Nothing to configure first.** L1 talks to no service, so the OpenSearch
+and Qdrant settings do not matter yet — those belong to Step 2c, once the
+services are actually up. Library log noise is already suppressed in code
+(`logging_setup.py::configure_logging` sets both the `opensearch` and
+`qdrant_client` loggers to ERROR); earlier revisions of this document asked
+you to add those two lines by hand, and that instruction is obsolete.
 
 **Windows (PowerShell):**
 ```powershell
@@ -563,7 +558,7 @@ Runs in the foreground and holds this window — own PowerShell window, exactly
 like Qdrant and OpenSearch above.
 
 ```powershell
-cd D:\work\softwares\llama.cpp
+cd D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\llama-precompiled
 .\llama-server.exe -m ..\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf `
     -ngl 28 -c 1536 --chat-template chatml --port 8080 `
     > ..\logs\llama-server_cogito.log 2>&1
@@ -854,7 +849,7 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
 ```
 
 **What changed — this is L2, and this is the moment it "works".** Same schema
-as Step 1a's L1 telemetry (see that step for the full field-by-field
+as Step 1b's L1 telemetry (see that step for the full field-by-field
 glossary); only the fields that actually moved are shown here:
 
 ```json
@@ -1309,7 +1304,7 @@ but every degradation writes a log line. When confused: read stderr.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 476 tests, all offline, a few seconds
+python -m pytest tests/ -q   # 492 tests, all offline, a few seconds
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -1404,6 +1399,8 @@ manual. Skip this section entirely if you only ever use the CLI.
 ===============================================================================
 
 ```powershell
+d:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\research_agent\.venv\Scripts\Activate.ps1
+
 $env:PYTHONPATH = "src"
 uvicorn research_agent.api.server:app --reload
 ```
@@ -1609,7 +1606,7 @@ LANGFUSE_ENVIRONMENT=development
 
 ```powershell
 pip install langfuse
-python -m pytest -q                          # 476/476, fully offline, unaffected
+python -m pytest -q                          # 492/492, fully offline, unaffected
 python -m research_agent.cli "your question" --debug
 ```
 
@@ -1753,7 +1750,7 @@ the telemetry change, move on.
 
 ## Running and Interpreting the Test Suite
 
-The suite is **476 tests**, fully offline — no services, no API keys, no
+The suite is **492 tests**, fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -1765,7 +1762,7 @@ python -m pytest tests/ -q
 tests/unit/                   170 tests   one file per src/research_agent/ module
 tests/integration/             20 tests   full graph.invoke() runs, offline
                               --------
-                              476 tests
+                              492 tests
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -2137,6 +2134,40 @@ highest seen); if this fires routinely for you, `revision_cycles` and
 `escalations` in the same log line tell you whether the cost is coming
 from repeated critique failures or from repeated human redirects, which
 is the first thing worth checking before raising the threshold.
+
+**D-59 adds two more.** Both are new this revision, and unlike every
+WARNING above, both describe an action actually taken — they are not
+observational.
+
+**`node.gaps_skipped_nothing_to_target`** — `agents/gathering.py::
+gap_generator_node`, at most once per gather cycle, when the run has no
+uncovered goal AND no ungrounded goal left to work on:
+
+```json
+{"msg": "node.gaps_skipped_nothing_to_target", "depth": 2}
+```
+
+The node returns an empty backlog without calling the LLM, and D-1's
+empty-backlog exit routes to the compiler. Seeing this is normal on a run
+that genuinely converged. Seeing it at `depth: 1` on a query you expected
+to need several cycles usually means your goals were marked covered by
+evidence you would not have accepted — check `grounded_score` against
+`recall` in the telemetry block before changing anything here.
+
+**`sources.off_topic_dropped`** — `guardrails/sources.py`, once per
+compile, when a web page was filed under a goal the report cites but is
+not topically about that goal:
+
+```json
+{"msg": "sources.off_topic_dropped", "dropped": 9, "kept": 25}
+```
+
+A page reaching this check was retrieved, scored, tagged with a real goal
+id, and belongs to a goal the compiler cited — everything except being
+about the right subject. A high `dropped` count means a gather cycle
+drifted off-topic and the drift got as far as the report's attribution
+block; it does not mean the prose is wrong. Read it alongside
+`corpus_recall` and `grounded_score`.
 
 **Phase 4 (D-57) adds two more, both `chain`/`web_search` scoped.** Neither
 changes routing either.
@@ -2683,8 +2714,8 @@ both are healthy signs.
 Release notes accumulated during development, newest concern last. **None of
 this is needed to operate the system** — it is kept for archaeology: to explain
 why a setting has the value it does, and what a given fix was responding to.
-Historical test counts (57 → 135 → 157 → 294 → 341 → 344 → 348 → 476) appear
-below as they were written; the current count is 476 and is stated in
+Historical test counts (57 → 135 → 157 → 294 → 341 → 344 → 348 → 476 → 492) appear
+below as they were written; the current count is 492 and is stated in
 *Running and Interpreting the Test Suite*.
 
 **Every note below refers to the document structure AT THE TIME it was
@@ -2773,6 +2804,6 @@ current one.
 > still pass a report whose claims aren't backed by any retrieved
 > evidence; there is no programmatic, claim-by-claim grounding check yet).
 > For the rationale behind a specific design decision, see `DECISIONS.md`
-> (D-1 through D-35). If a step below "works" but the result looks thin
+> (D-1 onward; see that file for the current range). If a step below "works" but the result looks thin
 > or oddly confident, check those two documents before assuming your
 > setup is broken — it may be a known, documented gap instead.
