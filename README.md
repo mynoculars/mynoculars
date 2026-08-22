@@ -85,6 +85,23 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > BOTH MCP servers: relative paths resolved against the launch directory,
 > not the repo. **Test suite: 476/476** (348 before Phase 4).
 
+> **Post-Phase-4 correctness pass (D-60/D-61).** Diagnosed from a diff of
+> two live runs — p205.211 and p205.212, same code, same query, one shipping
+> a 652-character report with zero citations and the other a correct 11,121-
+> character one. The only difference was that Gemini errored in one run and
+> succeeded in the other. Three defects in one chain: the quality judge was
+> handed `answer[:4000]` and so scored a mid-word truncation, i.e. the gate
+> measured LENGTH not quality; `finish_reason` was never read, so a
+> provider-reported truncated generation shipped as a finished report; and
+> `FallbackRouter.complete` returned the LAST answer rather than the BEST,
+> with the final provider exempt from scoring entirely. D-61 adds
+> `guardrails/dedup.py` (one corpus sentence appeared **26 times** in a
+> single 10,626-token compiler prompt — the corpus/MCP counterpart to the
+> per-domain cap D-57 already applies to web results) and moves RRF's join
+> key from `title` to `content_id`, closing Limitations 2 and 3.
+> **Test suite: 518/518**, up from 492. `DECISIONS.md` D-60/D-61 carry the
+> full account with the live counts.
+
 > **Post-Phase-3 work (D-38–D-46, no separate phase number assigned):** retrieval was rebuilt as a multi-tier ladder ending in the model’s own knowledge (4 tiers then; 5 since Phase 4 added web search), with anti-fabrication limits, deterministic citation repair, and a critic that now sees the evidence it verifies against. Not a phase/tier bump in name — `DECISIONS.md` is the source of truth for this range; see D-38 through D-46.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
@@ -2092,13 +2109,19 @@ visible rather than deleted, so the history stays auditable.
    bracket citations at all, so a regex would have been silent on the least
    grounded report of the set. That is why the measurement reads
    `state.evidence` instead.*
-2. RRF joins the two legs on `title`, not on any store id — silently wrong for
-   a corpus with duplicate or missing titles. This codebase already has the
-   right primitive to fix it (`content_id()`, the same UUID5-of-content
-   function used for Qdrant/memory dedup) — it just hasn't been applied to
-   the OpenSearch join key yet.
-3. `Evidence.task_key` for memory items uses `hash()`, which is per-process
-   randomised — memory task keys are not stable across runs.
+2. ~~RRF joins the two legs on `title`, not on any store id~~ — **fixed,
+   D-61(b).** `retrieval/hybrid.py::_join_key` now fuses on
+   `content_id(content)`, the same UUID5-of-content function already used
+   for Qdrant point ids and memory dedup. Closed three failures at once:
+   two different documents sharing a title (or a 60-char boilerplate
+   prefix) used to fuse into one and silently lose a document; and the
+   same document titled in only one store never fused at all, scoring a
+   genuine two-leg agreement as two single-leg hits — which lands exactly
+   on the `min_evidence_score` boundary collision P2-01's follow-up fixed.
+3. ~~`Evidence.task_key` for memory items uses `hash()`~~ — **fixed.**
+   `memory/semantic_memory.py::retrieve` builds `memory-<content_id>`;
+   `hash()` appears nowhere in `src/` any more. This entry was already
+   stale when D-60/D-61 landed and is corrected rather than deleted.
 4. Reusing the same `--thread-id` across unrelated runs silently accumulates
    reducer-backed state (`evidence`, `counters`, etc.) — see the Postgres
    section above for the full explanation and a live example. Not addressed
@@ -2107,6 +2130,36 @@ visible rather than deleted, so the history stays auditable.
    real run (`P2-12`, Tier 3, depends on P2-01 which is done). Wiring the
    detector to something more than explicit markers is the only remaining
    step to make `E2` reachable in practice, not just in principle.
+
+6. **Nothing retries a failed provider call.** `llm/client.py` sets a
+   per-request timeout but has no retry, and `FallbackRouter` does not add
+   one either — the client's docstring says "the router owns retry/fallback
+   policy", and the router's policy is to hop, not to re-attempt. A single
+   transient 429 or connection reset therefore consumes a whole provider
+   position in the chain.
+   **This is a stated choice, not an oversight.** Falling through to a
+   different provider is usually a better answer than retrying one that
+   just failed, and run p205.212 shows the design working: Gemini returned
+   an `HTTPStatusError`, the chain absorbed it, and D-60(c) now makes that
+   path return the best retained answer rather than depending on luck.
+   Adding retry means choosing backoff and idempotency semantics, and no
+   live run has yet shown a failure it would have caught — D-54's reasoning
+   for not building against an unobserved failure mode applies directly.
+   Revisit if provider errors ever become a *majority* of
+   `llm_fallback_hops` rather than the occasional one.
+7. **The HTTP API is unauthenticated by design.** `api/server.py` exposes
+   `POST /research`, `POST /resume` and `GET /health` with no auth, no CORS
+   policy and no rate limiting. Resolved deliberately in
+   `internal/PHASE-2_PLAN.md`: *"Production concerns — auth, multi-tenancy,
+   scaling | Out of scope for a reference implementation."* That remains the
+   right call and this entry does not reopen it.
+   It is recorded here only because of a tension worth naming: the module
+   docstring calls the endpoint a demonstration, but D-37 packages this repo
+   as an installable artifact whose declared public surface includes those
+   three HTTP shapes — so somebody will eventually deploy it. **If you run
+   this anywhere reachable, put it behind a gateway that terminates auth and
+   rate-limits.** The graph has no notion of a caller identity, so there is
+   nothing inside the application to fall back on.
 
 ## Documentation Corrections
 

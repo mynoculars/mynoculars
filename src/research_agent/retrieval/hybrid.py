@@ -30,11 +30,48 @@ from research_agent import langfuse as lf
 from research_agent.guardrails.retrieval import passes_similarity_floor
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.storage.opensearch_store import OpenSearchStore
-from research_agent.storage.qdrant_store import QdrantStore
+from research_agent.storage.qdrant_store import QdrantStore, content_id
 
 logger = logging.getLogger(__name__)
 
 RRF_K = 60  # standard smoothing constant; larger = flatter rank influence
+
+
+def _join_key(hit: Dict[str, Any]) -> str:
+    """The identity a document is fused on across the dense and keyword legs.
+
+    CALLED BY   HybridRetriever.search, once per hit from each leg.
+
+    FIX-4 — was `hit.get("title") or hit.get("content", "")[:60]`, i.e. the
+    document TITLE, falling back to a 60-character content prefix. Both
+    halves were wrong in the same direction, and the README carried this as
+    a known limitation ("silently wrong for a corpus with duplicate or
+    missing titles") for several revisions:
+
+      - two genuinely different documents sharing a title FUSE INTO ONE,
+        so one of them silently disappears from the results and the other
+        inherits a rank it did not earn;
+      - two different documents sharing a 60-char prefix (boilerplate
+        headers, a common lead sentence, templated release notes) do the
+        same;
+      - and the same document indexed with a title in one store but not
+        the other NEVER fuses, so a real two-leg agreement is scored as
+        two separate single-leg hits — which matters directly, because a
+        rank-0 single-leg hit squashes to exactly the min_evidence_score
+        boundary (the P2-01 follow-up collision).
+
+    `content_id` (uuid5 of the content) is the identity function this
+    codebase already uses for Qdrant point ids and memory dedup, so this
+    makes the join key agree with how the documents were STORED rather
+    than inventing a third notion of document identity. Neither store
+    chunks, so one JSONL line is one document in both — the contents are
+    byte-identical by construction and hash to the same id.
+
+    The `or ""` guard keeps the previous tolerance for a hit missing
+    `content` entirely: those all collapse to one key, exactly as an empty
+    prefix slice did before, rather than raising.
+    """
+    return content_id(hit.get("content") or "")
 
 
 def rrf_fuse(rankings: List[List[str]], k: int = RRF_K) -> Dict[str, float]:
@@ -290,22 +327,12 @@ class HybridRetriever:
         by_id: Dict[str, Dict[str, Any]] = {}
         dense_rank: List[str] = []
         for h in dense_hits:
-            # h.get("title") or h["content"][:60] — use the document's
-            # title as its identity if it has one; otherwise fall back to
-            # the first 60 characters of its content (h["content"][:60] is
-            # a slice, same mechanism used elsewhere in this codebase).
-            # This is the JOIN KEY between the two legs — see the module's
-            # design decision above and this project's README for the
-            # known limitation this creates with duplicate/missing titles.
-            # .get("content", "") -- not h["content"] -- so a hit missing
-            # the field can't KeyError here while every OTHER read of the
-            # same field in this codebase already tolerates its absence.
-            doc_id = h.get("title") or h.get("content", "")[:60]
+            doc_id = _join_key(h)
             by_id[doc_id] = h
             dense_rank.append(doc_id)
         kw_rank: List[str] = []
         for h in kw_hits:
-            doc_id = h.get("title") or h.get("content", "")[:60]
+            doc_id = _join_key(h)
             # by_id.setdefault(doc_id, h): if doc_id is ALREADY a key in
             # by_id (e.g. this same document also appeared in the dense
             # leg above), leave the existing value untouched; only insert

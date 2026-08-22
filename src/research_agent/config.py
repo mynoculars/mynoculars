@@ -304,7 +304,7 @@ class Settings(BaseSettings):
     retrieval_floor_warn_ratio: float = Field(0.8, ge=0.0, le=1.0)
     # Guardrail G4 (P205 Phase 2): fraction of quality-judge calls
     # (evaluation/quality.py::score_answer, invoked from
-    # llm/router.py::FallbackRouter._passes_quality) that FAILED to
+    # llm/router.py::FallbackRouter._score_quality) that FAILED to
     # score at all -- judge unreachable, bad JSON, non-numeric score --
     # per run, above which telemetry_node logs a WARNING
     # (quality.judge_unreliable). Purely observational, same shape as

@@ -35,6 +35,18 @@ What lives here today:
                    package docstring's "only moved code" rule doesn't
                    technically cover it. See hedging.py's own docstring
                    for why it exists and what it does.
+    dedup.py       Collapses byte-identical evidence per goal before it
+                   enters a prompt (FIX-5). Also new rather than moved,
+                   and recorded here for the same reason hedging.py is:
+                   it is deterministic post-retrieval shaping applied at
+                   a fixed point, from the same compiler_node call site,
+                   and it is the corpus/MCP counterpart to a guard this
+                   codebase already accepted for web results
+                   (websearch/filtering.py::cap_by_domain -- repeated
+                   hits read to the compiler as independent sources
+                   agreeing). Touches only the PROMPT's copy of the
+                   evidence, never ResearchState.evidence, so no
+                   telemetry figure moves.
 
 What deliberately does NOT live here, and why:
     State reducers (state.py) — LangGraph requires these as Annotated[...]

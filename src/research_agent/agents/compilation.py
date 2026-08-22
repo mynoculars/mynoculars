@@ -28,6 +28,7 @@ from research_agent import langfuse as lf
 from research_agent.agents.escalation import escalation_allowed
 from research_agent.config import Settings
 from research_agent.guardrails.citations import clean_citations
+from research_agent.guardrails.dedup import dedupe_evidence
 from research_agent.guardrails.hedging import enforce_hedging
 from research_agent.guardrails.sources import (append_web_sources,
                                                 count_listed_sources)
@@ -100,8 +101,18 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
                       f"No retrieval was attempted. Rephrase the query and retry.")
             return {"final_report": report}
         router.set_node("compiler")
+        # FIX-5: collapse byte-identical evidence per goal BEFORE it goes
+        # into the prompt. Tiers 1-3 of the D-38 ladder all resolve to the
+        # same ingested documents, so one corpus sentence reliably arrives
+        # again tagged "mcp", and again on each gather lap. Live count
+        # (run p205.211): one sentence appeared 26 times in a single
+        # 10,626-token compiler prompt. See guardrails/dedup.py for the
+        # full account and for why this deliberately touches only the
+        # PROMPT's copy, never state.evidence -- every telemetry figure
+        # below still counts what was genuinely retrieved.
+        prompt_evidence, dedup_counters = dedupe_evidence(state.evidence)
         report = router.complete(templates.compile_report(
-            state.raw_query, state.goals, state.evidence, state.critique_notes))
+            state.raw_query, state.goals, prompt_evidence, state.critique_notes))
         # A model under fallback can still wrap its answer in a code fence
         # despite compile_report's explicit "write Markdown, not JSON, no
         # fence" instruction -- observed live from Mistral after a
@@ -156,7 +167,8 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # is the one node whose drained counters can include
         # llm_quality_calls (the self-scoring gate only runs on free text).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
-                    **citation_counters, **hedge_counters, **source_counters}
+                    **citation_counters, **hedge_counters, **source_counters,
+                    **dedup_counters}
         return {"final_report": report, "counters": counters}
 
     return compiler_node
@@ -209,9 +221,18 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         if state.planning_error or state.abort_reason:
             return {"critique_passed": True}
         router.set_node("critic")
+        # FIX-5, same pass as compiler_node. D-46 exists because the critic
+        # was being asked to verify claims against evidence it could not
+        # see; templates.critique caps its evidence block at the last 60
+        # items, so 67 occurrences of four sentences could crowd out the
+        # evidence a claim actually rests on and reintroduce the exact
+        # problem D-46 fixed. Counted only in compiler_node, so the run's
+        # evidence_deduplicated figure stays one number about one report
+        # rather than double-counting the same duplicates twice per cycle.
+        prompt_evidence, _ = dedupe_evidence(state.evidence)
         result = router.complete_json(templates.critique(
             state.raw_query, state.final_report, state.goals,
-            state.evidence))
+            prompt_evidence))
         passed = bool(result.get("passed", False))
         notes = [str(n) for n in result.get("notes", [])]
         revision = state.revision_count + 1
