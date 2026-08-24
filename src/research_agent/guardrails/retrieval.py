@@ -13,6 +13,22 @@ noticing the other exists. See each function's own docstring for why the
 operators differ; they are not a typo of each other.
 """
 
+from typing import List
+
+from research_agent.retrieval.terms import distinctive_terms
+from research_agent.state import Evidence
+
+# S-7: moved from prompts/templates.py, where it lived despite being a
+# retrieval-scoring constant, not a prompt. Not approximate -- exactly
+# 0.5, for any query, regardless of how relevant the document actually
+# was, because RRF scores rank position rather than similarity. A score
+# at or below this ceiling means no document that both retrieval legs
+# agreed on, which is the strongest cheap signal available that the
+# corpus may not cover the goal. tests/unit/test_prompts.py still
+# cross-checks this against RRF_K/RRF_SQUASH, so a change to either
+# fails the suite rather than silently rotting this threshold.
+SINGLE_LEG_SCORE_CEILING = 0.5
+
 
 def passes_similarity_floor(similarity: float, floor: float) -> bool:
     """The DENSE-leg floor, applied BEFORE fusion (retrieval/hybrid.py).
@@ -45,3 +61,33 @@ def passes_evidence_gate(score: float, floor: float) -> bool:
     for the live trace that found this).
     """
     return score > floor
+
+
+def has_grounded_evidence(goal_id: str, goal_terms: set,
+                          evidence: List[Evidence], min_score: float) -> bool:
+    """True if a REAL DOCUMENT, actually about this goal, covers it (G2/D-47).
+
+    Three conjuncts, none of them redundant:
+      - source in ("corpus", "mcp") -- a document, not recollection and not
+        a web snippet (D-57: web COVERS but never GROUNDS).
+      - score above the coverage floor -- passes_evidence_gate above, so
+        this and the post-fusion coverage gate can never disagree.
+      - shares distinctive vocabulary with the goal's own description --
+        the D-39 topical gate. Without it, an off-topic corpus hit that
+        cleared the floor by cross-leg agreement counted as grounding for
+        a goal it had nothing to do with (observed live, run p205.132).
+
+    Single source of truth for this predicate (M-1): previously
+    duplicated between agents/gathering.py and an inline block in
+    agents/compilation.py::telemetry_node with a hardcoded `> 0.5`
+    instead of `min_score` -- the two metrics silently disagreed
+    whenever MIN_EVIDENCE_SCORE was changed from its default. Moved here
+    (D-59 originally extracted it to module level in gathering.py; this
+    relocates it next to passes_evidence_gate, the gate it reuses) so
+    every caller shares one comparison and one floor.
+    """
+    return any(
+        e.goal_id == goal_id and e.source in ("corpus", "mcp")
+        and passes_evidence_gate(e.score, min_score)
+        and (not goal_terms or goal_terms & distinctive_terms(e.content))
+        for e in evidence)

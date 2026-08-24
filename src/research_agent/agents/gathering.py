@@ -46,16 +46,17 @@ import logging
 from typing import Any, Callable, Dict, List
 
 from research_agent import langfuse as lf
-from research_agent.agents.escalation import escalation_allowed
+from research_agent.agents.escalation import raise_or_log
 from research_agent.agents.task_utils import cap_and_filter
-from research_agent.tools.retrieval_chain import _distinctive_terms
 from research_agent.config import Settings
-from research_agent.guardrails.retrieval import passes_evidence_gate
+from research_agent.guardrails.retrieval import (SINGLE_LEG_SCORE_CEILING,
+                                                  has_grounded_evidence,
+                                                  passes_evidence_gate)
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.orchestration.contracts import validated_worker
 from research_agent.prompts import templates
-from research_agent.prompts.templates import SINGLE_LEG_SCORE_CEILING
+from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import Evidence, ResearchState, SearchTask, WorkerPayload
 
 logger = logging.getLogger(__name__)
@@ -286,33 +287,6 @@ def build_merger_node(router: FallbackRouter, settings: Settings, debug: bool = 
     return merger_node
 
 
-def has_grounded_evidence(goal_id: str, goal_terms: set,
-                          evidence: List[Evidence], min_score: float) -> bool:
-    """True if a REAL DOCUMENT, actually about this goal, covers it (G2/D-47).
-
-    Three conjuncts, none of them redundant:
-      - source in ("corpus", "mcp") -- a document, not recollection and not
-        a web snippet (D-57: web COVERS but never GROUNDS).
-      - score above the coverage floor -- the same D-17 predicate
-        progress_checker uses, so the two can never disagree.
-      - shares distinctive vocabulary with the goal's own description --
-        the D-39 topical gate. Without it, an off-topic corpus hit that
-        cleared the floor by cross-leg agreement counted as grounding for
-        a goal it had nothing to do with (observed live, run p205.132).
-
-    Extracted to module level (D-59) because gap_generator_node now needs
-    the identical verdict to decide which goals a grounded-gate cycle
-    should actually target. Two inline copies of a three-part predicate is
-    exactly how progress_checker's and telemetry's grounding numbers drifted
-    apart the first time.
-    """
-    return any(
-        e.goal_id == goal_id and e.source in ("corpus", "mcp")
-        and passes_evidence_gate(e.score, min_score)
-        and (not goal_terms or goal_terms & _distinctive_terms(e.content))
-        for e in evidence)
-
-
 def build_progress_checker_node(settings: Settings, debug: bool = False):
     """Build the coverage/recall checker — the loop's clock (D-3)."""
 
@@ -367,7 +341,7 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         # Same topical gate telemetry_node's corpus_recall already applies
         # (D-39) -- precomputed once, outside the per-goal loop, since
         # every goal's description is fixed for this whole node call.
-        goal_terms = {g.goal_id: _distinctive_terms(g.description)
+        goal_terms = {g.goal_id: distinctive_terms(g.description)
                      for g in state.goals}
         for g in state.goals:
             # Strict `>`, not `>=` — see the docstring above. A score that
@@ -442,23 +416,11 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
             trigger = "E2" if any(g.contested for g in goals) else "E3"
             # D-23 bound: this branch fires on EVERY cycle once the depth
             # budget is spent, and a human redirect routes straight back
-            # here — so without escalation_allowed() the same trigger is
-            # re-raised with the same payload indefinitely and
-            # route_convergence's own "depth spent -> compiler" exit is
-            # never reachable. See agents/escalation.py.
-            if escalation_allowed(state, settings):
-                update["escalation_trigger"] = trigger
-                log_event(logger, "escalation.raised", trigger=trigger,
-                          recall=round(recall, 3))
-            elif settings.hitl_enabled:
-                log_event(logger, "escalation.suppressed", level=logging.WARNING,
-                          trigger=trigger, recall=round(recall, 3),
-                          reason="max_escalations_reached",
-                          reviews=len(state.escalation_history))
-            else:
-                log_event(logger, "escalation.stub", level=logging.WARNING,
-                          trigger=trigger, recall=round(recall, 3),
-                          reason="depth_exhausted")
+            # here -- see agents/escalation.py::raise_or_log, which folds
+            # escalation_allowed() with the suppressed/stub logging.
+            update.update(raise_or_log(state, settings, trigger,
+                                       reason="depth_exhausted",
+                                       recall=round(recall, 3)))
         return update
 
     return progress_checker_node
@@ -615,24 +577,15 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
             update = {"pending_tasks": [], "human_guidance": ""}
             if state.recall_score < settings.recall_target:
                 trigger = "E2" if any(g.contested for g in state.goals) else "E3"
-                # D-23 bound — see agents/escalation.py::escalation_allowed.
+                # D-23 bound — see agents/escalation.py::raise_or_log.
                 # Without it this guard is the single most reachable
                 # infinite-escalation source in the graph: it fires on the
                 # FIRST gather cycle for any query the corpus does not
                 # genuinely cover, and a human redirect that fails to
                 # produce tasks lands right back on it.
-                if escalation_allowed(state, settings):
-                    update["escalation_trigger"] = trigger
-                    log_event(logger, "escalation.raised", trigger=trigger,
-                              reason="no_strong_evidence_for_any_uncovered_goal")
-                elif settings.hitl_enabled:
-                    log_event(logger, "escalation.suppressed", level=logging.WARNING,
-                              trigger=trigger, reason="max_escalations_reached",
-                              reviews=len(state.escalation_history))
-                else:
-                    log_event(logger, "escalation.stub", level=logging.WARNING,
-                              trigger=trigger,
-                              reason="no_strong_evidence_for_any_uncovered_goal")
+                update.update(raise_or_log(
+                    state, settings, trigger,
+                    reason="no_strong_evidence_for_any_uncovered_goal"))
             return update
         # D-59: WHICH goals this cycle is actually for. Uncovered goals are
         # the original and still the common case -- but they are not the
@@ -655,7 +608,7 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         # Naming the ungrounded goals instead gives the cycle the job it
         # was actually dispatched for: find a DOCUMENT for a goal currently
         # propped up by weaker provenance.
-        goal_terms = {g.goal_id: _distinctive_terms(g.description)
+        goal_terms = {g.goal_id: distinctive_terms(g.description)
                       for g in state.goals}
         if uncovered:
             target_goals = uncovered
@@ -709,20 +662,15 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
                 # is what "redirect does nothing" looked like from
                 # outside. Fall through to the compiler instead: an empty
                 # backlog is D-1's own terminal exit, and the report will
-                # say honestly what was and was not retrieved.
+                # say honestly what was and was not retrieved. Deliberately
+                # NOT raise_or_log here -- this suppression has nothing to
+                # do with the D-23 review budget, so it does not belong to
+                # that helper's suppressed/stub shape.
                 log_event(logger, "escalation.suppressed", level=logging.WARNING,
                           trigger=trigger, reason="redirect_produced_no_tasks")
-            elif escalation_allowed(state, settings):
-                update["escalation_trigger"] = trigger
-                log_event(logger, "escalation.raised", trigger=trigger,
-                          reason="task_supply_exhausted")
-            elif settings.hitl_enabled:
-                log_event(logger, "escalation.suppressed", level=logging.WARNING,
-                          trigger=trigger, reason="max_escalations_reached",
-                          reviews=len(state.escalation_history))
             else:
-                log_event(logger, "escalation.stub", level=logging.WARNING,
-                          trigger=trigger, reason="task_supply_exhausted")
+                update.update(raise_or_log(state, settings, trigger,
+                                           reason="task_supply_exhausted"))
         return update
 
     return gap_generator_node

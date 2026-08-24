@@ -53,22 +53,10 @@ import logging
 from typing import Any, Callable, List, Optional
 
 from research_agent.logging_setup import log_event
+from research_agent.retrieval.terms import FILLER, distinctive_terms
 from research_agent.state import Evidence, SearchTask
 
 logger = logging.getLogger(__name__)
-
-# Query scaffolding that carries no topical signal. Shared by the
-# reformulator (which strips it) and the relevance gate (which must not
-# count it as an on-topic match -- "comparison" appearing in both a query
-# about armies and a document about Redis is not evidence of anything).
-_FILLER = {
-    "the", "a", "an", "of", "and", "or", "in", "on", "for", "with",
-    "to", "vs", "versus", "between", "comparison", "compare",
-    "comparative", "analysis", "analyze", "evaluate", "evaluation",
-    "assess", "assessment", "examine", "including", "their", "both",
-    "its", "recent", "current", "overview", "study", "report",
-    "data", "rate", "rates", "scale", "system", "systems", "features",
-}
 
 ToolFn = Callable[[SearchTask], List[Evidence]]
 
@@ -81,51 +69,14 @@ def _reformulate(query: str) -> str:
     comparison scaffolding that task producers habitually emit, keeps
     proper nouns and content words, and caps length.
     """
-    filler = _FILLER
     words = [w for w in query.replace(":", " ").replace(",", " ").split()
              if w.strip()]
-    kept = [w for w in words if w.lower().strip(".") not in filler]
+    kept = [w for w in words if w.lower().strip(".") not in FILLER]
     # Keep proper nouns and the first few content words -- enough to stay
     # on topic, short enough to actually match.
     if not kept:
         kept = words
     return " ".join(kept[:6])
-
-
-def _distinctive_terms(text: str) -> set:
-    """Lower-cased content words carrying topical signal, minus scaffolding.
-
-    Pure and cheap: this runs inside every parallel worker, on every tier,
-    so it must not allocate much or call anything.
-
-    Three rules, each closing a live-observed hole in the gate that
-    consumes this (`_sufficient`, and `corpus_recall` in telemetry_node,
-    which deliberately reuses this same function so the two can never
-    disagree):
-
-    1. Words longer than three characters are kept, as before.
-    2. SHORT ALL-CAPS TOKENS ARE KEPT TOO. The old length-only rule threw
-       away exactly the tokens carrying the most topical signal in this
-       project's real traffic: "GDP growth India US 2020-2023" retained
-       neither GDP nor US, and "Indian Army ... Chinese PLA" dropped PLA
-       -- the single most distinctive word in the query. An acronym is
-       the opposite of filler, and length is the wrong proxy for it.
-    3. BARE NUMBERS ARE DROPPED. A standalone number is a weak topical
-       signal that travels in pairs: "2020-2023" contributed TWO terms,
-       so any off-topic document mentioning the same two years cleared a
-       two-term overlap bar on years alone. Mixed alphanumerics (pm10,
-       t90, 155mm) are real terms and are kept -- only all-digit tokens
-       go.
-    """
-    out = set()
-    for word in "".join(
-            c if c.isalnum() else " " for c in text).split():
-        low = word.lower()
-        if low in _FILLER or low.isdigit():
-            continue
-        if len(low) > 3 or (len(low) >= 2 and word.isupper()):
-            out.add(low)
-    return out
 
 
 def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
@@ -196,11 +147,11 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         on_floor = [e for e in evidence if e.score > min_evidence_score]
         if not on_floor:
             return False
-        terms = _distinctive_terms(query)
+        terms = distinctive_terms(query)
         if not terms:
             return True  # nothing to test against; trust the score
         need = min(3, len(terms), max(2, len(terms) // 4))
-        return any(len(terms & _distinctive_terms(e.content)) >= need
+        return any(len(terms & distinctive_terms(e.content)) >= need
                    for e in on_floor)
 
     def retrieval_chain(task: SearchTask) -> List[Evidence]:
@@ -239,37 +190,39 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
                               task=task.key, items=len(found), query=short)
                     return collected
 
-        if mcp is not None:
-            found = _try("mcp", mcp, task)
+        # Tiers 3-4: mcp, web -- same shape (_try -> extend -> _sufficient
+        # -> log chain.answered -> return), expressed once as data instead
+        # of two near-identical blocks (S-6). Web's extra failure-path log
+        # (chain.web_gate_rejected) is the one thing that still differs
+        # per tier, so it stays a small special case inside the loop
+        # rather than forcing mcp to carry an on-miss hook it never uses.
+        for name, fn in (("mcp", mcp), ("web", web)):
+            if fn is None:
+                continue
+            found = _try(name, fn, task)
             collected.extend(found)
             if _sufficient(found, task.query):
-                log_event(logger, "chain.answered", tier="mcp", task=task.key,
+                log_event(logger, "chain.answered", tier=name, task=task.key,
                           items=len(found))
                 return collected
-
-        if web is not None:
-            found = _try("web", web, task)
-            collected.extend(found)
-            # _sufficient's topical gate applies here exactly as it does to
-            # every other tier, deliberately, even though a search engine
-            # has ALREADY done its own relevance judgement. Two reasons:
-            # consistency (one rule for what "a tier answered" means), and
-            # the fact that an engine's relevance is judged against the
-            # query string, while this gate is judged against the query's
-            # distinctive terms -- which is the check that catches a
-            # plausible-looking result set about the wrong subject.
-            #
-            # The risk this creates is real and worth watching: web
-            # snippets are short (~150-250 chars), so a genuinely relevant
-            # result can fail a 2-distinctive-term overlap and drop the
-            # ladder to the model tier unnecessarily. That is why the miss
-            # is logged rather than silent -- measure before tuning, the
-            # same posture D-54 took toward the call budget.
-            if _sufficient(found, task.query):
-                log_event(logger, "chain.answered", tier="web", task=task.key,
-                          items=len(found))
-                return collected
-            if found:
+            if name == "web" and found:
+                # _sufficient's topical gate applies here exactly as it
+                # does to every other tier, deliberately, even though a
+                # search engine has ALREADY done its own relevance
+                # judgement. Two reasons: consistency (one rule for what
+                # "a tier answered" means), and the fact that an engine's
+                # relevance is judged against the query string, while this
+                # gate is judged against the query's distinctive terms --
+                # which is the check that catches a plausible-looking
+                # result set about the wrong subject.
+                #
+                # The risk this creates is real and worth watching: web
+                # snippets are short (~150-250 chars), so a genuinely
+                # relevant result can fail a 2-distinctive-term overlap
+                # and drop the ladder to the model tier unnecessarily.
+                # That is why the miss is logged rather than silent --
+                # measure before tuning, the same posture D-54 took
+                # toward the call budget.
                 log_event(logger, "chain.web_gate_rejected",
                           task=task.key, items=len(found),
                           reason="web returned results that missed the "

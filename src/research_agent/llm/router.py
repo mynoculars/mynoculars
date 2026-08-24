@@ -64,7 +64,7 @@ Python mechanics used in this file, if any of this is new to you:
 
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from research_agent.config import Settings
 from research_agent.tracing import NullTracer, Tracer
@@ -351,62 +351,46 @@ class FallbackRouter:
     def complete(self, messages: List[Message]) -> str:
         """Free-text call. Step down the chain on error OR low quality.
 
-        CALLED BY   compiler_node (agents/compilation.py) — the ONLY node
+        CALLED BY   compiler_node (agents/compilation.py) -- the ONLY node
                     in the whole codebase that makes a free-text (as
                     opposed to JSON) LLM call, which is why this is the
                     only call path where the quality gate below ever runs.
         RETURNS     the first answer that both succeeds AND clears the
-                    quality gate; if none does, the LAST provider's answer
-                    (better a low-scored answer than nothing), or raises if
-                    every single provider in the chain errored outright.
+                    quality gate (an immediate return, mid-loop); failing
+                    that, the BEST-scoring candidate any provider produced
+                    (S-3's `_best`, below); or raises if the entire chain
+                    errored with nothing to fall back to.
 
-        Same trigger at every hop. Returns the first answer that both succeeds
-        and clears the quality gate; if none does, returns the BEST-SCORING
-        answer any provider produced (better a low-scored answer than nothing,
-        and better the best low-scored answer than the last one), or raises if
-        the entire chain errored.
+        Two phases (S-3, previously one loop with three exit mechanisms --
+        continue/break/a bottom return -- and a fabricated score standing
+        in for "unscored, accept anyway"):
 
-        FIX-3 — "best answer wins", replacing "last answer wins". This is the
-        defect that made run p205.211 ship a 652-character report with zero
-        citations while run p205.212 shipped a correct 11,121-character one
-        from the SAME code and the SAME query. The old policy discarded a
-        rejected answer permanently and returned whatever the chain happened
-        to end on:
+          1. Walk the chain once, collecting (name, answer, score) for
+             every candidate that does NOT win an immediate return. score
+             is None in exactly one case: the last provider succeeded with
+             no earlier candidate to judge it against, so it is accepted
+             unscored, same as before.
+          2. `_best(candidates)` picks the winner -- a small, pure,
+             unit-testable function, not inline running-max state threaded
+             through every branch.
 
-          p205.211  mistral -> good 10,103-char report, judged 0.45, REJECTED
-                    gemini  -> 732-char fragment, LAST provider so never
-                               judged at all -> shipped
-          p205.212  mistral -> good  4,670-char report, judged 0.35, REJECTED
-                    gemini  -> HTTPStatusError
-                            -> chain exhausted -> mistral's answer returned
-
-        The only difference between the two runs was that gemini failed in
-        one and succeeded in the other. The "good" run was good by accident:
-        a provider error was the only thing standing between the user and the
-        fragment. Two changes close that:
-
-          1. every scored candidate is retained with its score, and chain
-             exhaustion returns the BEST of them, not the last;
-          2. the last provider in the chain is no longer exempt from scoring
-             WHEN an earlier candidate already exists to compare it against —
-             its answer is judged by the PREVIOUS provider (never itself,
-             P2-11 holds) and the higher score wins.
-
-        Change 2 costs one extra scoring call, and only in the exact
-        situation that produced the bad run: an earlier answer was rejected
-        and the last provider then answered. When nothing was rejected the
-        last provider is still returned unscored, exactly as before, so the
-        common path costs nothing new.
+        FIX-3 policy, unchanged: the first answer that clears the quality
+        threshold wins immediately; otherwise the BEST-scoring candidate
+        wins, not the last one to arrive (run p205.211's defect: a
+        732-character fragment shipped over a complete, 10,103-character
+        report because the last provider in the chain was exempt from
+        scoring). The last provider is judged too, by the PREVIOUS
+        provider (P2-11's never-self-judge rule), but ONLY when an
+        earlier candidate already exists to compare it against -- so the
+        common path (nothing rejected before the last provider) still
+        costs no extra scoring call.
         """
         last_exc: Optional[Exception] = None
-        # The best answer seen so far and the score it earned. `best_score`
-        # starts below any real score so the first candidate always wins.
-        best_answer: Optional[str] = None
-        best_score: float = -1.0
-        best_name: str = ""
+        # (name, answer, score) for every candidate that did not win an
+        # immediate return. Fed to _best() once the chain is exhausted.
+        candidates: List[Tuple[str, str, Optional[float]]] = []
 
         for i, provider in enumerate(self.providers):
-            # 1. availability / error
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 answer = provider.complete(messages)
@@ -421,68 +405,61 @@ class FallbackRouter:
                 lf.event(run_id_var.get(), "llm.fallback",
                         metadata={"from_provider": provider.name, "to_provider": nxt,
                                   "reason": type(exc).__name__, "mode": "text"})
-                continue  # move on to the next provider in the loop
+                continue
 
-            # 2. quality gate.
-            # `i + 1 < len(self.providers)` is just "is there at least one
-            # more provider after this one in the list?"
             has_next = i + 1 < len(self.providers)
 
             if has_next:
+                # P2-11: the judge is always the NEXT provider in the
+                # chain, never `provider` itself.
                 self._bump("llm_quality_calls")  # P2-07: a real judging call
-                # P2-11: the judge is always the NEXT provider in the chain,
-                # never `provider` itself — self.providers[i + 1] is safe
-                # here precisely because this block is gated on `has_next`.
                 score = self._score_quality(provider, messages, answer,
                                             judge=self.providers[i + 1])
-                if score > best_score:
-                    best_answer, best_score, best_name = answer, score, provider.name
-                if score < self.quality_threshold:
-                    self._bump("llm_fallback_hops")
-                    log_event(logger, "llm.fallback", from_provider=provider.name,
-                              to_provider=self.providers[i + 1].name,
-                              reason="low_quality", mode="text")
-                    lf.event(run_id_var.get(), "llm.fallback",
-                            metadata={"from_provider": provider.name,
-                                      "to_provider": self.providers[i + 1].name,
-                                      "reason": "low_quality", "mode": "text"})
-                    continue
-            elif best_answer is not None:
-                # LAST provider, and an earlier answer was already rejected.
-                # Previously this answer was returned unscored and unbeatable
-                # — the exact path that shipped p205.211's 732-char fragment
-                # over a complete report. Score it too (judged by the
-                # PREVIOUS provider, so P2-11's never-self-judge rule holds)
-                # and keep whichever is better.
+                if score >= self.quality_threshold:
+                    if i > 0:
+                        log_event(logger, "llm.served_by_fallback",
+                                  provider=provider.name, position=i, mode="text")
+                    return answer
+                candidates.append((provider.name, answer, score))
+                self._bump("llm_fallback_hops")
+                log_event(logger, "llm.fallback", from_provider=provider.name,
+                          to_provider=self.providers[i + 1].name,
+                          reason="low_quality", mode="text")
+                lf.event(run_id_var.get(), "llm.fallback",
+                        metadata={"from_provider": provider.name,
+                                  "to_provider": self.providers[i + 1].name,
+                                  "reason": "low_quality", "mode": "text"})
+                continue
+
+            # Last provider in the chain -- no further hop to fall back to.
+            if candidates:
+                # An earlier candidate exists to judge this one against
+                # (judged by the PREVIOUS provider, so P2-11's
+                # never-self-judge rule still holds).
                 self._bump("llm_quality_calls")
                 score = self._score_quality(provider, messages, answer,
                                             judge=self.providers[i - 1])
-                if score > best_score:
-                    best_answer, best_score, best_name = answer, score, provider.name
+                prior_name, _prior_answer, prior_score = self._best(candidates)
+                if score > prior_score:
+                    candidates.append((provider.name, answer, score))
                 else:
                     log_event(logger, "llm.last_provider_worse",
                               provider=provider.name, score=score,
-                              kept_provider=best_name, kept_score=best_score)
-                break
+                              kept_provider=prior_name, kept_score=prior_score)
             else:
-                # LAST provider and nothing to compare against: accept it
-                # unscored, exactly as before. Scoring here could only
-                # discard the sole answer for nothing in return.
-                best_answer, best_score, best_name = answer, self.quality_threshold, provider.name
-                break
+                # Nothing to compare against: accept it unscored, exactly
+                # as before. Scoring here could only discard the sole
+                # answer for nothing in return.
+                candidates.append((provider.name, answer, None))
+            break
 
-            if i > 0:
-                log_event(logger, "llm.served_by_fallback",
-                          provider=provider.name, position=i, mode="text")
-            return answer
-
-        # Either the chain is exhausted, or the last provider answered and we
-        # broke out above. Return the BEST answer anyone produced (FIX-3),
-        # not the last one that happened to arrive.
-        if best_answer is not None:
-            if best_score < self.quality_threshold:
+        if candidates:
+            best_name, best_answer, best_score = self._best(candidates)
+            effective_score = (best_score if best_score is not None
+                               else self.quality_threshold)
+            if effective_score < self.quality_threshold:
                 log_event(logger, "llm.chain_exhausted_low_quality",
-                          provider=best_name, score=best_score)
+                          provider=best_name, score=effective_score)
             elif best_name != self.providers[0].name:
                 log_event(logger, "llm.served_by_fallback", provider=best_name,
                           position=[p.name for p in self.providers].index(best_name),
@@ -490,3 +467,24 @@ class FallbackRouter:
             return best_answer
         assert last_exc is not None
         raise last_exc
+
+    @staticmethod
+    def _best(candidates: List[Tuple[str, str, Optional[float]]]
+             ) -> Tuple[str, str, Optional[float]]:
+        """Pick the highest-scoring candidate. 6 lines, pure, testable
+        without any provider (S-3).
+
+        Ties keep the EARLIER candidate -- a running max only replaces on
+        a strict `>`, matching the original inline comparison this
+        replaces. None ranks last: it only ever appears as the SOLE
+        candidate (the unscored last-provider-with-nothing-to-compare
+        case in complete() above), so nothing ever actually has to lose
+        to it.
+        """
+        best = candidates[0]
+        for c in candidates[1:]:
+            c_score = c[2] if c[2] is not None else -1.0
+            best_score = best[2] if best[2] is not None else -1.0
+            if c_score > best_score:
+                best = c
+        return best

@@ -15,7 +15,7 @@ exhaustive regression testing—not a hosted SaaS, but a demonstration of how
 to build agentic systems that degrade gracefully and improve with oversight.
 
 > **The four banners below are HISTORY, kept for auditability.** For the
-> current state of any decision, `DECISIONS.md` (D-1…D-54) is the
+> current state of any decision, `DECISIONS.md` (D-1…D-64) is the
 > authoritative log; to just run something, jump to [Setup](#setup).
 
 > **Guardrails, Phases 1–3 — new since D-46.** A dedicated
@@ -1644,17 +1644,17 @@ research-agent-dmp/
 │   ├── evaluation/          # answer quality self-scoring
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # 476 tests, offline. Organized by module,
+├── tests/                   # offline. Organized by module,
 │                              mirroring src/research_agent/'s own layout:
 │                              tests/unit/<module>.py (one file per source
 │                              module) + tests/integration/<scenario>.py
 │                              (full graph.invoke() runs). See
 │                              OPERATIONS.md "Running and Interpreting the
-│                              Test Suite" for the full file-by-file map.
-│                              Two new unit files, prior session:
-│                              test_api_server.py, test_agents_compilation.py.
-│                              Phase 3: test_langfuse.py (33 tests, fully
-│                              offline — no real Langfuse project, no network).
+│                              Test Suite" for the full file-by-file map
+│                              and how to read the current count (M-4: a
+│                              literal count here goes stale on the next
+│                              added test — run `pytest -q` for the real
+│                              number).
 ├── scripts/ingest_sample_data.py
 ├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
 ├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool 
@@ -1675,7 +1675,7 @@ research-agent-dmp/
 ├── requirements-websearch.txt  # Phase 4 only: ddgs + mcp. Install into the SAME
 │                              venv that runs the agent — see Setup
 ├── .env.example  run.bat  reset.bat
-└── DECISIONS.md             # populated: D-1..D-58, sourced from code comments
+└── DECISIONS.md             # populated: D-1..D-64, sourced from code comments
 ```
 
 ## Setup
@@ -1691,7 +1691,7 @@ cp .env.example .env          # defaults run fully offline (LLM_MODE=stub)
 export PYTHONPATH=src
 
 python -m research_agent.cli "Compare Redis and Memcached for session caching"
-python -m pytest tests/ -q    # expect: 476 passed
+python -m pytest tests/ -q    # expect: all green — see the summary line for the count (M-4)
 ```
 
 **Or install it as a package** (`pyproject.toml`, new) — which is what
@@ -1886,9 +1886,9 @@ This table lists only decisions with code behind them here.
 | — | Graceful degradation everywhere | First run must succeed on a bare laptop |
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
-`DECISIONS.md` (populated as of P2-09) is now the authoritative consolidated
-log for D-1 through D-35 — this table is a curated subset for readability,
-not a replacement.
+`DECISIONS.md` (populated as of P2-09, extended in every pass since) is the
+authoritative consolidated log, currently D-1 through D-64 — this table is a
+curated subset for readability, not a replacement.
 
 ## Limitations
 
@@ -2177,7 +2177,7 @@ auditable rather than invisible.
 | design §9: `MAX_REVISIONS` default 3 | Code default is **2** (`config.py`) |
 | README structure tree: root `agentic-research-agent/` | Distributed directory is `research-agent-dmp/` |
 | Storage diagram implied one Qdrant use | Two collections; `CORPUS_INDEX` names **both** a Qdrant collection and an OpenSearch index |
-| `DECISIONS.md` referenced as the decision log | Populated (D-1 through D-35, sourced from code comments and this document's own citations — a few numbers, D-7/9/10/11, are flagged as ungrounded rather than invented) |
+| `DECISIONS.md` referenced as the decision log | Populated, currently D-1 through D-64 (sourced from code comments and this document's own citations — D-7/9/10/11 are flagged as ungrounded rather than invented; see `DECISIONS.md`'s own header for the up-to-date range and gap note rather than repeating the count here) |
 | `internal/LEARNING_GUIDE.md` cited as a companion doc | `internal/` is in `.gitignore`, so it ships only in archives like this one |
 | OPERATIONS §L1: "add two `logging.getLogger(...)` lines" | Already present in `logging_setup.py::configure_logging` |
 | This README's own citations of "`PHASE2_PLAN.md`" | The actual tracked file is `internal/PHASE-2_PLAN.md` (hyphenated, under `internal/`) |

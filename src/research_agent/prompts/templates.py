@@ -41,6 +41,7 @@ Python mechanics used in this file, if any of this is new to you:
 from typing import List, Optional
 
 from research_agent.guardrails.fencing import fence_untrusted
+from research_agent.guardrails.retrieval import SINGLE_LEG_SCORE_CEILING
 from research_agent.llm.client import Message
 from research_agent.state import Evidence, Goal
 
@@ -315,23 +316,16 @@ def generate_gaps(goals: List[Goal], evidence: List[Evidence], depth: int,
             f'JSON schema: {schema}'}]
 
 
-# The exact score an Evidence item gets when it was the TOP hit of a
-# SINGLE retrieval leg: min(1.0, (1 / RRF_K) * RRF_SQUASH) = (1/60) * 30.
-# Not approximate -- exactly 0.5, for any query, regardless of how relevant
-# the document actually was, because RRF scores rank position rather than
-# similarity. So a goal whose best evidence sits at or below this ceiling
-# has NO document that both retrieval legs agreed on, which is the
-# strongest cheap signal available that the corpus may not cover it.
-#
-# Deliberately NOT imported from retrieval/hybrid.py and
-# tools/corpus_search.py: this module is imported by the agents, which are
-# imported by those modules' own callers, and a prompt template reaching
-# back into the retrieval stack to read two constants is the kind of edge
-# that turns into an import cycle later. tests/unit/test_prompts.py does
-# the cross-module import instead and asserts this value still matches, so
-# a change to RRF_K or RRF_SQUASH fails the suite rather than silently
-# rotting this threshold.
-SINGLE_LEG_SCORE_CEILING = 0.5
+# S-7: SINGLE_LEG_SCORE_CEILING moved to guardrails/retrieval.py -- it is
+# a retrieval-scoring constant, not a prompt, and lived here only because
+# importing it from the retrieval stack once risked an import cycle (this
+# module is imported by the agents, which are imported by the retrieval
+# stack's own callers). guardrails/retrieval.py sits below that cycle
+# (it imports only state.py and retrieval/terms.py, neither of which
+# import back into prompts/templates.py), so importing it directly here
+# is safe. Re-imported under the same name so
+# `from research_agent.prompts.templates import SINGLE_LEG_SCORE_CEILING`
+# (tests/unit/test_prompts.py's own drift guard) keeps working unchanged.
 
 
 def compile_report(query: str, goals: List[Goal], evidence: List[Evidence],

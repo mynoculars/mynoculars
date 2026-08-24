@@ -27,9 +27,13 @@ shown.
 >    it on is one `.env` line plus one `pip install` — see *Enabling Web
 >    Search (Phase 4)*.
 >
-> Test suite: **492 tests**, fully offline. Every historical release note
-> that used to sit here has moved to *Appendix C — Version History* at the
-> end of this document; nothing there is needed to run the system.
+> Test suite: fully offline, all green — see **Running and Interpreting the
+> Test Suite** for how to run it and read the result; a literal count is
+> deliberately not repeated here, since it drifts every time a test is
+> added and a stale one costs more trust than no number at all (M-4). Every
+> historical release note that used to sit here has moved to *Appendix C —
+> Version History* at the end of this document; nothing there is needed to
+> run the system.
 
 ---
 
@@ -226,10 +230,10 @@ start blaming a service for a problem.
 $env:PYTHONPATH = "src"
 python -m pytest tests/ -q
 
-# expect: 492 passed
+# expect: all green (see the summary line pytest prints, e.g. "N passed")
 ```
 
-**492 passed means the graph, the reducers, the guardrails and every tool seam
+**All green means the graph, the reducers, the guardrails and every tool seam
 are correct.** The suite is fully offline: no services, no API keys, no
 network, a few seconds to run. So a failure here is *never* an environment
 problem — it is a real regression in the code, and no amount of restarting
@@ -241,7 +245,7 @@ space: the problem is configuration, data, or a service — not logic.
 
 | Result | What it means | Do next |
 |---|---|---|
-| `492 passed` | Code is sound | Continue to Step 1b |
+| All passed, 0 failed | Code is sound | Continue to Step 1b |
 | Some failures | A real regression | Stop. Read the failure. Do not proceed to L2 |
 | `ModuleNotFoundError: research_agent` | `PYTHONPATH` not set | `$env:PYTHONPATH = "src"` |
 | `ModuleNotFoundError: mcp` (9 failures) | You have `mcp` 2.x | `pip install "mcp>=1.9,<2"` — 2.0 moved `mcp.server.fastmcp` |
@@ -1304,7 +1308,7 @@ but every degradation writes a log line. When confused: read stderr.
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
 export PYTHONPATH=src        # or $env:PYTHONPATH="src" on Windows
-python -m pytest tests/ -q   # 492 tests, all offline, a few seconds
+python -m pytest tests/ -q   # fully offline, a few seconds — see summary line for count
 ```
 This needs NO services and NO model — it uses the stub and fakes. If these pass,
 the graph logic is correct. Run this after any code change. **See "Running and
@@ -1606,7 +1610,7 @@ LANGFUSE_ENVIRONMENT=development
 
 ```powershell
 pip install langfuse
-python -m pytest -q                          # 492/492, fully offline, unaffected
+python -m pytest -q                          # all green, fully offline, unaffected
 python -m research_agent.cli "your question" --debug
 ```
 
@@ -1750,7 +1754,7 @@ the telemetry change, move on.
 
 ## Running and Interpreting the Test Suite
 
-The suite is **492 tests**, fully offline — no services, no API keys, no
+The suite is fully offline — no services, no API keys, no
 network. It's organized into `tests/unit/` and `tests/integration/`:
 
 ```powershell
@@ -1759,10 +1763,13 @@ python -m pytest tests/ -q
 ```
 
 ```text
-tests/unit/                   170 tests   one file per src/research_agent/ module
-tests/integration/             20 tests   full graph.invoke() runs, offline
+tests/unit/                   one file per src/research_agent/ module
+tests/integration/            full graph.invoke() runs, offline
                               --------
-                              492 tests
+                              see the summary line pytest -q prints
+                              for the exact, current count (M-4: a
+                              literal number here goes stale the next
+                              time a test is added or removed)
 ```
 
 The suite is organized by MODULE, mirroring `src/research_agent/`'s own
@@ -2715,8 +2722,11 @@ Release notes accumulated during development, newest concern last. **None of
 this is needed to operate the system** — it is kept for archaeology: to explain
 why a setting has the value it does, and what a given fix was responding to.
 Historical test counts (57 → 135 → 157 → 294 → 341 → 344 → 348 → 476 → 492) appear
-below as they were written; the current count is 492 and is stated in
-*Running and Interpreting the Test Suite*.
+below as they were written, at the time each note was made. As of this pass
+none of them is current — see **Running and Interpreting the Test Suite**
+above, which reports the count by running the suite rather than stating a
+literal (M-4: six different hardcoded counts across this document and the
+README had drifted out of sync with each other and with the actual suite).
 
 **Every note below refers to the document structure AT THE TIME it was
 written**, including section names that have since been renamed or moved

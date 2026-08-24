@@ -198,9 +198,9 @@ def test_an_on_topic_corpus_hit_still_stops_the_ladder():
 def test_scaffolding_words_do_not_count_as_topical_overlap():
     """"comparison" appearing in both a query about armies and a document
     about Redis is not evidence of anything."""
-    from research_agent.tools.retrieval_chain import _distinctive_terms
-    shared = _distinctive_terms("Comparison analysis of Indian army") & \
-        _distinctive_terms("Comparison analysis of Redis throughput")
+    from research_agent.retrieval.terms import distinctive_terms
+    shared = distinctive_terms("Comparison analysis of Indian army") & \
+        distinctive_terms("Comparison analysis of Redis throughput")
     assert shared == set()
 
 
@@ -299,9 +299,9 @@ def test_short_all_caps_acronyms_survive_as_distinctive_terms():
     real traffic: "GDP growth India US 2020-2023" retained neither GDP
     nor US, and an Indian-vs-PLA query dropped PLA -- its single most
     distinctive word."""
-    from research_agent.tools.retrieval_chain import _distinctive_terms
-    assert "pla" in _distinctive_terms("Indian Army size composition Chinese PLA")
-    gdp = _distinctive_terms("GDP growth India US 2020-2023")
+    from research_agent.retrieval.terms import distinctive_terms
+    assert "pla" in distinctive_terms("Indian Army size composition Chinese PLA")
+    gdp = distinctive_terms("GDP growth India US 2020-2023")
     assert {"gdp", "us"} <= gdp
 
 
@@ -312,10 +312,10 @@ def test_bare_years_are_not_distinctive_terms():
     overlap bar on years alone -- defeating the D-55 floor-raise for the
     date-ranged queries this project issues constantly. Mixed
     alphanumerics (pm10, 155mm) are real terms and must survive."""
-    from research_agent.tools.retrieval_chain import _distinctive_terms
-    terms = _distinctive_terms("GDP growth India US 2020-2023")
+    from research_agent.retrieval.terms import distinctive_terms
+    terms = distinctive_terms("GDP growth India US 2020-2023")
     assert not {"2020", "2023"} & terms
-    assert "pm10" in _distinctive_terms("US air quality PM10 levels")
+    assert "pm10" in distinctive_terms("US air quality PM10 levels")
 
 
 def test_year_collision_alone_no_longer_satisfies_the_topical_gate():

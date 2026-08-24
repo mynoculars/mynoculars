@@ -37,12 +37,12 @@ comes from the graph's own checkpointer, not from this app.
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from research_agent import langfuse as lf
-from research_agent.assembly import build_app_and_settings
+from research_agent.assembly import build_app_and_settings, reject_if_thread_in_use
 from research_agent.logging_setup import run_id_var
 from research_agent.state import ResearchState
 from research_agent.storage.postgres import close_checkpointer, record_run
@@ -352,9 +352,25 @@ def research(req: ResearchRequest) -> dict:
     ("api-<12 hex chars>", mirroring cli.py's own "run-<12 hex chars>"
     default) — this is the only place an API-driven run's identity is
     decided.
+
+    RAISES  HTTPException(409) if the caller supplied a thread_id that
+            already holds a run (M-2 / D-20). An HTTP client can reuse
+            a thread_id far more casually than a human retyping
+            --thread-id, and without this check the graph's reducers
+            silently blend the old run's evidence and counters into
+            the new one -- see assembly.reject_if_thread_in_use.
     """
     thread_id = req.thread_id or f"api-{uuid.uuid4().hex[:12]}"
     run_id_var.set(thread_id)
+    prior_query = reject_if_thread_in_use(_graph, _config(thread_id))
+    if prior_query:
+        raise HTTPException(
+            status_code=409,
+            detail=f"thread_id '{thread_id}' already holds a run for "
+                   f"\"{prior_query}\". Re-invoking it with a new query "
+                   f"ACCUMULATES the old run's evidence and counters "
+                   f"instead of replacing them (D-20). Use a fresh "
+                   f"thread_id, or omit it to get a generated one.")
     with _traced_request(thread_id, "research_run",
                          input={"query": req.query}) as trace:
         result = _graph.invoke(ResearchState(raw_query=req.query),

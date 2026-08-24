@@ -34,13 +34,28 @@ class _FakeGraph:
         raise AssertionError("these tests must not run the graph")
 
 
+class _StateSnapshot:
+    """Minimal stand-in for LangGraph's StateSnapshot -- only `.values` is
+    read by assembly.reject_if_thread_in_use (M-2)."""
+
+    def __init__(self, values=None):
+        self.values = values or {}
+
+
 class _ScriptedGraph:
     """A graph whose invoke() returns a caller-supplied result (or raises
     a caller-supplied exception), so the endpoints can be driven end to
-    end without running anything real."""
+    end without running anything real.
 
-    def __init__(self, result=None, raises=None):
+    get_state() defaults to an empty snapshot (no prior raw_query) so the
+    M-2 thread-reuse guard in api/server.py::research passes through
+    unless a test explicitly sets `prior_state` to simulate a thread
+    already in use.
+    """
+
+    def __init__(self, result=None, raises=None, prior_state=None):
         self.result, self.raises = result, raises
+        self.prior_state = prior_state or {}
         self.invocations = 0
 
     def invoke(self, *a, **k):
@@ -48,6 +63,9 @@ class _ScriptedGraph:
         if self.raises is not None:
             raise self.raises
         return self.result
+
+    def get_state(self, *a, **k):
+        return _StateSnapshot(self.prior_state)
 
 
 class _FakeSettings:
@@ -176,6 +194,38 @@ def test_research_accepts_a_query_at_the_length_cap():
     with TestClient(server.app) as client:
         resp = client.post("/research", json={"query": "x" * 2000})
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# M-2: the API shares cli.py's D-20 thread-reuse guard
+# ---------------------------------------------------------------------------
+
+
+def test_research_rejects_a_thread_id_already_in_use():
+    """A caller-supplied thread_id whose checkpoint already holds a
+    raw_query must be refused (409), not silently blended (D-20) -- see
+    assembly.reject_if_thread_in_use. Previously api/server.py had no
+    get_state() call anywhere, so an HTTP client reusing a thread_id hit
+    this exact defect the CLI already guards against."""
+    graph = _ScriptedGraph(prior_state={"raw_query": "earlier query"})
+    server = _import_server(_bundle(app=graph))
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "new query",
+                                               "thread_id": "reused-thread"})
+    assert resp.status_code == 409
+    assert "earlier query" in resp.json()["detail"]
+    assert graph.invocations == 0  # refused before the graph ever ran
+
+
+def test_research_with_a_fresh_thread_id_is_not_rejected():
+    """The common case -- no thread_id, or one that has never been used --
+    must still reach the graph exactly as before M-2."""
+    graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {}})
+    server = _import_server(_bundle(app=graph))
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "q"})
+    assert resp.status_code == 200
+    assert graph.invocations == 1
 
 
 def test_shutdown_closes_the_mcp_bridge_as_well_as_the_checkpointer():

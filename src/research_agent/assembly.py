@@ -28,7 +28,7 @@ CALLED BY   cli.py::main (once per command-line invocation) and
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from research_agent import langfuse as lf
 from research_agent.config import (
@@ -279,3 +279,32 @@ def build_app_and_settings(tracer=None):
     return AppBundle(app=app, settings=settings, durable=durable,
                      checkpointer=checkpointer, mcp_bridge=mcp_bridge,
                      web_mcp_bridge=web_mcp_bridge, router=router)
+
+
+def reject_if_thread_in_use(app, config) -> Optional[str]:
+    """The D-20 guard, shared by cli.py and api/server.py (M-2).
+
+    A thread_id IDENTIFIES one run. Starting a FRESH query on a thread
+    that already holds state does not replace that state -- `evidence`
+    is Annotated[..., operator.add] and `counters` merges, so both
+    ACCUMULATE, while reducerless fields like iteration_depth reset to
+    0. Found live (run p205.70-check, second invocation): search_calls
+    18 = 12 + 6, memory_writes 31 = 15 + 16, revision_cycles 3 = 1 + 2,
+    and the previous run's E3 escalation still in telemetry. Worse, the
+    previous run's evidence was still marking goals covered, so a run
+    that retrieved ONE item reported recall 1.0 at depth 1.
+
+    Previously only cli.py ran this check; api/server.py invoked the
+    graph directly with no app.get_state() call anywhere, so an HTTP
+    client reusing a thread_id -- which happens far more casually than
+    a human retyping --thread-id -- silently blended two runs. Both
+    callers now share this one check instead of the CLI's copy risking
+    drifting out of sync with an API that never had it.
+
+    Returns the prior run's raw_query if the thread already holds one
+    (the caller decides how to report that -- CLI exit code, API HTTP
+    status), or None if the thread is free to start a fresh run.
+    """
+    snapshot = app.get_state(config)
+    prior = getattr(snapshot, "values", None) or {}
+    return prior.get("raw_query") or None

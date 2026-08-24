@@ -25,11 +25,12 @@ from collections import Counter
 from typing import Any, Dict
 
 from research_agent import langfuse as lf
-from research_agent.agents.escalation import escalation_allowed
+from research_agent.agents.escalation import raise_or_log
 from research_agent.config import Settings
 from research_agent.guardrails.citations import clean_citations
 from research_agent.guardrails.dedup import dedupe_evidence
 from research_agent.guardrails.hedging import enforce_hedging
+from research_agent.guardrails.retrieval import has_grounded_evidence
 from research_agent.guardrails.sources import (append_web_sources,
                                                 count_listed_sources)
 from research_agent.llm.client import strip_code_fence
@@ -37,7 +38,7 @@ from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
-from research_agent.tools.retrieval_chain import _distinctive_terms
+from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import ResearchState
 
 logger = logging.getLogger(__name__)
@@ -248,24 +249,12 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
                 # D-23 bound: an E4 redirect routes back to compiler ->
                 # critic, and revision_count only ever grows, so this
                 # branch is true on every subsequent pass — the same
-                # unbounded re-raise E2/E3 has. escalation_allowed()
-                # (agents/escalation.py) folds hitl_enabled in with the
-                # per-run review budget.
-                if escalation_allowed(state, settings):
-                    # D-23: raise E4 — the graph will interrupt for a human.
-                    update["escalation_trigger"] = "E4"
-                    log_event(logger, "escalation.raised", trigger="E4",
-                              revisions=revision)
-                elif settings.hitl_enabled:
-                    log_event(logger, "escalation.suppressed", level=logging.WARNING,
-                              trigger="E4", revisions=revision,
-                              reason="max_escalations_reached",
-                              reviews=len(state.escalation_history))
-                else:
-                    # Stub path (HITL disabled): log loudly and ship the
-                    # report marked unreviewed — never silently as "good".
-                    log_event(logger, "escalation.stub", level=logging.WARNING,
-                              trigger="E4", revisions=revision, notes=notes)
+                # unbounded re-raise E2/E3 has. raise_or_log
+                # (agents/escalation.py) folds escalation_allowed with
+                # the suppressed/stub logging shared by all four triggers.
+                update.update(raise_or_log(state, settings, "E4",
+                                           reason="critique_budget_exhausted",
+                                           revisions=revision, notes=notes))
         log_event(logger, "node.critique", passed=passed, revision=revision)
         lf.score(run_id_var.get(), "critique_passed", passed,
                 comment=f"revision={revision}")
@@ -307,10 +296,15 @@ def build_memory_writer_node(memory: SemanticMemory, settings,
         if debug:
             log_event(logger, "node.enter", node="memory_writer")
         # D-24 quality gate -- see SemanticMemory.store_run. Evidence that
-        # never cleared the coverage bar must not become permanently
-        # promoted cross-run memory.
+        # never cleared the memory-write floor must not become permanently
+        # promoted cross-run memory. M-3: this is settings.memory_write_min_score,
+        # a SEPARATE (lower) floor from the coverage gate's
+        # min_evidence_score -- gating on the coverage floor made every
+        # single-leg RRF hit ineligible, since it can score at most the
+        # single-leg ceiling. See memory_write_min_score's own docstring
+        # in config.py.
         written = memory.store_run(state.raw_query, state.evidence,
-                                   min_score=settings.min_evidence_score)
+                                   min_score=settings.memory_write_min_score)
         return {"counters": {"memory_writes": float(written)}}
 
     return memory_writer_node
@@ -453,15 +447,17 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         # honesty counterpart to recall was fooled exactly the way the
         # chain's sufficiency test used to be. A goal counts here only if a
         # DOCUMENT both scored above the floor and shares vocabulary with
-        # that goal's own description.
-        _doc_sources = {"corpus", "mcp"}
-        _goal_terms = {g.goal_id: _distinctive_terms(g.description)
+        # that goal's own description -- has_grounded_evidence (M-1) is
+        # the single implementation of that predicate, shared with
+        # progress_checker_node and gap_generator_node in gathering.py, so
+        # this floor and theirs can never drift apart again the way a
+        # second, hardcoded `> 0.5` copy previously let them.
+        _goal_terms = {g.goal_id: distinctive_terms(g.description)
                        for g in state.goals}
         _doc_covered = {
-            e.goal_id for e in state.evidence
-            if e.source in _doc_sources and e.score > 0.5
-            and (not _goal_terms.get(e.goal_id)
-                 or _goal_terms[e.goal_id] & _distinctive_terms(e.content))}
+            g.goal_id for g in state.goals
+            if has_grounded_evidence(g.goal_id, _goal_terms[g.goal_id],
+                                     state.evidence, settings.min_evidence_score)}
         corpus_recall = (round(len([g for g in goal_ids if g in _doc_covered])
                                / len(goal_ids), 3) if goal_ids else 0.0)
         evidenced = {e.goal_id for e in state.evidence}

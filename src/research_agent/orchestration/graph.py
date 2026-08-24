@@ -190,9 +190,12 @@ def dispatch_tasks(state: ResearchState, hint_to_node: dict, from_node: str = "t
     log_event(logger, "route.decision", from_node=from_node, to_node=to_node,
               reason=reason, escalation_trigger=state.escalation_trigger,
               pending_tasks=len(state.pending_tasks))
-    if state.escalation_trigger in ("E2", "E3"):
+    # S-4: branch on the SAME decision just logged, rather than
+    # re-evaluating the identical conditions a second time -- one place
+    # decides the routing policy, this just acts on it.
+    if to_node == "human_escalation":
         return "human_escalation"  # gap generator exhausted its supply (D-23)
-    if not state.pending_tasks:
+    if to_node == "compiler":
         return "compiler"
     return [Send(hint_to_node.get(t.tool_hint, "search_worker"), WorkerPayload(task=t))
             for t in state.pending_tasks]

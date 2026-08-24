@@ -221,16 +221,12 @@ class SearchTask(BaseModel):
     goal_id: str
     priority: int = 0             # D-13: producers rank; top MAX_FANOUT survive
     depth: int = 0                # echoed into failed-key records (D-16)
-    # P2-14 (D-25): which specialist worker should handle this task, if any.
-    # "" (the default -- every task before this shipped, and every task a
-    # producer emits when settings.available_tool_hints is empty, which it
-    # is by default) always routes to "search_worker", byte-identical to
-    # pre-P2-14 behavior. task_utils.py::cap_and_filter is the ONLY place
-    # that ever sets this to anything else, and only ever to a value it has
-    # independently confirmed is both requested by the producer's raw
-    # output AND currently wired into the running graph (see that
-    # function's docstring) -- dispatch_tasks itself does not re-validate
-    # this field, it trusts it.
+    # Which specialist worker handles this task, if any (D-25). "" (the
+    # default) routes to search_worker. task_utils.py::cap_and_filter is
+    # the only place that ever sets this to anything else, and only after
+    # confirming the hint is both requested by the producer and currently
+    # wired into the running graph — dispatch_tasks trusts this field
+    # rather than re-validating it.
     tool_hint: str = ""
 
 
@@ -288,27 +284,23 @@ class Evidence(BaseModel):
     # flag, not a judgment call — see model_knowledge.py::_looks_overspecific.
     # False for every corpus/mcp/memory item; those are never flagged.
     hedge_specific: bool = False
-    # Phase 4 (D-57): provenance for source="web" items, and ONLY those.
-    # None for every corpus/mcp/model/memory item, which is why both are
-    # Optional with a None default rather than "" -- an empty string would
-    # read as "this item has a URL and it is blank", which is a different
-    # and untrue claim.
+    # Provenance for source="web" items, and only those (D-57). None for
+    # everything else, rather than "", so an unset URL cannot be confused
+    # with an empty one.
     #
-    # WHY THESE LIVE ON Evidence AT ALL, when D-40 forbids URLs in report
-    # prose: attribution is not citation. The compiler still cites [gN] and
-    # nothing else; these two fields exist so a DETERMINISTIC pass can build
-    # a Sources section from the evidence actually cited, rather than asking
-    # the model to carry URLs through the prose and hoping. D-51 is the
-    # precedent -- a prompt instruction to hedge was not sufficient, and a
-    # prompt instruction to attribute would not be either.
+    # WHY THESE LIVE ON Evidence: D-40 forbids URLs in report prose, but
+    # attribution is not citation — the compiler still cites only [gN].
+    # These two fields let a deterministic pass build a Sources section
+    # from the evidence actually cited (D-51's precedent: a prompt
+    # instruction to hedge was not sufficient on its own; neither would one
+    # to attribute be).
     #
-    # `domain` is stored, not derived, DESPITE websearch/provider.py making
-    # the opposite choice on WebResult. The two are not inconsistent: there,
-    # url and domain live on one object in one process, so deriving avoids a
-    # second source of truth. Here the value has already crossed a process
-    # boundary as JSON, and re-deriving it agent-side would mean two
-    # different implementations of "what is this URL's domain" that can
-    # disagree -- so the server's answer is carried, not recomputed.
+    # `domain` is stored, not derived, unlike websearch/provider.py's
+    # WebResult. There the value lives in one process and re-deriving costs
+    # nothing; here it already crossed a process boundary as JSON, and
+    # re-deriving domain-from-url agent-side would be a second
+    # implementation that can disagree with the server's — so the server's
+    # answer is carried, not recomputed.
     url: Optional[str] = None
     domain: Optional[str] = None
 

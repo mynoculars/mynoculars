@@ -48,14 +48,14 @@ from typing import Dict, List, Optional, Tuple
 
 from research_agent.logging_setup import log_event
 from research_agent.state import Evidence, Goal
-from research_agent.tools.retrieval_chain import _distinctive_terms
+from research_agent.retrieval.terms import distinctive_terms
 
 logger = logging.getLogger(__name__)
 
 # Matches the [gN] markers D-40 requires in report prose -- the same pattern
 # agents/compilation.py::compiler_node already uses to count evidence_cited.
 # Shared shape rather than a second, subtly different definition of "what a
-# citation looks like", for the same reason D-47 reuses _distinctive_terms
+# citation looks like", for the same reason D-47 reuses distinctive_terms
 # instead of writing a second notion of "on topic".
 _CITATION_RE = re.compile(r"\[g(\d+)\]")
 
@@ -147,7 +147,7 @@ def append_web_sources(report: str,
     # or when a goal's description yields no distinctive terms -- an
     # untestable claim is left alone rather than resolved against the item.
     if goals:
-        goal_terms = {g.goal_id: _distinctive_terms(g.description)
+        goal_terms = {g.goal_id: distinctive_terms(g.description)
                       for g in goals}
         # D-64: the reviewer's redirect guidance counts as on-topic too.
         # WHY: the gate above tests evidence against the goal descriptions
@@ -175,20 +175,20 @@ def append_web_sources(report: str,
         # would type, so they are still dropped. The union WIDENS the gate
         # by exactly one thing -- what the human explicitly asked for --
         # and by nothing else. With no redirect, `guidance` is "",
-        # _distinctive_terms("") is empty, and the union is byte-identical
+        # distinctive_terms("") is empty, and the union is byte-identical
         # to the pre-D-64 behaviour.
-        guidance_terms = _distinctive_terms(guidance)
+        guidance_terms = distinctive_terms(guidance)
         on_topic = [e for e in listed
                     if not goal_terms.get(e.goal_id)
                     or (goal_terms[e.goal_id] | guidance_terms)
-                    & _distinctive_terms(e.content)]
+                    & distinctive_terms(e.content)]
         if guidance_terms:
             # Visible when guidance is what saved an item, so a reviewer can
             # tell "the gate passed it" from "the gate passed it because I
             # asked for it" without re-running anything.
             strict = [e for e in listed
                       if not goal_terms.get(e.goal_id)
-                      or goal_terms[e.goal_id] & _distinctive_terms(e.content)]
+                      or goal_terms[e.goal_id] & distinctive_terms(e.content)]
             if len(on_topic) != len(strict):
                 log_event(logger, "sources.kept_by_guidance",
                           rescued=len(on_topic) - len(strict),

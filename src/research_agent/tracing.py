@@ -64,7 +64,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from research_agent.logging_setup import enable_narrative_logging, flush_narrative
+from research_agent.reporting.narrative import enable_narrative_logging, flush_narrative
 
 
 class Tracer:

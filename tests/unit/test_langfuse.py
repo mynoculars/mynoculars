@@ -261,7 +261,14 @@ def test_unrecognized_cost_mode_keeps_the_pre_existing_behavior():
 
 def _generation_kwargs(settings, **gen):
     """Run one Observer.generation() against a fake client and return the
-    kwargs it handed to start_observation."""
+    kwargs it handed to start_observation.
+
+    M-5: Observer.generation() calls into the SDK's own type/constant
+    surface even when handed a fake client, so every caller of this
+    helper is an enabled-path test -- gated at the source here rather
+    than at each of the three call sites.
+    """
+    pytest.importorskip("langfuse")
     seen = {}
 
     class _Obs:
@@ -352,6 +359,7 @@ def test_observer_span_uses_a_real_trace_context(monkeypatch):
     """Confirms the real call shape reaches the client: a deterministic
     trace_id derived from thread_id via create_trace_id(seed=...), and
     start_observation/... .end() actually invoked."""
+    pytest.importorskip("langfuse")
     calls = []
 
     class _FakeObservation:
@@ -379,6 +387,7 @@ def test_observer_nests_observations_under_the_open_root_span():
     """With a root span open, every later observation must carry the
     root's span id as parent_span_id -- that is what makes the trace a
     tree instead of a flat list of siblings."""
+    pytest.importorskip("langfuse")
     calls = []
 
     class _FakeObservation:
@@ -417,6 +426,7 @@ def test_observer_does_not_nest_once_the_root_is_closed():
     """After end_trace the root is gone, so an observation must fall back
     to a flat, trace-only context rather than raising or reusing a stale
     parent id."""
+    pytest.importorskip("langfuse")
     calls = []
 
     class _FakeObservation:
@@ -447,6 +457,7 @@ def test_observer_does_not_nest_once_the_root_is_closed():
 def test_observer_nesting_degrades_when_the_root_handle_has_no_id():
     """A root handle without a usable `.id` must produce the old flat
     behavior, not an exception and not a garbage parent_span_id."""
+    pytest.importorskip("langfuse")
     calls = []
 
     class _IdlessObservation:
@@ -523,6 +534,7 @@ def _span_ctx_client(log):
 def test_span_ctx_opens_before_the_body_and_closes_after():
     """The whole point of span_ctx over span(): the observation exists
     while the work runs, so its timestamps are the work's real ones."""
+    pytest.importorskip("langfuse")
     log = []
     obs = Observer(client=_span_ctx_client(log), settings=_settings())
     with obs.span_ctx("t1", "node:classify", input={"x": 1}) as handle:
@@ -536,6 +548,7 @@ def test_span_ctx_opens_before_the_body_and_closes_after():
 
 
 def test_span_ctx_marks_error_and_reraises_untouched():
+    pytest.importorskip("langfuse")
     log = []
     obs = Observer(client=_span_ctx_client(log), settings=_settings())
     with pytest.raises(ValueError, match="boom"):
@@ -583,6 +596,7 @@ def test_traced_node_prefers_span_ctx_when_the_observer_has_it():
 
 
 def test_observer_generation_computes_cost_and_usage(monkeypatch):
+    pytest.importorskip("langfuse")
     calls = []
 
     class _FakeObservation:
@@ -923,6 +937,7 @@ def test_start_trace_enters_propagate_attributes_with_session_id(monkeypatch):
     propagate_attributes context carrying session_id=thread_id, entered
     BEFORE the root span is created (ordering is load-bearing -- see
     module docstring)."""
+    pytest.importorskip("langfuse")
     calls, client = _fake_client_and_propagate_attributes(monkeypatch)
     obs = Observer(client=client, settings=_settings(langfuse_environment="staging"))
 
@@ -971,6 +986,7 @@ def test_start_trace_does_not_leak_the_context_if_start_observation_fails(monkey
 def test_shutdown_closes_any_still_open_session_contexts(monkeypatch):
     """Backstop half of the same fix: a context left open by a crashed
     run (end_trace never reached) must still be closed on shutdown."""
+    pytest.importorskip("langfuse")
     calls, client = _fake_client_and_propagate_attributes(monkeypatch)
     obs = Observer(client=client, settings=_settings())
 

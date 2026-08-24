@@ -103,6 +103,52 @@ def escalation_allowed(state: ResearchState, settings) -> bool:
     return len(state.escalation_history) < settings.max_escalations
 
 
+def raise_or_log(state: ResearchState, settings, trigger: str, reason: str,
+                 **ctx: Any) -> Dict[str, Any]:
+    """Raise `trigger`, or log why it was not raised — never both (S-5).
+
+    CALLED BY   every site that decides a trigger SHOULD fire:
+                progress_checker_node (E2/E3), gap_generator_node (E2/E3,
+                two sites), critic_node (E4). Same four-branch shape
+                previously duplicated at each site (~15 lines x 4):
+                escalation_allowed -> raise; elif hitl_enabled -> log
+                "escalation.suppressed" (budget spent); else -> log
+                "escalation.stub" (HITL off, disabled-mode parity, D-23/
+                P2-09). One implementation means the E1/E2/E3/E4 parity
+                between these three log lines is now structural rather
+                than something four copies could drift apart on again.
+
+    RETURNS     {"escalation_trigger": trigger} if the trigger was
+                actually raised, an empty dict otherwise. Callers do
+                `update.update(raise_or_log(...))` -- an empty dict update
+                is always safe.
+
+    `reason` is the caller's account of WHY this trigger fired (e.g.
+    "task_supply_exhausted", "depth_exhausted") -- used on the
+    "escalation.stub" line, where it is the only explanation a reader
+    gets since HITL is off and nothing else records the attempt. The
+    "escalation.suppressed" line always uses "max_escalations_reached"
+    instead: that IS why it was suppressed, regardless of what would
+    otherwise have caused the raise. `**ctx` is extra structured context
+    (e.g. recall=, revisions=) attached identically to every log line
+    this call might emit, so a field present on one branch is present on
+    all three -- the asymmetry P2-09 fixed for E2/E3 vs E1/E4 cannot
+    recur by construction.
+    """
+    if escalation_allowed(state, settings):
+        log_event(logger, "escalation.raised", trigger=trigger, reason=reason, **ctx)
+        return {"escalation_trigger": trigger}
+    if settings.hitl_enabled:
+        log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                  trigger=trigger, reason="max_escalations_reached",
+                  reviews=len(state.escalation_history), **ctx)
+    else:
+        log_event(logger, "escalation.stub", level=logging.WARNING,
+                  trigger=trigger, reason=reason, **ctx)
+    return {}
+
+
+
 def _payload_for(state: ResearchState) -> Dict[str, Any]:
     """The state slice a human needs to decide. Read-only — safe pre-interrupt."""
     trigger = state.escalation_trigger or "E?"

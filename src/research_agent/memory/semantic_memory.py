@@ -371,7 +371,12 @@ class SemanticMemory:
         if min_score > 0.0:
             kept = [e for e in fresh if e.score > min_score]
             if len(kept) != len(fresh):
+                # M-3: WARNING, not INFO -- this previously fired silently
+                # on an entire batch (run p205.231-check: 62 candidates,
+                # 62 dropped, memory_writes 0) with no signal at the log
+                # level anyone actually watches a run at.
                 log_event(logger, "memory.below_quality_floor",
+                          level=logging.WARNING,
                           dropped=len(fresh) - len(kept), floor=min_score)
             fresh = kept
         items = [{

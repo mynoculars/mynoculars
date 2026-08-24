@@ -220,40 +220,16 @@ class Settings(BaseSettings):
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = "gemini-2.0-flash"
     llm_quality_threshold: float = Field(0.6, ge=0.0, le=1.0)
-    # Two SEPARATE timeouts, not one shared value (this used to be a single
-    # llm_timeout_seconds applied to every provider identically — see
-    # PHASE2_PLAN.md / a live debug trace for why that was wrong in
-    # practice: a local llama-server-hosted model like Cogito can spend its
-    # first request of a session just loading the model into memory before
-    # it ever starts on your actual prompt, and its largest prompts (e.g.
-    # compiler's ~4500-token report-writing call) can genuinely need more
-    # wall-clock time than a fast cloud API ever would. Giving Cogito the
-    # SAME short timeout as Mistral/Gemini meant it was being given up on
-    # for being slow, not for being wrong — these two fields let it have
-    # more room while keeping the cloud fallbacks quick to fail over.
+    # Separate timeouts per tier (D-54's llm_max_tokens neighbor): a local
+    # llama-server-hosted model can spend its first request just loading
+    # into memory, and the compiler's largest prompts need real wall-clock
+    # time no fast cloud API would — giving it the same short timeout as
+    # the cloud fallbacks meant it was given up on for being slow, not
+    # wrong.
     llm_primary_timeout_seconds: float = Field(120.0, gt=0.0)   # local Cogito
     llm_timeout_seconds: float = Field(90.0, gt=0.0)            # Mistral, Gemini
-    # Guardrail G6 (P205 Phase 2): the generation budget sent to every
-    # provider on every call (llm/client.py::OpenAICompatibleClient).
-    # Before this, the only control on a runaway generation was
-    # _truncate_at_sentinel -- applied AFTER a full response (and its
-    # full latency and token cost) already came back. Live evidence:
-    # "llm.truncated_runaway_generation" fired repeatedly across nearly
-    # every run this session, on classify, goal_manager, task_expander,
-    # gap_generator, and both compiler calls -- each one a request that
-    # ran to completion, at full cost, before anything trimmed it.
-    # 4096 is deliberately generous, not tight: this session's own
-    # traces show LEGITIMATE compile_report completions reaching
-    # 1400-1800+ completion_tokens on a normal five-goal report, so
-    # anything close to that would truncate real, wanted output.
-    # 4096 sits well above every observed legitimate call in this
-    # codebase while still bounding a truly pathological continuation
-    # (a runaway generation observed live ran to ~10,900 raw characters,
-    # several times any real answer's length) -- the goal is bounding
-    # UNBOUNDED generation, not rationing normal ones. Tune down only
-    # after checking your own compiled-report token sizes, the same way
-    # min_similarity/min_evidence_score ask you to check your own corpus.
-    llm_max_tokens: int = Field(4096, ge=1)
+    llm_max_tokens: int = Field(4096, ge=1)  # D-54: request-level generation cap
+
 
     # --- Storage endpoints -------------------------------------------------
     postgres_dsn: str = "postgresql://agent:agent@localhost:5432/agent"
@@ -285,57 +261,33 @@ class Settings(BaseSettings):
     # RRF_SQUASH scaling in tools/corpus_search.py — NOT independently
     # calibrated against every corpus. Tune against your own data.
     min_evidence_score: float = Field(0.5, ge=0.0)
-    # P2-01, the other half of the same fix: a floor applied at RETRIEVAL
-    # time (retrieval/hybrid.py), before a hit ever becomes Evidence at
-    # all — as opposed to min_evidence_score above, which filters AFTER
-    # retrieval, at the coverage-checking step. Without this, a dense
-    # index still always returns its k nearest neighbours no matter how
-    # irrelevant, and min_evidence_score alone was the only gate; this
-    # adds a second, earlier one so an out-of-domain query can actually
-    # produce zero evidence rather than three confident wrong answers.
+    # M-3: a separate, lower floor for what may enter long-term memory
+    # (memory/semantic_memory.py::store_run), decoupled from
+    # min_evidence_score above. Single-leg RRF fusion caps a score at
+    # exactly SINGLE_LEG_SCORE_CEILING (0.5, guardrails/retrieval.py), so
+    # gating memory writes at the SAME floor as coverage made every
+    # single-leg hit ineligible for memory. Tune alongside
+    # min_evidence_score if you change either.
+    memory_write_min_score: float = Field(0.4, ge=0.0)
+    # The other half of the same fix: a floor at RETRIEVAL time
+    # (retrieval/hybrid.py), before a hit ever becomes Evidence — without
+    # it a dense index still returns its k nearest neighbours regardless
+    # of relevance, and min_evidence_score alone was the only gate.
     min_similarity: float = Field(0.35, ge=0.0, le=1.0)
-    # Guardrail G1: fraction of dense-leg candidates dropped by
-    # min_similarity, per run, above which telemetry_node logs a WARNING
-    # (retrieval.floor_starvation). Purely observational -- does not
-    # change routing or filtering -- catches a miscalibrated floor
-    # silently zeroing the dense leg for a whole run (see run
-    # p205.131-check: floor=0.55 dropped every single dense hit and
-    # nothing surfaced it outside the raw debug log).
-    retrieval_floor_warn_ratio: float = Field(0.8, ge=0.0, le=1.0)
-    # Guardrail G4 (P205 Phase 2): fraction of quality-judge calls
-    # (evaluation/quality.py::score_answer, invoked from
-    # llm/router.py::FallbackRouter._score_quality) that FAILED to
-    # score at all -- judge unreachable, bad JSON, non-numeric score --
-    # per run, above which telemetry_node logs a WARNING
-    # (quality.judge_unreliable). Purely observational, same shape as
-    # retrieval_floor_warn_ratio just above: score_answer's fail-open
-    # design is correct (a broken judge must never reject a good
-    # answer) and this does not change that -- it only makes a run
-    # where the judge NEVER actually judged anything (every live run
-    # this session showed llm_quality_calls_failed == llm_quality_calls)
-    # visible instead of looking identical to a run where every answer
-    # genuinely scored well.
-    quality_judge_warn_ratio: float = Field(0.5, ge=0.0, le=1.0)
+    retrieval_floor_warn_ratio: float = Field(0.8, ge=0.0, le=1.0)  # D-48
+    quality_judge_warn_ratio: float = Field(0.5, ge=0.0, le=1.0)  # D-53
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound
     # Guardrail G2: the OTHER half of convergence, alongside recall_target.
-    # recall_target alone answers "is every goal covered by SOMETHING";
-    # this answers "how much of that coverage is a real document, not the
-    # model's own recollection". route_convergence only accepts recall
-    # reaching target as full convergence when grounded_score also clears
-    # this floor; otherwise it spends remaining depth budget trying for
-    # better grounding first. Live evidence for why this floor exists:
-    # run p205.131-check reached recall=1.0 with corpus_recall=0.0 (every
-    # goal covered by MCP/model, zero by the ingested corpus) and shipped
-    # a report the critic then rejected twice on fabricated figures --
-    # two full compile+critique cycles spent on a failure this check
-    # would have caught BEFORE compiling even started. 0.5 is a starting
-    # point (at least half of covered goals should have a real document
-    # backing them) -- tune against your own corpus like min_evidence_score.
+    # recall_target answers "is every goal covered by SOMETHING"; this
+    # answers "how much of that coverage is a real document, not the
+    # model's own recollection" — route_convergence only accepts full
+    # convergence when both clear their floor (D-47). 0.5 is a starting
+    # point; tune against your own corpus like min_evidence_score.
     grounded_recall_target: float = Field(0.5, ge=0.0, le=1.0)
-    # D-38: the retrieval escalation ladder. model_knowledge_enabled is ON
-    # by default -- a missing corpus document is a retrieval limitation,
-    # not an absence of knowledge, and reporting the former as the latter
-    # was this system's single worst failure mode. Set false to restore
+    # D-38: the retrieval escalation ladder's terminal tier. On by default
+    # — a missing corpus document is a retrieval limitation, not an
+    # absence of knowledge, and reporting the former as the latter was
+    # this system's single worst failure mode. False restores
     # corpus-only behaviour.
     model_knowledge_enabled: bool = True
     # Must exceed min_evidence_score or model evidence can never mark a
@@ -348,58 +300,33 @@ class Settings(BaseSettings):
     # degradation posture: shipping inert, enabled deliberately.
     hitl_enabled: bool = False
     # CURRENTLY UNREAD -- kept, not deleted, and labelled rather than left
-    # looking live. Text-searching this field name across the repo returns
-    # this line and nothing else: no node, tool or producer consults it.
-    # It arrived as the surviving fragment of a partially-applied P205
-    # patch whose other fields never landed (the comment block that used to
-    # sit here described a web-search tier that did not exist in code --
-    # that block is now replaced by the real settings under "Phase 4: web
-    # search" below). The INTENT was: how many times one query formulation
-    # may be retried across later gather cycles once every tier came back
-    # empty, with D-16's depth gate still applying on top; 0 reproduces the
-    # current one-shot-per-formulation behaviour, which is what the code
-    # actually does today regardless of this value. Either wire it or drop
-    # it -- but not silently, and not as part of Phase 4.
+    # looking live. No node, tool or producer consults it; text-searching
+    # this field name across the repo returns only this line. The INTENT
+    # was: how many times one query formulation may be retried across
+    # later gather cycles once every tier came back empty, with D-16's
+    # depth gate still applying on top. Either wire it or drop it -- but
+    # not silently.
     max_task_retries: int = Field(2, ge=0)
     # D-23 (bound): the maximum number of times ONE run may pause for a
     # human. Without this, HITL removes the loop bounds it is layered on
-    # top of: route_convergence and dispatch_tasks both test
-    # escalation_trigger BEFORE the "depth budget spent -> compiler" and
-    # "empty backlog -> compiler" exits, so a re-raised E2/E3 re-enters
-    # human_escalation instead of terminating. Every redirect then returns
-    # to the same check, whose condition is still true, and re-raises the
-    # identical trigger with the identical payload -- an unbounded
-    # human-nagging loop that ends only at recursion_limit (exit code 2,
-    # no report, no debug trace). Once this budget is spent, the raising
-    # nodes take their existing HITL-OFF branch instead: log loudly and
-    # fall through to the compiler, which produces an honest, grounded
-    # report from whatever WAS retrieved. 0 disables pausing entirely
-    # without needing to also flip hitl_enabled.
+    # top of -- route_convergence and dispatch_tasks both test
+    # escalation_trigger before their normal exits, so a re-raised E2/E3
+    # re-enters human_escalation instead of terminating, and an unbounded
+    # human-nagging loop ends only at recursion_limit (exit code 2, no
+    # report). Once this budget is spent, the raising nodes take their
+    # existing HITL-OFF branch instead: log loudly and fall through to
+    # the compiler with whatever WAS retrieved. 0 disables pausing
+    # entirely without needing to also flip hitl_enabled.
     max_escalations: int = Field(2, ge=0)
     recursion_limit: int = Field(60, ge=10)   # D-8: invoke-time backstop
-    # Guardrail G7 (P205 Phase 3, observability half only): a run-level
-    # WARNING when total llm_provider_calls clears this threshold --
-    # same shape as retrieval_floor_warn_ratio/quality_judge_warn_ratio
-    # above, purely observational, no routing change. Deliberately NOT a
-    # circuit breaker: max_depth, max_revisions, and max_escalations
-    # above -- together with recursion_limit as a hard graph-level
-    # backstop -- already bound every run's worst case; a redirect
-    # requires a fresh human decision each time and max_escalations caps
-    # how many total redirects a run can have, so the "unbounded loop"
-    # scenario a circuit breaker would defend against cannot actually
-    # occur under the existing bounds. No run has come close to this
-    # threshold (18 provider calls is the highest observed, across a
-    # run with two escalations and three revision cycles) -- this
-    # exists to make a genuinely runaway run visible, the same
-    # measure-before-enforcing step that preceded G4's threshold.
-    run_call_budget_warn: int = Field(40, ge=1)
+    run_call_budget_warn: int = Field(40, ge=1)  # D-54: observational only
     # D-18/P2-12: LLM-based contradiction detection in merger_node. Off by
-    # default — costs one extra LLM call per merger execution (i.e. once
-    # per gather cycle, up to max_depth times per run) whenever any goal
-    # has 2+ evidence items. When off, merger_node keeps the ORIGINAL
-    # marker-only behaviour (honours an explicit Evidence.contradicts, which
-    # no tool in this build sets — see agents/gathering.py). Turning this
-    # on is what makes E2 reachable in a real run for the first time.
+    # default — costs one extra LLM call per merger execution (up to
+    # max_depth times per run) whenever any goal has 2+ evidence items.
+    # When off, merger_node keeps the ORIGINAL marker-only behaviour
+    # (honours an explicit Evidence.contradicts, which no tool in this
+    # build sets). Turning this on is what makes E2 reachable in a real
+    # run for the first time.
     contradiction_detection_enabled: bool = False
 
     # --- Memory decay (D-24/D-27) -------------------------------------------

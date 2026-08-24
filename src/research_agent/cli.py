@@ -55,7 +55,8 @@ from research_agent import langfuse as lf
 # startup path from a module named "cli". Keeping both names bound
 # here means every existing `from research_agent.cli import ...` call
 # site -- including any outside this repo -- keeps working unchanged.
-from research_agent.assembly import AppBundle, build_app_and_settings
+from research_agent.assembly import (AppBundle, build_app_and_settings,
+                                     reject_if_thread_in_use)
 from research_agent.config import get_settings
 from research_agent.logging_setup import run_id_var
 from research_agent.state import ResearchState
@@ -295,22 +296,13 @@ def _run(app, settings, args, thread_id, tracer) -> int:
     # shutdown()'s end-open-roots loop is the backstop for whatever
     # this doesn't catch.
     try:
-        # D-20 guard: a thread_id IDENTIFIES one run. Starting a FRESH
-        # query on a thread that already holds state does not replace that
-        # state -- `evidence` is Annotated[..., operator.add] and `counters`
-        # merges, so both ACCUMULATE, while reducerless fields like
-        # iteration_depth reset to 0. Found live (run p205.70-check, second
-        # invocation): search_calls 18 = 12 + 6, memory_writes 31 = 15 + 16,
-        # revision_cycles 3 = 1 + 2, and the previous run's E3 escalation
-        # still in telemetry. Worse, the previous run's evidence was still
-        # marking goals covered, so a run that retrieved ONE item reported
-        # recall 1.0 at depth 1. Refuse rather than silently blend two runs.
-        snapshot = app.get_state(config)
-        prior = getattr(snapshot, "values", None) or {}
-        if prior.get("raw_query"):
+        # D-20 guard (M-2: shared with api/server.py via
+        # assembly.reject_if_thread_in_use — see its docstring for why).
+        prior_query = reject_if_thread_in_use(app, config)
+        if prior_query:
             print(
                 f"[thread-id '{thread_id}' already holds a run for "
-                f"\"{prior['raw_query']}\". Re-invoking it with a new query "
+                f"\"{prior_query}\". Re-invoking it with a new query "
                 f"ACCUMULATES the old run's evidence and counters instead of "
                 f"replacing them (D-20). Use a fresh --thread-id, or omit the "
                 f"flag to get a generated one.]",
