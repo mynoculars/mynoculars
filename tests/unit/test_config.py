@@ -193,3 +193,28 @@ def test_a_repo_relative_venv_interpreter_resolves(tmp_path, monkeypatch):
                 == str(REPO_ROOT / ".venv-test-marker"))
     finally:
         fake_venv.rmdir()
+
+
+# ---------------------------------------------------------------------------
+# S-11 -- configure_logging() runs before the warn_on_* config checks
+# ---------------------------------------------------------------------------
+
+
+def test_get_settings_configures_logging_before_returning(monkeypatch):
+    """S-11: configure_logging() must run inside get_settings(), after
+    Settings() is built and before it returns -- so the three warn_on_*
+    checks (which fire at WARNING) log against an already-configured root
+    logger instead of risking that message being lost."""
+    import research_agent.config as config_module
+
+    calls = []
+    monkeypatch.setattr(config_module, "configure_logging",
+                        lambda level: calls.append(level))
+    config_module.get_settings.cache_clear()
+    try:
+        settings = config_module.get_settings()
+        assert calls == [settings.log_level], (
+            "configure_logging must be called exactly once, with the "
+            "constructed settings' own log_level")
+    finally:
+        config_module.get_settings.cache_clear()

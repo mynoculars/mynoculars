@@ -8,11 +8,13 @@ shown.
 
 > ## Latest version notes — read these five, then start
 >
-> 1. **`.env.example` ships `MIN_SIMILARITY=0.35`, which filters nothing on
->    this corpus.** Set it to `0.60` before your first L2 query — Step 2e
->    below makes this a required step, and *Calibrate the Retrieval Floor*
->    explains how to measure it for your own corpus. Skip it and your first
->    run will report `recall: 1.0` on a question the corpus cannot answer.
+> 1. **`.env.example` ships `MIN_SIMILARITY=0.60`, already calibrated for
+>    this repo's own sample corpus** (see *Calibrate the Retrieval Floor*
+>    below for how that number was measured, and how to re-measure it for
+>    your own corpus if you replace the sample data). Nothing to change
+>    here on a fresh clone — this note exists because earlier revisions of
+>    this repo shipped `0.35`, which filtered nothing and let `recall:
+>    1.0` be reported on a question the corpus could not actually answer.
 > 2. **Use a fresh `--thread-id` per QUESTION.** Re-running the same question
 >    on one id is safe and useful; reusing that id for a *different* question
 >    silently merges the old run's evidence into the new one.
@@ -820,31 +822,29 @@ time). If either line says `SKIPPED (unreachable)`, that engine isn't running or
 `.env` points at the wrong place — fix that before continuing. You can run one
 engine only; retrieval will use whichever leg is up.
 
-### Step 2e — REQUIRED: raise the retrieval floor before you trust a result
+### Step 2e — Understand the retrieval floor before you trust a result
 
-> ⚠ **Do this now, before your first L2 query. It is not optional and it is
-> not tuning-for-later.**
->
-> `.env.example` ships `MIN_SIMILARITY=0.35`. **That value filters nothing on
-> this repo's own sample corpus** — measured cosine similarity for deliberate
-> nonsense queries clusters at 0.40–0.53, i.e. *above* the shipped floor. Left
-> at 0.35 the dense leg admits pure noise, and your very first run will report
-> `recall: 1.0` on a query the corpus cannot answer.
+> ℹ **`.env.example` already ships the calibrated value below.** Earlier
+> revisions of this repo shipped `MIN_SIMILARITY=0.35`, which filtered
+> nothing on this repo's own sample corpus and let a run report `recall:
+> 1.0` on a query the corpus could not actually answer. Nothing to change
+> on a fresh clone — this section explains WHY the shipped value is what
+> it is, so you know how to re-measure it if you swap in your own corpus.
 >
 > ```ini
-> # in .env
+> # .env.example / your .env
 > MIN_SIMILARITY=0.60
 > ```
 >
-> 0.60 is the calibrated starting point for THIS corpus, not a universal
-> constant. **Calibrate the Retrieval Floor** later in this document is the
-> full procedure and explains how to measure it for your own corpus — but do
-> not run L2 on 0.35 and form an opinion about the system's recall first.
+> Measured cosine similarity for deliberate nonsense queries against this
+> repo's sample corpus clusters at 0.40–0.53 with this embedding model —
+> above where `0.35` would filter. Left at `0.35` the dense leg would
+> admit pure noise.
 >
-> Why does the repo ship a value it documents as wrong? Because the right
-> value is corpus-dependent and nobody can pick it for you; 0.35 is a
-> deliberately inert default that changes no behaviour. That is defensible as
-> a library default and indefensible as an operating value — hence this box.
+> 0.60 is the calibrated starting point for THIS corpus, not a universal
+> constant. **Calibrate the Retrieval Floor** later in this document is
+> the full procedure and explains how to measure it for your own corpus
+> if you replace the sample data.
 
 ### Step 2f — Run the SAME query, now with data
 
@@ -889,11 +889,13 @@ agent now remembers the first run.
 ## Step 3 — Calibrate the retrieval floor (required before trusting any result)
 
 *Formerly "Fine-Tuning the System". Renamed because the old name undersold
-it: this is not optional polish. `.env.example`'s shipped
-`MIN_SIMILARITY=0.35` admits pure noise on this corpus, so until you have
-worked through this section your `recall` numbers do not mean what they
-appear to mean. Step 2e is the one-line version; this is the measurement
-procedure behind it.*
+it: this is not optional polish. `.env.example` now ships this repo's own
+calibrated `MIN_SIMILARITY=0.60` out of the box (an earlier revision
+shipped `0.35`, which admitted pure noise on this corpus), but that value
+is specific to the SAMPLE corpus — if you replace it with your own data,
+your `recall` numbers do not mean what they appear to mean until you
+re-run this measurement. Step 2e is the one-line version; this is the
+measurement procedure behind it.*
 
 Everything above gets the agent *running*. This section is about making it
 *correct* for your corpus — which is a different problem, and one the rest
@@ -1045,7 +1047,7 @@ discipline. Every value below lives in `.env`.
 
 | Setting | Default | Raise it when | Lower it when | Watch |
 |---|---|---|---|---|
-| `MIN_SIMILARITY` | `0.35` (too low — measure it) | off-topic queries still return evidence | genuinely on-topic goals come back uncovered | `retrieval.below_floor`, `dense` counts |
+| `MIN_SIMILARITY` | `0.60` (calibrated for the sample corpus — re-measure if you replace it) | off-topic queries still return evidence | genuinely on-topic goals come back uncovered | `retrieval.below_floor`, `dense` counts |
 | `MIN_EVIDENCE_SCORE` | `0.5` | rarely — it is pinned to the RRF single-leg ceiling | never below 0.5 without reading the RRF table above | `recall` when one leg is down |
 | `RECALL_TARGET` | `0.85` | you want the loop to work harder before compiling | runs escalate too eagerly | `iterations`, `escalations` |
 | `MAX_DEPTH` | `3` | gap-filling is converging but running out of cycles | runs are slow and later cycles add nothing | `iterations` vs `evidence_items` |
@@ -2470,8 +2472,12 @@ $env:HITL = "true"             # silently does NOTHING — common typo
 
 ### `recall: 1.0` on a query the corpus should not be able to answer
 
-Your retrieval floor is too low — `MIN_SIMILARITY=0.35` (the shipped default)
-admits noise on this corpus. This is not a troubleshooting-time fix; it is a
+Check your `MIN_SIMILARITY` — this symptom means it is set too low for
+your corpus and is admitting noise. The shipped `.env.example` default
+(`0.60`) is already calibrated for this repo's own sample corpus; if
+you're seeing this with an unmodified `.env.example`, confirm your `.env`
+isn't overriding it back down (an old copy from before this repo shipped
+`0.35`, for instance). This is not a troubleshooting-time fix; it is a
 setup-time one. See
 **[Step 3 — Calibrate the retrieval floor](#step-3-calibrate-the-retrieval-floor-required-before-trusting-any-result)**
 for the full measurement procedure, and

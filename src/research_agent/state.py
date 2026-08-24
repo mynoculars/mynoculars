@@ -365,6 +365,14 @@ class ResearchState(BaseModel):
     # with zero goals — same edge case recall_score already handles —
     # never looks falsely ungrounded.
     grounded_score: float = 1.0
+    # S-8: grounded_score AS READ when this cycle's progress_checker_node
+    # call started -- i.e. the PREVIOUS cycle's grounded_score, not the
+    # value being written this same cycle. -1.0 (outside grounded_score's
+    # real [0,1] range) means "no previous cycle yet" -- route_convergence
+    # uses this to give grounding exactly one gap_generator attempt before
+    # comparing, rather than declaring a stall on the very first
+    # below-target measurement.
+    grounded_score_prev: float = -1.0
 
     # Human-in-the-loop escalation (D-23/D-28)
     escalation_trigger: Optional[str] = None      # E1/E2/E3/E4; set by the

@@ -305,6 +305,9 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
                               AND (not contested)
                 state.recall_score = covered_goals / total_goals
                                      (1.0 if there are no goals at all)
+                state.grounded_score_prev = grounded_score AS READ this
+                    call (i.e. last cycle's value) -- S-8, so
+                    route_convergence can detect a stall between cycles.
                 state.iteration_depth += 1   <- the ONLY place this ticks,
                                                 exactly once per cycle
                 IF terminally short (hitl_enabled AND depth>=max_depth AND
@@ -399,7 +402,12 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
                 sum(g.covered for g in goals) / len(goals) if goals else 1.0)
         lf.score(run_id_var.get(), "grounded", grounded, comment=f"depth={depth}")
         update = {"goals": goals, "recall_score": recall,
-                  "grounded_score": grounded, "iteration_depth": depth}
+                  "grounded_score": grounded, "iteration_depth": depth,
+                  # S-8: the value grounded_score HELD before this cycle's
+                  # write, above -- i.e. last cycle's measurement. route_
+                  # convergence compares the new value against this one to
+                  # detect a stall (see that function's own comment).
+                  "grounded_score_prev": state.grounded_score}
         # D-23: at terminal non-convergence the CHECK raises the trigger
         # (E2 if a contradiction blocks a goal, else E3). Routing reads it.
         # P2-09: the non-convergence CONDITION is evaluated regardless of

@@ -39,6 +39,7 @@ from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
+from research_agent.reporting.metrics import count_sections
 from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import ResearchState
 
@@ -158,7 +159,10 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # already-computable facts about the report this node just
         # produced; logging_setup.py::NarrativeFormatter renders this as
         # this span's DECISION line (see _decision_text).
-        sections = len(re.findall(r"(?m)^#{1,6} ", report))
+        # S-10: shared with cli.py's RESULT block via reporting/metrics.py
+        # -- previously two different regexes (this one counted level-1
+        # headings too) reported two different counts for the same report.
+        sections = count_sections(report)
         evidence_cited = len(cited_goal_ids(report))
         log_event(logger, "node.compiled", sections=sections,
                   evidence_cited=evidence_cited, output_chars=len(report),

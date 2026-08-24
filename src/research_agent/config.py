@@ -64,7 +64,7 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from research_agent.logging_setup import log_event
+from research_agent.logging_setup import configure_logging, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -625,9 +625,9 @@ def warn_on_likely_env_typos() -> None:
     typo pattern (P2-09).
 
     CALLED BY   get_settings(), below, once per process (immediately after
-                Settings() is constructed) — this never blocks startup,
-                it only makes a previously-silent misconfiguration visible
-                in the log the first time it happens.
+                Settings() is constructed and configure_logging() has run,
+                S-11 — so this and the other two warn_on_* checks log
+                against an already-configured root logger).
     READS       os.environ directly — the one exception to config.py's own
                 rule that this is the only place the process environment
                 is read (see the module docstring); Settings itself never
@@ -725,9 +725,20 @@ def get_settings() -> Settings:
                 and only place Settings() gets constructed.
     RETURNS     the same Settings instance on every call within one process
                 (see the @lru_cache explanation in the module docstring).
+
+    S-11: configure_logging() runs HERE, immediately after Settings() is
+    built and before any of the three warn_on_* checks below, rather than
+    later in assembly.py (its previous call site). Those checks fire at
+    WARNING and exist specifically to surface misconfiguration a person
+    needs to see — logging them against an unconfigured root logger (no
+    handler attached yet, format unset) risked exactly that message being
+    the one that got lost. assembly.py's own configure_logging call is
+    now redundant (get_settings() always runs first, every real entry
+    point calls it before assembly) and has been removed.
     """
-    warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     settings = Settings()
+    configure_logging(settings.log_level)
+    warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     warn_on_inert_coverage_gate(settings)
     warn_on_web_search_band(settings)
     return settings

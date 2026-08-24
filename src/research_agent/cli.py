@@ -59,9 +59,28 @@ from research_agent.assembly import (AppBundle, build_app_and_settings,
                                      reject_if_thread_in_use)
 from research_agent.config import get_settings
 from research_agent.logging_setup import run_id_var
+from research_agent.reporting.metrics import count_sections
 from research_agent.state import ResearchState
 from research_agent.tracing import NullTracer, Tracer
 from research_agent.storage.postgres import close_checkpointer, record_run
+
+
+def _fmt_hitl_wall_time_line(hitl_triggered: bool, elapsed_s: float) -> str:
+    """One line reporting whether HITL fired and the total wall-clock
+    time from the first invoke() to the run actually finishing.
+
+    Pure and side-effect-free (matches _fmt_result_summary's own shape
+    just below) so it is directly unit-testable without running main()'s
+    interactive loop.
+
+    elapsed_s deliberately INCLUDES any time spent blocked on a human at
+    the "action [approve/redirect/abort]:" prompt -- the person asked how
+    long THEY waited for an answer, and a human review pause is part of
+    that, not separate from it.
+    """
+    minutes, seconds = divmod(elapsed_s, 60)
+    status = "HITL triggered" if hitl_triggered else "HITL Not triggered"
+    return f"{status} | Total wall time: {int(minutes)}min {seconds:.2f}secs"
 
 
 def _fmt_result_summary(telemetry: dict, report: str) -> str:
@@ -117,11 +136,15 @@ def _fmt_result_summary(telemetry: dict, report: str) -> str:
     src_line = " / ".join(f"{k} {v}" for k, v in by_source.items()) or "none"
 
     # Report shape is measured here rather than pulled from telemetry
-    # because telemetry does not carry it: the count of markdown "## "
-    # headings and the character length are the two figures that made
+    # because telemetry does not carry it: the count of Markdown
+    # sections and the character length are the two figures that made
     # p205.211's failure obvious on sight (3 sections / 2,737 chars, then
-    # 0 sections / 652 chars on the revision).
-    sections = sum(1 for ln in report.splitlines() if ln.startswith("## "))
+    # 0 sections / 652 chars on the revision). S-10: shared with
+    # compiler_node's "node.compiled" log line via reporting/metrics.py
+    # -- previously two different regexes (this one only matched exactly
+    # "## ", compiler_node's matched "#" through "######") reported two
+    # different counts for the same report.
+    sections = count_sections(report)
 
     lines = [
         "",
@@ -308,6 +331,15 @@ def _run(app, settings, args, thread_id, tracer) -> int:
                 f"flag to get a generated one.]",
                 file=sys.stderr)
             return 3
+        # Wall-clock timer for the "HITL triggered | Total wall time: ..."
+        # line printed once the run finishes, below. time.monotonic(), not
+        # time.time(): a wall-clock elapsed measurement must never go
+        # backwards or jump if the system clock is adjusted mid-run (NTP
+        # sync, DST) -- the same reasoning pause_started below already
+        # uses time.time() for, since THAT measurement is reported on its
+        # own (human review latency), not accumulated into a total.
+        run_started = time.monotonic()
+        hitl_triggered = False
         result = app.invoke(ResearchState(raw_query=args.query), config=config)
 
         # HITL loop (D-23): an interrupted run surfaces "__interrupt__" instead
@@ -322,6 +354,7 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         # finally returns a result WITHOUT that key — i.e. the run has actually
         # finished.
         while "__interrupt__" in result:
+            hitl_triggered = True
             # result["__interrupt__"] is a list (LangGraph supports multiple
             # simultaneous interrupts in more advanced graphs, though this
             # project's graph only ever produces one at a time); [0] takes the
@@ -395,6 +428,15 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         print("\n=== FINAL REPORT ===")
         print(report)
         print(_fmt_result_summary(telemetry, report))
+        # Total wall-clock time from the first app.invoke() call to the
+        # run actually finishing; hitl_triggered reports whether the run
+        # paused for a human at all -- a fast HITL run (instant approve)
+        # and a slow non-HITL run (a genuinely long gather loop) are both
+        # real, distinct facts this line surfaces. See
+        # _fmt_hitl_wall_time_line's own docstring for why elapsed_s
+        # includes time spent blocked on the human.
+        elapsed_s = time.monotonic() - run_started
+        print(_fmt_hitl_wall_time_line(hitl_triggered, elapsed_s))
         print("\n--- telemetry (full) ---")
         print(json.dumps(telemetry, indent=2))
         record_run(settings.postgres_dsn, thread_id, args.query,

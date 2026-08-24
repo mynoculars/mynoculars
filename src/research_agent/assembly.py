@@ -38,7 +38,7 @@ from research_agent.config import (
     split_csv,
 )
 from research_agent.llm.router import FallbackRouter
-from research_agent.logging_setup import configure_logging, log_event
+from research_agent.logging_setup import log_event
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.orchestration.graph import build_graph
 from research_agent.retrieval.hybrid import HybridRetriever
@@ -131,7 +131,12 @@ def build_app_and_settings(tracer=None):
         caller).
     """
     settings = get_settings()
-    configure_logging(settings.log_level)
+    # S-11: configure_logging() used to run here — moved into
+    # get_settings() itself so the three warn_on_* config checks log
+    # against an already-configured root logger instead of risking their
+    # WARNING being lost before any handler existed. get_settings() always
+    # runs first (every entry point calls it before build_app_and_settings),
+    # so a second call here would only be a redundant, idempotent no-op.
     # Phase 3: build the process-wide Langfuse Observer here, alongside
     # everything else this function wires up. LANGFUSE_ENABLED=false (the
     # default) makes this a zero-cost no-op -- see langfuse/client.py's

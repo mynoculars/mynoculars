@@ -207,15 +207,14 @@ def route_convergence(state: ResearchState, settings: Settings
     cycle. This is the fork that decides whether the loop continues.
 
     READS   state.escalation_trigger, state.recall_score,
-            state.grounded_score, state.iteration_depth,
-            settings.recall_target, settings.grounded_recall_target,
-            settings.max_depth.
+            state.grounded_score, state.grounded_score_prev,
+            state.iteration_depth, settings.recall_target,
+            settings.grounded_recall_target, settings.max_depth.
     RETURNS "human_escalation" if progress_checker just raised E2/E3;
             otherwise "compiler" if recall has reached target AND that
-            coverage is adequately grounded (Guardrail G2) OR the depth
-            budget is spent (either way, there's nothing more useful to
-            gain by looping again); otherwise "gap_generator" — go round
-            again.
+            coverage is adequately grounded (Guardrail G2), OR grounding
+            has stalled across a cycle (S-8, below), OR the depth budget
+            is spent; otherwise "gap_generator" — go round again.
 
     D-14 point 1: recall/depth only — NEVER the backlog, which is stale
     here (it still holds the just-dispatched tasks). The backlog is judged
@@ -237,11 +236,36 @@ def route_convergence(state: ResearchState, settings: Settings
     grounding — there is no budget left to spend chasing it further, and
     an ungrounded-but-complete draft is still better data for the critic
     (and, if it fails, for a human at E4) than no draft at all.
+
+    S-8 (grounding-stall exit): the branch above sends the run back to
+    gap_generator for ANOTHER cycle every time grounding is short — but
+    against an off-topic corpus (armies query, Redis corpus is the
+    live-evidenced case) grounded_score cannot move no matter how many
+    times gap_generator is asked, and nothing previously noticed. Live
+    trace: `grounded 0.00` at depth 1, still `0.00` at depth 2, still
+    `0.00` at depth 3 — three consecutive laps, 6 extra LLM calls, 57 web
+    fetches, 223.7s spent arriving exactly where the run already was at
+    depth 1. Grounding gets exactly ONE gap_generator attempt (the branch
+    above, unchanged) before this stall check applies: if grounded_score
+    did NOT increase between the previous cycle and this one (and there
+    WAS a previous cycle — grounded_score_prev's -1.0 sentinel excludes
+    the very first below-target measurement, which deserves its one
+    attempt), route to compiler instead of spending remaining depth
+    budget on a condition already shown not to move.
     """
     if state.escalation_trigger in ("E2", "E3"):
         to_node, reason = "human_escalation", f"{state.escalation_trigger} raised by progress_checker"
     elif state.iteration_depth >= settings.max_depth:
         to_node, reason = "compiler", f"depth {state.iteration_depth}/{settings.max_depth} budget spent, recall {state.recall_score:.2f} (grounded {state.grounded_score:.2f})"
+    elif (state.recall_score >= settings.recall_target
+          and state.grounded_score < settings.grounded_recall_target
+          and state.grounded_score_prev >= 0.0
+          and state.grounded_score <= state.grounded_score_prev):
+        to_node, reason = "compiler", f"grounding stalled: {state.grounded_score:.2f} did not improve on {state.grounded_score_prev:.2f}, stopping rather than spending remaining depth {state.iteration_depth}/{settings.max_depth} chasing it"
+        log_event(logger, "convergence.grounding_stalled", level=logging.WARNING,
+                  grounded=round(state.grounded_score, 3),
+                  grounded_prev=round(state.grounded_score_prev, 3),
+                  depth=state.iteration_depth, max_depth=settings.max_depth)
     elif state.recall_score >= settings.recall_target and state.grounded_score < settings.grounded_recall_target:
         to_node, reason = "gap_generator", f"recall {state.recall_score:.2f} reached target but grounded {state.grounded_score:.2f} below {settings.grounded_recall_target:.2f}, depth {state.iteration_depth}/{settings.max_depth} remains"
     elif state.recall_score >= settings.recall_target:

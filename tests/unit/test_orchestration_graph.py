@@ -113,6 +113,41 @@ def test_convergence_g2_compiles_when_recall_and_grounding_both_met():
     assert route_convergence(state, _S) == "compiler"
 
 
+def test_convergence_grounding_gets_exactly_one_gap_generator_attempt():
+    """S-8: the very first below-target grounded_score measurement
+    (grounded_score_prev's -1.0 sentinel, meaning no prior cycle yet)
+    must still route to gap_generator -- the stall check only applies
+    from the SECOND measurement onward."""
+    state = _state(recall_score=1.0, grounded_score=0.0,
+                   grounded_score_prev=-1.0, iteration_depth=0)
+    assert route_convergence(state, _S) == "gap_generator"
+
+
+def test_convergence_stalled_grounding_compiles_instead_of_looping_again(caplog):
+    """S-8: live trace (run p205.131-check) showed grounded_score stuck at
+    0.00 for THREE consecutive cycles against an off-topic corpus -- once
+    a cycle shows no improvement over the previous one, stop spending
+    depth budget on it rather than trying again."""
+    import logging
+    state = _state(recall_score=1.0, grounded_score=0.0,
+                   grounded_score_prev=0.0, iteration_depth=1)
+    with caplog.at_level(logging.WARNING):
+        result = route_convergence(state, _S)
+    assert result == "compiler"
+    stalled = [r for r in caplog.records
+              if "convergence.grounding_stalled" in r.message]
+    assert stalled, "expected a WARNING when grounding stalls"
+
+
+def test_convergence_does_not_call_it_stalled_when_grounding_improved():
+    """A cycle that DID improve grounded_score, even if still below
+    target, must keep looping -- only a flat or regressed score counts
+    as stalled."""
+    state = _state(recall_score=1.0, grounded_score=0.3,
+                   grounded_score_prev=0.1, iteration_depth=1)
+    assert route_convergence(state, _S) == "gap_generator"
+
+
 # ---------------------------------------------------------------------------
 # route_after_critique (D-22)
 # ---------------------------------------------------------------------------
