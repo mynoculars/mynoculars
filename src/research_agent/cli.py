@@ -63,6 +63,85 @@ from research_agent.tracing import NullTracer, Tracer
 from research_agent.storage.postgres import close_checkpointer, record_run
 
 
+def _fmt_result_summary(telemetry: dict, report: str) -> str:
+    """Render the human-readable verdict block printed after the report.
+
+    CALLED BY   main(), between the report and the raw telemetry dump.
+
+    WHY THIS EXISTS: the deliverable was the only output this file did not
+    label. `=== HUMAN REVIEW REQUIRED ===` had a banner and
+    `--- telemetry ---` had a marker, but `print(report)` had neither, so
+    after several hundred lines of stderr JSON the report simply began --
+    opening on a markdown `#` heading that reads as more noise in a
+    terminal rather than as the answer.
+
+    Worse, the run's VERDICT was legible only by reading 45 lines of JSON.
+    Runs p205.211 and p205.212 differed by `critique_passed`,
+    `revision_cycles` and a 652-vs-9,603-character report, and none of that
+    was visible at a glance; the difference was only found by diffing two
+    log files. Every number below is one telemetry already computed --
+    D-12's "aggregate, never invent" applies here exactly as it does in the
+    telemetry node, and this function derives nothing new. The raw JSON is
+    still printed in full underneath, unchanged, for anything that parses
+    it.
+
+    `.get` with defaults throughout, never `[]`: an interrupted or degraded
+    run reaches this line with a partial (or empty) telemetry dict, and the
+    whole point of the summary is to stay readable exactly then. A missing
+    key renders as "n/a", never a KeyError -- the same reasoning that made
+    main() read `result.get("telemetry")` in the first place.
+    """
+    def num(key, default="n/a"):
+        v = telemetry.get(key)
+        return default if v is None else v
+
+    passed = telemetry.get("critique_passed")
+    cycles = telemetry.get("revision_cycles", 0)
+    if passed is True:
+        verdict = "PASSED"
+    elif passed is False:
+        verdict = "FAILED"
+    else:
+        verdict = "n/a (run did not reach the critic)"
+    if cycles:
+        verdict += f" after {cycles} revision cycle(s)"
+
+    # "E4 -> approve, E1 -> redirect", or "none". Reads the same list the
+    # JSON shows; the arrow is the only thing added.
+    esc = telemetry.get("escalations") or []
+    esc_line = ", ".join(f"{e.get('trigger', '?')} -> {e.get('action', '?')}"
+                         for e in esc) or "none"
+
+    by_source = telemetry.get("evidence_by_source") or {}
+    src_line = " / ".join(f"{k} {v}" for k, v in by_source.items()) or "none"
+
+    # Report shape is measured here rather than pulled from telemetry
+    # because telemetry does not carry it: the count of markdown "## "
+    # headings and the character length are the two figures that made
+    # p205.211's failure obvious on sight (3 sections / 2,737 chars, then
+    # 0 sections / 652 chars on the revision).
+    sections = sum(1 for ln in report.splitlines() if ln.startswith("## "))
+
+    lines = [
+        "",
+        "=== RESULT ===",
+        f"Critique     : {verdict}",
+        f"Escalations  : {esc_line}",
+        f"Report       : {sections} section(s), {len(report):,} chars",
+        f"Goals        : {num('goals')} ({len(telemetry.get('goals_without_evidence') or [])} without evidence)",
+        f"Evidence     : {num('evidence_items')} item(s) -- {src_line}",
+        f"Recall       : {num('recall')}   grounding_ratio {num('grounding_ratio')}"
+        f"   grounded {num('grounded_score')}   corpus_recall {num('corpus_recall')}",
+        f"Providers    : {num('llm_provider_calls')} call(s), "
+        f"{num('llm_fallback_hops')} fallback hop(s), "
+        f"{num('llm_quality_calls_failed')}/{num('llm_quality_calls')} quality check(s) failed",
+        f"Search       : {num('search_calls')} call(s), {num('search_failures')} failed",
+    ]
+    if telemetry.get("planning_error"):
+        lines.append(f"Planning     : {telemetry['planning_error']}")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     """Run one query end to end; returns process exit code.
 
@@ -317,8 +396,14 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         # turned a degraded run into a bare KeyError traceback.
         telemetry = result.get("telemetry") or {}
         report = result.get("final_report", "(no report was produced)")
+        # The banner matches the "=== ... ===" convention this file already
+        # uses for HUMAN REVIEW REQUIRED above; the report was the only
+        # output printed with no label at all. Leading newline so it
+        # separates cleanly from whatever stderr last wrote to the terminal.
+        print("\n=== FINAL REPORT ===")
         print(report)
-        print("\n--- telemetry ---")
+        print(_fmt_result_summary(telemetry, report))
+        print("\n--- telemetry (full) ---")
         print(json.dumps(telemetry, indent=2))
         record_run(settings.postgres_dsn, thread_id, args.query,
                    telemetry.get("recall", 0.0), telemetry)

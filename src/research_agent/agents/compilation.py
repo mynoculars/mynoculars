@@ -149,7 +149,7 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # cited web evidence, which is every run with WEB_SEARCH_ENABLED
         # false (the default).
         report, source_counters = append_web_sources(
-            report, state.evidence, state.goals)
+            report, state.evidence, state.goals, state.human_guidance)
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,

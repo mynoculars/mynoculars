@@ -96,6 +96,7 @@ def _cited_goal_ids(report: str) -> set:
 def append_web_sources(report: str,
                        evidence: List[Evidence],
                        goals: Optional[List[Goal]] = None,
+                       guidance: str = "",
                        ) -> Tuple[str, Dict[str, float]]:
     """Append a Sources section for cited web evidence. Returns (report, counters).
 
@@ -148,9 +149,50 @@ def append_web_sources(report: str,
     if goals:
         goal_terms = {g.goal_id: _distinctive_terms(g.description)
                       for g in goals}
+        # D-64: the reviewer's redirect guidance counts as on-topic too.
+        # WHY: the gate above tests evidence against the goal descriptions
+        # composed BEFORE the human intervened. A redirect changes what the
+        # run is looking for -- E4's handler routes guidance to
+        # gap_generator precisely so it reaches retrieval (see
+        # agents/escalation.py) -- but the goal text is never rewritten to
+        # match. So web pages fetched BECAUSE A HUMAN ASKED FOR THEM were
+        # judged against goals that predate the request, found to share no
+        # distinctive terms, and silently suppressed. Live shape: goals
+        # about "political systems and governance structures", reviewer
+        # guidance "UN reports of press freedom, democracy index", and the
+        # resulting watchdog URLs dropped to a man -- the report came back
+        # with no Sources section at all and nothing in the prose to
+        # explain why.
+        #
+        # This inverts the right priority. The reviewer's guidance is the
+        # most authoritative statement of relevance anywhere in the run: a
+        # person read the report and said what was missing. Stale goal text
+        # should not outrank it.
+        #
+        # D-59 still holds. Its motivating failure was nine Redis-monitoring
+        # URLs listed under [g1] in an India-vs-US report; those match
+        # neither the goal terms nor any guidance a reviewer of that report
+        # would type, so they are still dropped. The union WIDENS the gate
+        # by exactly one thing -- what the human explicitly asked for --
+        # and by nothing else. With no redirect, `guidance` is "",
+        # _distinctive_terms("") is empty, and the union is byte-identical
+        # to the pre-D-64 behaviour.
+        guidance_terms = _distinctive_terms(guidance)
         on_topic = [e for e in listed
                     if not goal_terms.get(e.goal_id)
-                    or goal_terms[e.goal_id] & _distinctive_terms(e.content)]
+                    or (goal_terms[e.goal_id] | guidance_terms)
+                    & _distinctive_terms(e.content)]
+        if guidance_terms:
+            # Visible when guidance is what saved an item, so a reviewer can
+            # tell "the gate passed it" from "the gate passed it because I
+            # asked for it" without re-running anything.
+            strict = [e for e in listed
+                      if not goal_terms.get(e.goal_id)
+                      or goal_terms[e.goal_id] & _distinctive_terms(e.content)]
+            if len(on_topic) != len(strict):
+                log_event(logger, "sources.kept_by_guidance",
+                          rescued=len(on_topic) - len(strict),
+                          on_goal_terms=len(strict))
         if len(on_topic) != len(listed):
             log_event(logger, "sources.off_topic_dropped",
                       dropped=len(listed) - len(on_topic),
