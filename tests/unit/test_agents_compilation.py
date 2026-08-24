@@ -464,3 +464,164 @@ def test_corpus_recall_does_not_count_a_web_sourced_item():
     assert telemetry["corpus_recall"] == 0.0, (
         'if this fails, check whether "web" was added to _doc_sources in '
         "telemetry_node")
+
+
+# ---------------------------------------------------------------------------
+# D-66 -- the deterministic zero-citation gate
+# ---------------------------------------------------------------------------
+
+
+class _JudgeShouldNotBeCalled:
+    """Fake router whose complete_json raises -- proves the deterministic
+    gate short-circuits BEFORE ever asking the LLM judge to score a report
+    already known to fail."""
+
+    def set_node(self, node):
+        pass
+
+    def complete_json(self, messages, temperature=0.0):
+        raise AssertionError("router.complete_json must not be called "
+                             "when the zero-citation gate already failed "
+                             "the report")
+
+    def drain_counters(self):
+        return {}
+
+
+class _CannedJudge:
+    """Fake router that always returns a canned passing critique -- used
+    to prove the gate is SKIPPED (the judge IS reached) in the cases
+    where D-66 should not apply."""
+
+    def __init__(self):
+        self.called = False
+
+    def set_node(self, node):
+        pass
+
+    def complete_json(self, messages, temperature=0.0):
+        self.called = True
+        return {"passed": True, "score": 0.9, "notes": []}
+
+    def drain_counters(self):
+        return {}
+
+
+def _make_critic_state(final_report="# Report\n\nNo citations here."):
+    return ResearchState(
+        raw_query="Compare Redis and Memcached",
+        goals=[Goal(goal_id="g1", description="Compare Redis throughput")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           score=0.9, content="Redis is single-threaded")],
+        final_report=final_report)
+
+
+def test_zero_citation_gate_fails_the_report_without_calling_the_judge():
+    """D-66: a served report with evidence available but zero [gN]
+    citations must fail deterministically -- never reach the LLM judge,
+    which has nothing to fail an uncited report ON (zero claims means
+    zero unsupported claims)."""
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    node = build_critic_node(_JudgeShouldNotBeCalled(),
+                             Settings(_env_file=None, llm_mode="live"))
+    update = node(_make_critic_state())
+    assert update["critique_passed"] is False
+    assert update["critique_notes"], "must explain why it failed"
+    assert "cites no evidence" in update["critique_notes"][0]
+
+
+def test_zero_citation_gate_is_skipped_in_stub_mode():
+    """StubClient's fixed placeholder report never carries [gN] markers by
+    design -- the gate must not fire in stub mode, or every offline test
+    using the canned stub report would fail critique."""
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    judge = _CannedJudge()
+    node = build_critic_node(judge, Settings(_env_file=None, llm_mode="stub"))
+    node(_make_critic_state())
+    assert judge.called, "stub mode must reach the judge, not the gate"
+
+
+def test_zero_citation_gate_is_skipped_when_nothing_was_ever_retrieved():
+    """A report citing nothing because NOTHING was retrieved is not this
+    failure mode -- gated on state.evidence being non-empty."""
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    judge = _CannedJudge()
+    node = build_critic_node(judge, Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(raw_query="q", goals=[], evidence=[],
+                          final_report="# Report\n\nNothing was found.")
+    node(state)
+    assert judge.called, "no evidence retrieved must still reach the judge"
+
+
+def test_zero_citation_gate_is_skipped_when_citations_are_present():
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    judge = _CannedJudge()
+    node = build_critic_node(judge, Settings(_env_file=None, llm_mode="live"))
+    state = _make_critic_state(final_report="# Report\n\nRedis is fast [g1].")
+    node(state)
+    assert judge.called, "a report that DID cite must still reach the judge"
+
+
+def test_telemetry_warns_when_a_report_ships_with_no_citations(caplog):
+    """D-66 backstop: if a zero-citation report still ships (HITL off,
+    revision budget exhausted), telemetry_node must WARN -- the last line
+    of sight after the critic gate."""
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(
+        raw_query="q", goals=[Goal(goal_id="g1", description="d")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           score=0.9, content="x")],
+        final_report="# Report\n\nNo citations here.")
+    with caplog.at_level(_logging.WARNING):
+        node(state)
+    warned = [r for r in caplog.records
+             if "report.shipped_with_no_citations" in r.message]
+    assert warned, "expected a WARNING when the shipped report cites nothing"
+
+
+def test_telemetry_does_not_warn_in_stub_mode(caplog):
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="stub"))
+    state = ResearchState(
+        raw_query="q", goals=[Goal(goal_id="g1", description="d")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           score=0.9, content="x")],
+        final_report="# Report (stub mode)\n\nNo citations here.")
+    with caplog.at_level(_logging.WARNING):
+        node(state)
+    warned = [r for r in caplog.records
+             if "report.shipped_with_no_citations" in r.message]
+    assert not warned, "stub mode must never trigger this warning"
+
+
+def test_telemetry_does_not_warn_when_the_report_cites_something(caplog):
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(
+        raw_query="q", goals=[Goal(goal_id="g1", description="d")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           score=0.9, content="x")],
+        final_report="# Report\n\nSupported by evidence [g1].")
+    with caplog.at_level(_logging.WARNING):
+        node(state)
+    warned = [r for r in caplog.records
+             if "report.shipped_with_no_citations" in r.message]
+    assert not warned

@@ -88,8 +88,15 @@ def count_listed_sources(report: str) -> int:
     return len(_SOURCE_ENTRY_RE.findall(block))
 
 
-def _cited_goal_ids(report: str) -> set:
-    """Which goals the prose actually cites, as goal_id strings ("g3")."""
+def cited_goal_ids(report: str) -> set:
+    """Which goals the prose actually cites, as goal_id strings ("g3").
+
+    D-66: made public (was `_cited_goal_ids`) so agents/compilation.py's
+    compiler_node (the evidence_cited count) and critic_node (the
+    zero-citation gate) share this exact definition of "cited" with the
+    Sources attribution logic below, rather than each maintaining its own
+    `\\[g(\\d+)\\]` regex that could quietly drift apart from this one.
+    """
     return {f"g{m.group(1)}" for m in _CITATION_RE.finditer(report)}
 
 
@@ -129,7 +136,7 @@ def append_web_sources(report: str,
     if not web_items:
         return report, counters
 
-    cited = _cited_goal_ids(report)
+    cited = cited_goal_ids(report)
     listed = [e for e in web_items if e.goal_id in cited]
     # D-59: cited-goal membership alone is NOT a claim of support. A
     # drifted gather cycle can retrieve web results about an entirely

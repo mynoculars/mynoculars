@@ -32,6 +32,7 @@ from research_agent.guardrails.dedup import dedupe_evidence
 from research_agent.guardrails.hedging import enforce_hedging
 from research_agent.guardrails.retrieval import has_grounded_evidence
 from research_agent.guardrails.sources import (append_web_sources,
+                                                cited_goal_ids,
                                                 count_listed_sources)
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
@@ -158,7 +159,7 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # produced; logging_setup.py::NarrativeFormatter renders this as
         # this span's DECISION line (see _decision_text).
         sections = len(re.findall(r"(?m)^#{1,6} ", report))
-        evidence_cited = len({g.group(1) for g in re.finditer(r"\[g(\d+)\]", report)})
+        evidence_cited = len(cited_goal_ids(report))
         log_event(logger, "node.compiled", sections=sections,
                   evidence_cited=evidence_cited, output_chars=len(report),
                   hedge_markers_inserted=int(hedge_counters.get(
@@ -185,7 +186,8 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
 
         READS   state.planning_error, state.abort_reason — if either is
                 set there is nothing meaningful to critique.
-                Otherwise: state.raw_query, state.final_report, state.goals.
+                Otherwise: state.raw_query, state.final_report, state.goals,
+                state.evidence (for the deterministic gate below).
         CALLS   router.complete_json() asking ONLY two things: is the report
                 faithful to its OWN stated evidence, and does it address
                 every goal. The prompt explicitly forbids judging whether
@@ -193,7 +195,9 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
                 progress_checker, two phases upstream. One judge, one
                 question, each — merging these two would make the loop
                 unable to tell which remedy (rewrite vs. re-research) to
-                apply.
+                apply. SKIPPED (no LLM call) when the deterministic
+                zero-citation gate below already fails the report — see
+                that block's own comment (D-66).
         WRITES  state.critique_passed = bool
                 state.revision_count += 1        (ticks on EVERY pass,
                                                   pass or fail)
@@ -221,6 +225,50 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             log_event(logger, "node.enter", node="critic")
         if state.planning_error or state.abort_reason:
             return {"critique_passed": True}
+        if (settings.llm_mode != "stub" and state.evidence
+                and not cited_goal_ids(state.final_report)):
+            # D-66: a report can reach here having cited NOTHING despite
+            # evidence being available -- observed live, twice, both times
+            # via the same chain: every candidate in FallbackRouter's
+            # chain failed the quality bar, chain_exhausted_low_quality
+            # (D-60c) served the best-scoring survivor anyway, and that
+            # survivor's prose carried zero [gN] markers. The LLM judge
+            # has nothing to fail such a report ON -- zero claims means
+            # zero unsupported claims, so "faithful" and "cited nothing"
+            # were indistinguishable to it, and one live run's judge
+            # actually passed a report shaped exactly like this. This
+            # deterministic gate closes that -- same posture as
+            # D-40/D-43/D-51: enforce what a prompt instruction cannot
+            # reliably guarantee, without spending a judging call on an
+            # answer already known to fail. Gated on state.evidence being
+            # non-empty: a report legitimately citing nothing because
+            # NOTHING was ever retrieved is not this failure mode. Also
+            # gated OFF in stub mode: StubClient's fixed placeholder report
+            # (llm/client.py) never carries [gN] markers by design -- it
+            # exists to prove the graph executes offline, not to model
+            # citation discipline, and every existing offline test expects
+            # a stub run to pass critique.
+            passed = False
+            notes = [f"Report cites no evidence ([gN] markers) despite "
+                     f"{len(state.evidence)} evidence item(s) being "
+                     f"available. Every claim must attribute to retrieved "
+                     f"evidence."]
+            revision = state.revision_count + 1
+            update: Dict[str, Any] = {
+                "critique_passed": passed,
+                "revision_count": revision,
+                "critique_notes": notes,
+                "counters": {"revision_cycles": 1},
+            }
+            if revision >= settings.max_revisions:
+                update.update(raise_or_log(state, settings, "E4",
+                                           reason="report_cites_no_evidence",
+                                           revisions=revision, notes=notes))
+            log_event(logger, "critic.zero_citation_gate", level=logging.WARNING,
+                      revision=revision, evidence_items=len(state.evidence))
+            lf.score(run_id_var.get(), "critique_passed", passed,
+                    comment=f"revision={revision}")
+            return update
         router.set_node("critic")
         # FIX-5, same pass as compiler_node. D-46 exists because the critic
         # was being asked to verify claims against evidence it could not
@@ -480,6 +528,22 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         # candidates=0 (no dense leg ever ran, or min_similarity=0.0 so
         # this counter was never bumped) means "nothing to report", not
         # "starved" — ratio stays 0.0 rather than a misleading 0/0.
+        # D-66 (backstop): the deterministic critic gate above is meant to
+        # stop a zero-citation report before it ships, but a run with HITL
+        # disabled and its revision budget exhausted still ships whatever
+        # the gate last rejected (raise_or_log's stub path -- "log loudly
+        # and ship the report unreviewed" is this codebase's existing
+        # posture for an exhausted budget, unchanged here). This is the
+        # last-line-of-sight check for that case: same shape as G1/G4/G7
+        # above, purely observational, WARNs rather than blocks. Gated
+        # off in stub mode for the same reason the critic gate is (see
+        # that block's comment) -- StubClient's fixed placeholder report
+        # never carries [gN] markers by design.
+        if (settings.llm_mode != "stub" and state.evidence
+                and not cited_goal_ids(state.final_report)):
+            log_event(logger, "report.shipped_with_no_citations",
+                      level=logging.WARNING,
+                      evidence_items=len(state.evidence))
         retrieval_dense_candidates = int(c.get("retrieval_dense_candidates", 0))
         retrieval_dropped_by_floor = int(c.get("retrieval_dropped_by_floor", 0))
         retrieval_floor_drop_ratio = (
