@@ -5,37 +5,44 @@ search this repo already has, over the MCP protocol.
 Purpose:
     tools/mcp_client.py (P2-13) proves the CLIENT-side MCP plumbing works,
     but has nothing genuinely useful to talk to without a real MCP server
-    -- tests/fixtures/mcp_echo_server.py is a deliberately trivial fixture
-    for testing that plumbing, not something you'd want the agent
+    -- tests/fixtures/mcp_echo_http_server.py is a deliberately trivial
+    fixture for testing that plumbing, not something you'd want the agent
     actually citing evidence from. This script closes that gap: it is a
-    real MCP server, launchable as MCP_SERVER_COMMAND/MCP_SERVER_ARGS,
-    whose "search" tool wraps THIS SAME REPO'S existing
+    real MCP server whose "search" tool wraps THIS SAME REPO'S existing
     tools/corpus_search.py::make_corpus_tool -- the exact HybridRetriever
     (dense Qdrant + keyword OpenSearch, fused) that cli.py already builds
     for the non-MCP path. Running the agent with MCP_ENABLED=true and this
-    script configured returns REAL evidence from your real ingested
-    corpus, round-tripped through real MCP protocol -- not a canned
-    string, and not a reimplementation of retrieval logic (this file
-    contains no retrieval logic of its own at all; it only calls the
-    existing tool and reformats its output).
+    server running returns REAL evidence from your real ingested corpus,
+    round-tripped through real MCP protocol -- not a canned string, and
+    not a reimplementation of retrieval logic (this file contains no
+    retrieval logic of its own at all; it only calls the existing tool
+    and reformats its output).
 
-Usage (as an MCP_SERVER_COMMAND, not run directly by a person):
+D-76: standalone Streamable HTTP only -- this process is never spawned
+by the agent. Start it yourself, in its own terminal, and leave it
+running; stop it whenever you want, independent of any research_agent
+run's own lifetime.
+
+Usage:
+    # In its own terminal, left running:
+    python scripts/mcp_corpus_server.py --port 8765
+    # Stop it whenever you want: Ctrl+C, or kill the process. Every
+    # research_agent run simply fails to connect if the server isn't
+    # up -- it does not, and cannot, start or stop this process for you.
+
+    # In .env, pointing at that already-running server:
     MCP_ENABLED=true
-    MCP_SERVER_COMMAND=<path to your venv's python>
-    MCP_SERVER_ARGS=scripts/mcp_corpus_server.py
-    MCP_SERVER_ENV_ALLOWLIST=
+    MCP_SERVER_URL=http://127.0.0.1:8765/mcp
     MCP_TOOL_NAME=search
     MCP_QUERY_ARG_NAME=query
 
     This file lives at the REPO ROOT's scripts/ directory (like
     ingest_sample_data.py) and puts its own repo-relative "src" on
-    sys.path (resolved from __file__, not the CWD), so
-    it needs no PYTHONPATH set in the MCP subprocess's environment --
-    matching every other script in this repo, and matching P2-13's own
-    env-allowlist design (MCP_SERVER_ENV_ALLOWLIST can stay empty; this
-    server needs no inherited environment variables to build its own
-    Settings, since get_settings() reads directly from THIS process's
-    .env/environment at startup, same as any other entry point).
+    sys.path (resolved from __file__, not the CWD), so it needs no
+    PYTHONPATH set in ITS OWN terminal's environment for the script
+    itself to import -- but the shell you run it from still needs the
+    venv active (see OPERATIONS.md's "Running the MCP servers
+    standalone" for the T7/T8 terminal setup).
 
 Scope (deliberately minimal):
     ONE tool, "search", taking ONE argument, "query" -- matching
@@ -82,6 +89,7 @@ including under real concurrency (see the fix note above).
 """
 import asyncio
 import atexit
+import argparse
 import pathlib
 import sys
 import threading
@@ -98,6 +106,27 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
+# D-76: this server ALWAYS runs Streamable HTTP -- standalone-only, no
+# stdio mode. host/port are parsed BEFORE FastMCP() is constructed, not
+# inside `if __name__ == "__main__":` at the bottom -- they are FastMCP
+# CONSTRUCTOR arguments, not mcp.run() arguments, so they must be known
+# before the `mcp = FastMCP(...)` line below runs.
+def _parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address.")
+    parser.add_argument("--port", type=int, default=8765, help="Bind port.")
+    # parse_known_args, not parse_args: this module is also imported
+    # directly by tests/unit/test_mcp_corpus_server.py (to exercise its
+    # wrapping logic against a fake tool, with no real server ever run)
+    # -- at IMPORT time, under pytest's own argv (-q, file paths, ...),
+    # which are not this script's flags and must be silently ignored
+    # rather than raising SystemExit before the test module's own code
+    # ever runs.
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+_args = _parse_args()
 from research_agent.config import get_settings  # noqa: E402
 from research_agent.retrieval.hybrid import HybridRetriever  # noqa: E402
 from research_agent.state import SearchTask  # noqa: E402
@@ -110,7 +139,7 @@ from research_agent.tools.corpus_search import make_corpus_tool  # noqa: E402
 import qdrant_client  # noqa: F401,E402
 import opensearchpy  # noqa: F401,E402
 
-mcp = FastMCP("corpus-search-server")
+mcp = FastMCP("corpus-search-server", host=_args.host, port=_args.port)
 
 
 def _build_corpus_tool():
@@ -267,4 +296,4 @@ async def search(query: str) -> list:
     return await loop.run_in_executor(_search_executor, hits_for_query, query)
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="streamable-http")

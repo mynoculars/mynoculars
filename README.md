@@ -17,7 +17,7 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
 > human-in-the-loop escalation. All six phases of a comprehensive review
-> (`DECISIONS.md` D-1…D-71) are closed as of this revision -- correctness
+> (`DECISIONS.md` D-1…D-76) are closed as of this revision -- correctness
 > fixes, structural simplification, and operational hardening. Release
 > history, prior test counts, and superseded claims from earlier revisions
 > live in [CHANGELOG.md](CHANGELOG.md), not here.
@@ -579,11 +579,11 @@ The diagram above is tier 1 of 5. If corpus search comes back below `min_evidenc
   2  corpus, reformulated     in-process              "corpus"      YES
        │ _reformulate(), ≤6 words
        │ miss
-  3  mcp                      subprocess ──stdio──► scripts/mcp_corpus_server.py
+  3  mcp                      standalone ──HTTP────► scripts/mcp_corpus_server.py
        MCPBridge #1                                   "mcp"         YES
        │ ...but that is the SAME ingested corpus, reached a second way
        │ miss
-  4  web    (Phase 4)         subprocess ──stdio──► scripts/mcp_web_search_server.py
+  4  web    (Phase 4)         standalone ──HTTP────► scripts/mcp_web_search_server.py
        MCPBridge #2                                 └──► THE INTERNET
                                                       "web"         no
        │ miss
@@ -1508,10 +1508,13 @@ research-agent-dmp/
 │   ├── tools/                # the retrieval tools workers invoke (D-38 ladder):
 │   │                        retrieval_chain.py (the 5-tier ladder itself),
 │   │                        corpus_search.py, model_knowledge.py, and
-│   │                        mcp_client.py — stdio transport shared by BOTH
-│   │                        MCP bridges: make_mcp_tool (corpus, P2-13,
+│   │                        mcp_client.py — MCPBridge, shared by BOTH MCP
+│   │                        bridges: make_mcp_tool (corpus, P2-13,
 │   │                        MCP_ENABLED) and make_web_search_tool (Phase 4,
-│   │                        WEB_SEARCH_ENABLED)
+│   │                        WEB_SEARCH_ENABLED). Streamable HTTP only
+│   │                        (D-76): a pure network client connecting to an
+│   │                        independent, standalone server you start and
+│   │                        stop yourself — this process spawns nothing
 │   ├── websearch/            # Phase 4 (D-57): SearchProvider protocol, DDGS
 │   │                        provider, rank→score band, dedupe/domain-cap.
 │   │                        Imported ONLY by scripts/mcp_web_search_server.py
@@ -1555,7 +1558,7 @@ research-agent-dmp/
 ├── requirements-websearch.txt  # Phase 4 only: ddgs + mcp. Install into the SAME
 │                              venv that runs the agent — see Setup
 ├── .env.example  run.bat  reset.bat
-└── DECISIONS.md             # populated: D-1..D-71, sourced from code comments
+└── DECISIONS.md             # populated: D-1..D-76, sourced from code comments
 ```
 
 ## Setup
@@ -1594,28 +1597,36 @@ Windows: `run.bat` does the venv, install, and a stub run in one command.
 
 **Web search (Phase 4) is opt-in and does not affect the steps above.**
 `WEB_SEARCH_ENABLED=false` is the default, the `ddgs` client is not in
-`requirements.txt` at all, and the agent process never imports it. To turn
-it on:
+`requirements.txt` at all, and the agent process never imports it unless
+you turn this on. D-76: it is also a standalone server you run yourself,
+separately from the agent — there is nothing for the agent process to
+spawn.
 
 ```bash
-pip install -r requirements-websearch.txt   # into the SAME venv as the agent
+pip install -r requirements-websearch.txt   # into a venv for the SERVER
 
-# .env — these two lines are genuinely the whole minimum
+# In its own terminal, left running:
+python scripts/mcp_web_search_server.py --port 8766
+
+# .env — these two lines are the whole minimum
 WEB_SEARCH_ENABLED=true
-WEB_MCP_SERVER_COMMAND=
+WEB_MCP_SERVER_URL=http://127.0.0.1:8766/mcp
 
 python scripts/check_services.py            # look for the 'Web search (MCP)' row
 ```
 
-`WEB_MCP_SERVER_COMMAND` is deliberately left EMPTY: empty means
-`sys.executable`, the interpreter already running the agent (D-58). That is
-correct on every machine with no configuration, keeps machine-specific
-absolute paths out of a committed `.env`, and guarantees the server shares
-the agent's virtualenv — which matters because it imports `ddgs`, and a
-wrong interpreter dies before the MCP handshake and surfaces as an opaque
-`Connection closed` rather than a readable `ImportError`. Relative paths, if
-you set one, resolve against the REPO ROOT, not your working directory.
-Full walkthrough: `OPERATIONS.md` → *Enabling Web Search (Phase 4)*.
+Full walkthrough, including the standalone-server terminal setup:
+`OPERATIONS.md` → *Enabling Web Search (Phase 4)* and *Running the MCP
+servers standalone*.
+
+**MCP servers always run standalone (D-76), independent of any single
+run.** Both the corpus and web-search MCP servers are ordinary,
+independent processes you start yourself, in their own terminals, and
+leave running — the agent process never spawns either one, and stopping
+a `research_agent` run never stops them. Point the agent at an
+already-running server with `MCP_SERVER_URL` / `WEB_MCP_SERVER_URL`.
+Full start/stop workflow: `OPERATIONS.md` → *Running the MCP servers
+standalone*.
 
 Langfuse tracing is opt-in and does not affect the steps above: `langfuse` is
 an installed dependency (`requirements.txt`), but `LANGFUSE_ENABLED=false`
@@ -1753,8 +1764,7 @@ This table lists only decisions with code behind them here.
 | D-36 | External MCP tool inputs travel to the LLM inside an `<external_data>` fence, treated as data never instructions | Prompt-injection surface from third-party tool output must not be trusted at the same level as system/user turns |
 | D-37 | The repo is an installable artifact (`pyproject.toml`, optional dependency groups mirroring lazy-import code paths) | A core install genuinely omits FastAPI/MCP/Langfuse; `requirements.txt` stays the dev pin-set |
 | D-38 | Retrieval is a LADDER — corpus → reformulated retry → MCP → model’s own knowledge, stopping at the first tier clearing `min_evidence_score` | A corpus that doesn’t contain the subject was reporting a retrieval limitation as an absence of knowledge; the model tier is always last so a real document still wins |
-| D-57 | **Phase 4 — web search.** A real search engine as tier 4, reached over its OWN MCP server subprocess (`scripts/mcp_web_search_server.py`). `source="web"` evidence COVERS a goal but never GROUNDS one | Tiers 1–3 all resolve to the same ingested documents, so “the corpus does not contain it” fell straight through to recollection. Tagging web results `"mcp"` would have made every snippet inflate `grounded_score` and `corpus_recall` — the exact blindness D-43/D-47 exist to expose |
-| D-58 | MCP server paths resolve against the REPO ROOT, and an empty `WEB_MCP_SERVER_COMMAND` means `sys.executable` | `MCPBridge` never sets `StdioServerParameters.cwd`, so relative paths silently resolved against the launch directory — verified failing as an opaque “Connection closed” when run from anywhere but the repo root. Empty-means-`sys.executable` keeps machine-specific paths out of the committed `.env` and guarantees the server shares the agent’s virtualenv |
+| D-57 | **Phase 4 — web search.** A real search engine as tier 4, reached over its OWN MCP server (`scripts/mcp_web_search_server.py`). `source="web"` evidence COVERS a goal but never GROUNDS one | Tiers 1–3 all resolve to the same ingested documents, so “the corpus does not contain it” fell straight through to recollection. Tagging web results `"mcp"` would have made every snippet inflate `grounded_score` and `corpus_recall` — the exact blindness D-43/D-47 exist to expose |
 | D-39 | A tier only counts as "answered" if its evidence shares distinctive terms with the query, not merely a high RRF score | Fixed-k retrieval over a small corpus always returns k results — score alone can never signal "nothing relevant here" |
 | D-40 | Citations are goal ids only (`[g1]`) — never pasted evidence text, never internal scores | Live output was gluing source sentences onto claims with no delimiter and leaking `score=0.60`-style bookkeeping into the report |
 | D-41 | The model-knowledge tier has hard anti-fabrication limits (no invented named entities, confidence reflects the weakest part of a compound claim) | Self-reported confidence alone does not catch confabrication; this reduces but does not eliminate the failure rate, which is why `corpus_recall` stays in telemetry |
@@ -1767,7 +1777,7 @@ This table lists only decisions with code behind them here.
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
 `DECISIONS.md` (populated as of P2-09, extended in every pass since) is the
-authoritative consolidated log, currently D-1 through D-71 — this table is a
+authoritative consolidated log, currently D-1 through D-76 — this table is a
 curated subset for readability, not a replacement.
 
 ## Limitations
@@ -1823,10 +1833,12 @@ visible rather than deleted, so the history stays auditable.
     a fixed list of other plausible env-key typos. (The variable itself
     still requires the exact name `HITL_ENABLED` — this only adds
     visibility when you get it wrong, it doesn't relax the requirement.)
-14. ~~MCP deferred~~ — **P2-13**, `tools/mcp_client.py` (stdio transport,
-    D-30 constraints) + `scripts/mcp_corpus_server.py` (real server
-    wrapping the existing corpus tool). Off by default
-    (`MCP_ENABLED=false`).
+14. ~~MCP deferred~~ — **P2-13**, `tools/mcp_client.py` + `scripts/mcp_corpus_server.py`
+    (real server wrapping the existing corpus tool). Off by default
+    (`MCP_ENABLED=false`). Originally stdio (spawned by the agent, D-30);
+    **D-76** removed that entirely in favor of D-30's other documented
+    transport, Streamable HTTP — a standalone server you start and stop
+    yourself, independent of any run, reached at `MCP_SERVER_URL`.
 15. ~~Single tool, single worker type~~ — **P2-14**, `SearchTask.tool_hint`
     (D-25) routes a task to a named specialist (`"mcp"` today, the only
     one this build has) instead of the default corpus worker.

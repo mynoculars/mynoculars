@@ -2,8 +2,7 @@
 tools/mcp_client.py — MCP-mediated tool, alongside tools/corpus_search.py.
 
 Purpose:
-    Implements D-26 (tool mediation via MCP) and D-30 (the specific
-    transport/security constraints for that mediation) as a SECOND ToolFn
+    Implements D-26 (tool mediation via MCP) as a SECOND ToolFn
     implementation (agents/gathering.py::ToolFn), proving the seam
     corpus_search.py's own docstring has claimed since the core build
     shipped: "the graph-level tool-calling pattern is identical, so
@@ -14,11 +13,12 @@ Purpose:
 
 Responsibilities:
     - MCPBridge: owns one persistent background event loop + one
-      persistent stdio-connected ClientSession, for the process's
-      lifetime. Exists because every OTHER node in this codebase is a
-      plain synchronous function (confirmed: no `async def` anywhere in
-      agents/*.py), but the MCP SDK is async-only -- something has to
-      bridge the two without converting the whole graph to async.
+      persistent Streamable-HTTP-connected ClientSession, for the
+      process's lifetime. Exists because every OTHER node in this
+      codebase is a plain synchronous function (confirmed: no
+      `async def` anywhere in agents/*.py), but the MCP SDK is
+      async-only -- something has to bridge the two without converting
+      the whole graph to async.
     - make_mcp_tool(): builds the actual ToolFn closure, matching
       corpus_search.make_corpus_tool()'s exact shape and calling
       convention so agents/gathering.py::search_worker cannot tell the
@@ -36,42 +36,42 @@ flagged before writing any code here):
 
 Design decision -- A PERSISTENT background loop, not asyncio.run() per
 call:
-    A stdio-connected MCP server is a real subprocess with real startup
-    cost; spawning a fresh one per tool call would be wasteful, and
-    asyncio.run() tears down its event loop when it returns, which would
-    invalidate a ClientSession/transport tied to that loop. So the
-    subprocess and the ClientSession are established ONCE (lazily, on
-    first use) and kept alive on a dedicated background thread running
-    its own event loop for as long as the process lives; every synchronous
-    ToolFn call submits its coroutine onto THAT SAME loop via
-    asyncio.run_coroutine_threadsafe(...), which is safe to call from any
-    thread (including however LangGraph happens to execute concurrent
-    search_worker instances for one gather-cycle superstep) -- asyncio
-    objects themselves are only ever touched from the one thread that
-    owns their loop.
+    Reconnecting per call would add real network round-trip cost on every
+    single tool invocation, and asyncio.run() tears down its event loop
+    when it returns, which would invalidate a ClientSession/transport tied
+    to that loop. So the connection and the ClientSession are established
+    ONCE (lazily, on first use) and kept alive on a dedicated background
+    thread running its own event loop for as long as the process lives;
+    every synchronous ToolFn call submits its coroutine onto THAT SAME
+    loop via asyncio.run_coroutine_threadsafe(...), which is safe to call
+    from any thread (including however LangGraph happens to execute
+    concurrent search_worker instances for one gather-cycle superstep) --
+    asyncio objects themselves are only ever touched from the one thread
+    that owns their loop.
 
-D-30 constraints, implemented exactly as specified (not re-litigated
-here):
-    - stdio transport only, in this build -- Streamable HTTP is D-30's
-      other allowed transport for a REMOTE server, but is not implemented
-      here; adding it later is a new MCPBridge variant, not a change to
-      make_mcp_tool's contract. SSE is explicitly PROHIBITED by D-30 and
-      never used anywhere in this module.
-    - Explicit per-server env ALLOWLIST, never a blanket os.environ
-      passthrough -- confirmed necessary: mcp.StdioServerParameters's own
-      `env` field defaults to None, which mcp's stdio_client interprets as
-      "inherit the parent's FULL environment" if left unset. This module
-      NEVER leaves it unset; _build_subprocess_env always constructs an
-      explicit dict from only the allowlisted names.
-    - AsyncExitStack for stdio server lifecycle, so the subprocess and its
-      streams are guaranteed to be torn down together, in the right order,
-      even if something raises partway through connecting.
+Transport (D-30, D-75, D-76): Streamable HTTP only.
+    D-30 originally scoped this module to stdio (a local server this
+    process spawns and owns) and documented Streamable HTTP as a
+    deferred remote-server variant. D-75 built the HTTP variant out
+    alongside stdio, config-selectable. D-76 removed stdio entirely: this
+    codebase now ALWAYS connects to an independent, already-running MCP
+    server over HTTP -- nothing is spawned, ever, by this process. See
+    the module's own history in DECISIONS.md (D-30, D-75, D-76) for why
+    the shape changed twice. SSE is not, and has never been, a supported
+    value -- D-30 prohibited it outright from the start.
+
+    Why HTTP-only rather than a config choice: a config flag that can
+    still select stdio invites exactly the coupling D-76 removed it to
+    avoid -- "start it once, leave it running, point one or more runs at
+    it, stop it whenever you want" is not compatible with a mode where
+    this process might instead spawn and own a subprocess. One transport,
+    always independent, is the simpler invariant to reason about and the
+    one actually wanted operationally.
 """
 
 import asyncio
 import json
 import logging
-import os
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -83,46 +83,43 @@ from research_agent.state import Evidence, SearchTask, Volatility
 logger = logging.getLogger(__name__)
 
 
-def _build_subprocess_env(env_allowlist: List[str]) -> Dict[str, str]:
-    """Build the subprocess env dict from an explicit allowlist of names.
-
-    CALLED BY   MCPBridge._connect, below.
-    WHY THIS EXISTS (D-30): mcp.StdioServerParameters's own `env` field
-    defaults to None, and mcp's stdio_client treats that as "inherit the
-    parent process's FULL environment" -- which could leak this process's
-    entire environment (API keys, DB credentials, everything in .env)
-    into a third-party MCP server subprocess. This function is the ONLY
-    place that ever builds the `env` dict passed to StdioServerParameters
-    in this module, and it only ever includes names explicitly listed in
-    `env_allowlist` that are ALSO actually set in this process's own
-    environment -- an allowlisted name that happens not to be set is
-    simply absent from the result, never an error.
-    """
-    return {name: os.environ[name] for name in env_allowlist if name in os.environ}
-
-
 class MCPBridge:
     """Owns one persistent background event loop + one persistent
-    stdio-connected ClientSession, for the process's lifetime.
+    Streamable-HTTP-connected ClientSession, for the process's lifetime.
+    A pure network client -- nothing is ever spawned by this process
+    (D-76); the server this connects to is independent, already running,
+    and entirely unaffected by close() below.
 
     CALLED BY   make_mcp_tool, below, which wraps this in a plain
                 synchronous ToolFn closure -- nothing outside this module
                 (and make_mcp_tool) ever touches an MCPBridge directly.
     LIFECYCLE   Nothing happens at construction time -- the background
-                thread, event loop, subprocess, and ClientSession are all
+                thread, event loop, connection, and ClientSession are all
                 created lazily, on the FIRST call_tool() call (see
                 start()). Call close() when done (cli.py does this at
                 shutdown, mirroring how storage/postgres.py's checkpointer
                 is explicitly closed); an MCPBridge that's never started
-                has nothing to close.
+                has nothing to close. close() only ever closes THIS
+                process's own connection -- the server itself is a
+                separate, independent process, started and stopped by
+                you, not by anything in this codebase.
     """
 
-    def __init__(self, command: str, args: Optional[List[str]] = None,
-                 env_allowlist: Optional[List[str]] = None,
-                 startup_timeout_seconds: float = 30.0):
-        self._command = command
-        self._args = args or []
-        self._env_allowlist = env_allowlist or []
+    def __init__(self, url: str, startup_timeout_seconds: float = 30.0):
+        """
+        Parameters:
+            url: the standalone MCP server's HTTP endpoint, e.g.
+                "http://127.0.0.1:8765/mcp". Required -- validated eagerly
+                at construction, not deferred to the first call_tool(): a
+                config with no URL should fail loudly at startup, not
+                three tool calls into a run.
+            startup_timeout_seconds: how long to wait for the initial
+                connection handshake before raising TimeoutError.
+        """
+        if not url:
+            raise ValueError("MCPBridge requires a url (D-76: standalone "
+                             "Streamable HTTP server only)")
+        self._url = url
         self._startup_timeout = startup_timeout_seconds
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -177,7 +174,7 @@ class MCPBridge:
                 self._thread.start()
         if not self._ready.wait(timeout=self._startup_timeout):
             raise TimeoutError(
-                f"MCP server '{self._command}' did not become ready within "
+                f"MCP server '{self._url}' did not become ready within "
                 f"{self._startup_timeout}s")
         if self._start_error is not None:
             raise self._start_error
@@ -222,19 +219,18 @@ class MCPBridge:
         WHY THIS SHAPE, not "connect in one run_until_complete call, then
         run_forever(), then disconnect via a SEPARATE run_coroutine_threadsafe
         call" (the first version of this method, before a real end-to-end
-        test against tests/fixtures/mcp_echo_server.py caught the bug):
-        the MCP SDK's stdio_client/ClientSession context managers are built
-        on anyio cancel scopes, which anyio requires to be exited from the
-        EXACT SAME asyncio Task they were entered in -- not just the same
-        event loop. Splitting connect and disconnect into two separately-
-        submitted coroutines put them in two different Tasks on the same
-        loop, which LOOKS fine (same loop, same thread) but anyio itself
-        raises `RuntimeError: Attempted to exit cancel scope in a
-        different task than it was entered in`. Keeping the whole
-        connect -> wait -> disconnect sequence in one coroutine, submitted
-        once via run_until_complete, is what actually satisfies that
-        constraint. Concurrent call_tool() invocations are unaffected --
-        each is its own SEPARATE coroutine that only calls
+        test caught the bug): the MCP SDK's client/ClientSession context
+        managers are built on anyio cancel scopes, which anyio requires to
+        be exited from the EXACT SAME asyncio Task they were entered in --
+        not just the same event loop. Splitting connect and disconnect
+        into two separately-submitted coroutines put them in two different
+        Tasks on the same loop, which LOOKS fine (same loop, same thread)
+        but anyio itself raises `RuntimeError: Attempted to exit cancel
+        scope in a different task than it was entered in`. Keeping the
+        whole connect -> wait -> disconnect sequence in one coroutine,
+        submitted once via run_until_complete, is what actually satisfies
+        that constraint. Concurrent call_tool() invocations are unaffected
+        -- each is its own SEPARATE coroutine that only calls
         self._session.call_tool(...), never touches the exit stack's
         cancel scopes, and is safe to run in a different task than
         _serve()'s (confirmed empirically: this is exactly what already
@@ -243,16 +239,20 @@ class MCPBridge:
         """
         from contextlib import AsyncExitStack
 
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        from mcp import ClientSession
+        # streamable_http_client yields a THIRD value (a get-session-id
+        # callback) that ClientSession itself has no use for; only the
+        # read/write streams matter here. Named `streamable_http_client`,
+        # not the older `streamablehttp_client` (still present in the
+        # installed SDK but emits a DeprecationWarning -- confirmed
+        # against the actual installed mcp 1.29.0, not assumed from docs).
+        from mcp.client.streamable_http import streamable_http_client
 
         self._exit_stack = AsyncExitStack()
         try:
-            params = StdioServerParameters(
-                command=self._command, args=self._args,
-                env=_build_subprocess_env(self._env_allowlist))
-            read_stream, write_stream = await self._exit_stack.enter_async_context(
-                stdio_client(params))
+            read_stream, write_stream, _get_session_id = (
+                await self._exit_stack.enter_async_context(
+                    streamable_http_client(self._url)))
             self._session = await self._exit_stack.enter_async_context(
                 ClientSession(read_stream, write_stream))
             await self._session.initialize()
@@ -291,20 +291,19 @@ class MCPBridge:
         scripts/mcp_corpus_server.py, not a bug in this method): the
         DEFAULT timeout_seconds=30.0 (and settings.mcp_call_timeout_seconds's
         own 30.0 default) can be too tight for a real corpus-backed MCP
-        server's FIRST call after the subprocess starts -- that call is
-        what lazily builds the real QdrantStore/OpenSearchStore/
+        server's FIRST call after the server process starts -- that call
+        is what lazily builds the real QdrantStore/OpenSearchStore/
         HybridRetriever INSIDE the server process (see
         scripts/mcp_corpus_server.py::_get_corpus_tool), which can itself
         take real time (fastembed's embedding model load, real network
         round trips to Qdrant/OpenSearch) well beyond what a trivial echo
         server needs. Several search_worker calls arriving concurrently
-        against the SAME persistent stdio session can also serialize
-        behind one another (one stdio pipe, processed one request at a
-        time by a typical MCP server), compounding the effective wait for
-        whichever calls land later in that queue. If you see TimeoutError
-        failures against a real corpus-backed server, raise
-        MCP_CALL_TIMEOUT_SECONDS well above the 30s default (e.g. 120)
-        before assuming something is broken.
+        against the SAME persistent connection can also serialize behind
+        one another depending on the server's own concurrency model,
+        compounding the effective wait for whichever calls land later in
+        that queue. If you see TimeoutError failures against a real
+        corpus-backed server, raise MCP_CALL_TIMEOUT_SECONDS well above
+        the 30s default (e.g. 120) before assuming something is broken.
         """
         # error=str(exc)[:300] follow-up: bare concurrent.futures.TimeoutError
         # has an EMPTY message (confirmed: str(TimeoutError()) == "") -- a
@@ -353,7 +352,7 @@ class MCPBridge:
         loop = self._loop
         if loop is None:
             raise RuntimeError(
-                f"MCP bridge for '{self._command}' is closed; cannot call "
+                f"MCP bridge for '{self._url}' is closed; cannot call "
                 f"tool {name!r}")
         future = asyncio.run_coroutine_threadsafe(_traced_call(), loop)
         started_at = time.time()
@@ -380,7 +379,8 @@ class MCPBridge:
             raise TimeoutError(message) from None
 
     def close(self) -> None:
-        """Tear down the session, subprocess, and background loop/thread.
+        """Tear down this process's session and background loop/thread.
+        The independent server itself is never touched (D-76).
 
         CALLED BY   cli.py, once, at process shutdown -- mirrors how
                     storage/postgres.py's checkpointer is explicitly
@@ -391,8 +391,8 @@ class MCPBridge:
         exit stack from here -- see _serve()'s docstring for exactly why
         that distinction matters (an earlier version of this method did
         close the exit stack directly, from a separately-submitted
-        coroutine, and a real end-to-end test against a live stdio
-        server caught the anyio cancel-scope violation that caused).
+        coroutine, and a real end-to-end test caught the anyio
+        cancel-scope violation that caused).
         Setting the event via call_soon_threadsafe is what actually lets
         _serve()'s own task (already waiting on that event) proceed to
         run its own `await self._exit_stack.aclose()` -- in the SAME task
@@ -406,10 +406,12 @@ class MCPBridge:
         if self._thread.is_alive():
             # Best-effort cleanup only -- the thread is a daemon thread (see
             # start()), so it will not block process exit even if it never
-            # finishes; this just means the subprocess/session teardown
-            # didn't complete cleanly within the timeout.
+            # finishes; this just means this connection's own teardown
+            # didn't complete cleanly within the timeout. The SERVER is
+            # unaffected either way (D-76) -- this is purely about this
+            # process's own background thread.
             log_event(logger, "mcp.close_timed_out", level=logging.WARNING,
-                      command=self._command)
+                      url=self._url)
         self._loop = None
         self._thread = None
         self._shutdown_event = None
@@ -569,9 +571,8 @@ def make_web_search_tool(
          handful of shared lines a merged implementation would save.
 
     Both factories still share the ENTIRE transport: one MCPBridge class,
-    one subprocess lifecycle, one timeout mechanism, one env allowlist. What
-    differs is only the parsing, which is exactly the part that genuinely
-    differs.
+    one connection lifecycle, one timeout mechanism. What differs is only
+    the parsing, which is exactly the part that genuinely differs.
 
     THE WIRE SHAPE THIS PARSES, verified against the installed FastMCP
     rather than assumed (see tests/unit/test_mcp_web_search_server.py::

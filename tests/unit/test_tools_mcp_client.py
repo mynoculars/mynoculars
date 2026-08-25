@@ -1,34 +1,44 @@
 """
-tests/unit/test_tools_mcp_client.py — tools/mcp_client.py (P2-13).
+tests/unit/test_tools_mcp_client.py — tools/mcp_client.py (P2-13, D-76).
 
-Covers: config.py's split_csv helper, the subprocess-env allowlist
-(_build_subprocess_env never forwards os.environ wholesale — D-30),
-make_mcp_tool's Evidence-construction/parsing logic against a fake
-bridge, and MCPBridge's real subprocess-spawning/lifecycle behavior
-(bad command, timeout error messages, concurrent first-call safety).
+Covers: make_mcp_tool's Evidence-construction/parsing logic against a fake
+bridge, and MCPBridge's real connection/lifecycle behavior over a real
+Streamable HTTP connection (unreachable-server error, timeout error
+messages, concurrent first-call safety).
+
+D-76: MCPBridge only ever connects to a standalone, already-running MCP
+server now -- this process spawns nothing, ever. (Earlier revisions of
+this file also covered stdio: a subprocess-env allowlist helper and
+several tests against a real spawned subprocess. D-76 removed the stdio
+transport from MCPBridge entirely, so that coverage moved or was retired
+along with the code it tested -- see DECISIONS.md D-76.)
 
 Unlike every other file in this suite (see conftest.py's module
 docstring: "every test runs fully offline"), THREE tests below
-(test_mcp_tool_round_trips_through_a_real_stdio_server,
+(test_mcp_tool_round_trips_through_a_real_streamable_http_server,
 test_mcp_bridge_survives_many_concurrent_first_calls,
 test_mcp_bridge_timeout_error_is_actually_informative) genuinely spawn a
-real subprocess and talk real MCP protocol over real stdio pipes. This
-is still fully self-contained and offline in the sense that matters (no
-network call, no external service, no non-deterministic dependency) —
-the "servers" are tests/fixtures/mcp_echo_server.py and
-mcp_slow_server.py, ~20-line fixtures shipped in this repo, launched and
-torn down entirely within each test. This is deliberately NOT mocked: an
-earlier, mock-only version of this work shipped an MCPBridge.close()
-that raised `RuntimeError: Attempted to exit cancel scope in a different
-task than it was entered in` under real use — a genuine anyio/asyncio
-structured-concurrency constraint that no amount of mocking the SDK's
-objects would have caught. Real subprocess, real pipes, real protocol
+real server subprocess and talk real MCP protocol over a real loopback
+HTTP connection. This is still fully self-contained and offline in the
+sense that matters (no EXTERNAL network call, no external service, no
+non-deterministic dependency) — the "servers" are
+tests/fixtures/mcp_echo_http_server.py and mcp_slow_http_server.py, each
+a ~30-line fixture shipped in this repo, launched and torn down entirely
+within each test. This is deliberately NOT mocked: an earlier, mock-only
+version of this work shipped an MCPBridge.close() that raised
+`RuntimeError: Attempted to exit cancel scope in a different task than
+it was entered in` under real use — a genuine anyio/asyncio structured-
+concurrency constraint that no amount of mocking the SDK's objects would
+have caught. Real subprocess, real network connection, real protocol
 round trip is what caught it, and is kept here specifically so a future
 change to MCPBridge's lifecycle gets the same check.
 """
 
 import pathlib
+import socket
+import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -37,33 +47,32 @@ import pytest
 pytest.importorskip("mcp")
 
 
-def test_split_csv_strips_and_drops_empty_entries():
-    from research_agent.config import split_csv
-
-    assert split_csv("a, b ,,c") == ["a", "b", "c"]
-    assert split_csv("") == []
-    assert split_csv("   ") == []
-    assert split_csv("single") == ["single"]
-
-
-def test_build_subprocess_env_only_includes_allowlisted_names(monkeypatch):
-    from research_agent.tools.mcp_client import _build_subprocess_env
-
-    monkeypatch.setenv("MCP_TEST_ALLOWED_VAR", "yes")
-    monkeypatch.setenv("MCP_TEST_FORBIDDEN_VAR", "should-not-leak")
-
-    env = _build_subprocess_env(["MCP_TEST_ALLOWED_VAR", "MCP_TEST_NOT_SET_VAR"])
-
-    assert env == {"MCP_TEST_ALLOWED_VAR": "yes"}
-    assert "MCP_TEST_FORBIDDEN_VAR" not in env
-    assert "MCP_TEST_NOT_SET_VAR" not in env  # allowlisted but never set -> absent, not an error
+def _free_port() -> int:
+    """Ask the OS for an ephemeral port, then release it immediately --
+    good enough for a test fixture server started microseconds later;
+    avoids hardcoding a port that a concurrent test run could collide on."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def test_build_subprocess_env_returns_empty_dict_for_empty_allowlist(monkeypatch):
-    from research_agent.tools.mcp_client import _build_subprocess_env
+def _wait_for_port(port: int, timeout_s: float = 10.0) -> None:
+    """Poll until something is listening on 127.0.0.1:port, or raise.
 
-    monkeypatch.setenv("MCP_TEST_SOME_VAR", "x")
-    assert _build_subprocess_env([]) == {}
+    Spawning the fixture server and immediately trying to talk MCP to it
+    is racy -- the process needs a moment to import FastMCP/uvicorn and
+    bind its socket. A plain TCP connect poll is the cheapest reliable
+    way to know the HTTP listener is actually up, distinct from (and
+    prior to) speaking any MCP protocol to it.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError(f"nothing listening on 127.0.0.1:{port} after {timeout_s}s")
 
 
 # ---------------------------------------------------------------------------
@@ -189,48 +198,72 @@ def test_make_mcp_tool_content_is_capped_at_800_chars():
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_bridge_surfaces_a_clear_error_for_a_nonexistent_command():
-    """A bad command must fail fast and clearly (FileNotFoundError, in
-    practice), not hang -- proven against the REAL subprocess-spawning
-    path, not a mock (a mock could never demonstrate a real spawn
-    failure)."""
+def test_mcp_bridge_surfaces_a_clear_error_for_an_unreachable_server():
+    """Nothing listening at the configured URL must fail fast and
+    clearly, not hang -- proven against the REAL connection path, not a
+    mock (a mock could never demonstrate a real connection failure).
+
+    BaseException, not Exception: an unreachable server surfaces as
+    asyncio.CancelledError (a BaseException subclass since Python 3.8,
+    not an Exception subclass) bubbling up from the underlying
+    anyio/HTTP machinery -- confirmed empirically, not assumed. MCPBridge
+    itself catches BaseException in _serve() for exactly this reason
+    (see that method's own except clause); this test matches it."""
     from research_agent.tools.mcp_client import MCPBridge
 
-    bridge = MCPBridge(command="this-command-does-not-exist-anywhere",
-                       args=[], env_allowlist=[], startup_timeout_seconds=5.0)
+    port = _free_port()  # freed immediately -- guaranteed nothing is listening
+    bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
+                       startup_timeout_seconds=5.0)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(BaseException):
             bridge.call_tool("search", {"query": "x"}, timeout_seconds=5.0)
     finally:
         bridge.close()  # must not itself raise, even after a failed start
 
 
-def test_mcp_tool_round_trips_through_a_real_stdio_server():
-    """The genuine end-to-end proof: a real subprocess, real MCP protocol,
-    real stdio pipes, using tests/fixtures/mcp_echo_server.py (a ~20-line
-    FastMCP server shipped in this repo, deterministic, no external
-    dependencies of its own). This is what caught the anyio cancel-scope
-    bug in MCPBridge.close() that no amount of mocking would have --
-    see this module's docstring for the full story."""
+def test_mcp_tool_round_trips_through_a_real_streamable_http_server():
+    """The genuine end-to-end proof: a real subprocess, real MCP
+    protocol, real loopback HTTP connection, using
+    tests/fixtures/mcp_echo_http_server.py (a ~30-line FastMCP server
+    shipped in this repo, deterministic, no external dependencies of its
+    own). This is what caught the anyio cancel-scope bug in
+    MCPBridge.close() that no amount of mocking would have -- see this
+    module's docstring for the full story. Also specifically asserts
+    that closing this bridge does NOT kill the server process -- the
+    entire point of D-76's standalone-only design."""
     from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
 
-    server_path = str(pathlib.Path(__file__).parent.parent / "fixtures" / "mcp_echo_server.py")
-    bridge = MCPBridge(command=sys.executable, args=[server_path], env_allowlist=[])
-    tool = make_mcp_tool(bridge, "search", query_arg_name="query")
+    server_path = str(pathlib.Path(__file__).parent.parent / "fixtures"
+                      / "mcp_echo_http_server.py")
+    port = _free_port()
+    proc = subprocess.Popen([sys.executable, server_path, "--port", str(port)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        evidence = tool(_task(query="redis vs cassandra", key="t1", goal_id="g1"))
-        assert len(evidence) == 1
-        assert evidence[0].content == "canned result for: redis vs cassandra"
-        assert evidence[0].source == "mcp"
+        _wait_for_port(port)
+        bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
+                           startup_timeout_seconds=10.0)
+        tool = make_mcp_tool(bridge, "search", query_arg_name="query")
+        try:
+            evidence = tool(_task(query="redis vs cassandra", key="t1", goal_id="g1"))
+            assert len(evidence) == 1
+            assert evidence[0].content == "canned result for: redis vs cassandra"
+            assert evidence[0].source == "mcp"
 
-        # A second call on the SAME bridge proves the connection is
-        # actually PERSISTENT (reused), not re-spawned per call -- the
-        # whole point of the background-loop design over asyncio.run()
-        # per call (see MCPBridge's own docstring).
-        evidence2 = tool(_task(query="second query", key="t2", goal_id="g1"))
-        assert evidence2[0].content == "canned result for: second query"
+            # A second call on the SAME bridge proves the connection is
+            # actually PERSISTENT (reused), not re-established per call --
+            # the whole point of the background-loop design over
+            # asyncio.run() per call (see MCPBridge's own docstring).
+            evidence2 = tool(_task(query="second query", key="t2", goal_id="g1"))
+            assert evidence2[0].content == "canned result for: second query"
+        finally:
+            bridge.close()  # must succeed cleanly -- this is the regression check
+        # The server process must still be alive after bridge.close() --
+        # closing an HTTP client connection must never stop an
+        # independent server it does not own (D-76's entire point).
+        assert proc.poll() is None
     finally:
-        bridge.close()  # must succeed cleanly -- this is the regression check
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def test_mcp_bridge_survives_many_concurrent_first_calls():
@@ -242,30 +275,41 @@ def test_mcp_bridge_survives_many_concurrent_first_calls():
     'call_tool') -- exactly reproducing LangGraph fanning several
     search_worker instances out concurrently for one gather-cycle
     superstep. Uses the REAL fixture server (tests/fixtures/
-    mcp_echo_server.py) and REAL threads -- a mock could not have caught
-    this, since the bug was a genuine race between real OS threads."""
+    mcp_echo_http_server.py) and REAL threads -- a mock could not have
+    caught this, since the bug was a genuine race between real OS
+    threads."""
     from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
 
-    server_path = str(pathlib.Path(__file__).parent.parent / "fixtures" / "mcp_echo_server.py")
-    bridge = MCPBridge(command=sys.executable, args=[server_path], env_allowlist=[])
-    tool = make_mcp_tool(bridge, "search", query_arg_name="query")
-
-    def run_one(i):
-        return tool(_task(query=f"concurrent query {i}", key=f"t{i}", goal_id="g1"))
-
+    server_path = str(pathlib.Path(__file__).parent.parent / "fixtures"
+                      / "mcp_echo_http_server.py")
+    port = _free_port()
+    proc = subprocess.Popen([sys.executable, server_path, "--port", str(port)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        # 8 threads all calling the SAME bridge for the first time at
-        # once -- exactly the shape that crashed before the fix, at a
-        # concurrency level at least as high as this codebase's own
-        # MAX_FANOUT default ever produces in one gather cycle.
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(run_one, range(8)))
+        _wait_for_port(port)
+        bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
+                           startup_timeout_seconds=10.0)
+        tool = make_mcp_tool(bridge, "search", query_arg_name="query")
 
-        for i, evidence in enumerate(results):
-            assert len(evidence) == 1
-            assert evidence[0].content == f"canned result for: concurrent query {i}"
+        def run_one(i):
+            return tool(_task(query=f"concurrent query {i}", key=f"t{i}", goal_id="g1"))
+
+        try:
+            # 8 threads all calling the SAME bridge for the first time at
+            # once -- exactly the shape that crashed before the fix, at a
+            # concurrency level at least as high as this codebase's own
+            # MAX_FANOUT default ever produces in one gather cycle.
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(run_one, range(8)))
+
+            for i, evidence in enumerate(results):
+                assert len(evidence) == 1
+                assert evidence[0].content == f"canned result for: concurrent query {i}"
+        finally:
+            bridge.close()
     finally:
-        bridge.close()
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def test_mcp_bridge_timeout_error_is_actually_informative():
@@ -274,37 +318,37 @@ def test_mcp_bridge_timeout_error_is_actually_informative():
     TimeoutError" with zero further detail -- concurrent.futures.
     TimeoutError's own message is EMPTY (confirmed: str(TimeoutError())
     == ""), so there was genuinely nothing else to show. This uses a REAL
-    server (tests/fixtures/mcp_slow_server.py, which sleeps 5s) and a
+    server (tests/fixtures/mcp_slow_http_server.py, which sleeps 5s) and a
     deliberately short 1s timeout to trigger the real timeout path fast
     and deterministically, then checks the raised exception's message
     actually names the tool, the arguments, and how long it waited --
     not just the exception's class name."""
     from research_agent.tools.mcp_client import MCPBridge
 
-    server_path = str(pathlib.Path(__file__).parent.parent / "fixtures" / "mcp_slow_server.py")
-    # sys.executable, not a hardcoded "python3" -- FOUND BY A REAL FAILURE:
-    # on Windows there's typically no "python3" on PATH at all (the
-    # official installer only provides "python.exe"), so this fell back to
-    # whichever OTHER Python happened to resolve from PATH -- a completely
-    # different interpreter than the venv running pytest, missing the mcp
-    # package entirely, which crashed the subprocess immediately (surfacing
-    # as a confusing "McpError: Connection closed" rather than the
-    # ModuleNotFoundError that was the real cause, visible only in the
-    # subprocess's own captured stderr). Every other MCP test in this file
-    # already used sys.executable correctly; this one test didn't.
-    bridge = MCPBridge(command=sys.executable, args=[server_path], env_allowlist=[])
+    server_path = str(pathlib.Path(__file__).parent.parent / "fixtures"
+                      / "mcp_slow_http_server.py")
+    port = _free_port()
+    proc = subprocess.Popen([sys.executable, server_path, "--port", str(port)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
+        _wait_for_port(port)
+        bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
+                           startup_timeout_seconds=10.0)
         try:
-            bridge.call_tool("search", {"query": "redis vs cassandra"}, timeout_seconds=1.0)
-            assert False, "expected a TimeoutError"
-        except TimeoutError as exc:
-            message = str(exc)
-            assert message, "the whole point of this fix: the message must NOT be empty"
-            assert "search" in message
-            assert "redis vs cassandra" in message
-            assert "1.0" in message  # the configured timeout, visible in the message
+            try:
+                bridge.call_tool("search", {"query": "redis vs cassandra"}, timeout_seconds=1.0)
+                assert False, "expected a TimeoutError"
+            except TimeoutError as exc:
+                message = str(exc)
+                assert message, "the whole point of this fix: the message must NOT be empty"
+                assert "search" in message
+                assert "redis vs cassandra" in message
+                assert "1.0" in message  # the configured timeout, visible in the message
+        finally:
+            bridge.close()
     finally:
-        bridge.close()
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -514,3 +558,19 @@ def test_make_mcp_tool_is_unchanged_by_phase_4():
     assert len(evidence) == 1
     assert evidence[0].source == "mcp"
     assert evidence[0].url is None and evidence[0].domain is None
+
+
+# ---------------------------------------------------------------------------
+# MCPBridge construction validation
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_bridge_rejects_construction_with_no_url():
+    """Validated eagerly at construction, not deferred to the first
+    call_tool() -- a config with no URL should fail loudly at startup,
+    not three tool calls into a run (D-76: url is now MCPBridge's only
+    required argument)."""
+    from research_agent.tools.mcp_client import MCPBridge
+
+    with pytest.raises(ValueError, match="requires a url"):
+        MCPBridge(url="")

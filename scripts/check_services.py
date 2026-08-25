@@ -61,7 +61,7 @@ from typing import Optional
 # and failed with an opaque ModuleNotFoundError when it did not.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
-from research_agent.config import get_settings, split_csv  # noqa: E402
+from research_agent.config import get_settings  # noqa: E402
 
 
 @dataclass
@@ -160,51 +160,24 @@ def check_mcp(settings) -> ServiceStatus:
     (this repo's default) is a correct, working configuration, not a
     failure, so that case is reported as SKIPPED rather than FAIL.
 
-    IMPORTANT DIFFERENCE FROM EVERY OTHER CHECK IN THIS SCRIPT: Qdrant/
-    OpenSearch/Postgres/the LLM engine are all real STANDING services --
-    either already running somewhere or not, independent of this script.
-    MCP (D-30: stdio transport for local servers) is NOT a standing
-    service at all -- cli.py spawns a fresh subprocess via MCPBridge on
-    first real use, per CLI invocation, and it's torn down when that run
-    ends. There is nothing persistent to "check on" the way you'd check
-    a database is up. So this function does the only thing that's
-    actually meaningful: spawns its OWN throwaway instance of the real
-    configured subprocess (MCP_SERVER_COMMAND/MCP_SERVER_ARGS) via
-    MCPBridge -- the exact same class cli.py uses -- calls the
-    configured tool once with a throwaway query, then closes it. A PASS
-    here means "the spawn-and-call mechanism works right now, on this
-    machine, with this config" -- NOT "there is an MCP server currently
-    running that a real cli.py invocation would reuse." There is no such
-    persistent server to find, by design (see DECISIONS.md D-30's note
-    on the not-yet-built Streamable HTTP variant, which WOULD be a real
-    standing service if it existed).
+    D-76: MCP is a real STANDING service, exactly like Qdrant/OpenSearch/
+    Postgres/the LLM engine above -- an independent, already-running
+    server at settings.mcp_server_url, started and stopped by you,
+    entirely separately from this script or any `research_agent` run.
+    This check CONNECTS to that server and calls the configured tool
+    once; unlike every OTHER check in this script, a FAIL here most
+    likely means the standalone server simply isn't running -- see
+    OPERATIONS.md's "Running the MCP servers standalone" for how to
+    start it.
     """
     if not settings.mcp_enabled:
         return ServiceStatus("MCP server", True, "MCP_ENABLED=false -- skipped, not checked",
                               skipped=True)
 
-    # NO "command is empty" check, and its REMOVAL is the point (D-58).
-    # assembly.py resolves an empty MCP_SERVER_COMMAND to sys.executable, so
-    # empty is a WORKING configuration -- and the recommended one, for the
-    # same reasons it is recommended for WEB_MCP_SERVER_COMMAND. This check
-    # previously reported FAIL on a configuration the agent runs happily,
-    # which is worse than no check at all: it sends you hunting for a fault
-    # that is not there.
-    #
-    # Resolved through the SAME two helpers assembly.py uses, so this check
-    # exercises the real launch path rather than a lookalike that could pass
-    # while a real run fails, or vice versa.
-    from research_agent.config import resolve_repo_path, resolve_server_command
     from research_agent.tools.mcp_client import MCPBridge
 
-    command = resolve_server_command(settings.mcp_server_command)
-    args = [resolve_repo_path(a) for a in split_csv(settings.mcp_server_args)]
-
     t0 = time.time()
-    bridge = MCPBridge(
-        command=command, args=args,
-        env_allowlist=split_csv(settings.mcp_server_env_allowlist),
-    )
+    bridge = MCPBridge(url=settings.mcp_server_url)
     try:
         result = bridge.call_tool(
             settings.mcp_tool_name,
@@ -213,64 +186,49 @@ def check_mcp(settings) -> ServiceStatus:
         item_count = len(getattr(result, "content", []) or [])
         return ServiceStatus(
             "MCP server", True,
-            f"{command} {args} -- "
-            f"tool '{settings.mcp_tool_name}' responded, {item_count} content item(s) "
-            "(spawned fresh for this check -- MCP has no persistent server; "
-            "this confirms the on-demand subprocess+stdio path works, not that "
-            "a server is 'up' the way Qdrant/OpenSearch/Postgres/the LLM are)",
+            f"{settings.mcp_server_url} -- "
+            f"tool '{settings.mcp_tool_name}' responded, {item_count} content item(s)",
             time.time() - t0)
     except Exception as e:
         return ServiceStatus(
             "MCP server", False,
-            f"{command} {args} -- "
+            f"{settings.mcp_server_url} -- "
             f"{type(e).__name__}: {e} "
-            "(this is a REAL failure -- the on-demand spawn mechanism itself is "
-            "broken, e.g. a bad command/path or a crash in mcp_corpus_server.py; "
-            "it is NOT a 'no server running' situation, since none is ever "
-            "supposed to be running independently -- see this function's own "
-            "docstring)",
+            "(most likely: nothing is listening at MCP_SERVER_URL -- start "
+            "the standalone server; see OPERATIONS.md 'Running the MCP "
+            "servers standalone')",
             time.time() - t0)
     finally:
         bridge.close()
 
 
 def check_web_search(settings) -> ServiceStatus:
-    """Phase 4 (D-57). Same spawn-a-throwaway-subprocess approach as
-    check_mcp above -- read that docstring first; everything it says about
-    MCP not being a standing service applies here identically.
+    """Phase 4 (D-57). Same standing-service model as check_mcp above
+    (D-76) -- read that docstring first.
 
-    THE ONE THING THIS CHECK CATCHES THAT NOTHING ELSE DOES: this subprocess
-    is the only part of the system that makes OUTBOUND INTERNET requests,
-    and tools/mcp_client.py::_build_subprocess_env forwards nothing from the
-    parent environment (D-30). Behind a corporate proxy with an empty
-    WEB_MCP_SERVER_ENV_ALLOWLIST, every search fails as an opaque timeout
-    and no unit test can tell you -- the entire suite is offline by design.
-    This is where that shows up, which is exactly what D-33 put this script
-    here for.
+    THE ONE THING THIS CHECK CATCHES THAT NOTHING ELSE DOES: the
+    standalone web-search server is the only part of the system that
+    makes OUTBOUND INTERNET requests. If ITS OWN environment (set however
+    you normally would, on the machine/terminal running it -- this
+    process no longer configures it, D-76) is missing proxy variables
+    behind a corporate proxy, every search fails as an opaque timeout and
+    no unit test can tell you -- the entire suite is offline by design.
+    This is where that shows up, which is exactly what D-33 put this
+    script here for.
 
     A PASS means a live query reached a real search engine and came back
-    scored. That makes this the ONLY verification of the live DDGS path in
-    the repo; the unit tests deliberately stop at a fake provider.
+    scored. That makes this the ONLY verification of the live DDGS path
+    in the repo; the unit tests deliberately stop at a fake provider.
     """
     if not settings.web_search_enabled:
         return ServiceStatus("Web search (MCP)", True,
                               "WEB_SEARCH_ENABLED=false -- skipped, not checked",
                               skipped=True)
 
-    # NO "command is empty" check here, deliberately, unlike check_mcp above:
-    # empty is the RECOMMENDED value for WEB_MCP_SERVER_COMMAND and means
-    # sys.executable (D-58). Resolved through the same two helpers
-    # assembly.py uses, so this check exercises the real launch path rather
-    # than a lookalike that could pass while a real run fails.
-    from research_agent.config import resolve_repo_path, resolve_server_command
     from research_agent.tools.mcp_client import MCPBridge
 
-    command = resolve_server_command(settings.web_mcp_server_command)
-    args = [resolve_repo_path(a) for a in split_csv(settings.web_mcp_server_args)]
-
     t0 = time.time()
-    bridge = MCPBridge(command=command, args=args,
-                        env_allowlist=split_csv(settings.web_mcp_server_env_allowlist))
+    bridge = MCPBridge(url=settings.web_mcp_server_url)
     try:
         result = bridge.call_tool(
             settings.web_mcp_tool_name,
@@ -288,29 +246,27 @@ def check_web_search(settings) -> ServiceStatus:
                 "Web search (MCP)", False,
                 f"tool '{settings.web_mcp_tool_name}' responded but returned NO "
                 "results for a deliberately broad query. Most likely the engine "
-                "is throttling this host, or the subprocess has no network "
-                "route -- check WEB_MCP_SERVER_ENV_ALLOWLIST includes your "
-                "proxy variables, since _build_subprocess_env forwards nothing "
-                "by default (D-30)",
+                "is throttling this host, or the standalone server's own "
+                "process has no network route -- check its environment "
+                "includes your proxy variables if you are behind one",
                 time.time() - t0)
         return ServiceStatus(
             "Web search (MCP)", True,
-            f"{command} {args} -- "
+            f"{settings.web_mcp_server_url} -- "
             f"tool '{settings.web_mcp_tool_name}' returned {len(items)} scored "
             f"result(s) across {domains} domain(s) via "
             f"WEB_SEARCH_PROVIDER={settings.web_search_provider} "
-            "(spawned fresh for this check, and the ONLY live verification of "
-            "the search path in this repo -- the unit suite stops at a fake "
-            "provider by design)",
+            "(the ONLY live verification of the search path in this repo -- "
+            "the unit suite stops at a fake provider by design)",
             time.time() - t0)
     except Exception as e:
         return ServiceStatus(
             "Web search (MCP)", False,
-            f"{command} {args} -- "
+            f"{settings.web_mcp_server_url} -- "
             f"{type(e).__name__}: {e} "
-            "(a REAL failure of the on-demand spawn+search path: a bad "
-            "command/path, a missing 'ddgs' install in that interpreter, no "
-            "network route from the subprocess, or upstream throttling)",
+            "(most likely: nothing is listening at WEB_MCP_SERVER_URL -- "
+            "start the standalone server; see OPERATIONS.md 'Running the "
+            "MCP servers standalone')",
             time.time() - t0)
     finally:
         bridge.close()

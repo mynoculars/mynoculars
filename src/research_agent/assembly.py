@@ -31,12 +31,7 @@ import logging
 from typing import NamedTuple, Optional
 
 from research_agent import langfuse as lf
-from research_agent.config import (
-    get_settings,
-    resolve_repo_path,
-    resolve_server_command,
-    split_csv,
-)
+from research_agent.config import get_settings
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event
 from research_agent.memory.semantic_memory import SemanticMemory
@@ -190,21 +185,11 @@ def build_app_and_settings(tracer=None):
     mcp_bridge = None
     mcp_tool = None
     if settings.mcp_enabled:
-        # D-58: command and args resolved against the REPO ROOT, never the
-        # current working directory. MCPBridge does not set
-        # StdioServerParameters.cwd, so the subprocess inherits whatever
-        # directory the agent was launched from -- meaning the shipped
-        # `MCP_SERVER_ARGS=scripts\mcp_corpus_server.py` has always worked
-        # only because every documented invocation starts in the repo root.
-        # Verified by spawning real subprocesses: relative args with
-        # cwd=/tmp fail as an opaque "Connection closed", never as a
-        # file-not-found. Absolute paths and bare PATH names both pass
-        # through unchanged, so no working configuration changes meaning.
-        mcp_bridge = MCPBridge(
-            command=resolve_server_command(settings.mcp_server_command),
-            args=[resolve_repo_path(a) for a in split_csv(settings.mcp_server_args)],
-            env_allowlist=split_csv(settings.mcp_server_env_allowlist),
-        )
+        # D-76: always a standalone Streamable HTTP server -- this process
+        # never spawns one. MCPBridge itself validates that a url is
+        # actually present (raises at construction if not) rather than
+        # assembly.py duplicating that check.
+        mcp_bridge = MCPBridge(url=settings.mcp_server_url)
         mcp_tool = make_mcp_tool(
             mcp_bridge, settings.mcp_tool_name,
             query_arg_name=settings.mcp_query_arg_name,
@@ -215,30 +200,16 @@ def build_app_and_settings(tracer=None):
             # the previous hardcoded 1.0 did to recall.
             unscored_score=settings.min_evidence_score)
     # Phase 4 (D-57): a SECOND bridge, to a SECOND server. Deliberately not
-    # a reuse of the one above: in every deployment so far that one runs
-    # scripts/mcp_corpus_server.py, so the two servers speak different tool
-    # schemas, need different timeouts (local stores vs. outbound internet)
-    # and need different env allowlists. Both share the entire MCPBridge
-    # transport -- what differs is only configuration and parsing.
+    # a reuse of the one above: the two servers speak different tool
+    # schemas and need different timeouts (local stores vs. outbound
+    # internet). Both share the entire MCPBridge transport -- what differs
+    # is only configuration and parsing. D-76: both are always standalone
+    # servers at their own independently-configured URL; this process
+    # spawns neither.
     web_mcp_bridge = None
     web_tool = None
     if settings.web_search_enabled:
-        web_mcp_bridge = MCPBridge(
-            # D-58: empty command means sys.executable -- the interpreter
-            # already running the agent. That is the RECOMMENDED setting: it
-            # is correct on every machine with no configuration, and it
-            # guarantees the server runs in the SAME virtualenv, which
-            # matters because it imports ddgs. A wrong interpreter dies
-            # before the MCP handshake and surfaces as "Connection closed"
-            # rather than as a readable ImportError.
-            command=resolve_server_command(settings.web_mcp_server_command),
-            args=[resolve_repo_path(a)
-                  for a in split_csv(settings.web_mcp_server_args)],
-            # Defaults to HTTPS_PROXY,HTTP_PROXY,NO_PROXY -- unlike the
-            # corpus server, this subprocess makes outbound internet calls
-            # and _build_subprocess_env forwards nothing by default (D-30).
-            env_allowlist=split_csv(settings.web_mcp_server_env_allowlist),
-        )
+        web_mcp_bridge = MCPBridge(url=settings.web_mcp_server_url)
         # No unscored_score counterpart here, and its absence is the point:
         # the web server computes a real per-result score from the engine's
         # own ranking (websearch/scoring.py) and sends it on the wire, so

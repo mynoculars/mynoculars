@@ -10,26 +10,29 @@ Purpose:
     that missing rung: a real search engine, reachable over the transport
     the agent already speaks.
 
-Usage (as a WEB_MCP_SERVER_COMMAND, not run directly by a person):
+Usage -- standalone Streamable HTTP server (D-76: this is the only mode):
+    # In its own terminal, left running:
+    python scripts/mcp_web_search_server.py --port 8766
+    # Stop it whenever you want: Ctrl+C, or kill the process.
+
+    # In .env, pointing at that already-running server:
     WEB_SEARCH_ENABLED=true
-    WEB_MCP_SERVER_COMMAND=<path to your venv's python>
-    WEB_MCP_SERVER_ARGS=scripts/mcp_web_search_server.py
-    WEB_MCP_SERVER_ENV_ALLOWLIST=HTTPS_PROXY,HTTP_PROXY,NO_PROXY
+    WEB_MCP_SERVER_URL=http://127.0.0.1:8766/mcp
     WEB_MCP_TOOL_NAME=web_search
     WEB_MCP_QUERY_ARG_NAME=query
 
     Like scripts/mcp_corpus_server.py, this file lives in the repo root's
     scripts/ directory and puts its own repo-relative "src" on sys.path
-    resolved from __file__ (never from the CWD), so it needs no PYTHONPATH
-    in the subprocess environment.
+    resolved from __file__ (never from the CWD) -- but the shell you run
+    it from still needs the venv active (see OPERATIONS.md's "Running
+    the MCP servers standalone" for the T7/T8 terminal setup).
 
-    THE ONE ENV ALLOWLIST ENTRY THAT MATTERS (and the reason the corpus
-    server needs none): this process makes OUTBOUND INTERNET requests.
-    tools/mcp_client.py::_build_subprocess_env never forwards os.environ
-    (D-30), so behind a corporate proxy the subprocess gets no
-    HTTPS_PROXY/HTTP_PROXY/NO_PROXY unless they are named explicitly, and
-    every search fails as an opaque timeout with nothing in the log
-    explaining why. Name them.
+    THIS PROCESS MAKES OUTBOUND INTERNET REQUESTS. Behind a corporate
+    proxy, set HTTPS_PROXY/HTTP_PROXY/NO_PROXY on THIS terminal's own
+    environment before launching it (D-76: there is no longer an
+    agent-side env allowlist to configure this through -- this is now an
+    independent process with its own environment, set however you
+    normally would for any long-running server).
 
 Scope (deliberately minimal, mirroring the corpus server's own posture):
     ONE tool, "web_search", taking a query and an optional result cap.
@@ -100,6 +103,7 @@ kind of check.
 """
 import asyncio
 import atexit
+import argparse
 import pathlib
 import sys
 import threading
@@ -113,6 +117,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
+# D-76: this server ALWAYS runs Streamable HTTP -- standalone-only, same
+# reasoning as scripts/mcp_corpus_server.py's identical block -- host/port
+# parsed BEFORE FastMCP() below, since they are constructor arguments,
+# not mcp.run() arguments.
+def _parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766)
+    # parse_known_args -- see mcp_corpus_server.py's identical block for
+    # why (this module is also imported directly by
+    # tests/unit/test_mcp_web_search_server.py, under pytest's own argv).
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+_args = _parse_args()
 from research_agent.config import get_settings  # noqa: E402
 from research_agent.websearch.filtering import cap_by_domain, dedupe_by_url  # noqa: E402
 from research_agent.websearch.provider import as_payload  # noqa: E402
@@ -125,7 +145,7 @@ try:  # pragma: no cover - install-shape branch
 except ImportError:  # pragma: no cover - install-shape branch
     ddgs = None
 
-mcp = FastMCP("web-search-server")
+mcp = FastMCP("web-search-server", host=_args.host, port=_args.port)
 
 
 def _build_provider():
@@ -295,4 +315,4 @@ async def web_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="streamable-http")

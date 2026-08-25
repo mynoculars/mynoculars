@@ -13,8 +13,6 @@ import logging
 from research_agent.config import (
     REPO_ROOT,
     Settings,
-    resolve_repo_path,
-    resolve_server_command,
     warn_on_likely_env_typos,
     warn_on_web_search_band,
 )
@@ -112,87 +110,6 @@ def test_repo_root_points_at_the_actual_repository():
     the entire point (see the constant's comment)."""
     assert (REPO_ROOT / "src" / "research_agent" / "config.py").exists()
     assert (REPO_ROOT / "scripts" / "mcp_web_search_server.py").exists()
-
-
-def test_a_relative_path_resolves_against_the_repo_not_the_cwd(monkeypatch, tmp_path):
-    """The bug this closes: MCPBridge never sets
-    StdioServerParameters.cwd, so the server subprocess inherits whatever
-    directory the agent was launched from. Verified by spawning real
-    subprocesses -- relative args with cwd=/tmp fail as an opaque
-    "Connection closed", never as a file-not-found."""
-    monkeypatch.chdir(tmp_path)
-    resolved = resolve_repo_path("scripts/mcp_web_search_server.py")
-    assert resolved == str(REPO_ROOT / "scripts" / "mcp_web_search_server.py")
-
-
-def test_windows_separators_resolve_on_any_platform():
-    """The shipped .env.example uses backslashes. Without normalization,
-    pathlib on POSIX reads "scripts\\x.py" as ONE filename containing a
-    backslash, so the same .env would behave differently on the two
-    platforms."""
-    assert (resolve_repo_path(r"scripts\mcp_web_search_server.py")
-            == str(REPO_ROOT / "scripts" / "mcp_web_search_server.py"))
-
-
-def test_an_absolute_path_is_returned_unchanged():
-    """Someone who wrote an absolute path meant it."""
-    import sys
-
-    assert resolve_repo_path(sys.executable) == sys.executable
-
-
-def test_a_bare_command_name_is_not_turned_into_a_repo_path():
-    """THE reason resolve_repo_path checks existence rather than blindly
-    prefixing REPO_ROOT. "python3"/"uvx"/"npx" are names the OS resolves
-    through PATH, not paths -- prefixing would make every one of them a
-    guaranteed FileNotFoundError."""
-    assert resolve_repo_path("python3") == "python3"
-    assert resolve_repo_path("uvx") == "uvx"
-
-
-def test_a_relative_path_that_resolves_nowhere_is_left_alone():
-    """Not this function's job to raise: MCPBridge already errors clearly
-    naming the command, and check_services.py exists to surface exactly this
-    before a real run. Raising here would turn a config mistake into an
-    import-time crash of the whole application."""
-    assert resolve_repo_path("nope/missing.py") == "nope/missing.py"
-
-
-def test_an_empty_path_stays_empty():
-    assert resolve_repo_path("") == ""
-
-
-def test_an_empty_command_means_the_agents_own_interpreter():
-    """The RECOMMENDED configuration, not a fallback for the careless: it is
-    correct on every machine with no configuration at all, and it guarantees
-    the server runs in the SAME virtualenv -- which matters because
-    mcp_web_search_server.py imports ddgs, and a wrong interpreter dies
-    before the MCP handshake and surfaces as "Connection closed" rather than
-    as a readable ImportError."""
-    import sys
-
-    assert resolve_server_command("") == sys.executable
-    assert resolve_server_command("   ") == sys.executable
-
-
-def test_an_explicit_command_is_honoured_over_sys_executable():
-    """A real case, just not the common one: the server genuinely needing a
-    DIFFERENT interpreter than the agent."""
-    assert resolve_server_command("python3") == "python3"
-
-
-def test_a_repo_relative_venv_interpreter_resolves(tmp_path, monkeypatch):
-    """The portable middle option: ".venv/Scripts/python.exe" committed to
-    .env works on any clone, on any drive, from any working directory --
-    provided the venv is inside the repo."""
-    fake_venv = REPO_ROOT / ".venv-test-marker"
-    fake_venv.mkdir(exist_ok=True)
-    try:
-        monkeypatch.chdir(tmp_path)
-        assert (resolve_server_command(".venv-test-marker")
-                == str(REPO_ROOT / ".venv-test-marker"))
-    finally:
-        fake_venv.rmdir()
 
 
 # ---------------------------------------------------------------------------

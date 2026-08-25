@@ -69,113 +69,8 @@ from research_agent.logging_setup import configure_logging, log_event
 logger = logging.getLogger(__name__)
 
 # The repository root, derived from THIS FILE's location and never from the
-# current working directory:
-#
-#     <repo>/src/research_agent/config.py  ->  parents[2] == <repo>
-#
-# Why this exists (Phase 4 / D-58), and why CWD is not good enough:
-# tools/mcp_client.py::MCPBridge builds an mcp.StdioServerParameters WITHOUT
-# setting its `cwd` field, so the server subprocess inherits the CWD of
-# whichever process launched the agent. Any relative path in MCP_SERVER_ARGS
-# or WEB_MCP_SERVER_COMMAND is therefore resolved against THAT directory,
-# not against the repo.
-#
-# Verified directly rather than assumed, by spawning real subprocesses:
-#
-#   command=<abs>  args=["scripts/x.py"]  cwd=<repo>  -> OK
-#   command=<abs>  args=["scripts/x.py"]  cwd=/tmp    -> FAIL, McpError
-#   command="./python"                    cwd=<repo>  -> OK
-#   command="./python"                    cwd=/tmp    -> FAIL, FileNotFoundError
-#
-# So the shipped `MCP_SERVER_ARGS=scripts\\mcp_corpus_server.py` has always
-# worked only because every documented invocation happens to start in the
-# repo root. Running the CLI from anywhere else, or under a service manager,
-# scheduled task or IDE that sets its own working directory, breaks it -- and
-# breaks it as an opaque "Connection closed", never as "file not found".
+# current working directory. A general path anchor.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-
-def resolve_repo_path(value: str) -> str:
-    """Resolve a possibly-relative path against REPO_ROOT, not the CWD.
-
-    CALLED BY   assembly.py, for BOTH MCP bridges' command and args.
-
-    Rules, in order:
-
-    1. Empty stays empty. "is this configured at all" is the caller's
-       decision to make, not this function's.
-    2. Backslashes are normalized to forward slashes FIRST. The shipped
-       .env.example uses Windows separators, and pathlib on POSIX treats
-       "scripts\\x.py" as a single filename containing a backslash rather
-       than as a path -- so the same .env would silently behave differently
-       on the two platforms. Normalizing makes one .env portable across
-       both. Safe because no path this project references legitimately
-       contains a backslash in a filename.
-    3. An ABSOLUTE path is returned unchanged. Someone who wrote an
-       absolute path meant it.
-    4. A relative path is resolved against REPO_ROOT -- but ONLY IF the
-       result actually EXISTS. Otherwise the original string is returned
-       untouched.
-
-       That existence check is what keeps a BARE COMMAND NAME working.
-       "python3", "uvx" and "npx" are not paths at all; they are names the
-       OS resolves through PATH. <repo>/python3 does not exist, so the name
-       passes through unchanged and PATH lookup still happens. Blindly
-       prefixing REPO_ROOT would turn every bare command into a
-       guaranteed FileNotFoundError.
-
-    Deliberately does NOT raise on a path that resolves nowhere. A wrong
-    path is the caller's problem to report with its own context -- MCPBridge
-    already produces a clear error naming the command, and
-    scripts/check_services.py exists to surface exactly this before a real
-    run. Raising here would turn a configuration mistake into an import-time
-    crash of the whole application.
-    """
-    if not value:
-        return value
-    normalized = value.replace("\\", "/")
-    candidate = pathlib.Path(normalized)
-    if candidate.is_absolute():
-        return str(candidate)
-    resolved = REPO_ROOT / candidate
-    return str(resolved) if resolved.exists() else value
-
-
-def resolve_server_command(value: str) -> str:
-    """The command to launch an MCP server subprocess with.
-
-    CALLED BY   assembly.py, for both bridges.
-
-    AN EMPTY VALUE MEANS sys.executable -- the interpreter currently running
-    the agent -- and that is the RECOMMENDED configuration, not a fallback
-    for the careless.
-
-    Why empty-means-sys.executable is the most portable answer available:
-
-      - It is correct by construction on every machine. No absolute path to
-        get wrong, no path to update when a colleague clones to a different
-        drive, no CI runner needing its own override, no difference between
-        Windows and POSIX layouts (Scripts/python.exe vs bin/python).
-      - It GUARANTEES the server runs in the same virtualenv as the agent.
-        That matters concretely here: scripts/mcp_web_search_server.py
-        imports `ddgs`, and a bare "python" resolved through PATH can easily
-        be a system interpreter that has never seen this project's
-        dependencies -- failing as an opaque "Connection closed" rather than
-        as a readable ImportError, because the subprocess dies before the
-        MCP handshake completes.
-      - It keeps the checked-in .env.example free of machine-specific
-        absolute paths, which is the thing that makes a config file
-        non-portable in the first place.
-
-    A non-empty value is honoured and passed through resolve_repo_path, so
-    an absolute path, a repo-relative path (".venv/Scripts/python.exe") and
-    a bare PATH name ("python3") all work. Use one only when the server
-    genuinely must run under a DIFFERENT interpreter than the agent -- a
-    real case, just not the common one.
-    """
-    if not value or not value.strip():
-        return sys.executable
-    return resolve_repo_path(value.strip())
 
 
 class Settings(BaseSettings):
@@ -345,7 +240,7 @@ class Settings(BaseSettings):
     # the default AND the permanent parity oracle — never deleted.
     memory_server_side_decay: bool = False
 
-    # --- MCP tool seam (P2-13, implements D-26/D-30) ------------------------
+    # --- MCP tool seam (P2-13, implements D-26; D-76: Streamable HTTP only) -
     # Off by default: corpus_search.py (the original function-registry tool)
     # remains cli.py's DEFAULT worker regardless of this flag. When enabled,
     # cli.py ADDITIONALLY wires tools/mcp_client.py's tool in as a second,
@@ -358,24 +253,16 @@ class Settings(BaseSettings):
     # "which hints are available" setting exists, deliberately, since
     # "mcp" is the only specialist this build can ever wire in.
     mcp_enabled: bool = False
-    # The command to launch a LOCAL MCP server over stdio (D-30 -- the only
-    # transport this build implements; never SSE, which D-30 prohibits
-    # outright). Empty string is a deliberately invalid default: turning
-    # mcp_enabled on without also setting a real command is a configuration
-    # mistake this should surface early, not silently do nothing.
-    mcp_server_command: str = ""
-    # Comma-separated argv for the command above (e.g. "-m,my_mcp_server").
-    # A plain string, not a List[str] Settings field, so a person editing
-    # .env doesn't need to know pydantic-settings' JSON-for-lists env
-    # convention -- split_and_strip below does the parsing this codebase's
-    # other comma-separated-feeling settings don't otherwise need.
-    mcp_server_args: str = ""
-    # Comma-separated env VAR NAMES allowed to reach the MCP server
-    # subprocess (D-30: never a blanket os.environ passthrough -- see
-    # tools/mcp_client.py::_build_subprocess_env for exactly why that
-    # matters). Empty by default: an MCP server gets NO inherited
-    # environment variables unless each one is explicitly named here.
-    mcp_server_env_allowlist: str = ""
+    # D-76: the already-running, standalone MCP server's endpoint, e.g.
+    # "http://127.0.0.1:8765/mcp". This process NEVER spawns a server --
+    # it only connects to one you started yourself, separately, and
+    # nothing in this codebase can start or stop it. Empty is a
+    # deliberately invalid default: turning mcp_enabled on with no URL
+    # should surface early, not silently do nothing. (D-75 briefly made
+    # this config-selectable between a spawned stdio server and a
+    # standalone HTTP one; D-76 removed the stdio path entirely -- see
+    # DECISIONS.md for why. This is the only connection setting now.)
+    mcp_server_url: str = ""
     # The server-side tool name this build calls (a server can expose more
     # than one tool; this build only ever calls exactly one).
     mcp_tool_name: str = "search"
@@ -477,35 +364,12 @@ class Settings(BaseSettings):
     # is never called, and the retrieval ladder is byte-identical to every
     # run before Phase 4.
     web_search_enabled: bool = False
-    # EMPTY IS THE RECOMMENDED VALUE, not an unset one: resolve_server_command
-    # (above) turns it into sys.executable, the interpreter already running
-    # the agent. That is correct on every machine with no configuration at
-    # all, and it guarantees the server runs in the SAME virtualenv -- which
-    # matters because the server imports ddgs, and a wrong interpreter dies
-    # before the MCP handshake and surfaces as "Connection closed" rather
-    # than as a readable ImportError.
-    #
-    # Set this only when the server must genuinely run under a DIFFERENT
-    # interpreter than the agent. Absolute paths, repo-relative paths and
-    # bare PATH names are all accepted -- see resolve_server_command.
-    web_mcp_server_command: str = ""
-    # Relative to the REPO ROOT, resolved by resolve_repo_path -- NOT to the
-    # current working directory, which is what mcp.StdioServerParameters
-    # would otherwise use (D-58).
-    web_mcp_server_args: str = "scripts/mcp_web_search_server.py"
-    # THE ENTRY THAT MATTERS, and the reason this defaults NON-EMPTY while
-    # mcp_server_env_allowlist defaults empty: this subprocess makes
-    # OUTBOUND INTERNET requests. tools/mcp_client.py::_build_subprocess_env
-    # never forwards os.environ (D-30), so behind a corporate proxy the
-    # server would receive no HTTPS_PROXY/HTTP_PROXY/NO_PROXY and every
-    # search would fail as an opaque timeout with nothing in the log
-    # explaining why. The corpus server needs none of this because it talks
-    # only to Qdrant/OpenSearch on URLs it reads from its own .env.
-    #
-    # Naming a variable here does NOT leak it unless it is actually set in
-    # this process -- see _build_subprocess_env. On a machine with no proxy
-    # configured this default forwards nothing at all.
-    web_mcp_server_env_allowlist: str = "HTTPS_PROXY,HTTP_PROXY,NO_PROXY"
+    # D-76: the already-running, standalone web-search MCP server's
+    # endpoint, e.g. "http://127.0.0.1:8766/mcp" -- this process never
+    # spawns it. Configured entirely independently from mcp_server_url
+    # above; the two standalone servers are unrelated processes with
+    # different ports.
+    web_mcp_server_url: str = ""
     web_mcp_tool_name: str = "web_search"
     web_mcp_query_arg_name: str = "query"
     # Higher than mcp_call_timeout_seconds' 30.0 default: a corpus lookup
@@ -589,35 +453,14 @@ _KNOWN_ENV_TYPOS = {
     "CONTRADICTION_DETECTION": "CONTRADICTION_DETECTION_ENABLED",
     "SERVER_SIDE_DECAY": "MEMORY_SERVER_SIDE_DECAY",
     "MCP": "MCP_ENABLED",
-    "MCP_COMMAND": "MCP_SERVER_COMMAND",
-    "MCP_ARGS": "MCP_SERVER_ARGS",
-    "MCP_ENV_ALLOWLIST": "MCP_SERVER_ENV_ALLOWLIST",
+    "MCP_URL": "MCP_SERVER_URL",
     "WEB_SEARCH": "WEB_SEARCH_ENABLED",
     "WEB_SEARCH_SCORE": "WEB_SEARCH_MIN_SCORE",
     "WEB_SEARCH_RESULTS": "WEB_SEARCH_MAX_RESULTS",
     "WEB_SEARCH_TIMEOUT": "WEB_SEARCH_PROVIDER_TIMEOUT_SECONDS",
-    "WEB_MCP": "WEB_MCP_SERVER_COMMAND",
-    "WEB_MCP_COMMAND": "WEB_MCP_SERVER_COMMAND",
-    "WEB_MCP_ARGS": "WEB_MCP_SERVER_ARGS",
-    "WEB_MCP_ENV_ALLOWLIST": "WEB_MCP_SERVER_ENV_ALLOWLIST",
+    "WEB_MCP": "WEB_MCP_SERVER_URL",
+    "WEB_MCP_URL": "WEB_MCP_SERVER_URL",
 }
-
-
-def split_csv(value: str) -> list:
-    """Split a comma-separated Settings string into a clean list.
-
-    CALLED BY   cli.py::build_app_and_settings, for
-                settings.mcp_server_args and
-                settings.mcp_server_env_allowlist -- both plain comma-
-                separated strings rather than pydantic-settings' native
-                List[str] fields (see config.py's MCP settings comments
-                for why: a person editing .env by hand shouldn't need to
-                know pydantic-settings' JSON-for-lists env convention).
-    Empty entries (from a trailing comma, double comma, or an entirely
-    empty input string) are dropped, and every remaining entry is
-    whitespace-stripped -- "a, b ,,c" -> ["a", "b", "c"].
-    """
-    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def warn_on_likely_env_typos() -> None:

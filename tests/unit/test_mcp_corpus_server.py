@@ -4,7 +4,7 @@ OWN wrapping logic (hits_for_query, search, _get_corpus_tool).
 
 A real MCP server wrapping the EXISTING tools/corpus_search.py tool --
 built because a fair question ("the MCP server just has to call the
-corpus tools, right?") pointed out that tests/fixtures/mcp_echo_server.py
+corpus tools, right?") pointed out that tests/fixtures/mcp_echo_http_server.py
 proves the wiring but returns nothing genuinely useful. This tests
 scripts/mcp_corpus_server.py's own wrapping logic via a fake corpus tool
 substituted directly into the module's _corpus_tool global -- deliberately

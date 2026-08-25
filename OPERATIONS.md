@@ -6,7 +6,7 @@ shown.
 
 **Mismatch** means stop and debug.
 
-> ## Latest version notes — read these five, then start
+> ## Latest version notes — read these six, then start
 >
 > 1. **`.env.example` ships `MIN_SIMILARITY=0.60`, already calibrated for
 >    this repo's own sample corpus** (see *Calibrate the Retrieval Floor*
@@ -18,16 +18,23 @@ shown.
 > 2. **Use a fresh `--thread-id` per QUESTION.** Re-running the same question
 >    on one id is safe and useful; reusing that id for a *different* question
 >    silently merges the old run's evidence into the new one.
-> 3. **`MCP_SERVER_COMMAND=` (blank) is now the recommended value**, not a
->    misconfiguration — it resolves to the agent's own interpreter (D-58).
->    On a checkout *without* D-58 a blank value fails silently as
->    `Connection closed`. **Step 2a — 5. MCP corpus server** covers both.
+> 3. **MCP is now standalone-only (D-76).** The agent never spawns an MCP
+>    server — `MCP_SERVER_URL` / `WEB_MCP_SERVER_URL` point at a server
+>    YOU start yourself, in its own terminal, and stop whenever you want.
+>    **Running the MCP servers standalone** covers the full workflow; if
+>    you have `MCP_SERVER_COMMAND`/`MCP_SERVER_ARGS`/`MCP_TRANSPORT` in an
+>    old `.env`, they are no longer read — delete them and set the `_URL`
+>    instead.
 > 4. **`pip install "mcp>=1.9"` resolves to 2.x today and breaks the MCP
 >    servers** (`mcp.server.fastmcp` moved). `requirements.txt` now pins
 >    `mcp>=1.9,<2`; if you installed before that pin landed, reinstall.
 > 5. **Web search (Phase 4) is off by default** and needs no action. Turning
->    it on is one `.env` line plus one `pip install` — see *Enabling Web
+>    it on means starting its standalone server too — see *Enabling Web
 >    Search (Phase 4)*.
+> 6. **Every MCP server needs its own terminal, with the venv active and
+>    `PYTHONPATH=src` set** — a fresh window inherits neither from your
+>    working shell. See *Running the MCP servers standalone*'s `TERMINAL:`
+>    callout (T7/T8).
 >
 > Test suite: fully offline, all green — see **Running and Interpreting the
 > Test Suite** for how to run it and read the result; a literal count is
@@ -55,6 +62,7 @@ shown.
 - **[Part 2 — Optional capabilities](#part-2-optional-capabilities)**
   - [Running the HTTP API (optional)](#running-the-http-api-optional)
   - [Enabling Web Search (Phase 4, optional)](#enabling-web-search-phase-4-optional)
+  - [Running the MCP servers standalone (D-76)](#running-the-mcp-servers-standalone-d-76)
   - [Enabling Langfuse Observability (Phase 3, optional)](#enabling-langfuse-observability-phase-3-optional)
 - **[Part 3 — Tuning `.env`](#part-3-tuning-env)**
 - **[Part 4 — Reference & debugging](#part-4-reference-debugging)**
@@ -138,6 +146,7 @@ L3:
 | **T4 — llama-server** | The local LLM | L3 only | **Yes**, until Ctrl-C |
 | **T5 — uvicorn** | The FastAPI server | Only if using the HTTP API | **Yes**, until Ctrl-C |
 | **T6 — logs/psql/DBeaver** | Tailing a log, ad-hoc `psql`, or the DBeaver GUI | As needed | No |
+| **T7 — standalone MCP server(s)** | `mcp_corpus_server.py`/`mcp_web_search_server.py` (D-76: always standalone) | Only if `MCP_ENABLED` or `WEB_SEARCH_ENABLED` is true | **Yes**, until Ctrl-C. Needs its own terminal per server — T7 for corpus, T8 if also running web search |
 
 **Postgres does not get its own terminal.** `pg_ctl start` launches it as a
 detached background process and returns your prompt immediately — run it from
@@ -592,71 +601,30 @@ if they are not.
 
 ---
 
-#### 5. MCP corpus server — **do not start this yourself**
+#### 5. MCP corpus server — always standalone, D-76
 
-This is the one people get wrong, so read the whole subsection.
+**Never spawned by the agent.** `scripts/mcp_corpus_server.py` is an
+independent, long-running server process you start yourself, in its own
+terminal, and stop whenever you want — nothing in `research_agent` can
+start or stop it, and a `research_agent` run's own lifetime never
+affects it. See **Running the MCP servers standalone**, right after this
+section, for the full start/stop workflow and the required `TERMINAL:`
+setup (T7).
 
-**There is no MCP service to start.** Unlike every other row in the table, the
-MCP corpus server is **not** a standing process. The agent spawns
-`scripts/mcp_corpus_server.py` as a child process over stdio when it needs it,
-and tears it down when the run ends. Running it manually in a terminal
-accomplishes nothing — it will sit waiting for JSON-RPC on a stdin nobody is
-writing to.
-
-**`.env`:**
+**`.env` (pointing the agent at that already-running server):**
 
 ```ini
 MCP_ENABLED=true
-MCP_SERVER_COMMAND=
-MCP_SERVER_ARGS=scripts\mcp_corpus_server.py
-MCP_SERVER_ENV_ALLOWLIST=
+MCP_SERVER_URL=http://127.0.0.1:8765/mcp
 MCP_TOOL_NAME=search
 MCP_QUERY_ARG_NAME=query
 MCP_MAX_WORKERS=6
 MCP_CALL_TIMEOUT_SECONDS=120
 ```
 
-**About `MCP_SERVER_COMMAND` being blank — this changed, and the change
-matters:**
-
-> **Before D-58, a blank `MCP_SERVER_COMMAND` was a silent failure.** The value
-> went straight to the subprocess spawn, an empty command could not be
-> executed, and — because the spawn dies before the MCP handshake completes —
-> the error surfaced as a generic `Connection closed` rather than anything
-> naming the real cause. Commenting the line out to "use the default" produced
-> exactly this. There was no default.
->
-> **Since D-58, blank is valid and is the RECOMMENDED value.** `config.py::
-> resolve_server_command` turns an empty command into `sys.executable`: the
-> interpreter already running the agent. That is better than the absolute path
-> for three concrete reasons — it needs no configuration, it survives being
-> cloned to another machine or drive, and it *guarantees* the server runs in
-> the same virtualenv as the agent, which is what makes its imports work.
->
-> **If you are on a checkout without D-58, blank still fails.** Check with
-> `python scripts/check_services.py`: if the MCP row reports
-> `MCP_SERVER_COMMAND is empty -- misconfigured`, your `check_services.py`
-> predates the fix, and so does your `assembly.py`. Either apply D-58 or set an
-> absolute path.
-
-Both of these are correct configurations:
-
-```ini
-
-# Recommended — portable, always the agent's own interpreter
-MCP_SERVER_COMMAND=
-
-# Also fine — explicit, but machine-specific; do not commit it
-MCP_SERVER_COMMAND=D:\work\...\research_agent\.venv\Scripts\python.exe
-```
-
-`MCP_SERVER_ARGS` is resolved **relative to the repository root**, not your
-working directory — so `scripts\mcp_corpus_server.py` works from anywhere.
-(Before D-58 it resolved against the launch directory, so it worked only if
-you happened to `cd` into the repo first.)
-
-**Verify MCP actually starts** — this is the only way to know, and it spawns a
-real server to find out:
+**Verify MCP actually reaches the server** — this connects to it and
+calls the tool once to find out; a FAIL here most likely means the
+standalone server (see below) simply isn't running yet:
 
 ```powershell
 python scripts/check_services.py
@@ -665,9 +633,8 @@ python scripts/check_services.py
 A healthy row looks like:
 
 ```text
-PASS  MCP server   <python.exe> ['...\scripts\mcp_corpus_server.py'] --
+PASS  MCP server   http://127.0.0.1:8765/mcp --
                    tool 'search' responded, N content item(s)
-                   (spawned fresh for this check -- MCP has no persistent server)
 ```
 
 **Failure symptoms and what each one means:**
@@ -675,9 +642,8 @@ PASS  MCP server   <python.exe> ['...\scripts\mcp_corpus_server.py'] --
 | Row / log | Meaning | Fix |
 |---|---|---|
 | `SKIPPED -- MCP_ENABLED=false` | Off in `.env`. Correct and working | Nothing. This is the repo default |
-| `MCP_SERVER_COMMAND is empty -- misconfigured` | Your checkout predates D-58 | Apply D-58, or set an absolute path to your venv python |
-| `McpError: Connection closed` | The subprocess died before the handshake | Wrong interpreter, a `.venv` missing dependencies, or a bad `MCP_SERVER_ARGS` path |
-| `FileNotFoundError` | `MCP_SERVER_COMMAND` points at an interpreter that is not there | Blank it out, or fix the path |
+| `ConnectionError` / `Connection refused` | Nothing is listening at `MCP_SERVER_URL` | Start the standalone server first — see **Running the MCP servers standalone** |
+| `MCPBridge requires a url` (raised at startup) | `MCP_ENABLED=true` but `MCP_SERVER_URL` is empty | Set the URL |
 | `TimeoutError` after `MCP_CALL_TIMEOUT_SECONDS` | Server started but never answered | Usually a cold embedding-model load on first call. `120` is generous for this reason |
 | Nothing at all in the logs | `MCP_ENABLED=false` | Set it `true` if you actually want MCP |
 
@@ -687,6 +653,10 @@ search through the MCP server *instead of* the in-process tool. It reaches the
 demonstration, not extra recall. Leaving it `false` costs you nothing in answer
 quality. (Web search, Phase 4, is a genuinely *different* MCP server that does
 add reach — see Part 2.)
+
+---
+
+See **[Running the MCP servers standalone](#running-the-mcp-servers-standalone-d-75-optional)** (Part 2) for the full start/stop workflow and the `.env` for both modes.
 
 ---
 
@@ -1444,8 +1414,13 @@ connection on FastAPI shutdown, not per-request.
 ## Enabling Web Search (Phase 4, optional)
 
 Off by default. With `WEB_SEARCH_ENABLED=false` the retrieval ladder is
-byte-identical to every pre-Phase-4 run — no second subprocess, no outbound
+byte-identical to every pre-Phase-4 run — no server to start, no outbound
 requests, nothing to configure.
+
+D-76: the web-search server is always standalone — you run it yourself,
+in its own terminal, separately from the agent. See **Running the MCP
+servers standalone** below for the full workflow; this section covers
+the parts specific to web search.
 
 ### 1. Install the dependency
 
@@ -1453,60 +1428,33 @@ requests, nothing to configure.
 pip install -r requirements-websearch.txt
 ```
 
-**Into the same virtualenv that runs the agent.** The search server
-subprocess is launched with `sys.executable` (see step 2), so if `ddgs` is
-missing from *that* environment the subprocess dies before the MCP handshake
-and you get an opaque `Connection closed`, never a readable `ImportError`.
+**Into whichever venv you'll run the standalone server from** — it can
+be the same venv as the agent, or a separate one; the two are
+independent processes now (D-76). If `ddgs` is missing from that
+environment, the server dies on import, before it ever binds a port.
 
-### 2. Configure `.env`
+### 2. Start the server and configure `.env`
+
+```powershell
+# In its own terminal (T8), left running:
+python scripts/mcp_web_search_server.py --port 8766
+```
 
 ```ini
 WEB_SEARCH_ENABLED=true
+WEB_MCP_SERVER_URL=http://127.0.0.1:8766/mcp
 ```
 
-That is genuinely the whole minimum. **Leave `WEB_MCP_SERVER_COMMAND`
-empty** — that is the recommended setting, not an unset one. Empty means
-`sys.executable`, the interpreter already running the agent (D-58), which:
-
-- is correct on every machine with zero configuration — nothing
-  machine-specific in the committed `.env`, nothing to change when a
-  colleague clones to a different drive, no separate CI override, no
-  Windows/POSIX split (`.venv\Scripts\python.exe` vs `.venv/bin/python`);
-- guarantees the server runs in the **same virtualenv** as the agent, which
-  is what makes step 1 sufficient;
-- cannot drift from however you launched the agent.
-
-Set it only if the server must run under a genuinely *different* interpreter.
-All three forms work:
-
-| Form | Example | Notes |
-|---|---|---|
-| *(empty)* | | **Recommended.** `sys.executable`. |
-| Repo-relative | `.venv/Scripts/python.exe` | Portable across clones, if the venv lives inside the repo. |
-| Absolute | `C:\projects\research_agent\.venv\Scripts\python.exe` | Correct but machine-specific — do not commit it. |
-| Bare PATH name | `python3` | Least reliable: whatever PATH resolves to, which may not have `ddgs`. |
-
-**Relative paths resolve against the repository root, not your working
-directory.** Worth stating because the MCP SDK does the opposite —
-`MCPBridge` does not set `StdioServerParameters.cwd`, so without D-58’s
-resolution a relative path would break the moment you ran the CLI from
-anywhere but the repo root, or from a service manager, scheduled task, or
-IDE that sets its own working directory. Backslashes and forward slashes
-both work on both platforms.
+That is genuinely the whole minimum.
 
 ### 3. Behind a corporate proxy
 
-```ini
-WEB_MCP_SERVER_ENV_ALLOWLIST=HTTPS_PROXY,HTTP_PROXY,NO_PROXY
-```
-
-This is the shipped default, and it is the one setting most likely to bite
-you. The search server is the only subprocess making outbound internet
-calls, and `_build_subprocess_env` forwards **nothing** from the parent
-environment (D-30). With an empty allowlist behind a proxy, every search
-fails as a timeout with nothing in the log explaining why. Naming a variable
-here does not leak it unless it is actually set — on a machine with no proxy
-this forwards nothing.
+Set `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` on the **standalone server's
+own terminal environment**, before launching it — D-76: there is no
+longer an agent-side env allowlist to configure this through, since
+nothing is spawned. This is the one setting most likely to bite you:
+with no proxy variables and a proxy in the way, every search fails as a
+timeout with nothing in the log explaining why.
 
 ### 4. Verify
 
@@ -1520,15 +1468,16 @@ design and stops at a fake provider. A PASS means a real query reached a
 real engine and came back scored:
 
 ```
-PASS  Web search (MCP)  ... tool 'web_search' returned 5 scored result(s)
-                           across 4 domain(s) via WEB_SEARCH_PROVIDER=ddgs
+PASS  Web search (MCP)  http://127.0.0.1:8766/mcp -- tool 'web_search'
+                         returned 5 scored result(s) across 4 domain(s)
+                         via WEB_SEARCH_PROVIDER=ddgs
 ```
 
 | Symptom | Cause |
 |---|---|
-| `Connection closed` | Almost always `ddgs` missing from the interpreter running the server, or a bad `WEB_MCP_SERVER_ARGS` path. The subprocess died before the handshake. |
-| `responded but returned NO results` | Engine throttling this host, or the subprocess has no network route — check the proxy allowlist above. |
-| `FileNotFoundError` | `WEB_MCP_SERVER_COMMAND` points at an interpreter that is not there. Try emptying it. |
+| `ConnectionError` / `Connection refused` | Nothing is listening at `WEB_MCP_SERVER_URL` — start the standalone server first |
+| `responded but returned NO results` | Engine throttling this host, or the standalone server's own process has no network route — check its proxy environment |
+| `Connection closed` mid-search | Almost always `ddgs` missing from the interpreter the standalone server was started with |
 
 ### What to expect in a run
 
@@ -1593,6 +1542,110 @@ no SLA, throttling expected. Replacing it is one new module in
 `build_provider`, and one `WEB_SEARCH_PROVIDER` value — nothing in
 `agents/`, `orchestration/` or `tools/` changes, because the agent process
 never imports the search implementation at all.
+
+## Running the MCP servers standalone (D-76)
+
+> **TERMINAL:** **this needs its own terminal (T7 — T8 too, if you also
+> run the web-search server).** Both server scripts run in the
+> FOREGROUND and hold the terminal until you Ctrl-C them — that is
+> normal, not a hang, same as `uvicorn` (T5) above. Start each one in
+> its own dedicated window, leave it running, and issue your actual
+> `research_agent` runs from your working shell (T1).
+>
+> **That terminal needs the venv active AND `PYTHONPATH` set to the
+> repo's `src` folder — a fresh window inherits neither from T1.** Both
+> server scripts import `research_agent.*` modules (`config.py`,
+> `retrieval/hybrid.py`, and so on) directly, exactly like the CLI does,
+> so the same two-step setup every other terminal in this document needs
+> applies here too:
+>
+> ```powershell
+> # In the NEW terminal, before running either server script:
+> .venv\Scripts\Activate.ps1              # activate the SAME venv as T1
+> $env:PYTHONPATH = "src"                 # so `research_agent` is importable
+> ```
+>
+> ```bash
+> # macOS/Linux equivalent:
+> source .venv/bin/activate
+> export PYTHONPATH=src
+> ```
+>
+> Skipping this produces `ModuleNotFoundError: research_agent` the moment
+> the server script tries to import anything from this repo — before it
+> ever gets as far as binding a port. (This is `PYTHONPATH`, not
+> `PYTHONHOME` — setting `PYTHONHOME` instead changes where Python looks
+> for its OWN standard library and will break the interpreter rather than
+> fix the import; see **Troubleshooting Common Errors** if you see
+> `ModuleNotFoundError` after doing this and are unsure why.)
+
+D-76: `scripts/mcp_corpus_server.py` and `scripts/mcp_web_search_server.py`
+are ALWAYS standalone servers — there is no other mode. Each behaves like
+any other long-running server process on your machine: you start it, it
+keeps running until you stop it, and nothing about a `research_agent`
+run's own lifetime affects it. Neither script accepts a `--transport`
+flag; both always run Streamable HTTP.
+
+**Start the corpus server, in its own terminal (T7), left running:**
+
+```powershell
+python scripts\mcp_corpus_server.py --port 8765
+```
+
+**Stop it whenever you want** — `Ctrl+C` in that terminal, or kill the
+process by any normal means. There is no `research_agent`-side command to
+start or stop it; it is not that process's to control.
+
+**Point `research_agent` at it (`.env`):**
+
+```ini
+MCP_ENABLED=true
+MCP_SERVER_URL=http://127.0.0.1:8765/mcp
+MCP_TOOL_NAME=search
+MCP_QUERY_ARG_NAME=query
+```
+
+**Verify:** `python scripts/check_services.py` connects to the
+already-running server over HTTP and calls the configured tool once, so
+a FAILURE here means the standalone server itself is not reachable
+(wrong host/port, not started, or a firewall) — never a spawn problem,
+since nothing is ever spawned.
+
+**The web-search server works identically**, in its own terminal (T8)
+with the same venv-active + `PYTHONPATH=src` setup as T7 above:
+
+```powershell
+python scripts\mcp_web_search_server.py --port 8766
+```
+
+```ini
+WEB_SEARCH_ENABLED=true
+WEB_MCP_SERVER_URL=http://127.0.0.1:8766/mcp
+WEB_MCP_TOOL_NAME=web_search
+WEB_MCP_QUERY_ARG_NAME=query
+```
+
+**Why a standalone server, rather than the agent spawning one per run
+(the pre-D-76 behavior)?** Three real reasons: (1) a cold
+corpus-backed server's first call is slow (fastembed model load, real
+Qdrant/OpenSearch round trips — see `MCP_CALL_TIMEOUT_SECONDS`'s own
+note above) — paid once, ever, rather than once per run. (2) Multiple
+runs, or multiple people, sharing one warm server. (3) The server's own
+lifetime under your direct control — start it when you start working,
+stop it when you're done, independent of any individual run finishing,
+crashing, or being interrupted.
+
+**Failure symptoms:**
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `ConnectionError` / `Connection refused` at run start | Nothing is listening at `MCP_SERVER_URL` | Start the standalone server first, or check the host/port match |
+| Works, then stops working mid-session | The standalone server was stopped or crashed | Check its terminal/logs; restart it |
+| `MCPBridge requires a url` (raised at startup) | `MCP_ENABLED=true` but `MCP_SERVER_URL` is empty | Set the URL |
+| Closing/finishing a `research_agent` run also seems to stop the server | It shouldn't, and doesn't — if the server process itself exited, check ITS OWN terminal for an unrelated crash, not `research_agent`'s logs | See the standalone server's own output |
+| `ModuleNotFoundError: research_agent`, in the SERVER's own terminal (T7/T8), immediately on startup | That terminal never got the venv activated and `PYTHONPATH=src` set — a new window inherits neither from T1 | Run the two setup lines at the top of this section, in that same terminal, before the server script |
+
+---
 
 ## Enabling Langfuse Observability (Phase 3, optional)
 
@@ -1742,9 +1795,9 @@ Nothing in this part needs to be read in order.
 | **Postgres** | Durable checkpointer + run history | 5432 | Falls back to in-memory checkpointer; HITL still works within a run |
 | **llama-server (Qwen)** | Primary LLM (L3 only) | 8080 | L3 fails unless Gemini fallback is set |
 | **Gemini API** | Fallback LLM (L3 only) | cloud | No fallback; primary must work |
-| **Web search server** (Phase 4, optional) | Retrieval tier 4, when corpus + MCP both miss | — (stdio subprocess, no port) | Ladder falls straight through to the model's own knowledge, exactly as before Phase 4 — `WEB_SEARCH_ENABLED=false` is the default. NOT a standing service: a fresh subprocess is spawned per CLI run and torn down with it |
-| **Outbound internet** (Phase 4, optional) | The search server's HTTP calls | 443 | Every web search fails. Behind a proxy this needs `WEB_MCP_SERVER_ENV_ALLOWLIST` — see "Enabling Web Search" |
-| **MCP corpus server** (optional) | Corpus search over MCP instead of in-process | — (stdio subprocess) | Nothing — `MCP_ENABLED=false` is the default and retrieval uses the in-process tool. **Never started by hand**: the agent spawns and reaps it per run |
+| **Web search server** (Phase 4, optional) | Retrieval tier 4, when corpus + MCP both miss | 8766 (default; standalone, D-76) | Ladder falls straight through to the model's own knowledge, exactly as before Phase 4 — `WEB_SEARCH_ENABLED=false` is the default. Standing service: start it yourself, leave it running — see "Running the MCP servers standalone" |
+| **Outbound internet** (Phase 4, optional) | The search server's HTTP calls | 443 | Every web search fails. Behind a proxy this needs proxy env vars set on the standalone server's OWN terminal — see "Enabling Web Search" |
+| **MCP corpus server** (optional) | Corpus search over MCP instead of in-process | 8765 (default; standalone, D-76) | Nothing — `MCP_ENABLED=false` is the default and retrieval uses the in-process tool. Standing service: start it yourself, leave it running, stop it whenever you want — see *Running the MCP servers standalone* |
 | **uvicorn / FastAPI** (optional) | The HTTP API (`/health`, `/research`, `/resume`) | 8000 | Nothing — the CLI is unaffected. Needs its own terminal when you do want it |
 | **Langfuse** (Phase 3, optional) | Hosted trace/cost UI | cloud/self-hosted | Traces just don't appear; agent runs identically — `LANGFUSE_ENABLED=false` is the default |
 
@@ -2632,7 +2685,7 @@ values with an odd number of `"` characters.
 | **L1 / L2 / L3** | Run levels | Skeleton (no services) / real retrieval / real LLM. See *There Are THREE Run Levels* |
 | **HITL** | Human-In-The-Loop | The graph pauses for human approve/redirect/abort at four escalation points |
 | **E1–E4** | Escalation triggers | E1 zero goals, E2 contested goals, E3 cannot-converge, E4 critique exhausted — the four points HITL can interrupt |
-| **MCP** | Model Context Protocol | The tool protocol used here for two stdio subprocess servers: the corpus server (P2-13) and the web-search server (Phase 4) |
+| **MCP** | Model Context Protocol | The tool protocol used here for two standalone Streamable HTTP servers (D-76): the corpus server (P2-13) and the web-search server (Phase 4) |
 | **RRF** | Reciprocal Rank Fusion | How the dense (Qdrant) and keyword (OpenSearch) result lists are merged into one ranking |
 | **`RRF_K`** | RRF constant | Damping term in the RRF formula; higher values flatten the difference between ranks |
 | **`RRF_SQUASH`** | RRF score scaling | Maps a fused RRF score into 0–1 so it is comparable with `MIN_EVIDENCE_SCORE` |
