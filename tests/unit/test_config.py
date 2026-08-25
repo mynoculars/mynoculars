@@ -1,14 +1,17 @@
 """
-tests/unit/test_config.py — config.py's env-typo detection (P2-09).
+tests/unit/test_config.py — config.py's env-typo detection (P2-09, D-79).
 
-Covers warn_on_likely_env_typos() (P2-09) and warn_on_web_search_band()
-(Phase 4 / D-57). Does NOT cover Settings' own field validation or
-defaults — those are exercised implicitly by every other test file in this
-suite, each of which constructs a Settings instance suited to what it's
-testing.
+Covers warn_on_likely_env_typos() (P2-09; D-79 extended it to also see
+.env-FILE-only keys, not just os.environ, and to cover the six settings
+D-76 removed outright) and warn_on_web_search_band() (Phase 4 / D-57).
+Does NOT cover Settings' own field validation or defaults — those are
+exercised implicitly by every other test file in this suite, each of
+which constructs a Settings instance suited to what it's testing.
 """
 
 import logging
+
+import pytest
 
 from research_agent.config import (
     REPO_ROOT,
@@ -135,3 +138,79 @@ def test_get_settings_configures_logging_before_returning(monkeypatch):
             "constructed settings' own log_level")
     finally:
         config_module.get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# D-79 -- warn_on_likely_env_typos must also see .env-FILE-only keys, and
+# must know about the six settings D-76 removed outright
+# ---------------------------------------------------------------------------
+
+
+def test_env_file_keys_reads_the_actual_dotenv_file(tmp_path, monkeypatch):
+    """The regression this whole fix exists to close, proven directly:
+    a key set ONLY in .env (never exported to the real shell) must be
+    visible to _env_file_keys() -- confirmed empirically (constructing a
+    real Settings from a temp .env and checking os.environ immediately
+    after) that pydantic-settings' own env_file parsing never writes
+    those values into os.environ at all."""
+    from research_agent.config import _env_file_keys
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("WEB_MCP_SERVER_COMMAND=/some/path\n"
+                                   "WEB_SEARCH_ENABLED=true\n")
+    keys = _env_file_keys()
+    assert "WEB_MCP_SERVER_COMMAND" in keys
+    assert "WEB_SEARCH_ENABLED" in keys
+
+
+def test_env_file_keys_returns_empty_set_for_a_missing_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no .env in this directory
+    from research_agent.config import _env_file_keys
+    assert _env_file_keys() == set()
+
+
+def test_warn_on_likely_env_typos_catches_a_dotenv_only_mistake(
+        tmp_path, monkeypatch, caplog):
+    """The exact live scenario, reproduced directly: WEB_MCP_SERVER_COMMAND
+    set ONLY in .env (never exported), WEB_MCP_SERVER_URL never set at
+    all. Before D-79 this was invisible to warn_on_likely_env_typos
+    entirely -- it only ever checked os.environ, which a .env-only value
+    never reaches."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("WEB_MCP_SERVER_COMMAND", raising=False)
+    monkeypatch.delenv("WEB_MCP_SERVER_URL", raising=False)
+    (tmp_path / ".env").write_text(
+        "WEB_SEARCH_ENABLED=true\n"
+        "WEB_MCP_SERVER_COMMAND=D:\\work\\repo\\.venv\\Scripts\\python.exe\n")
+    with caplog.at_level(logging.WARNING):
+        warn_on_likely_env_typos()
+    matches = [r for r in caplog.records if "config.likely_typo" in r.message]
+    assert matches
+    assert matches[0].event_fields["set_key"] == "WEB_MCP_SERVER_COMMAND"
+    assert matches[0].event_fields["probably_meant"] == "WEB_MCP_SERVER_URL"
+
+
+@pytest.mark.parametrize("wrong,right", [
+    ("MCP_TRANSPORT", "MCP_SERVER_URL"),
+    ("MCP_SERVER_COMMAND", "MCP_SERVER_URL"),
+    ("MCP_SERVER_ARGS", "MCP_SERVER_URL"),
+    ("MCP_SERVER_ENV_ALLOWLIST", "MCP_SERVER_URL"),
+    ("WEB_MCP_TRANSPORT", "WEB_MCP_SERVER_URL"),
+    ("WEB_MCP_SERVER_COMMAND", "WEB_MCP_SERVER_URL"),
+    ("WEB_MCP_SERVER_ARGS", "WEB_MCP_SERVER_URL"),
+    ("WEB_MCP_SERVER_ENV_ALLOWLIST", "WEB_MCP_SERVER_URL"),
+])
+def test_warn_on_likely_env_typos_covers_every_d76_removed_setting(
+        wrong, right, monkeypatch, caplog):
+    """All six settings D-76 deleted from Settings (plus the two
+    already-removed args/allowlist siblings) must be recognized as
+    "probably meant the new _URL setting" -- not just the one that
+    happened to show up in a live run."""
+    monkeypatch.setenv(wrong, "some-old-value")
+    monkeypatch.delenv(right, raising=False)
+    with caplog.at_level(logging.WARNING):
+        warn_on_likely_env_typos()
+    matches = [r for r in caplog.records if "config.likely_typo" in r.message
+              and r.event_fields.get("set_key") == wrong]
+    assert matches, f"{wrong} was not flagged"
+    assert matches[0].event_fields["probably_meant"] == right

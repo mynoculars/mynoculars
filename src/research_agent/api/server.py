@@ -34,53 +34,97 @@ never updated.) Checkpointing itself, the thing that makes /resume work,
 comes from the graph's own checkpointer, not from this app.
 """
 
+import logging
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from research_agent import langfuse as lf
-from research_agent.assembly import build_app_and_settings, reject_if_thread_in_use
-from research_agent.logging_setup import run_id_var
+from research_agent.assembly import AppBundle, build_app_and_settings, reject_if_thread_in_use
+from research_agent.logging_setup import log_event, run_id_var
 from research_agent.state import ResearchState
 from research_agent.storage.postgres import close_checkpointer, record_run
 
-# Built ONCE, at import time (i.e. when uvicorn loads this module) — not
-# per-request. This is the exact same build_app_and_settings() call cli.py
-# makes per invocation; here it happens once and _graph/_settings are then
-# shared across every request the process ever serves. _graph is a
-# compiled LangGraph app (already bound to its checkpointer); _settings is
-# the process-wide config singleton (see config.py::get_settings).
-# P2-08: build_app_and_settings now returns an AppBundle (not a bare
-# 2-tuple) — _durable and _checkpointer were previously unreachable from
-# this file at all, which is what made both the /health gap and the
-# leaked-connection-on-shutdown gap possible.
-_bundle = build_app_and_settings()
-# Field-by-field, NEVER tuple-unpacking. AppBundle gained a fifth field
-# (mcp_bridge) in P2-13 while this line still unpacked four, which raised
-# ValueError at import time and made the entire API unstartable -- every
-# endpoint below, plus /health and the P2-08 record_run parity, unreachable.
-# Named access cannot break that way when a future field is added.
-_graph = _bundle.app
-_settings = _bundle.settings
-_durable = _bundle.durable
-_checkpointer = _bundle.checkpointer
-_mcp_bridge = _bundle.mcp_bridge
-_web_mcp_bridge = _bundle.web_mcp_bridge
+logger = logging.getLogger(__name__)
+
+# D-78: built LAZILY, in _lifespan's startup phase below -- NOT at import
+# time, and NOT unconditionally. Every name below starts as None/empty and
+# is only ever populated (or left None, on failure) once uvicorn actually
+# starts serving, never while the module is still being imported.
+#
+# WHY THIS CHANGED (was: `_bundle = build_app_and_settings()` at plain
+# module level, i.e. the very first thing this file did on import): a
+# real run hit this directly -- MCP_ENABLED=true with an empty
+# MCP_SERVER_URL (D-76 made that combination raise immediately, correctly,
+# instead of silently half-working) took down the ENTIRE uvicorn worker
+# before it could bind its port or serve /health, with a raw multiprocess
+# traceback as the only feedback. cli.py never had this problem: it calls
+# build_app_and_settings() inside main(), per invocation, so the exact
+# same misconfiguration fails as one clean, readable error at the moment
+# you try to run something -- everything else about the CLI still works.
+# This file now matches that: a bad config degrades /health and every
+# other endpoint to a clear 503, rather than preventing the process from
+# starting at all. See DECISIONS.md D-78 for the full account.
+_bundle: Optional[AppBundle] = None
+_graph = None
+_settings = None
+_durable = False
+_checkpointer = None
+_mcp_bridge = None
+_web_mcp_bridge = None
+# Set ONLY on a failed build -- str(exc), not the exception object itself,
+# so /health can return it as plain JSON without needing to know how to
+# serialize whatever build_app_and_settings happened to raise.
+_build_error: Optional[str] = None
+
+
+def _ensure_built() -> None:
+    """Raise HTTPException(503) if startup's build attempt failed.
+
+    CALLED BY   research() and resume() below, as their first line --
+                every endpoint that actually needs _graph/_settings to do
+                anything, so a caller gets one clear, actionable error
+                instead of an AttributeError on None.invoke(...) (a 500
+                with a traceback pointing at the wrong problem entirely).
+                /health does NOT call this -- it reports the same
+                _build_error directly, since liveness must stay reachable
+                even when the deeper build failed (that is the entire
+                point of this file's D-78 rework).
+    """
+    if _build_error is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Server started but its app bundle failed to build: "
+                   f"{_build_error} -- fix the underlying config (see the "
+                   f"startup log for the exact error) and restart the "
+                   f"server. GET /health reports this same detail.")
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Own the shutdown of everything build_app_and_settings opened.
+    """Build the app bundle at STARTUP (not import time, D-78 — see the
+    module-level comment above for the full story), then own the
+    shutdown of everything it opened.
+
+    A build failure here is caught and stored in _build_error rather than
+    left to propagate: propagating it would make FastAPI/uvicorn treat
+    lifespan startup itself as failed, which -- confirmed against the
+    actual behavior, not assumed -- still prevents the server from
+    serving ANY request, /health included. Catching it here is what
+    lets /health report the failure as a normal 200 (with an error body,
+    not an error status) instead of the port never opening at all.
 
     Replaces the deprecated @app.on_event("shutdown") hook. Closes BOTH
     the checkpointer connection (P2-08) and, when MCP or web search is
-    enabled, BOTH MCPBridges -- each owning a real subprocess and a
-    background thread
+    enabled, BOTH MCPBridges -- each owning a real background thread
     that were previously left running past shutdown here, even though
-    cli.py has always closed them in its own finally block.
+    cli.py has always closed them in its own finally block. Every close
+    call below is guarded: a failed build leaves these as None/False,
+    and closing something that was never built would itself raise.
 
     Also shuts the Langfuse Observer down, which cli.py's own finally
     block has always done and this file previously never did: without it
@@ -88,11 +132,31 @@ async def _lifespan(_app: FastAPI):
     SDK's queue, and any root span left open by a request that died
     mid-flight would never be exported at all (an un-.end()ed span is
     not "incomplete" in the OTel model -- it is never sent). Deliberately
-    LAST, after the checkpointer and bridge, so an exception closing
+    LAST, after the checkpointer and bridges, so an exception closing
     either of those cannot skip the flush.
     """
+    global _bundle, _graph, _settings, _durable, _checkpointer
+    global _mcp_bridge, _web_mcp_bridge, _build_error
+    try:
+        _bundle = build_app_and_settings()
+        _graph = _bundle.app
+        _settings = _bundle.settings
+        _durable = _bundle.durable
+        _checkpointer = _bundle.checkpointer
+        _mcp_bridge = _bundle.mcp_bridge
+        _web_mcp_bridge = _bundle.web_mcp_bridge
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad: ANY
+        # build failure (bad MCP config, an unreachable required store,
+        # a settings validation error) must degrade to a reachable
+        # /health, never take the whole process down. The exception is
+        # still logged in full here, at ERROR, so it is not silently
+        # swallowed -- only its propagation past this point is stopped.
+        _build_error = f"{type(exc).__name__}: {exc}"
+        log_event(logger, "api.startup_build_failed", level=logging.ERROR,
+                  error=_build_error)
     yield
-    close_checkpointer(_checkpointer)
+    if _checkpointer is not None:
+        close_checkpointer(_checkpointer)
     if _mcp_bridge is not None:
         _mcp_bridge.close()
     if _web_mcp_bridge is not None:
@@ -135,23 +199,35 @@ class ResearchRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    """Liveness probe — proves the process is up and the graph was built.
+    """Liveness probe — proves the process is up, and reports whether the
+    app bundle actually finished building.
 
-    READS   _settings.llm_mode, _durable (module-level, see above).
+    READS   _settings, _durable, _build_error (module-level, see above).
     CALLS   nothing external — no store or LLM reachability is checked
-            here. A 200 from this endpoint means "the FastAPI app started
-            successfully," not "Postgres/Qdrant/OpenSearch are reachable."
+            here. A 200 from this endpoint means "the FastAPI process is
+            up and serving," not "the app bundle built successfully" --
+            check the response body's own "status" field for that (D-78:
+            previously a build failure meant the process never started
+            at all, so /health was unreachable either way; now it is
+            always reachable, and tells you WHY if something failed).
             Each storage module does its own liveness probe independently
             at build_app_and_settings() time, and degrades silently if
             unreachable — see storage/qdrant_store.py and
             storage/opensearch_store.py for that behaviour.
-    RETURNS {"status": "ok", "llm_mode": "stub"|"live", "durable": bool}
-            P2-08: `durable` is new — False means checkpointing degraded to
+    RETURNS on a successful build:
+                {"status": "ok", "llm_mode": "stub"|"live", "durable": bool}
+            P2-08: `durable` — False means checkpointing degraded to
             an in-memory MemorySaver at startup (Postgres was unreachable),
             so any paused (interrupted) run will NOT survive a process
-            restart. Previously this was visible only in a startup log
-            line; a caller polling /health had no way to see it at all.
+            restart.
+            on a FAILED build (D-78):
+                {"status": "error", "detail": "<exception type and message>"}
+            -- every other endpoint (/research, /resume) returns
+            HTTPException(503) with this same detail until the server is
+            restarted with a corrected config.
     """
+    if _build_error is not None:
+        return {"status": "error", "detail": _build_error}
     return {"status": "ok", "llm_mode": _settings.llm_mode, "durable": _durable}
 
 
@@ -353,7 +429,12 @@ def research(req: ResearchRequest) -> dict:
     default) — this is the only place an API-driven run's identity is
     decided.
 
-    RAISES  HTTPException(409) if the caller supplied a thread_id that
+    RAISES  HTTPException(503) if startup's app-bundle build failed
+            (D-78) -- see _ensure_built()'s own docstring; checked FIRST,
+            before the D-20 check below, since neither _graph nor
+            reject_if_thread_in_use has anything valid to check against
+            otherwise.
+            HTTPException(409) if the caller supplied a thread_id that
             already holds a run (M-2 / D-20). An HTTP client can reuse
             a thread_id far more casually than a human retyping
             --thread-id, and without this check the graph's reducers
@@ -361,6 +442,7 @@ def research(req: ResearchRequest) -> dict:
             the new one -- see assembly.reject_if_thread_in_use.
     """
     thread_id = req.thread_id or f"api-{uuid.uuid4().hex[:12]}"
+    _ensure_built()
     run_id_var.set(thread_id)
     prior_query = reject_if_thread_in_use(_graph, _config(thread_id))
     if prior_query:
@@ -401,6 +483,8 @@ def resume(req: ResumeRequest) -> dict:
             (e.g. gap_generator on a "redirect") and pause AGAIN later on
             a subsequent trigger.
     WRITES  run_id_var set to req.thread_id, same reasoning as research().
+    RAISES  HTTPException(503) if startup's app-bundle build failed
+            (D-78) -- see _ensure_built()'s own docstring.
     RETURNS see _respond() — "done" if this resume ran the graph to
             completion, or another "interrupted" if a later check paused
             it again (e.g. a "redirect" that leads to a second failed
@@ -416,6 +500,7 @@ def resume(req: ResumeRequest) -> dict:
     and this endpoint will find nothing to resume.
     """
     run_id_var.set(req.thread_id)
+    _ensure_built()
     with _traced_request(req.thread_id, "research_resume",
                          input={"action": req.action,
                                 "guidance": req.guidance}) as trace:

@@ -14,6 +14,7 @@ exercise the graph (tests/integration/ already does) — they exist so that
 "the API process can start at all" is a thing the suite asserts.
 """
 
+import asyncio
 import importlib
 import sys
 from unittest.mock import patch
@@ -82,17 +83,39 @@ class _FakeBridge:
         self.closed = True
 
 
-def _import_server(bundle):
-    """Import api/server.py fresh with `bundle` injected.
+def _import_server(bundle, monkeypatch):
+    """Import api/server.py fresh with `bundle` injected, then drive its
+    startup so every test sees a fully-built module immediately.
 
-    build_app_and_settings runs at that module's IMPORT time, so it must be
-    patched before the import and the module must be evicted from
-    sys.modules first — otherwise a previously-imported copy is reused and
-    the patch has no effect.
+    D-78: build_app_and_settings() now runs LAZILY, inside _lifespan's
+    startup phase -- not at import time, so patching it only around the
+    import call (this function's previous shape, a `with patch(...):`
+    that exited before returning) no longer has any effect on the
+    module's globals; nothing calls the patched function until something
+    later triggers lifespan. monkeypatch.setattr, not a context-manager
+    patch, is what keeps the fake bundle active for the rest of the
+    test -- it reverts automatically at teardown, same as every other
+    monkeypatch fixture use in this suite.
+
+    Also drives _lifespan's startup half here (via a throwaway event
+    loop), rather than requiring every test to open a `with
+    TestClient(...)` first: several tests below inspect module globals
+    or call server._respond()/server._payload... directly, with no HTTP
+    request at all, and need _settings/_checkpointer/etc. populated
+    regardless. Tests that DO go on to use TestClient trigger a SECOND,
+    independent lifespan pass of their own -- harmless, since it re-reads
+    the same monkeypatched bundle and simply re-sets the same globals.
     """
     sys.modules.pop("research_agent.api.server", None)
-    with patch("research_agent.assembly.build_app_and_settings", return_value=bundle):
-        return importlib.import_module("research_agent.api.server")
+    server = importlib.import_module("research_agent.api.server")
+    monkeypatch.setattr(server, "build_app_and_settings", lambda: bundle)
+
+    async def _advance():
+        cm = server._lifespan(server.app)
+        await cm.__aenter__()
+
+    asyncio.run(_advance())
+    return server
 
 
 class _RecordingObserver:
@@ -129,14 +152,14 @@ def _bundle(**overrides):
     return AppBundle(**base)
 
 
-def test_server_module_imports_with_a_full_appbundle():
+def test_server_module_imports_with_a_full_appbundle(monkeypatch):
     """The regression guard. A tuple-unpack of the wrong arity raises
     ValueError right here, before any endpoint is even reachable."""
-    server = _import_server(_bundle())
+    server = _import_server(_bundle(), monkeypatch)
     assert server.app is not None
 
 
-def test_server_consumes_the_bundle_by_name_not_by_position():
+def test_server_consumes_the_bundle_by_name_not_by_position(monkeypatch):
     """Field ORDER must not matter: every consumer reads named attributes.
     Constructing the bundle purely by keyword and asserting each value
     landed on the right module global proves no positional assumption
@@ -146,15 +169,15 @@ def test_server_consumes_the_bundle_by_name_not_by_position():
     bridge = _FakeBridge()
     server = _import_server(_bundle(settings=settings, durable=False,
                                     checkpointer=checkpointer,
-                                    mcp_bridge=bridge))
+                                    mcp_bridge=bridge), monkeypatch)
     assert server._settings is settings
     assert server._durable is False
     assert server._checkpointer is checkpointer
     assert server._mcp_bridge is bridge
 
 
-def test_health_reports_llm_mode_and_durability():
-    server = _import_server(_bundle(durable=False))
+def test_health_reports_llm_mode_and_durability(monkeypatch):
+    server = _import_server(_bundle(durable=False), monkeypatch)
     with TestClient(server.app) as client:
         body = client.get("/health").json()
     assert body == {"status": "ok", "llm_mode": "stub", "durable": False}
@@ -165,32 +188,32 @@ def test_health_reports_llm_mode_and_durability():
 # ---------------------------------------------------------------------------
 
 
-def test_research_rejects_an_empty_query():
+def test_research_rejects_an_empty_query(monkeypatch):
     """min_length=1 -- an empty string previously reached classify_node
     and produced a meaningless LLM call; now it never leaves the API
     layer. Asserted as a 422 (FastAPI's own validation-error status),
     not a graph invocation -- the fake graph in this test file raises
     if invoked at all, so a passing test here already proves the graph
     was never reached."""
-    server = _import_server(_bundle())
+    server = _import_server(_bundle(), monkeypatch)
     with TestClient(server.app) as client:
         resp = client.post("/research", json={"query": ""})
     assert resp.status_code == 422
 
 
-def test_research_rejects_a_query_over_the_length_cap():
-    server = _import_server(_bundle())
+def test_research_rejects_a_query_over_the_length_cap(monkeypatch):
+    server = _import_server(_bundle(), monkeypatch)
     with TestClient(server.app) as client:
         resp = client.post("/research", json={"query": "x" * 2001})
     assert resp.status_code == 422
 
 
-def test_research_accepts_a_query_at_the_length_cap():
+def test_research_accepts_a_query_at_the_length_cap(monkeypatch):
     """Boundary check: exactly max_length must still be accepted -- the
     cap guards against UNBOUNDED input, not against ordinary long
     queries."""
     server = _import_server(_bundle(app=_ScriptedGraph(result={
-        "final_report": "ok", "telemetry": {}})))
+        "final_report": "ok", "telemetry": {}})), monkeypatch)
     with TestClient(server.app) as client:
         resp = client.post("/research", json={"query": "x" * 2000})
     assert resp.status_code == 200
@@ -201,14 +224,14 @@ def test_research_accepts_a_query_at_the_length_cap():
 # ---------------------------------------------------------------------------
 
 
-def test_research_rejects_a_thread_id_already_in_use():
+def test_research_rejects_a_thread_id_already_in_use(monkeypatch):
     """A caller-supplied thread_id whose checkpoint already holds a
     raw_query must be refused (409), not silently blended (D-20) -- see
     assembly.reject_if_thread_in_use. Previously api/server.py had no
     get_state() call anywhere, so an HTTP client reusing a thread_id hit
     this exact defect the CLI already guards against."""
     graph = _ScriptedGraph(prior_state={"raw_query": "earlier query"})
-    server = _import_server(_bundle(app=graph))
+    server = _import_server(_bundle(app=graph), monkeypatch)
     with TestClient(server.app) as client:
         resp = client.post("/research", json={"query": "new query",
                                                "thread_id": "reused-thread"})
@@ -217,23 +240,23 @@ def test_research_rejects_a_thread_id_already_in_use():
     assert graph.invocations == 0  # refused before the graph ever ran
 
 
-def test_research_with_a_fresh_thread_id_is_not_rejected():
+def test_research_with_a_fresh_thread_id_is_not_rejected(monkeypatch):
     """The common case -- no thread_id, or one that has never been used --
     must still reach the graph exactly as before M-2."""
     graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {}})
-    server = _import_server(_bundle(app=graph))
+    server = _import_server(_bundle(app=graph), monkeypatch)
     with TestClient(server.app) as client:
         resp = client.post("/research", json={"query": "q"})
     assert resp.status_code == 200
     assert graph.invocations == 1
 
 
-def test_shutdown_closes_the_mcp_bridge_as_well_as_the_checkpointer():
+def test_shutdown_closes_the_mcp_bridge_as_well_as_the_checkpointer(monkeypatch):
     """cli.py has always closed both; api/server.py closed only the
     checkpointer, leaving an MCP subprocess and its background thread
     running past shutdown."""
     bridge = _FakeBridge()
-    server = _import_server(_bundle(mcp_bridge=bridge))
+    server = _import_server(_bundle(mcp_bridge=bridge), monkeypatch)
     with patch("research_agent.api.server.close_checkpointer") as closer:
         with TestClient(server.app):
             pass
@@ -241,10 +264,10 @@ def test_shutdown_closes_the_mcp_bridge_as_well_as_the_checkpointer():
     assert closer.call_count == 1
 
 
-def test_respond_tolerates_a_run_that_never_reached_telemetry():
+def test_respond_tolerates_a_run_that_never_reached_telemetry(monkeypatch):
     """A run that ends without telemetry_node (recursion limit, abandoned
     resume) must not KeyError its way into a 500."""
-    server = _import_server(_bundle())
+    server = _import_server(_bundle(), monkeypatch)
     with patch("research_agent.api.server.record_run", return_value=None):
         out = server._respond("t-1", {"raw_query": "q"})
     assert out["status"] == "done"
@@ -252,8 +275,8 @@ def test_respond_tolerates_a_run_that_never_reached_telemetry():
     assert out["report"] == ""
 
 
-def test_respond_returns_the_review_payload_when_interrupted():
-    server = _import_server(_bundle())
+def test_respond_returns_the_review_payload_when_interrupted(monkeypatch):
+    server = _import_server(_bundle(), monkeypatch)
 
     class _Interrupt:
         value = {"trigger": "E3", "actions": ["approve", "redirect", "abort"]}
@@ -267,14 +290,14 @@ def test_respond_returns_the_review_payload_when_interrupted():
 # Langfuse trace lifecycle on the API path (Item 7)
 # ---------------------------------------------------------------------------
 
-def _server_with_observer(graph, observer):
+def _server_with_observer(graph, observer, monkeypatch):
     """Import server.py with a scripted graph AND a recording Observer
     swapped in behind the langfuse facade."""
-    server = _import_server(_bundle(app=graph))
+    server = _import_server(_bundle(app=graph), monkeypatch)
     return server
 
 
-def test_research_opens_and_closes_exactly_one_trace():
+def test_research_opens_and_closes_exactly_one_trace(monkeypatch):
     """The pairing is the point: start_trace without a matching end_trace
     leaks an attached OTel context onto a REUSED threadpool worker (see
     _traced_request's docstring), which is how one caller's session_id
@@ -282,7 +305,7 @@ def test_research_opens_and_closes_exactly_one_trace():
     obs = _RecordingObserver()
     graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {},
                                    "raw_query": "q"})
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
     with patch.object(server.lf, "get_observer", return_value=obs), \
          patch.object(server, "record_run", return_value=None), \
          patch.object(server.lf, "start_trace", obs.start_trace), \
@@ -297,13 +320,13 @@ def test_research_opens_and_closes_exactly_one_trace():
     assert kinds.index("start") < kinds.index("end")
 
 
-def test_research_closes_the_trace_even_when_the_graph_raises():
+def test_research_closes_the_trace_even_when_the_graph_raises(monkeypatch):
     """An un-.end()ed span is never exported at all, so a request that
     blew up would otherwise produce NO trace -- exactly the request you
     most want to inspect."""
     obs = _RecordingObserver()
     graph = _ScriptedGraph(raises=RuntimeError("boom"))
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
     with patch.object(server.lf, "start_trace", obs.start_trace), \
          patch.object(server.lf, "end_trace", obs.end_trace):
         client = TestClient(server.app, raise_server_exceptions=False)
@@ -313,7 +336,7 @@ def test_research_closes_the_trace_even_when_the_graph_raises():
     assert kinds == ["start", "end"], f"expected balanced pair, got {kinds}"
 
 
-def test_interrupted_research_still_closes_its_trace():
+def test_interrupted_research_still_closes_its_trace(monkeypatch):
     """A HITL pause must NOT leave the propagation context open across
     the gap between /research and /resume -- that gap can be minutes,
     and the worker thread serves other requests in the meantime."""
@@ -323,7 +346,7 @@ def test_interrupted_research_still_closes_its_trace():
         value = {"trigger": "E3"}
 
     graph = _ScriptedGraph(result={"__interrupt__": [_Interrupt()]})
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
     with patch.object(server.lf, "start_trace", obs.start_trace), \
          patch.object(server.lf, "end_trace", obs.end_trace):
         client = TestClient(server.app)
@@ -333,14 +356,14 @@ def test_interrupted_research_still_closes_its_trace():
     assert kinds == ["start", "end"]
 
 
-def test_resume_opens_its_own_trace_on_the_same_thread_id():
+def test_resume_opens_its_own_trace_on_the_same_thread_id(monkeypatch):
     """Two HTTP requests produce two root spans -- but both land on the
     same Langfuse trace, because trace_id is derived deterministically
     from thread_id. That is the version that cannot leak."""
     obs = _RecordingObserver()
     graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {},
                                    "raw_query": "q"})
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
     with patch.object(server, "record_run", return_value=None), \
          patch.object(server.lf, "start_trace", obs.start_trace), \
          patch.object(server.lf, "end_trace", obs.end_trace), \
@@ -355,7 +378,7 @@ def test_resume_opens_its_own_trace_on_the_same_thread_id():
     assert starts[0][2] == "research_resume"
 
 
-def test_concurrent_requests_never_interleave_their_traces():
+def test_concurrent_requests_never_interleave_their_traces(monkeypatch):
     """The failure mode this whole design exists to prevent: FastAPI runs
     these `def` endpoints in a REUSED threadpool, so an unbalanced
     context would bleed one request's session onto the next. Assert every
@@ -366,7 +389,7 @@ def test_concurrent_requests_never_interleave_their_traces():
     obs = _RecordingObserver()
     graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {},
                                    "raw_query": "q"})
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
 
     with patch.object(server, "record_run", return_value=None), \
          patch.object(server.lf, "start_trace", obs.start_trace), \
@@ -391,7 +414,7 @@ def test_concurrent_requests_never_interleave_their_traces():
         assert len(ends) == 1, f"{tid}: {len(ends)} ends"
 
 
-def test_scores_are_recorded_only_for_a_finished_run():
+def test_scores_are_recorded_only_for_a_finished_run(monkeypatch):
     """A still-interrupted response has no telemetry yet -- scoring it
     would write zeros that look like real measurements."""
     obs = _RecordingObserver()
@@ -400,7 +423,7 @@ def test_scores_are_recorded_only_for_a_finished_run():
         value = {"trigger": "E3"}
 
     graph = _ScriptedGraph(result={"__interrupt__": [_Interrupt()]})
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
     with patch.object(server.lf, "start_trace", obs.start_trace), \
          patch.object(server.lf, "end_trace", obs.end_trace), \
          patch.object(server.lf, "score", obs.score):
@@ -409,14 +432,14 @@ def test_scores_are_recorded_only_for_a_finished_run():
     assert not [c for c in obs.calls if c[0] == "score"]
 
 
-def test_finished_run_records_the_same_scores_the_cli_does():
+def test_finished_run_records_the_same_scores_the_cli_does(monkeypatch):
     obs = _RecordingObserver()
     telemetry = {"recall": 0.75, "critique_passed": True,
                  "evidence_items": 20, "goals": 4,
                  "search_calls": 10, "memory_hits": 5}
     graph = _ScriptedGraph(result={"final_report": "r", "raw_query": "q",
                                    "telemetry": telemetry})
-    server = _server_with_observer(graph, obs)
+    server = _server_with_observer(graph, obs, monkeypatch)
     with patch.object(server, "record_run", return_value=None), \
          patch.object(server.lf, "start_trace", obs.start_trace), \
          patch.object(server.lf, "end_trace", obs.end_trace), \
@@ -428,3 +451,97 @@ def test_finished_run_records_the_same_scores_the_cli_does():
     assert scored["critique_passed"] is True
     assert scored["evidence_per_goal"] == 5.0
     assert scored["memory_hit_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# D-78 -- a bad config must degrade the server, never take the whole
+# process down before it can even bind a port
+# ---------------------------------------------------------------------------
+
+
+def _import_server_with_failing_build(exc, monkeypatch):
+    """Import api/server.py fresh, but with build_app_and_settings()
+    RAISING instead of returning a bundle -- and drive startup, same as
+    _import_server above, so _build_error is populated by the time this
+    returns (never left to a caller's own TestClient entry, since some
+    tests below check module globals directly)."""
+    sys.modules.pop("research_agent.api.server", None)
+    server = importlib.import_module("research_agent.api.server")
+
+    def _raise():
+        raise exc
+
+    monkeypatch.setattr(server, "build_app_and_settings", _raise)
+
+    async def _advance():
+        cm = server._lifespan(server.app)
+        await cm.__aenter__()
+
+    asyncio.run(_advance())
+    return server
+
+
+def test_a_failed_build_does_not_prevent_the_module_from_importing(monkeypatch):
+    """The regression this whole rework exists to fix: a bad MCP config
+    (or any other build_app_and_settings failure) used to raise at
+    IMPORT time, which took the entire uvicorn worker down before it
+    could bind its port -- confirmed live, not hypothetical (see
+    DECISIONS.md D-78's own account). Importing must always succeed."""
+    server = _import_server_with_failing_build(
+        ValueError("MCPBridge requires a url"), monkeypatch)
+    assert server.app is not None
+
+
+def test_health_reports_the_failure_instead_of_being_unreachable(monkeypatch):
+    """/health must stay a normal 200 even when the build failed --
+    reporting failure IN the body, not by refusing to answer at all."""
+    server = _import_server_with_failing_build(
+        ValueError("MCPBridge requires a url"), monkeypatch)
+    with TestClient(server.app) as client:
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "MCPBridge requires a url" in body["detail"]
+
+
+def test_research_returns_503_after_a_failed_build(monkeypatch):
+    """A caller hitting /research after a bad startup config gets one
+    clear, actionable error -- not an AttributeError on None.invoke(...)
+    (a 500 pointing at the wrong problem entirely)."""
+    server = _import_server_with_failing_build(
+        ValueError("MCPBridge requires a url"), monkeypatch)
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "q"})
+    assert resp.status_code == 503
+    assert "MCPBridge requires a url" in resp.json()["detail"]
+
+
+def test_resume_returns_503_after_a_failed_build(monkeypatch):
+    server = _import_server_with_failing_build(
+        ValueError("MCPBridge requires a url"), monkeypatch)
+    with TestClient(server.app) as client:
+        resp = client.post("/resume", json={"thread_id": "t-1",
+                                             "action": "approve"})
+    assert resp.status_code == 503
+
+
+def test_shutdown_after_a_failed_build_does_not_raise(monkeypatch):
+    """close_checkpointer/bridge.close() must never be called against
+    None -- a failed build left every one of those as None, and shutdown
+    must tolerate that rather than raising ITS OWN exception on top of
+    the original build failure."""
+    server = _import_server_with_failing_build(
+        ValueError("boom"), monkeypatch)
+    with TestClient(server.app):
+        pass  # entry already ran startup (failed); exit runs shutdown
+    # No exception escaping the `with` block is the assertion.
+
+
+def test_a_successful_build_still_reports_ok(monkeypatch):
+    """The success path is unaffected by any of the above -- D-78 only
+    changes WHEN the build happens and how a FAILURE is reported."""
+    server = _import_server(_bundle(durable=True), monkeypatch)
+    with TestClient(server.app) as client:
+        resp = client.get("/health")
+    assert resp.json() == {"status": "ok", "llm_mode": "stub", "durable": True}

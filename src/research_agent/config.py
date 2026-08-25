@@ -460,7 +460,56 @@ _KNOWN_ENV_TYPOS = {
     "WEB_SEARCH_TIMEOUT": "WEB_SEARCH_PROVIDER_TIMEOUT_SECONDS",
     "WEB_MCP": "WEB_MCP_SERVER_URL",
     "WEB_MCP_URL": "WEB_MCP_SERVER_URL",
+    # D-79: six settings D-76 removed outright when stdio was deleted from
+    # MCPBridge -- a .env carried over from before that change (or a person
+    # remembering the old shape) silently does nothing now, and the
+    # process that actually NEEDS a value (MCP_SERVER_URL /
+    # WEB_MCP_SERVER_URL) is left empty, which raises at startup with no
+    # hint that these old names are the reason. Live-evidenced, not
+    # hypothetical: two separate real runs hit exactly this, one via the
+    # CLI (MCP_SERVER_URL empty) and one via uvicorn (WEB_MCP_SERVER_URL
+    # empty, WEB_MCP_SERVER_COMMAND set instead -- the exact old name).
+    "MCP_TRANSPORT": "MCP_SERVER_URL",
+    "MCP_SERVER_COMMAND": "MCP_SERVER_URL",
+    "MCP_SERVER_ARGS": "MCP_SERVER_URL",
+    "MCP_SERVER_ENV_ALLOWLIST": "MCP_SERVER_URL",
+    "WEB_MCP_TRANSPORT": "WEB_MCP_SERVER_URL",
+    "WEB_MCP_SERVER_COMMAND": "WEB_MCP_SERVER_URL",
+    "WEB_MCP_SERVER_ARGS": "WEB_MCP_SERVER_URL",
+    "WEB_MCP_SERVER_ENV_ALLOWLIST": "WEB_MCP_SERVER_URL",
 }
+
+
+def _env_file_keys() -> set:
+    """Keys actually SET in the .env file itself, as opposed to
+    os.environ (D-79).
+
+    CALLED BY   warn_on_likely_env_typos, below, to close a real blind
+                spot: confirmed empirically (constructing a Settings
+                instance from a temp .env file and checking os.environ
+                immediately after) that pydantic-settings' env_file
+                support parses the file and feeds it into ITS OWN field
+                resolution WITHOUT ever writing those values into the
+                real process environment. warn_on_likely_env_typos'
+                original `wrong in os.environ` check therefore only ever
+                caught a typo in a genuinely EXPORTED shell variable --
+                never a typo made by editing .env directly, which is how
+                the overwhelming majority of this project's users
+                actually configure it (every setup example in
+                OPERATIONS.md/README.md edits .env, not `$env:`/`export`).
+                The mechanism had been silently inert for its main
+                intended audience since it was written (P2-09).
+    READS       the SAME relative path Settings.model_config declares
+                (env_file=".env") -- resolved against the CWD, same as
+                Settings() itself, so this checks the exact file that
+                would actually be read, not a guess at where it might be.
+    RETURNS     an empty set if the file does not exist or cannot be
+                parsed -- dotenv_values() itself already degrades to an
+                empty dict on a missing path, confirmed directly, so no
+                try/except is needed here to match that behavior.
+    """
+    from dotenv import dotenv_values
+    return set(dotenv_values(".env").keys())
 
 
 def warn_on_likely_env_typos() -> None:
@@ -471,15 +520,16 @@ def warn_on_likely_env_typos() -> None:
                 Settings() is constructed and configure_logging() has run,
                 S-11 — so this and the other two warn_on_* checks log
                 against an already-configured root logger).
-    READS       os.environ directly — the one exception to config.py's own
-                rule that this is the only place the process environment
-                is read (see the module docstring); Settings itself never
-                sees these keys at all, precisely because they don't match
-                any declared field, which is the whole problem being
-                flagged here.
+    READS       os.environ AND the .env file itself (D-79 -- see
+                _env_file_keys' own docstring for why the file must be
+                checked separately from os.environ, not assumed to be
+                reflected in it). Settings itself never sees these keys
+                at all, precisely because they don't match any declared
+                field, which is the whole problem being flagged here.
     """
+    env_keys = set(os.environ) | _env_file_keys()
     for wrong, right in _KNOWN_ENV_TYPOS.items():
-        if wrong in os.environ and right not in os.environ:
+        if wrong in env_keys and right not in env_keys:
             log_event(logger, "config.likely_typo", level=logging.WARNING,
                       set_key=wrong, probably_meant=right)
 

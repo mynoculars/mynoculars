@@ -643,7 +643,7 @@ PASS  MCP server   http://127.0.0.1:8765/mcp --
 |---|---|---|
 | `SKIPPED -- MCP_ENABLED=false` | Off in `.env`. Correct and working | Nothing. This is the repo default |
 | `ConnectionError` / `Connection refused` | Nothing is listening at `MCP_SERVER_URL` | Start the standalone server first — see **Running the MCP servers standalone** |
-| `MCPBridge requires a url` (raised at startup) | `MCP_ENABLED=true` but `MCP_SERVER_URL` is empty | Set the URL |
+| `MCPBridge requires a url` (raised at startup) | `MCP_ENABLED=true` but `MCP_SERVER_URL` is empty -- possibly an OLD .env with `MCP_TRANSPORT`/`MCP_SERVER_COMMAND` etc. (removed in D-76, silently ignored now, D-79 warns about this at startup) | Set `MCP_SERVER_URL` |
 | `TimeoutError` after `MCP_CALL_TIMEOUT_SECONDS` | Server started but never answered | Usually a cold embedding-model load on first call. `120` is generous for this reason |
 | Nothing at all in the logs | `MCP_ENABLED=false` | Set it `true` if you actually want MCP |
 
@@ -1369,6 +1369,20 @@ manual. Skip this section entirely if you only ever use the CLI.
 > your checkout predates `AppBundle`'s current shape (`api/server.py` is
 > unpacking it as a 4-tuple against a struct that now has more fields) —
 > update the code, not your config.
+>
+> **A bad config (D-78) no longer prevents the server from starting at
+> all.** Earlier revisions built the entire app bundle at import time —
+> a real live case: `MCP_ENABLED=true` with an empty `MCP_SERVER_URL`
+> raised `ValueError` before uvicorn could even bind its port, taking
+> the whole worker process down with a raw traceback as the only
+> feedback. The build now happens at STARTUP instead (inside FastAPI's
+> lifespan hook), and a failure there degrades the server rather than
+> preventing it from running: `GET /health` still returns `200`, with
+> `{"status": "error", "detail": "<what actually went wrong>"}` in the
+> body, and `/research`/`/resume` return a clean `503` naming the same
+> detail. Fix the underlying `.env` problem (see the startup log line
+> `api.startup_build_failed` for the exact error) and restart the
+> server — there is no way to re-attempt the build without a restart.
 
 ===============================================================================
 **Terminal 5 — uvicorn / FastAPI**
@@ -1399,7 +1413,9 @@ curl http://127.0.0.1:8000/health
 backed by Postgres (`true`) or silently degraded to `MemorySaver()`
 (`false`) — same signal the CLI logs as `checkpointer.postgres_active`/
 `checkpointer.memory_fallback`, surfaced here for a caller that doesn't
-read logs (P2-08).
+read logs (P2-08). If startup's build failed (D-78), `status` is
+`"error"` instead of `"ok"`, `llm_mode`/`durable` are absent, and
+`detail` names what went wrong — see the callout above.
 
 **Run a query through it:**
 ```powershell
@@ -1545,6 +1561,70 @@ never imports the search implementation at all.
 
 ## Running the MCP servers standalone (D-76)
 
+### Quick start — copy-paste this, in order
+
+**Terminal T7 (new window) — start the corpus server:**
+
+```powershell
+cd D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\research_agent
+.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "src"
+python scripts\mcp_corpus_server.py --port 8765
+```
+```bash
+# macOS/Linux
+cd /path/to/research_agent
+source .venv/bin/activate
+export PYTHONPATH=src
+python scripts/mcp_corpus_server.py --port 8765
+```
+
+Leave this running. You'll see `Uvicorn running on http://127.0.0.1:8765`
+and the terminal will not return to a prompt — that's correct.
+
+**Terminal T8 (another new window, only if you also want web search) — start the web-search server:**
+
+```powershell
+cd D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\research_agent
+.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "src"
+python scripts\mcp_web_search_server.py --port 8766
+```
+```bash
+# macOS/Linux
+cd /path/to/research_agent
+source .venv/bin/activate
+export PYTHONPATH=src
+python scripts/mcp_web_search_server.py --port 8766
+```
+
+**In your `.env`** (edit, then re-run the agent from your working terminal, T1 — `.env` is read once at process startup, so a running CLI invocation won't pick up an edit mid-run):
+
+```ini
+MCP_ENABLED=true
+MCP_SERVER_URL=http://127.0.0.1:8765/mcp
+
+# only if you started T8 too
+WEB_SEARCH_ENABLED=true
+WEB_MCP_SERVER_URL=http://127.0.0.1:8766/mcp
+```
+
+**Verify both are actually reachable, from your working terminal (T1), before running a real query:**
+
+```powershell
+python scripts\check_services.py
+```
+
+Look for `PASS  MCP server` (and `PASS  Web search (MCP)` if you started T8).
+A `SKIPPED` row means the corresponding `_ENABLED` flag above is still
+`false` in `.env` — that's a config check, not a connectivity problem.
+
+**Stop either server whenever you want:** `Ctrl+C` in its own terminal
+(T7/T8). There is no command from T1 that starts or stops them — they
+are independent processes, on purpose (D-76).
+
+---
+
 > **TERMINAL:** **this needs its own terminal (T7 — T8 too, if you also
 > run the web-search server).** Both server scripts run in the
 > FOREGROUND and hold the terminal until you Ctrl-C them — that is
@@ -1641,7 +1721,7 @@ crashing, or being interrupted.
 |---|---|---|
 | `ConnectionError` / `Connection refused` at run start | Nothing is listening at `MCP_SERVER_URL` | Start the standalone server first, or check the host/port match |
 | Works, then stops working mid-session | The standalone server was stopped or crashed | Check its terminal/logs; restart it |
-| `MCPBridge requires a url` (raised at startup) | `MCP_ENABLED=true` but `MCP_SERVER_URL` is empty | Set the URL |
+| `MCPBridge requires a url` (raised at startup) | `MCP_ENABLED=true` but `MCP_SERVER_URL` is empty (or `WEB_SEARCH_ENABLED=true` with `WEB_MCP_SERVER_URL` empty) | Set the URL. **Check your `.env` for the OLD setting names first (D-79)** -- `MCP_TRANSPORT`/`MCP_SERVER_COMMAND`/`MCP_SERVER_ARGS`/`MCP_SERVER_ENV_ALLOWLIST` and their `WEB_MCP_*` equivalents were all removed in D-76 and are now silently ignored; a `.env` carried over from before that change is the most common cause of exactly this error. `research_agent.cli`/`get_settings()` now logs `config.likely_typo` at WARNING for every one of these old names, naming the `_URL` setting it probably meant -- check for that line before assuming the URL itself is wrong |
 | Closing/finishing a `research_agent` run also seems to stop the server | It shouldn't, and doesn't — if the server process itself exited, check ITS OWN terminal for an unrelated crash, not `research_agent`'s logs | See the standalone server's own output |
 | `ModuleNotFoundError: research_agent`, in the SERVER's own terminal (T7/T8), immediately on startup | That terminal never got the venv activated and `PYTHONPATH=src` set — a new window inherits neither from T1 | Run the two setup lines at the top of this section, in that same terminal, before the server script |
 

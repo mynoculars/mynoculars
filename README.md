@@ -17,7 +17,7 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
 > human-in-the-loop escalation. All six phases of a comprehensive review
-> (`DECISIONS.md` D-1…D-76) are closed as of this revision -- correctness
+> (`DECISIONS.md` D-1…D-79) are closed as of this revision -- correctness
 > fixes, structural simplification, and operational hardening. Release
 > history, prior test counts, and superseded claims from earlier revisions
 > live in [CHANGELOG.md](CHANGELOG.md), not here.
@@ -54,7 +54,93 @@ deliberately does not duplicate them:
 | `design/Research_Agent_Design.md` | The full target architecture and D-1…D-30 rationale — a strict superset of this build |
 | **`README.md`** (this file) | What exists, how it is wired, what each store actually holds, and what is broken |
 
-## Recent Fixes
+## Agent Harness
+
+This system **is** an agent harness, in the sense the term is used across
+current agentic-AI reference architectures: a runtime layer that sits
+around an LLM and is responsible for state, orchestration, planning,
+tool/retrieval access, model selection, verification, policy, memory,
+human escalation, and observability. The LLM supplies reasoning and
+content; the harness controls execution.
+
+```text
+                 ┌────────────────────────┐
+                 │      Frontier LLM       │
+                 │  local Cogito → Mistral │
+                 │      → Gemini Flash     │
+                 └───────────┬────────────┘
+                             │
+                ┌────────────▼────────────┐
+                │      AGENT HARNESS       │
+                │                          │
+                │  Planner / Reasoner      │
+                │  Memory                  │
+                │  Tool Router             │
+                │  Model Router            │
+                │  Verifier                │
+                │  Policy / Guardrails     │
+                │  HITL                    │
+                │  Observability           │
+                └──────┬─────────────┬─────┘
+                       │             │
+                 ┌─────▼─────┐ ┌─────▼─────┐
+                 │    RAG    │ │   Tools   │
+                 │ Qdrant +  │ │ MCP (D-76,│
+                 │ OpenSearch│ │ standalone│
+                 │  + RRF    │ │  servers) │
+                 └───────────┘ └───────────┘
+```
+
+**The one design principle everything else follows from:**
+
+> **The LLM decides *what to say*. The harness decides *what happens
+> next*.** Goals, task queries, report text, and critique verdicts are
+> all LLM output — content the harness reads and acts on. Which node
+> runs next, whether to loop again, when to escalate to a human, and
+> when to stop are ALL deterministic graph routing (`orchestration/
+> graph.py`'s conditional edges), never an LLM's own choice of what tool
+> to call next. This is a genuinely different shape from a free-form
+> autonomous agent loop, and it is deliberate — the fixed graph topology
+> is the single load-bearing architectural decision this whole project
+> rests on (see `internal/LEARNING_GUIDE.md` for the full argument for
+> why, and D-1's own rationale in `DECISIONS.md`).
+
+### System Architecture at a Glance
+
+| Harness role | This project | Where |
+|---|---|---|
+| **Frontier / Foundation LLM** | Local Cogito (primary) → Mistral → Gemini Flash, quality-gated fallback, per-hop timeout isolation | `llm/router.py::FallbackRouter`, `llm/client.py` |
+| **Planner / Reasoner** | Query classification → goal decomposition → task expansion → iterative gap-driven gathering → self-critique → compilation | `agents/planning.py`, `agents/gathering.py`, `agents/compilation.py` |
+| **Memory** | Cross-run semantic memory, Qdrant-backed, volatility-aware decay, namespaced by goal | `memory/semantic_memory.py` |
+| **Tool Router** | 5-tier retrieval ladder (corpus → reformulated → MCP → web → model knowledge); a task's `tool_hint` can route straight to a named specialist | `tools/retrieval_chain.py`, `agents/task_utils.py` |
+| **Model Router** | The same `FallbackRouter` above, reused for every LLM call in the graph, not just retrieval | `llm/router.py` |
+| **Verifier** | An LLM critic checking faithfulness/coverage against evidence, PLUS deterministic guardrails on top of it (grounded-convergence gate, the zero-citation gate, evidence-score gates) — "don't trust the LLM alone to enforce a hard rule" is a recurring pattern here | `agents/compilation.py::critic_node`, `guardrails/retrieval.py`, `orchestration/graph.py::route_convergence` |
+| **Policy / Guardrails** | Depth/revision/escalation budgets, prompt/data fencing for external content, citation cleanup, hedging enforcement, dedup | `guardrails/` package |
+| **HITL (Human control)** | `interrupt()`/resume, four trigger types (E1–E4: no goals, low relevance, low grounding, critique budget exhausted) | `agents/escalation.py`, `orchestration/graph.py` |
+| **Observability** | Structured JSON logs, a separate human-readable execution narrative, per-run telemetry (dozens of honesty metrics), optional Langfuse tracing, CLI wall-clock/HITL reporting | `logging_setup.py`, `reporting/narrative.py`, `agents/compilation.py::telemetry_node`, `langfuse/` |
+| **RAG** | Dense (Qdrant) + keyword (OpenSearch BM25), fused by RRF, with a two-stage relevance floor and a topical-overlap gate | `retrieval/hybrid.py`, `guardrails/retrieval.py` |
+| **Tools** | Corpus search (in-process or MCP-mediated), web search (MCP-mediated), model's own recollection as a last-resort tier | `tools/corpus_search.py`, `tools/mcp_client.py`, `tools/model_knowledge.py` |
+| **Execution** | Bounded LangGraph node execution, plus external MCP servers reached over Streamable HTTP (D-76: standalone processes you start and stop yourself, not spawned by the agent). **No general-purpose code-execution sandbox exists in this build** — that is a real, stated gap, not an oversight (see Limitations) | `orchestration/graph.py`, `tools/mcp_client.py` |
+| **Persistence** | PostgreSQL (workflow checkpoints + run history), Qdrant (dense retrieval + semantic memory), OpenSearch (BM25) — three stores with three distinct jobs, not one interchangeable "database" | `storage/postgres.py`, `storage/qdrant_store.py`, `storage/opensearch_store.py` |
+
+This table is a map, not a substitute for the sections below — each row's
+"Where" column is where the real detail (and the honest caveats) live.
+
+**What this project is / is not:**
+
+| This project **is** | This project **is not** |
+|---|---|
+| An agent harness reference implementation | A hosted product or SaaS |
+| A fixed-graph orchestration (deterministic routing) | A free-form autonomous agent that picks its own next action |
+| Hybrid RAG (dense + BM25 + RRF) | A vector-search-only demo |
+| Multi-provider model routing with quality gating | A single-model application |
+| MCP-mediated tool integration | A hard-coded, unpluggable search client |
+| Cross-run semantic long-term memory | Chat-turn history dressed up as memory |
+| Deterministic guardrails layered on top of LLM judgment | Safety enforced by prompting alone |
+| Self-critique with a human escalation path | Blind, unreviewed generation |
+| Bounded, budgeted iteration (depth/revision/escalation caps) | An unbounded agent loop |
+| Structured, queryable observability | `print()`-based debugging |
+
 
 All five Tier 1 items and all four Tier 2 items in `internal/PHASE-2_PLAN.md` have
 landed, plus one incidental fix outside either tier's original scope.
@@ -1558,7 +1644,7 @@ research-agent-dmp/
 ├── requirements-websearch.txt  # Phase 4 only: ddgs + mcp. Install into the SAME
 │                              venv that runs the agent — see Setup
 ├── .env.example  run.bat  reset.bat
-└── DECISIONS.md             # populated: D-1..D-76, sourced from code comments
+└── DECISIONS.md             # populated: D-1..D-79, sourced from code comments
 ```
 
 ## Setup
@@ -1777,7 +1863,7 @@ This table lists only decisions with code behind them here.
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
 `DECISIONS.md` (populated as of P2-09, extended in every pass since) is the
-authoritative consolidated log, currently D-1 through D-76 — this table is a
+authoritative consolidated log, currently D-1 through D-79 — this table is a
 curated subset for readability, not a replacement.
 
 ## Limitations
