@@ -292,3 +292,53 @@ def test_critique_forbids_the_query_vs_report_standard_for_named_entities():
     assert "never QUERY vs REPORT" in body
     assert 'not part of the question' in body
     assert "evidence legitimately introduces vocabulary the query itself never used" in body      
+
+
+# ---------------------------------------------------------------------------
+# D-73 -- revision passes lost citations more often than first compiles
+# ---------------------------------------------------------------------------
+
+
+def test_compile_report_reinforces_citations_on_a_revision_pass():
+    """D-73: live-evidenced pattern (runs p205.239/240-check) -- a FIRST
+    compile cited correctly, but the REWRITE after a critique failure came
+    back with zero [gN] citations, twice in a row, in both runs. The
+    critique-notes block must carry an explicit reminder that citations
+    are still required, immediately next to the "address every note"
+    instruction most likely to crowd it out."""
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Goal
+
+    body = compile_report("q", [Goal(goal_id="g1", description="d")], [],
+                          ["some critique note"])[-1]["content"]
+    assert "STILL cite every" in body
+    assert "[gN]" in body.split("STILL cite every")[1][:50]
+
+
+def test_compile_report_first_pass_has_no_revision_reminder():
+    """The reminder is specific to revision passes -- a first compile
+    (no critique_notes) must not carry it, since there is nothing being
+    "addressed" yet for the reminder to reinforce."""
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Goal
+
+    body = compile_report("q", [Goal(goal_id="g1", description="d")], [],
+                          [])[-1]["content"]
+    assert "STILL cite every" not in body
+    assert "A reviewer rejected" not in body
+
+
+def test_compile_report_revision_reminder_follows_the_critique_notes():
+    """Ordering matters: the reminder must come immediately AFTER the
+    critique notes list, not buried elsewhere, so it is the last thing
+    the model reads before "address every note" and the citation
+    requirement compete for its attention."""
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Goal
+
+    body = compile_report("q", [Goal(goal_id="g1", description="d")], [],
+                          ["fix the budget figure"])[-1]["content"]
+    notes_idx = body.index("fix the budget figure")
+    reminder_idx = body.index("STILL cite every")
+    citation_format_idx = body.index("CITATION FORMAT")
+    assert notes_idx < reminder_idx < citation_format_idx

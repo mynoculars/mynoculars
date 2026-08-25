@@ -382,8 +382,28 @@ def compile_report(query: str, goals: List[Goal], evidence: List[Evidence],
                    for g in goals)
     notes = ""
     if critique_notes:
+        # D-73: live-evidenced pattern (runs p205.239/240-check, both
+        # "Compare Armies of China and India") -- a FIRST compile cited
+        # correctly (evidence_cited: 4), but the REWRITE that followed a
+        # critique failure came back with evidence_cited: 0, twice in a
+        # row, in both runs. "Address every note" is a narrow, corrective
+        # framing -- fix these specific factual problems -- and a weaker
+        # model under that framing produced a much shorter, more
+        # defensive rewrite that dropped citation formatting entirely
+        # along with everything else it simplified away. The CITATION
+        # FORMAT block below already runs on every compile regardless of
+        # revision, but revision passes are where it empirically stopped
+        # being followed -- so this one line is repeated here,
+        # immediately next to the instruction most likely to crowd it
+        # out, rather than trusting the general instructions further
+        # down to survive a defensive rewrite.
         notes = ("\nA reviewer rejected the previous draft. Address every note:\n"
-                 + "\n".join(f"- {n}" for n in critique_notes))
+                 + "\n".join(f"- {n}" for n in critique_notes)
+                 + "\nWhile fixing the above, you must STILL cite every "
+                   "claim with [gN] markers, exactly as required below. "
+                   "A rewrite that drops citations entirely is not a fix "
+                   "and will be rejected regardless of whether the notes "
+                   "above were addressed.")
     return [_SYSTEM, {"role": "user", "content":
             f"TASK=compile\nWrite a well-structured Markdown research report — "
             f"prose and headings, NOT a JSON object and NOT wrapped in a code "
