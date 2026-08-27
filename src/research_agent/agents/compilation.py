@@ -28,7 +28,10 @@ from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
 from research_agent.config import Settings
 from research_agent.guardrails.citations import clean_citations
+from research_agent.guardrails.claims import audit_cited_figures
 from research_agent.guardrails.dedup import dedupe_evidence
+from research_agent.guardrails.grounding import (annotate_ungrounded_report,
+                                                  report_carries_grounding_notice)
 from research_agent.guardrails.hedging import enforce_hedging
 from research_agent.guardrails.retrieval import has_grounded_evidence
 from research_agent.guardrails.sources import (append_web_sources,
@@ -46,8 +49,22 @@ from research_agent.state import ResearchState
 logger = logging.getLogger(__name__)
 
 
-def build_compiler_node(router: FallbackRouter, debug: bool = False):
-    """Build the report compiler."""
+def build_compiler_node(router: FallbackRouter, settings: Settings,
+                        debug: bool = False):
+    """Build the report compiler.
+
+    `settings` is new here (D-85), and the parameter order deliberately
+    matches build_critic_node's existing (router, settings, debug) rather
+    than appending it last -- the two nodes are siblings and reading them
+    side by side should not require noticing that their signatures
+    disagree. Same precedent as build_telemetry_node gaining `settings`
+    for Guardrail G1 and build_merger_node gaining it for P2-12.
+
+    Used for exactly three values, all by the D-85 provenance notice:
+    settings.llm_mode (the stub gate), settings.min_evidence_score and
+    settings.grounded_recall_target (the grounding verdict). Nothing else
+    about this node's behaviour reads settings.
+    """
 
     def compiler_node(state: ResearchState) -> Dict[str, Any]:
         """Turns gathered evidence into the deliverable. Reached from THREE
@@ -153,6 +170,27 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # false (the default).
         report, source_counters = append_web_sources(
             report, state.evidence, state.goals, state.human_guidance)
+        # D-85: the provenance notice, LAST of all -- after the three
+        # passes above for the same reason append_web_sources runs after
+        # the first two (see guardrails/grounding.py's own docstring):
+        # clean_citations and enforce_hedging search the report for
+        # literal spans of evidence text, and generated text they were
+        # never meant to inspect belongs out of their reach. Running after
+        # append_web_sources additionally keeps the notice clear of the
+        # Sources block that count_listed_sources (D-59) parses back out.
+        #
+        # Gated OFF in stub mode, exactly like D-66's zero-citation gate
+        # and telemetry_node's report.shipped_with_no_citations backstop:
+        # StubClient's fixed placeholder report (llm/client.py) exists to
+        # prove the graph executes offline, and models nothing at all
+        # about where evidence came from. Annotating it would be noise in
+        # the one mode that is deliberately not a real answer.
+        if settings.llm_mode != "stub":
+            report, grounding_counters = annotate_ungrounded_report(
+                report, state.goals, state.evidence,
+                settings.min_evidence_score, settings.grounded_recall_target)
+        else:
+            grounding_counters = {}
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,
@@ -174,8 +212,22 @@ def build_compiler_node(router: FallbackRouter, debug: bool = False):
         # llm_quality_calls (the self-scoring gate only runs on free text).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
                     **citation_counters, **hedge_counters, **source_counters,
-                    **dedup_counters}
-        return {"final_report": report, "counters": counters}
+                    **dedup_counters, **grounding_counters}
+        # D-88: the SAME guardrail numbers, carried a second way -- scoped
+        # to THIS compile pass instead of summed across every revision.
+        # See ResearchState.last_compile_guardrails for why both views
+        # exist and why this one cannot simply be derived from the shipped
+        # report the way D-59 derived web_sources_listed (a citation that
+        # was REMOVED leaves nothing behind to count).
+        #
+        # Deliberately excludes the router's own counters: those are
+        # genuinely run-cumulative (provider calls, fallback hops, tokens)
+        # and have no per-report meaning.
+        last_compile = {**citation_counters, **hedge_counters,
+                        **source_counters, **dedup_counters,
+                        **grounding_counters}
+        return {"final_report": report, "counters": counters,
+                "last_compile_guardrails": last_compile}
 
     return compiler_node
 
@@ -548,6 +600,55 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             log_event(logger, "report.shipped_with_no_citations",
                       level=logging.WARNING,
                       evidence_items=len(state.evidence))
+        # D-85, same last-line-of-sight shape as the check just above:
+        # did a run whose corpus contributed too little actually ship
+        # saying so? Read from the SHIPPED report (D-59's rule), never
+        # from a counter -- compiler_node runs once per revision and its
+        # counters merge additively, so a counter here would describe the
+        # compile attempts rather than the artifact the reader received.
+        grounding_notice_shipped = report_carries_grounding_notice(
+            state.final_report)
+        # D-91: the cited-figure audit -- the third last-line-of-sight
+        # check on the SHIPPED report, alongside the two above. For every
+        # sentence that states a figure AND cites a goal, does any
+        # evidence under that goal actually contain the figure?
+        #
+        # Run HERE rather than in compiler_node for D-59's reason: this is
+        # a property of the artifact, and compiler_node runs once per
+        # revision with additively-merged counters, so a count taken there
+        # would describe the compile attempts (exactly the D-88 problem).
+        # Taken against state.final_report it is report-scoped by
+        # construction.
+        #
+        # Stub-gated like its two neighbours: StubClient's fixed
+        # placeholder report carries no [gN] markers by design, so there
+        # is nothing here for this to audit.
+        figure_findings: list = []
+        figure_counters: Dict[str, float] = {}
+        if settings.llm_mode != "stub":
+            figure_findings, figure_counters = audit_cited_figures(
+                state.final_report, state.goals, state.evidence)
+        if figure_findings:
+            log_event(logger, "report.unsupported_cited_figures",
+                      level=logging.WARNING,
+                      unsupported=len(figure_findings),
+                      checked=int(figure_counters.get(
+                          "cited_figures_checked", 0)),
+                      # Capped: a report can state many figures, and one
+                      # log line should stay readable. The full count is
+                      # the field above; telemetry carries the same
+                      # capped sample for the run record.
+                      examples=figure_findings[:5])
+        if (settings.llm_mode != "stub" and state.evidence and state.goals
+                and corpus_recall < settings.grounded_recall_target):
+            log_event(logger, "report.shipped_ungrounded",
+                      level=logging.WARNING,
+                      corpus_recall=corpus_recall,
+                      grounded_recall_target=settings.grounded_recall_target,
+                      notice_shipped=grounding_notice_shipped,
+                      web_sourced_items=web_sourced_items,
+                      model_sourced_items=int(
+                          evidence_by_source.get("model", 0)))
         retrieval_dense_candidates = int(c.get("retrieval_dense_candidates", 0))
         retrieval_dropped_by_floor = int(c.get("retrieval_dropped_by_floor", 0))
         retrieval_floor_drop_ratio = (
@@ -660,6 +761,32 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             "web_sources_listed": web_sources_listed,
             "web_sources_suppressed": max(
                 0, web_sourced_items - web_sources_listed),
+            # D-85. Read together with corpus_recall: `corpus_recall 0.0,
+            # grounding_notice_shipped true` is a run that answered from
+            # the web or from recollection AND told its reader so in the
+            # report itself. The same pair reading `false` means the
+            # deliverable claimed nothing about its own provenance --
+            # which is the state every run was in before D-85, and which
+            # report.shipped_ungrounded now WARNs about.
+            "grounding_notice_shipped": grounding_notice_shipped,
+            # D-91. Read as a pair: `checked` is how many cited figures
+            # the shipped report stated at all, `unsupported` how many of
+            # those appear in no evidence under the goal the sentence
+            # cites. `0 / 0` means the report stated no cited figures --
+            # not that it passed. A nonzero `unsupported` is the first
+            # claim-level (rather than report-level or evidence-set-level)
+            # honesty signal this harness has had.
+            "cited_figures_checked": int(
+                figure_counters.get("cited_figures_checked", 0)),
+            "cited_figures_unsupported": int(
+                figure_counters.get("cited_figures_unsupported", 0)),
+            # A capped sample, so the run record shows WHICH figures
+            # rather than only how many -- the difference between a
+            # number you can act on and one you have to reproduce.
+            "unsupported_figures": [
+                {"figure": f["figure"], "goals": f["goals"]}
+                for f in figure_findings[:5]
+            ],
             # Guardrail G3: model-tier items whose own text paired a
             # specific year with a specific quantity — flagged, not
             # dropped (see tools/model_knowledge.py::_looks_overspecific).
@@ -680,6 +807,39 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             "retrieval_keyword_calls": int(c.get("retrieval_keyword_calls", 0)),
             "retrieval_leg_unavailable": int(c.get("retrieval_leg_unavailable", 0)),
             "producer_rejects": int(c.get("producer_rejects", 0)),
+            # D-86: what the run actually COST, as opposed to how many
+            # requests it made. llm_provider_calls cannot distinguish
+            # three cheap classify calls from three 7,000-token compile
+            # calls; these can. Additive across the run is correct here --
+            # unlike the compile-scoped guardrail counts below, every
+            # token genuinely was spent.
+            "llm_prompt_tokens": int(c.get("llm_prompt_tokens", 0)),
+            "llm_completion_tokens": int(c.get("llm_completion_tokens", 0)),
+            "llm_total_tokens": int(c.get("llm_prompt_tokens", 0)
+                                    + c.get("llm_completion_tokens", 0)),
+            # D-87: which tier of the D-38 ladder actually answered, and
+            # how often a tier failed outright. Previously readable only
+            # by grepping `chain.answered` out of a debug trace. Read
+            # against corpus_recall: `{"corpus": 6}` with corpus_recall
+            # 1.0 is a healthy corpus run; `{"web": 6}` with corpus_recall
+            # 0.0 is the p205.246-check shape, and now says so in one
+            # field rather than three inferred ones.
+            "tier_answers": {
+                key[len("chain_answered_"):]: int(value)
+                for key, value in sorted(c.items())
+                if key.startswith("chain_answered_") and value
+            },
+            "chain_tier_failures": int(c.get("chain_tier_failed", 0)),
+            "chain_exhausted": int(c.get("chain_exhausted", 0)),
+            # D-88: guardrail work on the SHIPPED report specifically --
+            # citation repairs, hedge markers, dedup -- as opposed to the
+            # sum across every compile attempt, which is what reading
+            # these out of `counters` would give. See
+            # ResearchState.last_compile_guardrails.
+            "last_compile_guardrails": {
+                key: int(value)
+                for key, value in sorted(state.last_compile_guardrails.items())
+            },
             "search_calls": int(c.get("search_calls", 0)),
             "search_failures": int(c.get("search_failures", 0)),
             "memory_hits": int(c.get("memory_hits", 0)),

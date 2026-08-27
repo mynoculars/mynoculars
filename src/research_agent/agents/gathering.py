@@ -305,9 +305,12 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
                               AND (not contested)
                 state.recall_score = covered_goals / total_goals
                                      (1.0 if there are no goals at all)
-                state.grounded_score_prev = grounded_score AS READ this
-                    call (i.e. last cycle's value) -- S-8, so
-                    route_convergence can detect a stall between cycles.
+                state.grounded_score_prev = last cycle's MEASURED
+                    grounded_score (S-8, so route_convergence can detect a
+                    stall between cycles), or the -1.0 "no previous cycle"
+                    sentinel on the FIRST cycle, where no measurement
+                    exists yet -- see the write itself, below, for why
+                    that distinction is load-bearing.
                 state.iteration_depth += 1   <- the ONLY place this ticks,
                                                 exactly once per cycle
                 IF terminally short (hitl_enabled AND depth>=max_depth AND
@@ -401,13 +404,42 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
         lf.score(run_id_var.get(), "coverage",
                 sum(g.covered for g in goals) / len(goals) if goals else 1.0)
         lf.score(run_id_var.get(), "grounded", grounded, comment=f"depth={depth}")
+        # S-8: the value grounded_score HELD before this cycle's write --
+        # i.e. last cycle's MEASUREMENT. route_convergence compares the new
+        # value against this one to detect a stall (see its own comment).
+        #
+        # D-80: the first-cycle guard below is load-bearing, not defensive
+        # tidying. On cycle 1 there IS no previous measurement:
+        # state.grounded_score is still its construction default of 1.0
+        # (state.py picks 1.0 so a run with zero goals never reads as
+        # falsely ungrounded), a value this node has not yet written even
+        # once. Copying it recorded a phantom "the previous cycle scored
+        # 1.0", and route_convergence's stall check then read this cycle's
+        # real 0.00 as a failure to improve on it -- routing to the
+        # compiler at depth 1 with the entire gather loop unused, for every
+        # run whose first cycle is ungrounded. Live, run p205.246-check:
+        #
+        #   convergence.grounding_stalled grounded=0.0 grounded_prev=1.0
+        #                                 depth=1 max_depth=3
+        #
+        # and that run's own narrative summary read "Gather laps: 1"
+        # against MAX_DEPTH=3.
+        #
+        # -1.0 is grounded_score_prev's OWN documented "no previous cycle
+        # yet" sentinel (state.py), and route_convergence already excludes
+        # it explicitly (`state.grounded_score_prev >= 0.0`). Both the
+        # sentinel and the router's test for it were correct all along --
+        # nothing ever WROTE one, so the branch protecting the first cycle
+        # could never be taken. This writes it.
+        #
+        # state.iteration_depth is the value BEFORE this node's increment
+        # (`depth`, above, is the incremented one), so `== 0` is exactly
+        # "no gather cycle has completed yet".
+        is_first_cycle = state.iteration_depth == 0
         update = {"goals": goals, "recall_score": recall,
                   "grounded_score": grounded, "iteration_depth": depth,
-                  # S-8: the value grounded_score HELD before this cycle's
-                  # write, above -- i.e. last cycle's measurement. route_
-                  # convergence compares the new value against this one to
-                  # detect a stall (see that function's own comment).
-                  "grounded_score_prev": state.grounded_score}
+                  "grounded_score_prev": (-1.0 if is_first_cycle
+                                          else state.grounded_score)}
         # D-23: at terminal non-convergence the CHECK raises the trigger
         # (E2 if a contradiction blocks a goal, else E3). Routing reads it.
         # P2-09: the non-convergence CONDITION is evaluated regardless of

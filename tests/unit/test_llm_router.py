@@ -366,3 +366,100 @@ def test_error_on_last_provider_falls_back_to_the_rejected_answer():
     gemini = _Fixed("gemini", judge_score=0.35, error=True)
     chain = FallbackRouter([mistral, gemini], quality_threshold=0.6)
     assert chain.complete([{"role": "user", "content": "x"}]) == "THE GOOD REPORT"
+
+
+# ---------------------------------------------------------------------------
+# D-86: run-level token accounting
+# ---------------------------------------------------------------------------
+
+
+class _UsageClient:
+    """A provider that reports token usage the way OpenAICompatibleClient
+    does -- via a drain_usage() that returns once and then clears."""
+
+    def __init__(self, name, reply="answer", usage=(100, 20), raises=None):
+        self.name = name
+        self._reply = reply
+        self._usage = usage
+        self._raises = raises
+        self.drained = 0
+
+    def complete(self, messages, temperature=0.2):
+        if self._raises:
+            raise self._raises
+        return self._reply
+
+    def complete_json(self, messages, temperature=0.0):
+        if self._raises:
+            raise self._raises
+        return {"ok": True}
+
+    def drain_usage(self):
+        self.drained += 1
+        usage, self._usage = self._usage, (0, 0)
+        return usage
+
+    def set_trace_node(self, node):
+        pass
+
+
+def test_json_calls_accumulate_prompt_and_completion_tokens():
+    router = FallbackRouter([_UsageClient("primary", usage=(300, 40))], 0.6)
+
+    router.complete_json([{"role": "user", "content": "q"}])
+    counters = router.drain_counters()
+
+    assert counters["llm_prompt_tokens"] == 300.0
+    assert counters["llm_completion_tokens"] == 40.0
+
+
+def test_a_failed_provider_contributes_no_tokens_but_the_next_one_does():
+    """Tokens follow real completed calls, not attempts. A provider that
+    raised produced no usage to report; llm_provider_calls is the field
+    that counts the attempt."""
+    router = FallbackRouter(
+        [_UsageClient("primary", raises=RuntimeError("boom")),
+         _UsageClient("mistral", usage=(120, 15))], 0.6)
+
+    router.complete_json([{"role": "user", "content": "q"}])
+    counters = router.drain_counters()
+
+    assert counters["llm_provider_calls"] == 2.0
+    assert counters["llm_prompt_tokens"] == 120.0
+    assert counters["llm_completion_tokens"] == 15.0
+
+
+def test_a_provider_without_drain_usage_is_skipped_not_an_error():
+    """drain_usage is an OPTIONAL, duck-typed capability -- StubClient and
+    every hand-written test fake lack it and must keep working."""
+    class _NoUsage:
+        name = "plain"
+
+        def complete_json(self, messages, temperature=0.0):
+            return {"ok": True}
+
+        def set_trace_node(self, node):
+            pass
+
+    router = FallbackRouter([_NoUsage()], 0.6)
+
+    router.complete_json([{"role": "user", "content": "q"}])
+    counters = router.drain_counters()
+
+    assert "llm_prompt_tokens" not in counters
+    assert counters["llm_provider_calls"] == 1.0
+
+
+def test_usage_is_drained_once_per_call_so_it_cannot_be_counted_twice():
+    """drain, not peek -- the same reasoning drain_counters itself gives.
+    Two calls against a provider that reports usage only on the first must
+    total that usage once, not twice."""
+    provider = _UsageClient("primary", usage=(50, 5))
+    router = FallbackRouter([provider], 0.6)
+
+    router.complete_json([{"role": "user", "content": "q"}])
+    router.complete_json([{"role": "user", "content": "q"}])
+    counters = router.drain_counters()
+
+    assert provider.drained == 2
+    assert counters["llm_prompt_tokens"] == 50.0

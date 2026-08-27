@@ -451,6 +451,66 @@ def test_g2_topical_gate_rejects_on_topic_score_off_topic_content():
         "off-topic despite clearing the floor -- must not count as grounded")
 
 
+def test_first_cycle_writes_the_no_previous_cycle_sentinel():
+    """D-80 regression. On the FIRST cycle there is no previous
+    grounded_score measurement, so progress_checker_node must write
+    grounded_score_prev's -1.0 "no previous cycle yet" sentinel -- NOT
+    state.grounded_score, which at that moment is still its 1.0
+    construction default (state.py picks 1.0 so a zero-goal run never
+    reads as falsely ungrounded) and was never measured by anything.
+
+    Copying that default recorded a phantom "the previous cycle scored
+    1.0", which made route_convergence's stall check fire on cycle 1 for
+    every ungrounded run. See test_orchestration_graph.py's
+    test_first_ungrounded_cycle_loops_instead_of_reporting_a_stall for the
+    composed failure this defect actually produced."""
+    settings = Settings(_env_file=None, min_evidence_score=0.5,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[Goal(goal_id="g1",
+                    description="PLA size versus Indian Army size")],
+        # source="web" COVERS a goal but never GROUNDS one (D-57) -- exactly
+        # the shape run p205.246-check produced: recall 1.0, grounded 0.0.
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="web",
+                           content="The PLA fields roughly two million "
+                                   "active personnel; the Indian Army "
+                                   "around 1.2 million.", score=0.7)],
+    )
+    result = build_progress_checker_node(settings, debug=False)(state)
+
+    assert state.grounded_score == 1.0, (
+        "precondition: the untouched 1.0 default this test exists to stop "
+        "being copied into grounded_score_prev")
+    assert result["grounded_score"] == 0.0, "web evidence never grounds (D-57)"
+    assert result["grounded_score_prev"] == -1.0, (
+        "first cycle must report the sentinel, not the unmeasured default")
+
+
+def test_later_cycles_report_the_previous_cycles_real_measurement():
+    """The other half of D-80: from the SECOND cycle onward,
+    grounded_score_prev must carry forward what the PREVIOUS cycle
+    genuinely measured, so route_convergence's stall comparison has real
+    data on both sides. Only the first cycle is special-cased."""
+    settings = Settings(_env_file=None, min_evidence_score=0.5,
+                        model_knowledge_enabled=False)
+    state = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[Goal(goal_id="g1",
+                    description="PLA size versus Indian Army size")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="web",
+                           content="The PLA fields roughly two million "
+                                   "active personnel.", score=0.7)],
+        # A cycle has already completed and measured 0.25.
+        iteration_depth=1,
+        grounded_score=0.25,
+    )
+    result = build_progress_checker_node(settings, debug=False)(state)
+
+    assert result["grounded_score_prev"] == 0.25
+    assert result["iteration_depth"] == 2
+
+
 def test_g2_topical_gate_accepts_genuinely_on_topic_evidence():
     settings = Settings(_env_file=None, min_evidence_score=0.5,
                         model_knowledge_enabled=False)

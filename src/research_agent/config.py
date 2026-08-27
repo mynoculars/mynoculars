@@ -194,14 +194,19 @@ class Settings(BaseSettings):
     # D-23: human-in-the-loop escalation. Off by default — the graceful-
     # degradation posture: shipping inert, enabled deliberately.
     hitl_enabled: bool = False
-    # CURRENTLY UNREAD -- kept, not deleted, and labelled rather than left
-    # looking live. No node, tool or producer consults it; text-searching
-    # this field name across the repo returns only this line. The INTENT
-    # was: how many times one query formulation may be retried across
-    # later gather cycles once every tier came back empty, with D-16's
-    # depth gate still applying on top. Either wire it or drop it -- but
-    # not silently.
-    max_task_retries: int = Field(2, ge=0)
+    # D-82: `max_task_retries` used to sit here, labelled CURRENTLY UNREAD
+    # and inviting a future reader to "either wire it or drop it". Dropped,
+    # deliberately, rather than wired: D-16's retry rule already exists and
+    # is DEPTH-scoped -- agents/task_utils.py::cap_and_filter drops any key
+    # whose recorded failure depth is >= the depth currently producing
+    # tasks, so one query formulation may be re-emitted only by a strictly
+    # later gather cycle. Adding a second, TASK-scoped retry counter would
+    # have created two retry policies with no stated precedence between
+    # them, and the depth-scoped one is the right shape for this
+    # architecture: it is bounded by max_depth, which is one of the four
+    # independent termination bounds the whole graph rests on (D-3/D-14).
+    # A typed setting that does nothing is a trap for the next reader; a
+    # second retry policy would have been worse than the trap.
     # D-23 (bound): the maximum number of times ONE run may pause for a
     # human. Without this, HITL removes the loop bounds it is layered on
     # top of -- route_convergence and dispatch_tasks both test

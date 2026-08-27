@@ -12,10 +12,11 @@ functions directly against a hand-built ResearchState, or inspects
 build_graph's returned graph object without ever invoking it.
 """
 
+from research_agent.agents.gathering import build_progress_checker_node
 from research_agent.config import Settings
 from research_agent.orchestration.graph import (build_graph, dispatch_tasks,
                                                  route_after_critique, route_convergence)
-from research_agent.state import ResearchState, SearchTask
+from research_agent.state import Evidence, Goal, ResearchState, SearchTask
 
 _S = Settings(_env_file=None, llm_mode="stub", max_depth=2, max_revisions=2)
 
@@ -121,6 +122,99 @@ def test_convergence_grounding_gets_exactly_one_gap_generator_attempt():
     state = _state(recall_score=1.0, grounded_score=0.0,
                    grounded_score_prev=-1.0, iteration_depth=0)
     assert route_convergence(state, _S) == "gap_generator"
+
+
+def test_first_ungrounded_cycle_loops_instead_of_reporting_a_stall(caplog):
+    """D-80 regression -- and the reason it is composed rather than
+    hand-built.
+
+    The test directly above pins the same intended behaviour, but
+    constructs `grounded_score_prev=-1.0` by hand: a state the production
+    path could not actually produce, because progress_checker_node
+    overwrote that field with state.grounded_score (still its unmeasured
+    1.0 default) on every cycle INCLUDING the first. So that test passed
+    while the real graph did the opposite -- run p205.246-check logged
+    `convergence.grounding_stalled grounded=0.0 grounded_prev=1.0 depth=1`
+    and compiled at depth 1 with MAX_DEPTH=3 entirely unspent.
+
+    This test therefore builds no intermediate state of its own. It runs
+    the REAL progress_checker_node over a fresh ResearchState, feeds its
+    actual output into route_convergence, and asserts on the pair -- the
+    only arrangement that can catch a producer and a consumer disagreeing
+    about one field's contract."""
+    import logging
+
+    settings = Settings(_env_file=None, llm_mode="stub", max_depth=3,
+                        min_evidence_score=0.5, recall_target=0.85,
+                        grounded_recall_target=0.5,
+                        model_knowledge_enabled=False)
+    fresh = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[Goal(goal_id="g1",
+                    description="PLA size versus Indian Army size")],
+        # Covers the goal (recall 1.0) but cannot ground it (D-57) -- the
+        # exact shape the live run produced.
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="web",
+                           content="The PLA fields roughly two million "
+                                   "active personnel.", score=0.7)],
+    )
+
+    update = build_progress_checker_node(settings, debug=False)(fresh)
+    after = fresh.model_copy(update=update)
+
+    assert after.recall_score == 1.0 and after.grounded_score == 0.0, (
+        "precondition: the covered-but-ungrounded shape being routed on")
+
+    with caplog.at_level(logging.WARNING):
+        destination = route_convergence(after, settings)
+
+    assert destination == "gap_generator", (
+        "an ungrounded FIRST cycle must spend a gather cycle chasing "
+        "grounding (D-47), never be mistaken for a stall")
+    assert not [r for r in caplog.records
+                if "convergence.grounding_stalled" in r.message], (
+        "nothing has stalled yet -- there is no previous measurement to "
+        "compare the first one against")
+
+
+def test_second_ungrounded_cycle_does_report_a_stall(caplog):
+    """The complement of the test above, composed the same way: once a
+    REAL previous measurement exists and grounding has not improved on it,
+    the stall exit must still fire. D-80 restores the first-cycle
+    exemption without weakening what S-8 is actually for -- stopping a run
+    from spending its whole depth budget on a condition already shown not
+    to move."""
+    import logging
+
+    settings = Settings(_env_file=None, llm_mode="stub", max_depth=3,
+                        min_evidence_score=0.5, recall_target=0.85,
+                        grounded_recall_target=0.5,
+                        model_knowledge_enabled=False)
+    second_cycle = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[Goal(goal_id="g1",
+                    description="PLA size versus Indian Army size")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="web",
+                           content="The PLA fields roughly two million "
+                                   "active personnel.", score=0.7)],
+        # One cycle already ran and measured 0.0 grounding.
+        iteration_depth=1,
+        grounded_score=0.0,
+    )
+
+    update = build_progress_checker_node(settings, debug=False)(second_cycle)
+    after = second_cycle.model_copy(update=update)
+
+    assert after.grounded_score_prev == 0.0, "a real prior measurement"
+
+    with caplog.at_level(logging.WARNING):
+        destination = route_convergence(after, settings)
+
+    assert destination == "compiler"
+    assert [r for r in caplog.records
+            if "convergence.grounding_stalled" in r.message], (
+        "expected the S-8 stall WARNING once grounding genuinely fails to "
+        "improve between two measured cycles")
 
 
 def test_convergence_stalled_grounding_compiles_instead_of_looping_again(caplog):

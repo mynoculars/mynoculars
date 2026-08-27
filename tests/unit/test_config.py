@@ -7,6 +7,27 @@ D-76 removed outright) and warn_on_web_search_band() (Phase 4 / D-57).
 Does NOT cover Settings' own field validation or defaults — those are
 exercised implicitly by every other test file in this suite, each of
 which constructs a Settings instance suited to what it's testing.
+
+D-84 -- WHY EVERY TYPO TEST BELOW TAKES THE `isolated_from_dotenv`
+FIXTURE, AND WHY OMITTING IT IS A SILENT FAILURE:
+
+warn_on_likely_env_typos() reads the union of os.environ AND the .env
+file in the CURRENT WORKING DIRECTORY (D-79 -- deliberately, since
+editing .env is how nearly everyone configures this project). Its rule
+is "warn when the WRONG key is set and the RIGHT one is not". So any
+test that sets a typo in os.environ and asserts a warning is silently
+dependent on the developer's own .env: if that file happens to define
+the correct key -- which a working checkout's .env virtually always
+does -- the warning correctly does not fire and the test fails through
+no fault of the code.
+
+The tests D-79 shipped alongside its own change already knew this and
+chdir into tmp_path. The OLDER P2-09-era tests predate the .env read
+entirely (when only os.environ was consulted, the CWD was irrelevant)
+and were never updated, so D-79 broke them the moment it landed --
+10 failures on any checkout with a populated .env, reproduced on two
+independent machines. The fixture makes the isolation shared and
+explicit rather than something each new test has to remember.
 """
 
 import logging
@@ -21,7 +42,24 @@ from research_agent.config import (
 )
 
 
-def test_warn_on_likely_env_typos_flags_known_mistakes(monkeypatch, caplog):
+@pytest.fixture
+def isolated_from_dotenv(tmp_path, monkeypatch):
+    """Run the test in an empty directory, so warn_on_likely_env_typos'
+    .env half (D-79) sees nothing and only os.environ -- which the test
+    itself controls via monkeypatch -- decides the outcome.
+
+    Yields the temp directory, so a test that wants to exercise the .env
+    half deliberately can write its own file into it.
+
+    monkeypatch.chdir is undone at teardown like every other monkeypatch
+    change, so this cannot leak a changed CWD into any later test.
+    """
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_warn_on_likely_env_typos_flags_known_mistakes(
+        isolated_from_dotenv, monkeypatch, caplog):
     monkeypatch.setenv("HITL", "true")          # should have been HITL_ENABLED
     monkeypatch.delenv("HITL_ENABLED", raising=False)
     with caplog.at_level(logging.WARNING):
@@ -32,7 +70,8 @@ def test_warn_on_likely_env_typos_flags_known_mistakes(monkeypatch, caplog):
     assert matches[0].event_fields["probably_meant"] == "HITL_ENABLED"
 
 
-def test_warn_on_likely_env_typos_silent_when_correct_key_present(monkeypatch, caplog):
+def test_warn_on_likely_env_typos_silent_when_correct_key_present(
+        isolated_from_dotenv, monkeypatch, caplog):
     monkeypatch.setenv("HITL", "true")
     monkeypatch.setenv("HITL_ENABLED", "true")  # correct key also set -> no warning
     with caplog.at_level(logging.WARNING):
@@ -40,7 +79,8 @@ def test_warn_on_likely_env_typos_silent_when_correct_key_present(monkeypatch, c
     assert not [r for r in caplog.records if "config.likely_typo" in r.message]
 
 
-def test_warn_on_likely_env_typos_flags_the_new_web_search_names(monkeypatch, caplog):
+def test_warn_on_likely_env_typos_flags_the_new_web_search_names(
+        isolated_from_dotenv, monkeypatch, caplog):
     monkeypatch.setenv("WEB_SEARCH", "true")   # should have been WEB_SEARCH_ENABLED
     monkeypatch.delenv("WEB_SEARCH_ENABLED", raising=False)
     with caplog.at_level(logging.WARNING):
@@ -48,6 +88,30 @@ def test_warn_on_likely_env_typos_flags_the_new_web_search_names(monkeypatch, ca
     matches = [r for r in caplog.records if "config.likely_typo" in r.message]
     assert any(m.event_fields["probably_meant"] == "WEB_SEARCH_ENABLED"
                for m in matches)
+
+
+def test_a_correct_key_in_dotenv_silences_a_typo_exported_in_the_shell(
+        isolated_from_dotenv, monkeypatch, caplog):
+    """D-84: pin the cross-source union semantics that broke the tests
+    above, so the interaction is a specification rather than an accident
+    nobody wrote down.
+
+    The two sources are checked as ONE set: a typo exported in the shell
+    is NOT warned about when the correct key is present in .env. That is
+    the right behaviour -- the setting the operator actually needs IS
+    configured, so the stray key is redundant rather than harmful, and
+    warning about it would be noise. It is also exactly why the tests
+    above must run in an empty directory: a real checkout's .env supplies
+    the correct key for nearly every entry in _KNOWN_ENV_TYPOS."""
+    monkeypatch.setenv("HITL", "true")            # the typo, in the shell
+    monkeypatch.delenv("HITL_ENABLED", raising=False)
+    (isolated_from_dotenv / ".env").write_text(   # the correct key, in .env
+        "HITL_ENABLED=false\n")
+    with caplog.at_level(logging.WARNING):
+        warn_on_likely_env_typos()
+    assert not [r for r in caplog.records if "config.likely_typo" in r.message], (
+        "the correct key is configured, in .env -- the redundant typo is "
+        "not worth a warning")
 
 
 def test_web_search_band_warns_when_the_tier_would_be_inert(caplog):
@@ -86,21 +150,32 @@ def test_web_search_band_warns_when_floor_exceeds_ceiling(caplog):
             if "config.web_search_band_inverted" in r.message]
 
 
-def test_max_task_retries_is_still_unread_by_anything():
-    """Guard against this dead field quietly becoming load-bearing without a
-    decision being taken. It survives as the fragment of a partially-applied
-    patch, and config.py labels it CURRENTLY UNREAD. If someone wires it,
-    this test fails and that label must be corrected in the same change."""
+def test_max_task_retries_no_longer_exists_at_all():
+    """D-82: the decision this dead field's predecessor test demanded
+    ("either wire it or drop it -- but not silently") has now been taken,
+    and it was DROP. D-16's depth-scoped retry gate in
+    agents/task_utils.py::cap_and_filter is the one retry policy this
+    architecture has.
+
+    Kept as an assertion rather than deleted outright so that
+    reintroducing the field -- as a config key, a Settings attribute, or a
+    reader anywhere in src/ or scripts/ -- fails loudly and forces D-82 to
+    be revisited on purpose instead of by accident."""
     import pathlib
 
+    assert not hasattr(Settings(_env_file=None), "max_task_retries")
+
     root = pathlib.Path(__file__).parent.parent.parent
-    hits = []
-    for path in (list((root / "src").rglob("*.py"))
-                 + list((root / "scripts").rglob("*.py"))):
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        if "max_task_retries" in text and path.name != "config.py":
-            hits.append(str(path))
-    assert not hits, f"max_task_retries is now read by: {hits}"
+    hits = [str(path)
+            for path in (list((root / "src").rglob("*.py"))
+                         + list((root / "scripts").rglob("*.py")))
+            if "max_task_retries" in path.read_text(encoding="utf-8",
+                                                    errors="ignore")]
+    # config.py is allowed exactly one mention: D-82's own explanatory
+    # comment, which says why the field is gone. Any OTHER file mentioning
+    # it means something is reading a setting that no longer exists.
+    assert hits == [str(root / "src" / "research_agent" / "config.py")], (
+        f"max_task_retries reappeared in: {hits}")
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +276,17 @@ def test_warn_on_likely_env_typos_catches_a_dotenv_only_mistake(
     ("WEB_MCP_SERVER_ENV_ALLOWLIST", "WEB_MCP_SERVER_URL"),
 ])
 def test_warn_on_likely_env_typos_covers_every_d76_removed_setting(
-        wrong, right, monkeypatch, caplog):
+        wrong, right, isolated_from_dotenv, monkeypatch, caplog):
     """All six settings D-76 deleted from Settings (plus the two
     already-removed args/allowlist siblings) must be recognized as
     "probably meant the new _URL setting" -- not just the one that
-    happened to show up in a live run."""
+    happened to show up in a live run.
+
+    D-84: takes isolated_from_dotenv for the reason given in this
+    module's docstring -- a checkout whose .env defines MCP_SERVER_URL /
+    WEB_MCP_SERVER_URL (i.e. any working one) satisfies the "right key
+    not set" half of the rule and correctly suppresses every warning
+    this test asserts."""
     monkeypatch.setenv(wrong, "some-old-value")
     monkeypatch.delenv(right, raising=False)
     with caplog.at_level(logging.WARNING):

@@ -12,19 +12,31 @@ PASS/FAIL/SKIP summary):
     3. Postgres     (checkpointer + run history)
     4. LLM primary  (the local Llama/Qwen inference engine, llama.cpp's
                       server or equivalent, OpenAI-compatible /v1/models)
-    5. MCP server   (spawns a FRESH, throwaway instance of whatever
-                      MCP_SERVER_COMMAND points at, ONLY if MCP_ENABLED=true
-                      in .env; SKIPPED, not failed, when it's off, since
-                      that's this repo's default and a correct, working
-                      configuration. Unlike the four checks above, there
-                      is NO persistent MCP server to check -- cli.py
-                      itself spawns one fresh per invocation, on demand,
-                      via stdio (D-30); a PASS here means "the spawn
-                      mechanism works right now", not "a server is up")
-    6. FastAPI server (api/server.py's own /health endpoint -- this is
+    5. MCP server   (connects to the ALREADY-RUNNING standalone server at
+                      MCP_SERVER_URL, ONLY if MCP_ENABLED=true in .env;
+                      SKIPPED, not failed, when it's off, since that's this
+                      repo's default and a correct, working configuration.
+                      D-83: this paragraph used to describe a fresh stdio
+                      subprocess spawned per invocation from
+                      MCP_SERVER_COMMAND -- D-76 deleted that transport
+                      outright. Nothing in this repo spawns an MCP server
+                      any more; you start and stop it yourself, so a PASS
+                      here means "that server is up and answering", not
+                      "the spawn mechanism works")
+    6. Web search   (the SECOND standalone MCP server, at
+                      WEB_MCP_SERVER_URL, ONLY if WEB_SEARCH_ENABLED=true;
+                      SKIPPED when off. This row is the ONLY live
+                      verification of the web-search path anywhere in this
+                      repo -- the test suite stops at a fake provider by
+                      design)
+    7. FastAPI server (api/server.py's own /health endpoint -- this is
                       a separate, optional way to run this codebase
                       alongside the CLI, not required for L1/L2/L3;
-                      pass --skip-api if you only ever use the CLI)
+                      pass --skip-api if you only ever use the CLI. Note
+                      D-78: /health answers HTTP 200 even when the app
+                      bundle FAILED to build, carrying that failure in the
+                      response BODY -- so this check reads the body's own
+                      "status" field, never just the HTTP status code)
 
 Deliberately NOT a pytest test in tests/ -- this repo's test suite is
 proudly, entirely offline (see OPERATIONS.md "Running and Interpreting
@@ -155,6 +167,34 @@ def check_llm_primary(base_url: str) -> ServiceStatus:
                               time.time() - t0)
 
 
+def _discover_tools(bridge, configured: str, timeout: float):
+    """Ask a bridge what tools its server exposes (D-89).
+
+    Returns (suffix, warning) -- a string to append to the PASS detail
+    naming what the server actually offers, and a non-empty warning when
+    the CONFIGURED tool name is absent from that list.
+
+    Never raises and never turns a working service into a FAIL: discovery
+    is extra information about a server that has ALREADY answered a real
+    tool call by the time this runs. An SDK or server that does not
+    support tools/list is not a broken deployment, so it degrades to a
+    silent no-op -- the same graceful-degradation posture every storage
+    module in this repo takes.
+    """
+    try:
+        names = bridge.list_tools(timeout_seconds=timeout)
+    except Exception:  # noqa: BLE001 -- discovery is a bonus, never a gate
+        return "", ""
+    if not names:
+        return "", ""
+    suffix = f" [server exposes: {', '.join(sorted(names))}]"
+    if configured not in names:
+        return suffix, (f" -- WARNING: configured tool {configured!r} is NOT "
+                        f"among them; this run answered, but check the "
+                        f"configured name against that list")
+    return suffix, ""
+
+
 def check_mcp(settings) -> ServiceStatus:
     """Only runs when settings.mcp_enabled is True -- MCP_ENABLED=false
     (this repo's default) is a correct, working configuration, not a
@@ -184,10 +224,13 @@ def check_mcp(settings) -> ServiceStatus:
             {settings.mcp_query_arg_name: "health check"},
             timeout_seconds=settings.mcp_call_timeout_seconds)
         item_count = len(getattr(result, "content", []) or [])
+        suffix, warning = _discover_tools(
+            bridge, settings.mcp_tool_name, settings.mcp_call_timeout_seconds)
         return ServiceStatus(
             "MCP server", True,
             f"{settings.mcp_server_url} -- "
-            f"tool '{settings.mcp_tool_name}' responded, {item_count} content item(s)",
+            f"tool '{settings.mcp_tool_name}' responded, {item_count} content item(s)"
+            f"{suffix}{warning}",
             time.time() - t0)
     except Exception as e:
         return ServiceStatus(
@@ -255,8 +298,9 @@ def check_web_search(settings) -> ServiceStatus:
             f"{settings.web_mcp_server_url} -- "
             f"tool '{settings.web_mcp_tool_name}' returned {len(items)} scored "
             f"result(s) across {domains} domain(s) via "
-            f"WEB_SEARCH_PROVIDER={settings.web_search_provider} "
-            "(the ONLY live verification of the search path in this repo -- "
+            f"WEB_SEARCH_PROVIDER={settings.web_search_provider}"
+            f"{_discover_tools(bridge, settings.web_mcp_tool_name, settings.web_mcp_call_timeout_seconds)[0]}"
+            " (the ONLY live verification of the search path in this repo -- "
             "the unit suite stops at a fake provider by design)",
             time.time() - t0)
     except Exception as e:
@@ -276,13 +320,51 @@ def check_api_server(base_url: str) -> ServiceStatus:
     """GET /health -- api/server.py's own liveness endpoint. Optional
     component: this codebase runs perfectly well via the CLI alone, so a
     FAIL here just means "the FastAPI server isn't running right now",
-    not that anything is broken -- pass --skip-api if you never run it."""
+    not that anything is broken -- pass --skip-api if you never run it.
+
+    D-81: TWO different failures are possible here and only one of them is
+    an HTTP-level failure.
+
+      1. The process is not up / not reachable -- caught by the except
+         below, as it always was.
+      2. The process IS up but its app bundle FAILED to build, so every
+         /research and /resume call returns 503. D-78 made /health answer
+         **HTTP 200** in exactly this case, on purpose: liveness must stay
+         reachable so it can report WHY the deeper build failed. The
+         failure therefore lives in the response BODY ("status": "error",
+         plus a "detail"), never in the status code.
+
+    raise_for_status() cannot see case 2, so this function used to report
+    a completely unusable server as [PASS] -- inverting the entire point
+    of D-78. Live evidence (tmp/console-output.txt):
+
+        [PASS] FastAPI server http://127.0.0.1:8000/health --
+               {'status': 'error', 'detail': 'ValueError: MCPBridge
+                requires a url (D-76: ...)'}
+
+    The one tool whose job is to answer "is anything down" was answering
+    "everything is fine" about a server that could not serve a single
+    request. Reading the field D-78 actually sets is the whole fix.
+    """
     t0 = time.time()
     try:
         import httpx
         resp = httpx.get(f"{base_url.rstrip('/')}/health", timeout=5)
         resp.raise_for_status()
         data = resp.json()
+        # D-81 case 2. `!= "ok"` rather than `== "error"`: an unrecognised
+        # status is not something to pass optimistically, and a body with
+        # no status field at all is not this endpoint answering.
+        if data.get("status") != "ok":
+            return ServiceStatus(
+                "FastAPI server", False,
+                f"{base_url}/health -- reachable, but the server's app "
+                f"bundle FAILED to build: {data.get('detail') or data}. "
+                f"Every /research and /resume call returns 503 until the "
+                f"underlying config is fixed and the server restarted "
+                f"(D-78; see the server's own startup log for the full "
+                f"traceback)",
+                time.time() - t0)
         durable = data.get("durable", "?")
         return ServiceStatus(
             "FastAPI server", True,

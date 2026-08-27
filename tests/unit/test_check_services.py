@@ -125,3 +125,123 @@ def test_check_mcp_failure_message_points_at_starting_the_standalone_server(cs, 
 
     assert status.ok is False
     assert "standalone" in status.detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# D-81: check_api_server must read /health's BODY, not just its status code
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """The two methods check_api_server actually calls on an httpx
+    response. Deliberately minimal -- this file opens no sockets (see the
+    module docstring), so a real httpx.Response would be more machinery
+    than the assertion needs."""
+
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def raise_for_status(self):
+        # Every case under test is a real HTTP 200; the unreachable-server
+        # case is already covered by check_api_server's own except branch
+        # and needs no fake to reach it.
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def _patch_health(monkeypatch, payload: dict) -> None:
+    import httpx
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResponse(payload))
+
+
+def test_api_health_200_with_an_error_body_is_a_failure(cs, monkeypatch):
+    """D-81 regression, straight from tmp/console-output.txt.
+
+    D-78 makes /health answer HTTP 200 even when the app bundle failed to
+    build, precisely so liveness stays reachable and can report WHY --
+    the failure lives in the BODY. check_api_server called
+    raise_for_status() and nothing else, so it reported a server whose
+    every /research and /resume call returns 503 as [PASS]:
+
+        [PASS] FastAPI server ... {'status': 'error', 'detail':
+               'ValueError: MCPBridge requires a url (D-76: ...)'}
+    """
+    _patch_health(monkeypatch, {
+        "status": "error",
+        "detail": "ValueError: MCPBridge requires a url (D-76: standalone "
+                  "Streamable HTTP server only)"})
+
+    status = cs.check_api_server("http://127.0.0.1:8000")
+
+    assert status.ok is False
+    assert "MCPBridge requires a url" in status.detail, (
+        "the operator needs the actual build error, not just a FAIL")
+    assert "503" in status.detail, (
+        "and needs to know what it means for the other endpoints")
+
+
+def test_api_health_200_with_an_ok_body_still_passes(cs, monkeypatch):
+    """The healthy path is unchanged by D-81 -- including `durable`, which
+    P2-08 surfaces here so a run degraded to in-memory checkpointing is
+    visible without reading logs."""
+    _patch_health(monkeypatch, {"status": "ok", "llm_mode": "stub",
+                                "durable": True})
+
+    status = cs.check_api_server("http://127.0.0.1:8000")
+
+    assert status.ok is True
+    assert "durable=True" in status.detail
+
+
+def test_api_health_body_without_a_status_field_is_not_trusted(cs, monkeypatch):
+    """Defense in depth: a 200 from something that is NOT this endpoint
+    (a proxy's own health page, a captive portal) has no "status" field.
+    Absent is not ok -- the test is `!= "ok"`, never `== "error"`."""
+    _patch_health(monkeypatch, {"hello": "from some other service"})
+
+    assert cs.check_api_server("http://127.0.0.1:8000").ok is False
+
+
+# ---------------------------------------------------------------------------
+# D-89: tool discovery via MCP tools/list
+# ---------------------------------------------------------------------------
+
+
+class _ToolsBridge:
+    def __init__(self, names=None, raises=None):
+        self._names = names or []
+        self._raises = raises
+
+    def list_tools(self, timeout_seconds=30.0):
+        if self._raises:
+            raise self._raises
+        return self._names
+
+
+def test_discovery_reports_what_the_server_actually_exposes(cs):
+    suffix, warning = cs._discover_tools(
+        _ToolsBridge(["search", "healthcheck"]), "search", 5.0)
+
+    assert "search" in suffix and "healthcheck" in suffix
+    assert warning == ""
+
+
+def test_discovery_warns_when_the_configured_tool_is_absent(cs):
+    """A typo in MCP_TOOL_NAME, or a URL pointed at the wrong server, used
+    to surface only as a per-TASK failure once retrieval was underway."""
+    suffix, warning = cs._discover_tools(
+        _ToolsBridge(["web_search"]), "search", 5.0)
+
+    assert "web_search" in suffix
+    assert "search" in warning and "NOT" in warning
+
+
+def test_discovery_degrades_silently_when_the_server_cannot_list(cs):
+    """Discovery is extra information about a server that has ALREADY
+    answered a real tool call. An SDK or server without tools/list is not
+    a broken deployment and must never turn a PASS into a FAIL."""
+    assert cs._discover_tools(
+        _ToolsBridge(raises=RuntimeError("no tools/list")), "search", 5.0) == ("", "")
+    assert cs._discover_tools(_ToolsBridge([]), "search", 5.0) == ("", "")

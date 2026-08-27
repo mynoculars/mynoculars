@@ -43,7 +43,18 @@ from research_agent.langfuse.pricing import (
 
 
 def _settings(**overrides):
-    return Settings(**overrides)
+    """D-84 hardening. No behaviour change today, and none intended:
+    `_env_file=None` stops these tests reading the developer's own .env.
+
+    Every other Settings construction in this suite already passes it;
+    this one did not, so a checkout whose .env sets any LANGFUSE_* value
+    -- a real per-1M price, a mask mode, an enabled flag -- would quietly
+    change what these assertions run against. Same class of
+    environment-dependence D-84 fixed in test_config.py, found by
+    auditing for other instances of it rather than by waiting for it to
+    break a run.
+    """
+    return Settings(_env_file=None, **overrides)
 
 
 # ---------------------------------------------------------------------------

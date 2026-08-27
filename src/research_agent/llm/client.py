@@ -58,7 +58,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import httpx
 
@@ -436,6 +436,30 @@ class OpenAICompatibleClient:
         """The node name set on THIS thread, or None if none was set."""
         return getattr(self._trace_local, "node", None)
 
+    def drain_usage(self) -> Tuple[int, int]:
+        """Return (prompt_tokens, completion_tokens) for THIS thread's most
+        recent completed call, and clear it. (0, 0) if there was none.
+
+        CALLED BY   llm/router.py::FallbackRouter._bump_usage, immediately
+                    after each successful provider call -- including the
+                    quality-judge calls, which are real spend and are
+                    counted the same way.
+        WHY DRAIN RATHER THAN PEEK: the same reason drain_counters gives on
+        the router itself. A read-and-reset makes "each call reports only
+        what IT cost" structurally true, instead of something every call
+        site has to remember; a peek would let one provider's usage be
+        added twice if a later call raised before reporting its own.
+
+        Duck-typed on purpose -- the router looks this up with getattr and
+        skips a provider that lacks it, the same optional-capability
+        pattern corpus_search's drain_retrieval_counts and this class's own
+        set_trace_node/close already use. That is what lets StubClient (and
+        every hand-written test fake) stay unchanged.
+        """
+        usage = getattr(self._raw, "usage", None)
+        self._raw.usage = None
+        return usage or (0, 0)
+
     def close(self) -> None:
         """Close the underlying httpx.Client. Safe to call twice.
 
@@ -491,6 +515,23 @@ class OpenAICompatibleClient:
         text = _truncate_at_sentinel(raw_text)
         usage = data.get("usage", {})
         pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        # D-86: stash this call's token usage for FallbackRouter to drain
+        # (llm/router.py::_bump_usage) one line after this method returns.
+        #
+        # On self._raw -- the threading.local() this class ALREADY keeps --
+        # and for exactly the reason its own comment gives for _raw.text:
+        # one client instance is shared across the parallel search_worker
+        # fan-out, so a plain attribute would let one thread drain another
+        # thread's usage. Reusing the existing holder rather than adding a
+        # second one keeps "per-call state that must not race" in one
+        # place.
+        #
+        # A provider that reports no usage block (some OpenAI-compatible
+        # servers omit it) yields (0, 0) rather than None, so the router
+        # never has to special-case it -- an unreported call simply adds
+        # nothing to the run total, which is honest: we genuinely do not
+        # know what it cost.
+        self._raw.usage = (int(pt or 0), int(ct or 0))
         # FIX-2 (run p205.211 root cause, third link in the chain). Nothing
         # in this class ever looked at finish_reason, so a generation the
         # PROVIDER itself reported as cut off was returned as a finished

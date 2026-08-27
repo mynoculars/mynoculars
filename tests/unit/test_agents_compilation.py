@@ -12,8 +12,18 @@ wiring into compiler_node.
 """
 
 from research_agent.agents.compilation import build_compiler_node
+from research_agent.config import Settings
 from research_agent.llm.client import strip_code_fence
 from research_agent.state import Evidence, Goal, ResearchState
+
+# D-85 added `settings` to build_compiler_node. Deliberately LIVE mode
+# rather than stub: the D-85 provenance pass is gated off in stub mode, so
+# a stub Settings would skip it entirely and these tests would stop saying
+# anything about it. In live mode the pass genuinely runs against each
+# state below -- all of which have no goals and no evidence, so it must
+# no-op -- which makes every exact-equality assertion in this file double
+# as proof that the no-op path leaves the report byte-identical.
+_SETTINGS = Settings(_env_file=None, llm_mode="live")
 
 
 class _FakeRouter:
@@ -123,7 +133,7 @@ def test_compiler_node_strips_a_fence_the_model_added_despite_instructions():
     its answer in ```json anyway. The fence must not leak into
     final_report."""
     router = _FakeRouter('```json\n{"title": "x", "findings": {}}\n```')
-    node = build_compiler_node(router)
+    node = build_compiler_node(router, _SETTINGS)
     state = ResearchState(raw_query="q")
 
     result = node(state)
@@ -134,7 +144,7 @@ def test_compiler_node_strips_a_fence_the_model_added_despite_instructions():
 
 def test_compiler_node_leaves_clean_markdown_unchanged():
     router = _FakeRouter("# Report\n\nRedis is fast. [g1 | corpus | score=0.90]")
-    node = build_compiler_node(router)
+    node = build_compiler_node(router, _SETTINGS)
     state = ResearchState(raw_query="q")
 
     result = node(state)
@@ -146,7 +156,7 @@ def test_compiler_node_abort_path_is_unaffected_by_fence_stripping():
     """The two non-LLM report shapes (abort, planning_error) never call
     strip_code_fence at all — confirm the fix didn't touch that branch."""
     router = _FakeRouter("unused")
-    node = build_compiler_node(router)
+    node = build_compiler_node(router, _SETTINGS)
     state = ResearchState(raw_query="q", abort_reason="reviewer aborted")
 
     result = node(state)
@@ -625,3 +635,253 @@ def test_telemetry_does_not_warn_when_the_report_cites_something(caplog):
     warned = [r for r in caplog.records
              if "report.shipped_with_no_citations" in r.message]
     assert not warned
+
+
+# ---------------------------------------------------------------------------
+# D-85: the provenance notice, wired through compiler_node and read back by
+# telemetry_node
+# ---------------------------------------------------------------------------
+
+
+def _ungrounded_state():
+    """The p205.246-check shape: every goal covered, none of it grounded."""
+    return ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1"), _g("g2")],
+        evidence=[_e("g1", "The PLA fields about two million troops.",
+                     source="web", score=0.7),
+                  _e("g2", "The Indian Army fields about 1.2 million.",
+                     source="web", score=0.7)])
+
+
+def test_compiler_node_annotates_an_ungrounded_report_in_live_mode():
+    from research_agent.guardrails.grounding import NOTICE_MARKER
+
+    router = _FakeRouter("# Report\n\nBoth armies are large [g1] [g2].")
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live"))
+
+    result = node(_ungrounded_state())
+
+    assert NOTICE_MARKER in result["final_report"]
+    assert result["counters"]["grounding_notice_inserted"] == 1.0
+
+
+def test_compiler_node_does_not_annotate_in_stub_mode():
+    """Same gate D-66's zero-citation check and telemetry_node's
+    report.shipped_with_no_citations backstop already use. StubClient's
+    fixed placeholder report proves the graph executes offline; it models
+    nothing about where evidence came from, so annotating it would be
+    noise in the one mode that is deliberately not a real answer."""
+    from research_agent.guardrails.grounding import NOTICE_MARKER
+
+    router = _FakeRouter("# Report\n\nBoth armies are large [g1] [g2].")
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="stub"))
+
+    result = node(_ungrounded_state())
+
+    assert NOTICE_MARKER not in result["final_report"]
+    assert "grounding_notice_inserted" not in result["counters"]
+
+
+def test_telemetry_reports_whether_the_notice_actually_shipped():
+    """D-59's rule: read from the SHIPPED report, never from a counter --
+    compiler_node runs once per revision and its counters merge
+    additively, so a counter would describe the compile attempts rather
+    than the artifact the reader received."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.guardrails.grounding import annotate_ungrounded_report
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = _ungrounded_state()
+
+    bare = node(state.model_copy(update={
+        "final_report": "# Report\n\nBoth armies are large [g1] [g2]."}))
+    assert bare["telemetry"]["grounding_notice_shipped"] is False
+
+    annotated, _ = annotate_ungrounded_report(
+        "# Report\n\nBoth armies are large [g1] [g2].",
+        state.goals, state.evidence, 0.5, 0.5)
+    withnotice = node(state.model_copy(update={"final_report": annotated}))
+    assert withnotice["telemetry"]["grounding_notice_shipped"] is True
+
+
+def test_telemetry_warns_when_an_ungrounded_report_ships(caplog):
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = _ungrounded_state().model_copy(update={
+        "final_report": "# Report\n\nBoth armies are large [g1] [g2]."})
+    with caplog.at_level(_logging.WARNING):
+        node(state)
+    warned = [r for r in caplog.records
+              if "report.shipped_ungrounded" in r.message]
+    assert warned, "a run whose corpus contributed nothing must be visible"
+    assert warned[0].event_fields["notice_shipped"] is False
+
+
+def test_telemetry_does_not_warn_when_the_corpus_did_ground_the_run(caplog):
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(
+        raw_query="Redis eviction",
+        goals=[_g("g1")],
+        evidence=[Evidence(task_key="t", goal_id="g1", source="corpus",
+                           content="desc g1 eviction policies explained",
+                           score=0.9)],
+        final_report="# Report\n\nGrounded [g1].")
+    with caplog.at_level(_logging.WARNING):
+        node(state)
+    assert not [r for r in caplog.records
+                if "report.shipped_ungrounded" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# D-88: guardrail counts scoped to the SHIPPED report, not summed across
+# every compile attempt
+# ---------------------------------------------------------------------------
+
+
+def test_compiler_returns_compile_scoped_guardrail_counts():
+    """The same numbers reach state two ways: additively via `counters`
+    (a legitimate "how much repair did this whole RUN need" signal) and
+    replace-on-write via `last_compile_guardrails` (what THIS report
+    needed). Only the second can describe the artifact."""
+    router = _FakeRouter("# Report\n\nBoth armies are large [g1] [g2].")
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live"))
+
+    result = node(_ungrounded_state())
+
+    assert result["last_compile_guardrails"]["grounding_notice_inserted"] == 1.0
+    # Router counters are genuinely run-cumulative and have no per-report
+    # meaning, so they must NOT be duplicated into the compile-scoped view.
+    assert "llm_node_calls" not in result["last_compile_guardrails"]
+    assert "llm_provider_calls" not in result["last_compile_guardrails"]
+
+
+def test_telemetry_reads_the_report_scoped_field_not_the_summed_counter():
+    """The D-88 contract, pinned directly: given a `counters` dict inflated
+    by three compile attempts and a `last_compile_guardrails` describing
+    only the last, telemetry must report the last.
+
+    This is the exact defect D-59 found for web_sources_listed -- live, a
+    two-revision run reported 44 listed against a report containing 34.
+    Every one of those numbers was arithmetically correct and none of them
+    described what the reader actually received."""
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(
+        raw_query="q",
+        goals=[_g("g1")],
+        evidence=[_e("g1", "desc g1 content", source="corpus", score=0.9)],
+        final_report="# Report\n\nGrounded [g1].",
+        # Three compile attempts' worth of repairs...
+        counters={"citations_pasted_evidence_removed": 9.0},
+        # ...but the shipped report needed three.
+        last_compile_guardrails={"citations_pasted_evidence_removed": 3.0})
+
+    telemetry = node(state)["telemetry"]
+
+    assert telemetry["last_compile_guardrails"] == {
+        "citations_pasted_evidence_removed": 3}
+
+
+def test_telemetry_surfaces_token_totals_and_tier_answers():
+    """D-86 and D-87 together: what the run cost, and which tier of the
+    D-38 ladder actually answered it."""
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(
+        raw_query="q",
+        goals=[_g("g1")],
+        evidence=[_e("g1", "desc g1 content", source="corpus", score=0.9)],
+        final_report="# Report\n\nGrounded [g1].",
+        counters={"llm_prompt_tokens": 4023.0, "llm_completion_tokens": 2068.0,
+                  "chain_answered_corpus": 4.0, "chain_answered_web": 2.0,
+                  "chain_answered_model": 0.0, "chain_tier_failed": 1.0})
+
+    telemetry = node(state)["telemetry"]
+
+    assert telemetry["llm_prompt_tokens"] == 4023
+    assert telemetry["llm_completion_tokens"] == 2068
+    assert telemetry["llm_total_tokens"] == 6091
+    # A tier that answered nothing is omitted rather than reported as 0 --
+    # the dict names what DID answer, so it stays readable as the ladder
+    # grows.
+    assert telemetry["tier_answers"] == {"corpus": 4, "web": 2}
+    assert telemetry["chain_tier_failures"] == 1
+
+
+# ---------------------------------------------------------------------------
+# D-91: the cited-figure audit, wired into telemetry_node
+# ---------------------------------------------------------------------------
+
+
+def _figure_state(report):
+    return ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1")],
+        evidence=[_e("g1", "desc g1 -- the PLA fields about 2,000,000 "
+                     "personnel", source="corpus", score=0.9)],
+        final_report=report)
+
+
+def test_telemetry_reports_an_unsupported_cited_figure(caplog):
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = _figure_state(
+        "# R\n\nThe PLA fields 2,300,000 active personnel [g1].\n")
+
+    with caplog.at_level(_logging.WARNING):
+        telemetry = node(state)["telemetry"]
+
+    assert telemetry["cited_figures_checked"] == 1
+    assert telemetry["cited_figures_unsupported"] == 1
+    assert telemetry["unsupported_figures"] == [
+        {"figure": "2300000", "goals": ["g1"]}]
+    assert [r for r in caplog.records
+            if "report.unsupported_cited_figures" in r.message]
+
+
+def test_telemetry_is_quiet_when_every_cited_figure_checks_out(caplog):
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="live"))
+    state = _figure_state(
+        "# R\n\nThe PLA fields 2,000,000 active personnel [g1].\n")
+
+    with caplog.at_level(_logging.WARNING):
+        telemetry = node(state)["telemetry"]
+
+    assert telemetry["cited_figures_checked"] == 1
+    assert telemetry["cited_figures_unsupported"] == 0
+    assert telemetry["unsupported_figures"] == []
+    assert not [r for r in caplog.records
+                if "report.unsupported_cited_figures" in r.message]
+
+
+def test_the_figure_audit_is_gated_off_in_stub_mode(caplog):
+    """Same gate as its two neighbouring shipped-report checks (D-66,
+    D-85): StubClient's fixed placeholder report carries no [gN] markers
+    by design, so there is nothing here to audit."""
+    import logging as _logging
+    from research_agent.agents.compilation import build_telemetry_node
+
+    node = build_telemetry_node(Settings(_env_file=None, llm_mode="stub"))
+    state = _figure_state(
+        "# R\n\nThe PLA fields 2,300,000 active personnel [g1].\n")
+
+    with caplog.at_level(_logging.WARNING):
+        telemetry = node(state)["telemetry"]
+
+    assert telemetry["cited_figures_checked"] == 0
+    assert telemetry["cited_figures_unsupported"] == 0
+    assert not [r for r in caplog.records
+                if "report.unsupported_cited_figures" in r.message]

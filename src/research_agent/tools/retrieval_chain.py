@@ -50,7 +50,8 @@ Quality floor:
 """
 
 import logging
-from typing import Any, Callable, List, Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional
 
 from research_agent.logging_setup import log_event
 from research_agent.retrieval.terms import FILLER, distinctive_terms
@@ -111,10 +112,37 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
     answer. The exception is logged, never swallowed silently.
     """
 
+    # D-87: per-tier counters. The ladder's own behaviour was visible only
+    # in log lines (`chain.answered`, `chain.tier_failed`), which means the
+    # single most important question about a run -- WHICH TIER actually
+    # answered it -- could not be read from telemetry at all. `recall`,
+    # `corpus_recall` and `evidence_by_source` each tell part of it after
+    # the fact; none of them says how often the corpus was tried and
+    # missed before something else answered.
+    #
+    # threading.local(), for the same reason retrieval/hybrid.py and
+    # llm/router.py both use it: this closure IS the tool every parallel
+    # search_worker calls, so a plain dict here would be an unlocked
+    # read-modify-write across the whole fan-out.
+    tier_counts = threading.local()
+
+    def _bump_tier(key: str) -> None:
+        counts = getattr(tier_counts, "counts", None)
+        if counts is None:
+            counts = {}
+            tier_counts.counts = counts
+        counts[key] = counts.get(key, 0.0) + 1.0
+
+    def _drain_tier_counts() -> Dict[str, float]:
+        counts = getattr(tier_counts, "counts", None) or {}
+        tier_counts.counts = {}
+        return counts
+
     def _try(tier: str, fn: ToolFn, task: SearchTask) -> List[Evidence]:
         try:
             return fn(task) or []
         except Exception as exc:  # noqa: BLE001 -- a dead tier is not a dead task
+            _bump_tier("chain_tier_failed")
             log_event(logger, "chain.tier_failed", level=logging.WARNING,
                       tier=tier, task=task.key, reason=type(exc).__name__,
                       error=str(exc)[:300])
@@ -160,6 +188,7 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         found = _try("corpus", corpus, task)
         collected.extend(found)
         if _sufficient(found, task.query):
+            _bump_tier("chain_answered_corpus")
             log_event(logger, "chain.answered", tier="corpus", task=task.key,
                       items=len(found))
             return collected
@@ -186,6 +215,7 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
                          for e in found]
                 collected.extend(found)
                 if _sufficient(found, short):
+                    _bump_tier("chain_answered_corpus_reformulated")
                     log_event(logger, "chain.answered", tier="corpus_reformulated",
                               task=task.key, items=len(found), query=short)
                     return collected
@@ -202,6 +232,7 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
             found = _try(name, fn, task)
             collected.extend(found)
             if _sufficient(found, task.query):
+                _bump_tier(f"chain_answered_{name}")
                 log_event(logger, "chain.answered", tier=name, task=task.key,
                           items=len(found))
                 return collected
@@ -231,19 +262,37 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         if model is not None:
             found = _try("model", model, task)
             collected.extend(found)
+            _bump_tier("chain_answered_model")
             log_event(logger, "chain.answered", tier="model", task=task.key,
                       items=len(found),
                       sufficient=_sufficient(found, task.query))
             return collected
 
+        _bump_tier("chain_exhausted")
         log_event(logger, "chain.exhausted", level=logging.WARNING,
                   task=task.key, items=len(collected))
         return collected
 
-    # Preserve the duck-typed telemetry seam the search worker drains
-    # (agents/gathering.py) -- the corpus tier is the only tier that has
-    # retrieval-leg counters to report.
-    drain = getattr(corpus, "drain_retrieval_counts", None)
-    if drain is not None:
-        retrieval_chain.drain_retrieval_counts = drain  # type: ignore[attr-defined]
+    # The duck-typed telemetry seam agents/gathering.py::search_worker
+    # drains once per task. D-87 widened what it carries: it used to
+    # forward the corpus tier's retrieval-leg counters verbatim (the
+    # only tier that has any), and now merges the ladder's OWN per-tier
+    # counters on top -- so the worker's single existing drain call
+    # collects both and no node or contract had to change.
+    #
+    # Set unconditionally now, where it used to be set only when the
+    # corpus tool exposed a drain of its own: the tier counters exist
+    # regardless of what the corpus tier is (a real HybridRetriever in
+    # production, a bare fake in a test), and search_worker already
+    # tolerates the attribute being absent, so present-and-empty is
+    # strictly more informative than absent.
+    corpus_drain = getattr(corpus, "drain_retrieval_counts", None)
+
+    def drain_retrieval_counts() -> Dict[str, float]:
+        counts: Dict[str, float] = (dict(corpus_drain())
+                                    if corpus_drain is not None else {})
+        counts.update(_drain_tier_counts())
+        return counts
+
+    retrieval_chain.drain_retrieval_counts = drain_retrieval_counts  # type: ignore[attr-defined]
     return retrieval_chain

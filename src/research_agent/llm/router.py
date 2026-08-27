@@ -134,6 +134,42 @@ class FallbackRouter:
         counters = self._counters
         counters[key] = counters.get(key, 0.0) + amount
 
+    def _bump_usage(self, provider: ChatClient) -> None:
+        """Fold one provider call's token usage into this thread's counters.
+
+        D-86. The run-level token total was the one real-cost figure this
+        harness could not report: `llm_provider_calls` counts REQUESTS,
+        which says nothing about a run that made three cheap classify
+        calls versus one that made three 7,000-token compile calls. The
+        numbers were already being parsed and logged per call
+        (llm/client.py's `llm.call` line) -- they simply never aggregated
+        anywhere, so nothing could answer "what did this run cost".
+
+        CALLED BY   complete_json and complete below, immediately after a
+                    provider call SUCCEEDS, and by _score_quality for the
+                    judge's own call. A call that raised reported no
+                    usage and adds nothing.
+        WHY TOKENS AND NOT DOLLARS: langfuse/pricing.py can already turn
+        tokens into cost, but every LANGFUSE_PRICE_* setting defaults to
+        0.0 (deliberately -- see .env.example: an unconfigured provider
+        reporting $0 beats a silently guessed number). A spend figure
+        built on those defaults would be structurally zero. Tokens are
+        real whether or not anyone has configured a rate, so tokens are
+        what this counts.
+
+        getattr, not a direct call: `drain_usage` is an optional,
+        duck-typed capability (see its docstring in llm/client.py), so
+        StubClient and every hand-written test fake work unchanged.
+        """
+        drain = getattr(provider, "drain_usage", None)
+        if drain is None:
+            return
+        prompt_tokens, completion_tokens = drain()
+        if prompt_tokens:
+            self._bump("llm_prompt_tokens", float(prompt_tokens))
+        if completion_tokens:
+            self._bump("llm_completion_tokens", float(completion_tokens))
+
     def drain_counters(self) -> Dict[str, float]:
         """Return everything accumulated since the last drain, and reset.
 
@@ -286,6 +322,13 @@ class FallbackRouter:
         """
         score = score_answer(judge, messages, answer,
                              on_score_failed=lambda: self._bump("llm_quality_calls_failed"))
+        # D-86: a judging call is a real provider request that
+        # burns real tokens -- llm_quality_calls already counts
+        # that it happened; this counts what it cost. Draining it
+        # here also stops the judge's usage lingering on its
+        # thread-local and being attributed to that provider's
+        # NEXT call, when it is next reached as an answerer.
+        self._bump_usage(judge)
         if score < self.quality_threshold:
             log_event(logger, "llm.quality_reject", provider=provider.name,
                       judge=judge.name, score=score, threshold=self.quality_threshold)
@@ -320,6 +363,7 @@ class FallbackRouter:
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 result = provider.complete_json(messages)
+                self._bump_usage(provider)  # D-86
                 if i > 0:
                     log_event(logger, "llm.served_by_fallback",
                               provider=provider.name, position=i, mode="json")
@@ -394,6 +438,11 @@ class FallbackRouter:
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 answer = provider.complete(messages)
+                # D-86: drained here, BEFORE any quality scoring
+                # below, so the judge's own call (also counted, in
+                # _score_quality) can never be attributed to the
+                # provider that produced the answer.
+                self._bump_usage(provider)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 nxt = (self.providers[i + 1].name

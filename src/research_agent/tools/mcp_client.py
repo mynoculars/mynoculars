@@ -378,6 +378,51 @@ class MCPBridge:
                       timeout_s=timeout_seconds, arguments=args_preview)
             raise TimeoutError(message) from None
 
+    def list_tools(self, timeout_seconds: float = 30.0) -> List[str]:
+        """Ask the server which tools it actually exposes. Returns names.
+
+        D-89. Until this existed, a configured tool name that the server
+        does not offer -- a typo in MCP_TOOL_NAME, a server upgraded to a
+        new tool name, the corpus URL pointed at the web-search server by
+        mistake -- surfaced only as a per-TASK failure, once retrieval was
+        already underway, as whatever error the server chose to return.
+        The tool surface was never observable at all: a server offering
+        three tools where this build binds one looked identical to a
+        server offering exactly the one.
+
+        CALLED BY   scripts/check_services.py, which reports the real list
+                    and flags a configured name that is missing from it.
+        NOT called from assembly.py, deliberately: D-76 makes the server an
+        independent process that may legitimately be started AFTER the
+        agent, so making startup depend on it being reachable would trade
+        one failure mode for a worse one. Discovery belongs in the health
+        check, which is the thing you run when you want to know.
+
+        Same transport mechanics as call_tool above -- start() first, then
+        submit onto the bridge's own loop and block this thread for the
+        result. Raises whatever the session raises; the caller decides how
+        to report it.
+        """
+        self.start()
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError(
+                f"MCP bridge for '{self._url}' is closed; cannot list tools")
+        future = asyncio.run_coroutine_threadsafe(
+            self._session.list_tools(), loop)
+        started_at = time.time()
+        try:
+            result = future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            # Same reasoning as call_tool's own handler: a bare
+            # concurrent.futures.TimeoutError carries an EMPTY message, so
+            # re-raise with one that says what timed out and for how long.
+            elapsed = time.time() - started_at
+            raise TimeoutError(
+                f"MCP list_tools against {self._url!r} timed out after "
+                f"{elapsed:.1f}s (limit={timeout_seconds}s)") from None
+        return [getattr(t, "name", "") for t in getattr(result, "tools", None) or []]
+
     def close(self) -> None:
         """Tear down this process's session and background loop/thread.
         The independent server itself is never touched (D-76).

@@ -438,7 +438,10 @@ def build_graph(router: FallbackRouter, tool: ToolFn, memory: SemanticMemory,
     _add_node("merger", build_merger_node(router, settings, debug))  # P2-12
     _add_node("progress_checker", build_progress_checker_node(settings, debug))
     _add_node("gap_generator", build_gap_generator_node(router, settings, debug))
-    _add_node("compiler", build_compiler_node(router, debug))
+    # D-85: `settings` added -- see build_compiler_node's own docstring for
+    # the three values it reads and why the parameter order matches
+    # build_critic_node's rather than appending.
+    _add_node("compiler", build_compiler_node(router, settings, debug))
     _add_node("critic", build_critic_node(router, settings, debug))
     _add_node("memory_writer", build_memory_writer_node(memory, settings, debug))
     _add_node("telemetry", build_telemetry_node(settings, debug))

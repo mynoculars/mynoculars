@@ -419,3 +419,95 @@ def test_web_evidence_reaching_the_compiler_carries_its_url(monkeypatch):
     out = chain(_task())
     assert out[0].url == "https://example.org/report"
     assert out[0].domain == "example.org"
+
+
+# ---------------------------------------------------------------------------
+# D-87: per-tier counters, drained through the existing worker seam
+# ---------------------------------------------------------------------------
+
+
+def _tier_task(query="Redis eviction policies and memory limits"):
+    return SearchTask(key="g1::t", query=query, goal_id="g1")
+
+
+def _tier_hit(content, score=0.9):
+    return [Evidence(task_key="g1::t", goal_id="g1", source="corpus",
+                     content=content, score=score)]
+
+
+def test_the_answering_tier_is_counted_and_drained():
+    chain = make_retrieval_chain(
+        lambda t: _tier_hit("Redis eviction policies include allkeys-lru and "
+                       "volatile-ttl memory limits."),
+        min_evidence_score=0.5)
+
+    chain(_tier_task())
+    counts = chain.drain_retrieval_counts()
+
+    assert counts["chain_answered_corpus"] == 1.0
+
+
+def test_a_tier_that_raises_is_counted_as_a_failure_not_a_crash():
+    def _boom(task):
+        raise RuntimeError("backend down")
+
+    chain = make_retrieval_chain(
+        _boom, min_evidence_score=0.5,
+        model=lambda t: _tier_hit("Redis eviction policies and memory limits "
+                             "are well documented.", score=0.6))
+
+    chain(_tier_task())
+    counts = chain.drain_retrieval_counts()
+
+    # TWO, not one, and that is the real behaviour worth pinning:
+    # tier 1 (corpus) and tier 2 (the reformulated corpus retry)
+    # are the SAME tool, so one dead backend fails both. A run
+    # showing chain_tier_failed at twice the task count is a dead
+    # corpus, not two unrelated problems -- which is exactly the
+    # kind of thing this counter exists to make legible.
+    assert counts["chain_tier_failed"] == 2.0
+    assert counts["chain_answered_model"] == 1.0
+
+
+def test_an_exhausted_ladder_is_counted():
+    """No tier answered and no model tier wired -- the ladder ran out.
+    Previously visible only as a WARNING log line."""
+    chain = make_retrieval_chain(lambda t: [], min_evidence_score=0.5,
+                                 reformulate=False)
+
+    chain(_tier_task())
+    counts = chain.drain_retrieval_counts()
+
+    assert counts["chain_exhausted"] == 1.0
+
+
+def test_counts_drain_so_each_task_reports_only_its_own():
+    chain = make_retrieval_chain(
+        lambda t: _tier_hit("Redis eviction policies include allkeys-lru and "
+                       "volatile-ttl memory limits."),
+        min_evidence_score=0.5)
+
+    chain(_tier_task())
+    first = chain.drain_retrieval_counts()
+    second = chain.drain_retrieval_counts()
+
+    assert first["chain_answered_corpus"] == 1.0
+    assert second == {}
+
+
+def test_the_corpus_tools_own_counters_still_come_through():
+    """The seam previously forwarded the corpus tier's retrieval-leg
+    counters verbatim. D-87 merges tier counts ON TOP of those -- it must
+    not replace them, or P2-07's dense/keyword call counts vanish."""
+    def _corpus(task):
+        return _tier_hit("Redis eviction policies include allkeys-lru and "
+                    "volatile-ttl memory limits.")
+
+    _corpus.drain_retrieval_counts = lambda: {"retrieval_dense_calls": 1.0}
+
+    chain = make_retrieval_chain(_corpus, min_evidence_score=0.5)
+    chain(_tier_task())
+    counts = chain.drain_retrieval_counts()
+
+    assert counts["retrieval_dense_calls"] == 1.0
+    assert counts["chain_answered_corpus"] == 1.0

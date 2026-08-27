@@ -385,6 +385,31 @@ class ResearchState(BaseModel):
 
     # Compile & critique (D-22)
     final_report: str = ""
+    # D-88: the guardrail counts from the compile pass that produced the
+    # report currently in final_report -- citation repairs, hedge markers,
+    # evidence dedup.
+    #
+    # DELIBERATELY NOT REDUCER-BACKED, and that is the whole point. These
+    # same numbers are also folded into `counters` (below), which merges
+    # ADDITIVELY -- and compiler_node runs once per REVISION, so the
+    # cumulative view describes every compile ATTEMPT, not the artifact
+    # the reader received. D-59 already found and fixed exactly that for
+    # `web_sources_listed`/`web_sources_suppressed` by counting the
+    # shipped report instead; live, a two-revision run reported 44 listed
+    # against a report containing 34.
+    #
+    # That trick does not generalise: a REMOVED citation leaves no trace
+    # in the shipped text to count. So the report-scoped view is carried
+    # here instead, replace-on-write -- the same mechanism pending_tasks
+    # uses (D-2), and safe for the same reason: exactly one node writes it
+    # per superstep, and it is always rewritten whole rather than added
+    # to. The last compiler pass to run is the one that produced the
+    # shipped report, so last-write-wins IS the correct semantics.
+    #
+    # `counters` keeps the cumulative totals untouched -- they are a
+    # legitimate "how much repair did this whole run need" signal. The two
+    # answer different questions and both stay available.
+    last_compile_guardrails: Dict[str, float] = Field(default_factory=dict)
     critique_notes: Annotated[List[str], operator.add] = Field(default_factory=list)
     revision_count: int = 0
     critique_passed: bool = False
