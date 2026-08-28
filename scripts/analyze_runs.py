@@ -125,9 +125,39 @@ def summarize(runs) -> dict:
     completion_tokens = 0
     token_runs = 0           # runs that reported tokens at all (D-86+)
     recalls, corpus_recalls = [], []
+    # D-104. A failed run (D-103) carries no telemetry to aggregate, so it
+    # is separated out before any counting rather than diluting every
+    # denominator below. `runs` stays the number of ROWS analysed;
+    # `completed_runs` is what the rates are out of.
+    failures = Counter()             # failure type -> count
+    failure_chains = Counter()       # "provider outcome" -> count
+    failed_runs = 0
+    # D-105. Section 14.6's open follow-up: web_sources_listed 0 against a
+    # non-zero web_sources_suppressed is the loudest possible statement
+    # that a report cited nothing the Sources block could attribute. Run
+    # p205.253-check carried 0 / 78 in its telemetry the whole time and
+    # nobody read it. Counted here so nobody has to.
+    silent_source_runs = 0
 
     for run in runs:
         t = run["telemetry"]
+        if is_failed(t):
+            failed_runs += 1
+            failure = t.get("failure") or {}
+            failures[str(failure.get("type") or "unknown")] += 1
+            for pair in failure.get("chain") or []:
+                # Each pair is [provider, outcome] -- exactly what
+                # cli.py::_failure_record wrote. Counted per provider so a
+                # history can show that `primary` fails every time while
+                # the cloud hops rarely do.
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    failure_chains[f"{pair[0]} {pair[1]}"] += 1
+            # Nothing below applies to a row with no telemetry in it.
+            continue
+        listed = int(t.get("web_sources_listed") or 0)
+        suppressed = int(t.get("web_sources_suppressed") or 0)
+        if listed == 0 and suppressed > 0:
+            silent_source_runs += 1
         for tier, count in (t.get("tier_answers") or {}).items():
             tiers[tier] += int(count)
         if t.get("intent"):
@@ -157,6 +187,13 @@ def summarize(runs) -> dict:
 
     return {
         "runs": len(runs),
+        # D-104: rows analysed, minus the ones that never produced
+        # telemetry. Every rate printed by main() divides by THIS.
+        "completed_runs": len(runs) - failed_runs,
+        "failed_runs": failed_runs,
+        "failures_by_type": dict(failures.most_common()),
+        "failed_provider_outcomes": dict(failure_chains.most_common()),
+        "runs_listing_no_cited_web_sources": silent_source_runs,   # D-105
         "intents": dict(intents.most_common()),
         "tier_answers": dict(tiers.most_common()),
         "mean_recall": mean(recalls),
@@ -172,6 +209,17 @@ def summarize(runs) -> dict:
             round((prompt_tokens + completion_tokens) / token_runs)
             if token_runs else None),
     }
+
+
+def is_failed(telemetry) -> bool:
+    """Is this row a D-103 failed-run record?
+
+    The contract, stated once here and relied on everywhere else in this
+    file: a row is failed IFF its telemetry says so. Absence means
+    completed, which is already true of every row written before D-103 --
+    so this classifies the whole history correctly, not just new rows.
+    """
+    return (telemetry or {}).get("run_outcome") == "failed"
 
 
 def _pct(part: int, whole: int) -> str:
@@ -218,9 +266,29 @@ def main(argv=None) -> int:
           + (f", query ILIKE %{args.query_like}%" if args.query_like else "")
           + ")")
     if not facts["runs"]:
-        print("\n  Nothing recorded yet. agent_runs gains a row per completed "
-              "run, from the CLI or the API.")
+        print("\n  Nothing recorded yet. agent_runs gains a row per CLI run --"
+              "\n  one per completed run, and since D-103 one per failed run "
+              "too.")
         return 0
+
+    # D-104: printed FIRST, and before anything that divides by
+    # completed_runs, so a report whose rates are computed over a subset
+    # says so before it shows them rather than after.
+    if facts["failed_runs"]:
+        print()
+        print("Failures")
+        print("-" * 62)
+        print(f"  runs that did not finish: {facts['failed_runs']}"
+              f" / {facts['runs']}"
+              f"  ({_pct(facts['failed_runs'], facts['runs'])})")
+        for name, count in facts["failures_by_type"].items():
+            print(f"    {name:<38} {count}")
+        if facts["failed_provider_outcomes"]:
+            print("  provider outcomes on those runs (D-101):")
+            for name, count in facts["failed_provider_outcomes"].items():
+                print(f"    {name:<38} {count}")
+        print("  Every rate below is out of the "
+              f"{facts['completed_runs']} completed run(s).")
 
     print()
     print("Retrieval")
@@ -228,25 +296,34 @@ def main(argv=None) -> int:
     print(f"  tier answers            : {facts['tier_answers'] or '(none recorded)'}")
     print(f"  mean recall             : {facts['mean_recall']}")
     print(f"  mean corpus_recall      : {facts['mean_corpus_recall']}")
+    done = facts["completed_runs"]
     print(f"  runs the corpus grounded: {facts['runs_with_any_corpus_grounding']}"
-          f" / {facts['runs']}"
-          f"  ({_pct(facts['runs_with_any_corpus_grounding'], facts['runs'])})")
+          f" / {done}"
+          f"  ({_pct(facts['runs_with_any_corpus_grounding'], done)})")
     print()
     print("Honesty")
     print("-" * 62)
     print(f"  shipped provenance notice        : "
-          f"{facts['runs_shipping_provenance_notice']} / {facts['runs']}"
-          f"  ({_pct(facts['runs_shipping_provenance_notice'], facts['runs'])})")
+          f"{facts['runs_shipping_provenance_notice']} / {done}"
+          f"  ({_pct(facts['runs_shipping_provenance_notice'], done)})")
     print(f"  had unsupported cited figures    : "
-          f"{facts['runs_with_unsupported_figures']} / {facts['runs']}"
-          f"  ({_pct(facts['runs_with_unsupported_figures'], facts['runs'])})")
+          f"{facts['runs_with_unsupported_figures']} / {done}"
+          f"  ({_pct(facts['runs_with_unsupported_figures'], done)})")
     print(f"  escalated to a human             : "
-          f"{facts['runs_with_escalations']} / {facts['runs']}")
+          f"{facts['runs_with_escalations']} / {done}")
+    # D-105: 14.6's follow-up. Not a rate -- any non-zero count here is
+    # worth opening the run for, so it prints as a flagged line rather
+    # than a percentage that rounds a single occurrence to 0%.
+    if facts["runs_listing_no_cited_web_sources"]:
+        print(f"  !! cited NO web source, yet suppressed some: "
+              f"{facts['runs_listing_no_cited_web_sources']} / {done}")
+        print("     (web_sources_listed 0 with web_sources_suppressed > 0 --"
+              " the D-99 shape: a report whose citations nothing could read)")
     print()
     print("Cost")
     print("-" * 62)
     if facts["token_runs"]:
-        print(f"  runs reporting tokens   : {facts['token_runs']} / {facts['runs']}"
+        print(f"  runs reporting tokens   : {facts['token_runs']} / {done}"
               "   (older rows predate D-86)")
         print(f"  prompt / completion     : {facts['prompt_tokens']:,}"
               f" / {facts['completion_tokens']:,}")
@@ -263,10 +340,26 @@ def main(argv=None) -> int:
         print("-" * 62)
         for run in runs:
             t = run["telemetry"]
-            print(f"  #{run['id']:<5} {str(run['created_at'])[:19]}  "
-                  f"recall={t.get('recall', '?')} "
-                  f"corpus={t.get('corpus_recall', '?')} "
-                  f"tiers={t.get('tier_answers', {})}")
+            if is_failed(t):
+                # D-104: a failed row printed in the completed format
+                # reads as "recall=? corpus=? tiers={}", which is exactly
+                # how a very BAD run looks. They are different events and
+                # the listing must not blur them.
+                failure = t.get("failure") or {}
+                print(f"  #{run['id']:<5} {str(run['created_at'])[:19]}  "
+                      f"FAILED {failure.get('type', 'unknown')}"
+                      + (f" at {failure['node']}" if failure.get("node") else ""))
+                chain = failure.get("chain") or []
+                if chain:
+                    print("         "
+                          + " -> ".join(f"{p[0]} {p[1]}" for p in chain
+                                        if isinstance(p, (list, tuple))
+                                        and len(p) == 2))
+            else:
+                print(f"  #{run['id']:<5} {str(run['created_at'])[:19]}  "
+                      f"recall={t.get('recall', '?')} "
+                      f"corpus={t.get('corpus_recall', '?')} "
+                      f"tiers={t.get('tier_answers', {})}")
             print(f"         {str(run['query'])[:88]!r}")
 
     print()

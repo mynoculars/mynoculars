@@ -63,7 +63,8 @@ from research_agent.logging_setup import run_id_var
 from research_agent.reporting.metrics import count_sections
 from research_agent.state import ResearchState
 from research_agent.tracing import NullTracer, Tracer
-from research_agent.storage.postgres import close_checkpointer, record_run
+from research_agent.storage.postgres import (close_checkpointer,
+                                             record_failed_run, record_run)
 
 
 def _fmt_hitl_wall_time_line(hitl_triggered: bool, elapsed_s: float) -> str:
@@ -326,6 +327,39 @@ def main(argv=None) -> int:
             print(f"[debug trace written to {crash_trace_path}]", file=sys.stderr)
 
 
+def _failure_record(exc: BaseException) -> dict:
+    """Describe one failed run for its agent_runs row (D-103).
+
+    Pure and exception-shaped rather than a formatted string, so
+    analyze_runs.py can GROUP by failure type instead of grepping prose —
+    "how often do we lose a run to provider exhaustion" is a count, and a
+    count needs a field.
+
+    ProviderChainExhausted gets its chain, node and mode recorded, because
+    those are precisely what the bare exception could not carry (D-101)
+    and precisely what makes a run of these rows worth reading: a history
+    where `primary` fails every time says something a single run cannot.
+    The underlying `__cause__` comes along for the same reason main()
+    prints it — D-102's cap attribution lives in that string.
+
+    Messages are truncated at 500 characters. A row is a record, not a log
+    file, and an unbounded provider error would be the one field able to
+    bloat the table.
+    """
+    record = {"type": type(exc).__name__, "message": str(exc)[:500]}
+    if isinstance(exc, ProviderChainExhausted):
+        record["node"] = exc.node
+        record["mode"] = exc.mode
+        # list(), not the tuples themselves: this is about to become JSON,
+        # where a tuple would round-trip as a list anyway. Converting here
+        # keeps what is written equal to what is read back.
+        record["chain"] = [list(pair) for pair in exc.attempts]
+        if exc.__cause__ is not None:
+            record["cause"] = {"type": type(exc.__cause__).__name__,
+                               "message": str(exc.__cause__)[:500]}
+    return record
+
+
 def _run(app, settings, args, thread_id, tracer) -> int:
     """The actual run, factored out of main() so P2-08's finally/close
     wraps it cleanly without one giant try block."""
@@ -492,8 +526,13 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         print(_fmt_hitl_wall_time_line(hitl_triggered, elapsed_s))
         print("\n--- telemetry (full) ---")
         print(json.dumps(telemetry, indent=2))
+        # D-103: .get("recall") without a default. The old 0.0 fallback
+        # wrote a number nothing measured into the recall column, and a
+        # run that genuinely retrieved nothing recorded the identical
+        # value. The column is nullable; NULL is what "not measured"
+        # looks like.
         record_run(settings.postgres_dsn, thread_id, args.query,
-                   telemetry.get("recall", 0.0), telemetry)
+                   telemetry.get("recall"), telemetry)
 
         # Phase 3: custom scores pulled straight from the SAME telemetry dict
         # the report already printed above -- D-12's own rule ("aggregate,
@@ -522,6 +561,23 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         return 0 if telemetry else 1
     except Exception as exc:
         lf.end_trace(thread_id, metadata={"error": f"{type(exc).__name__}: {str(exc)[:300]}"})
+        # D-103: the single point every failing run passes through exactly
+        # once. Deliberately HERE and not in main()'s except clauses: a
+        # ProviderChainExhausted would pass through this block AND the
+        # handler above, double-recording the same run, and an exception
+        # main() does not recognise would never be recorded at all.
+        #
+        # Guarded on args.query because the column is TEXT NOT NULL and
+        # `--print-graph` with no query is a legitimate way to reach this
+        # function. Nothing ran in that case, so there is nothing to
+        # record.
+        #
+        # record_failed_run swallows its own database errors exactly as
+        # record_run does, so this cannot mask the original exception --
+        # which is re-raised on the next line, unchanged.
+        if args.query is not None:
+            record_failed_run(settings.postgres_dsn, thread_id, args.query,
+                              _failure_record(exc))
         raise
 
 

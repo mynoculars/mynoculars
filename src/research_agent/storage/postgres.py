@@ -220,18 +220,77 @@ def get_checkpointer(dsn: str) -> Tuple[Any, bool]:
 
 
 def record_run(dsn: str, thread_id: str, query: str,
-               recall: float, telemetry: Dict[str, Any]) -> Optional[int]:
-    """Insert one run-history row; returns row id or None when degraded.
+               recall: Optional[float],
+               telemetry: Dict[str, Any]) -> Optional[int]:
+    """Insert one COMPLETED run's history row; id, or None when degraded.
 
-    CALLED BY   cli.py::main, exactly once, right after a run finishes and
+    CALLED BY   cli.py::_run, exactly once, right after a run finishes and
                 its report/telemetry have already been printed. NEVER
                 called from api/server.py — API-driven runs get no history
                 row in agent_runs, a known asymmetry between the two
                 interfaces.
     WRITES      one row into the agent_runs table described by _RUNS_DDL
-                above — nothing else in this codebase reads that table back
-                afterward; it exists purely for manual inspection (e.g.
-                with a SQL client).
+                above. Read back by scripts/analyze_runs.py (D-92).
+
+    D-103: `recall` is now Optional and the caller passes
+    telemetry.get("recall") rather than telemetry.get("recall", 0.0). A run
+    that reached this line with no recall in its telemetry recorded a
+    literal 0.0 — a number nothing measured, indistinguishable in the
+    column from a run that genuinely retrieved nothing. NULL is the honest
+    value and the column has always allowed it.
+
+    A row written here carries NO `run_outcome` key, and that absence is
+    the contract: see record_failed_run below.
+    """
+    return _insert_run(dsn, thread_id, query, recall, telemetry)
+
+
+def record_failed_run(dsn: str, thread_id: str, query: str,
+                      failure: Dict[str, Any]) -> Optional[int]:
+    """Insert one FAILED run's history row; id, or None when degraded.
+
+    CALLED BY   cli.py::_run's `except Exception` block — the single point
+                every failing run passes through exactly once, whether or
+                not main() goes on to recognise the exception type.
+    WRITES      one row with recall NULL and a telemetry payload of
+                {"run_outcome": "failed", "failure": {...}} — `failure` is
+                built by the caller (cli.py::_failure_record), because
+                knowing that a ProviderChainExhausted has a chain is
+                cli.py's business, not this module's.
+
+    D-103. Before this, `record_run` sat on the happy path only, so a run
+    lost to provider exhaustion left NO row at all: "how often do we lose a
+    run this way" was unanswerable by analyze_runs.py (D-92), the tool
+    built to answer exactly that class of question — and a failed run is
+    the one you most want in the history.
+
+    WHY THIS DOES NOT BREAK telemetry_node's "never invent a number" rule,
+    which is why the D-92 review deferred this item: no telemetry figure is
+    written here, invented or otherwise. The row says the run failed and
+    why. That is a fact about the process, recorded by the process, not an
+    estimate of anything the graph would have measured.
+
+    WHY NO SCHEMA CHANGE: `_RUNS_DDL` already declares `recall REAL` and
+    `telemetry JSONB`, both NULLABLE. A migration would have been the
+    expensive part of this item and it is not needed.
+
+    WHY `run_outcome` IS ABSENT FROM SUCCESS ROWS: every row written before
+    this change lacks it, so "absent means completed" is already true of
+    the whole history. Stamping it onto new success rows only would create
+    two shapes of "completed" and make the older one look unclassified.
+    """
+    return _insert_run(dsn, thread_id, query, None,
+                       {"run_outcome": "failed", "failure": failure})
+
+
+def _insert_run(dsn: str, thread_id: str, query: str,
+                recall: Optional[float],
+                telemetry: Dict[str, Any]) -> Optional[int]:
+    """The shared INSERT behind both recorders above (D-103).
+
+    Factored out rather than duplicated so the two paths cannot drift on
+    the DDL, the parameterisation, or the degraded-database posture — the
+    failure path in particular must not be the one that learns to raise.
     """
     try:
         import psycopg

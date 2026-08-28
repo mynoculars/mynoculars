@@ -111,3 +111,120 @@ def test_main_reports_an_unreachable_postgres_as_exit_1(monkeypatch):
                             RuntimeError("connection refused")))
 
     assert analyze_runs.main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# D-104 -- failed runs (D-103) are separated before anything is counted
+# ---------------------------------------------------------------------------
+
+
+def _failed(failure_type="ProviderChainExhausted", **failure):
+    """A D-103 failure row, in the shape cli.py::_failure_record writes."""
+    failure.setdefault("message", "provider chain exhausted")
+    return {"id": 2, "thread_id": "t", "query": "q", "recall": None,
+            "telemetry": {"run_outcome": "failed",
+                          "failure": {"type": failure_type, **failure}},
+            "created_at": "2026-08-27"}
+
+
+def test_a_failed_run_is_counted_but_never_aggregated():
+    """The whole point of the split: a row with no telemetry must not
+    dilute a rate computed from telemetry."""
+    facts = _load().summarize([
+        _run(corpus_recall=1.0, grounding_notice_shipped=True),
+        _failed(),
+    ])
+
+    assert facts["runs"] == 2
+    assert facts["completed_runs"] == 1
+    assert facts["failed_runs"] == 1
+    # 1 of 1 COMPLETED run, not 1 of 2 rows.
+    assert facts["runs_with_any_corpus_grounding"] == 1
+    assert facts["runs_shipping_provenance_notice"] == 1
+    assert facts["mean_corpus_recall"] == 1.0
+
+
+def test_failures_are_grouped_by_type():
+    """'How often do we lose a run to provider exhaustion' is a count, and
+    a count needs a field -- which is why _failure_record writes the
+    exception type rather than only a formatted message."""
+    facts = _load().summarize([
+        _failed("ProviderChainExhausted"),
+        _failed("ProviderChainExhausted"),
+        _failed("GraphRecursionError"),
+    ])
+
+    assert facts["failed_runs"] == 3
+    assert facts["failures_by_type"] == {"ProviderChainExhausted": 2,
+                                         "GraphRecursionError": 1}
+
+
+def test_provider_outcomes_are_counted_across_failed_runs():
+    """A history where `primary` fails every time says something no single
+    run can -- which is the reason D-101's chain is recorded at all."""
+    facts = _load().summarize([
+        _failed(chain=[["primary", "HTTPStatusError"],
+                       ["mistral", "ReadTimeout"]]),
+        _failed(chain=[["primary", "HTTPStatusError"],
+                       ["mistral", "TruncatedGenerationError"]]),
+    ])
+
+    assert facts["failed_provider_outcomes"]["primary HTTPStatusError"] == 2
+    assert facts["failed_provider_outcomes"]["mistral ReadTimeout"] == 1
+
+
+def test_a_malformed_chain_entry_does_not_crash_the_report():
+    """Same posture as every other field here: a row written by hand, or
+    by a future revision, must not take down a history report."""
+    facts = _load().summarize([_failed(chain=[["primary"], "nonsense", None])])
+
+    assert facts["failed_runs"] == 1
+    assert facts["failed_provider_outcomes"] == {}
+
+
+def test_a_history_with_no_failures_reports_zero_not_absence():
+    facts = _load().summarize([_run(recall=1.0)])
+
+    assert facts["failed_runs"] == 0
+    assert facts["completed_runs"] == 1
+    assert facts["failures_by_type"] == {}
+
+
+def test_rows_written_before_D_103_classify_as_completed():
+    """`run_outcome` absent means completed, which is already true of the
+    entire pre-D-103 history. This is the property that lets one rule
+    classify old and new rows alike."""
+    module = _load()
+
+    assert module.is_failed({}) is False
+    assert module.is_failed(None) is False
+    assert module.is_failed({"recall": 0.0}) is False
+    assert module.is_failed({"run_outcome": "failed"}) is True
+
+
+# ---------------------------------------------------------------------------
+# D-105 -- 14.6's follow-up: a report that cited no web source at all
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_citing_no_web_source_while_suppressing_some_is_flagged():
+    """Run p205.253-check carried web_sources_listed 0 against
+    web_sources_suppressed 78 the whole time, and nobody read it."""
+    facts = _load().summarize([
+        _run(web_sources_listed=0, web_sources_suppressed=78),
+        _run(web_sources_listed=29, web_sources_suppressed=1),
+    ])
+
+    assert facts["runs_listing_no_cited_web_sources"] == 1
+
+
+def test_a_run_with_no_web_evidence_at_all_is_not_flagged():
+    """0 listed and 0 suppressed is a corpus-only run, not the D-99 shape.
+    Flagging it would make the counter fire on every offline run and mean
+    nothing."""
+    facts = _load().summarize([
+        _run(web_sources_listed=0, web_sources_suppressed=0),
+        _run(),  # a row predating the counters entirely
+    ])
+
+    assert facts["runs_listing_no_cited_web_sources"] == 0

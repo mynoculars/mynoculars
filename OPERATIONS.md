@@ -2490,7 +2490,15 @@ prompt too large for `LLM_PRIMARY_CONTEXT_TOKENS`, not a failure.
 
 As of D-100, `logs/run-<id>.txt` is written on the failure paths too, not
 only on a clean finish — so there is a narrative to read for every code in
-this table.
+this table. As of D-103 the same is true of the `agent_runs` table: codes
+`2` and `4`, and any unrecognised exception, each write a row with
+`recall` NULL and a `telemetry` payload of
+`{"run_outcome": "failed", "failure": {...}}`. Codes `0`, `1` and `3` are
+unchanged — `3` writes nothing because nothing ran.
+
+`scripts/analyze_runs.py` reads those rows back: a **Failures** block
+counts them by exception type and by which provider failed how, and every
+rate in the rest of that report divides by completed runs only.
 
 ## Writing Your Own Test Corpus
 

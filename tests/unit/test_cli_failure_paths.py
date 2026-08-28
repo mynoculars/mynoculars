@@ -13,6 +13,8 @@ no process wiring, and these drive main() end to end through a faked
 AppBundle. Same delivery reasoning recorded in DECISIONS.md D-62/D-63.
 """
 
+import json
+
 import pytest
 from langgraph.errors import GraphRecursionError
 
@@ -65,13 +67,15 @@ def wired(monkeypatch, settings):
     """main() with a faked bundle, and a tracer we can interrogate.
 
     Returns a callable: run(exception) -> (exit_code, tracer). The tracer
-    is ALSO parked on run.tracer, so a test whose exception propagates
-    out of main() -- and therefore never gets a return value -- can still
-    assert what the finally block did.
+    is ALSO parked on run.tracer, and every record_failed_run call on
+    run.recorded, so a test whose exception propagates out of main() --
+    and therefore never gets a return value -- can still assert what the
+    finally and except blocks did.
     """
     def run(exc):
         tracer = _RecordingTracer()
         run.tracer = tracer
+        run.recorded = []
         monkeypatch.setattr(cli, "Tracer", lambda _thread_id: tracer)
         monkeypatch.setattr(cli, "NullTracer", lambda: tracer)
         monkeypatch.setattr(
@@ -82,6 +86,14 @@ def wired(monkeypatch, settings):
         # any path under test here, but stubbing it keeps a future edit
         # from silently opening a socket in a unit test.
         monkeypatch.setattr(cli, "record_run", lambda *a, **kw: None)
+        # D-103 added a second recorder on the path every test here
+        # takes. The FIXTURE owns the spy rather than each test patching
+        # it: run() is what installs the monkeypatches, so a test that
+        # patched record_failed_run before calling wired() would have its
+        # patch silently replaced here and see zero calls.
+        monkeypatch.setattr(
+            cli, "record_failed_run",
+            lambda *a, **kw: run.recorded.append(a) or 1)
         code = cli.main(["a query", "--thread-id", "fake", "--debug"])
         return code, tracer
     return run
@@ -174,3 +186,111 @@ def test_the_crash_trace_path_is_reported_on_stderr(wired, capsys):
     captured = capsys.readouterr()
     assert "logs/run-fake.txt" in captured.err
     assert "logs/run-fake.txt" not in captured.out
+
+
+
+# ---------------------------------------------------------------------------
+# D-103 -- a failed run enters the history
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_run_is_recorded_once_with_no_invented_recall(wired):
+    """The gap D-103 closes: record_run sat on the happy path, so the run
+    you most want in the history was the one that never got a row. Once,
+    not once per except clause -- a ProviderChainExhausted passes through
+    _run's except AND main()'s handler."""
+    wired(_exhausted())
+
+    assert len(wired.recorded) == 1
+    _dsn, thread_id, query, failure = wired.recorded[0]
+    assert thread_id == "fake"
+    assert query == "a query"
+    assert failure["type"] == "ProviderChainExhausted"
+
+
+def test_the_recorder_is_reached_for_an_exception_main_does_not_handle(wired):
+    """Recorded in _run's except, not in main()'s handlers, precisely so
+    an unrecognised failure is still history."""
+    with pytest.raises(ZeroDivisionError):
+        wired(ZeroDivisionError("boom"))
+
+    assert len(wired.recorded) == 1
+    assert wired.recorded[0][3]["type"] == "ZeroDivisionError"
+
+
+def test_a_database_failure_while_recording_does_not_mask_the_run_failure(
+        wired, monkeypatch):
+    """record_failed_run swallows its own errors exactly as record_run
+    does. If that ever stopped being true, the original exception -- the
+    one worth seeing -- would be replaced by a database error. Patched
+    AFTER wired() has installed its own, which is why this one takes the
+    exception rather than the fixture's spy."""
+    code, _ = wired(_exhausted())
+    assert code == 4
+
+    monkeypatch.setattr(cli, "record_failed_run", lambda *a, **kw: None)
+    code, _ = wired(_exhausted())
+    assert code == 4
+
+
+def test_a_completed_run_with_no_recall_records_null_not_zero(monkeypatch,
+                                                              settings):
+    """D-103's other half. telemetry.get("recall", 0.0) wrote a number
+    nothing measured, and a run that genuinely retrieved nothing recorded
+    the identical value. The column is nullable."""
+    recorded = []
+
+    class _FinishingApp(_FakeApp):
+        def invoke(self, *args, **kwargs):
+            return {"telemetry": {"goals": 2}, "final_report": "r"}
+
+    tracer = _RecordingTracer()
+    monkeypatch.setattr(cli, "Tracer", lambda _t: tracer)
+    monkeypatch.setattr(
+        cli, "build_app_and_settings",
+        lambda tracer=None: AppBundle(app=_FinishingApp(None),
+                                      settings=settings, durable=True,
+                                      checkpointer=None))
+    monkeypatch.setattr(cli, "record_run",
+                        lambda *a, **kw: recorded.append(a) or 1)
+
+    cli.main(["a query", "--thread-id", "fake"])
+
+    assert recorded, "a completed run still records its row"
+    assert recorded[0][3] is None, "recall must be NULL, not a fabricated 0.0"
+
+
+def test_failure_record_captures_the_chain_node_and_cause():
+    record = cli._failure_record(_exhausted())
+
+    assert record["node"] == "compiler"
+    assert record["mode"] == "text"
+    assert record["chain"] == [["primary", "HTTPStatusError"],
+                               ["mistral", "ReadTimeout"],
+                               ["gemini", "TruncatedGenerationError"]]
+    assert record["cause"]["type"] == "TruncatedGenerationError"
+
+
+def test_failure_record_is_json_serialisable():
+    """It is about to be json.dumps'd into a JSONB column. Tuples would
+    round-trip as lists, so they are converted at the point of writing --
+    what is stored equals what is read back."""
+    json.dumps(cli._failure_record(_exhausted()))
+    json.dumps(cli._failure_record(ZeroDivisionError("boom")))
+
+
+def test_failure_record_of_an_ordinary_exception_carries_no_chain_keys():
+    """Only ProviderChainExhausted has a chain. Emitting an empty one for
+    everything else would make `failed_provider_outcomes` look measured
+    when nothing measured it."""
+    record = cli._failure_record(GraphRecursionError("limit"))
+
+    assert record["type"] == "GraphRecursionError"
+    assert "chain" not in record and "node" not in record
+
+
+def test_failure_record_truncates_an_unbounded_provider_message():
+    """A row is a record, not a log file."""
+    record = cli._failure_record(RuntimeError("x" * 5000))
+
+    assert len(record["message"]) == 500
