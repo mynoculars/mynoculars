@@ -59,12 +59,37 @@ logger = logging.getLogger(__name__)
 # self-scoring) to "Another model wrote the answer below" (accurate now that
 # `judge` is never the model that produced `answer`) — the wording is part
 # of the prompt a real model reads, so it needs to match reality.
+# D-106: `reason` added. The score alone has been decisive in five
+# consecutive live runs and diagnostic in none of them -- p205.254-check
+# rejected one compile at 0.5 and the next at 0.1, forcing the hop into
+# the truncation that caused the E4, and nothing anywhere recorded WHY
+# either number was chosen. A score you cannot interrogate is a number you
+# can only tune blindly, which is exactly what this project's own D-54
+# ordering forbids: measure first, build against what you measured.
+#
+# `score` is still FIRST and still the only required key. A judge that
+# ignores the new field, and StubClient's canned {"score": 0.9}, both
+# still parse exactly as before -- reason is read with .get() and its
+# absence is not an error.
+#
+# THIS IS A PROMPT CHANGE, and it is recorded as one: asking for a
+# justification can itself move a model's scores. Scores recorded before
+# and after this change are therefore not one population, and a
+# distribution that spans it should not be read as though they were.
+# Taken deliberately: the alternative is another five runs of the judge
+# being decisive and unexplained.
 _SCORING_PROMPT = (
     "TASK=quality\n"
     "Another model wrote the answer below for the preceding request. Rate how "
     "well it answers the request on a 0.0-1.0 scale. Respond ONLY with JSON: "
-    '{"score": <float>}\n\nANSWER:\n'
+    '{"score": <float>, "reason": "<one short sentence naming the single '
+    'biggest thing that decided the score>"}\n\nANSWER:\n'
 )
+
+# Cap on the reason as it reaches a log line. A judge that ignores "one
+# short sentence" must not be able to turn one JSON log record into a
+# page -- the same reasoning cli.py::_failure_record truncates on.
+_MAX_REASON_CHARS = 240
 
 # FIX-1 (run p205.211 root cause, first link in the chain). The judge used to
 # be handed `answer[:4000]` -- a raw character slice. A compiled report is
@@ -112,7 +137,9 @@ def _excerpt_for_judging(answer: str, max_chars: int = _MAX_ANSWER_CHARS) -> str
 
 
 def score_answer(judge: ChatClient, request_messages: List[Message], answer: str,
-                 on_score_failed: Optional[Callable[[], None]] = None) -> float:
+                 on_score_failed: Optional[Callable[[], None]] = None,
+                 on_scored: Optional[Callable[[float, str], None]] = None
+                 ) -> float:
     """Return a 0..1 quality score for `answer`, as judged by `judge`.
 
     CALLED BY   llm/router.py::FallbackRouter._score_quality, which in
@@ -142,6 +169,15 @@ def score_answer(judge: ChatClient, request_messages: List[Message], answer: str
             "scored low" without this function's return type changing.
             None (the default) means "don't bother" — every existing
             caller that doesn't pass this keeps behaving identically.
+        on_scored: optional callback invoked with (clamped_score, reason)
+            ONLY when the judge genuinely returned a score (D-106) — never
+            on the fail-open path, which is the whole point. The fabricated
+            1.0 this function returns when scoring breaks is not a
+            judgement, and folding it into a score distribution would make
+            a dead judge look like a generous one. `reason` is "" when the
+            judge did not supply one. Same optional-callback shape, and the
+            same rationale, as on_score_failed above: the caller gets the
+            detail it needs without this function's return type changing.
 
     Returns:
         Parsed score clamped to [0, 1]; 1.0 if scoring itself errors
@@ -166,13 +202,21 @@ def score_answer(judge: ChatClient, request_messages: List[Message], answer: str
         # JSON included one, otherwise default to 1.0 (treat a missing
         # field the same as "couldn't be scored, assume it's fine").
         score = float(result.get("score", 1.0))
+        # str() before slicing: a judge that answers with a number, a list
+        # or null here would otherwise raise INSIDE the try and be
+        # misreported as a scoring failure -- turning a usable score into
+        # a fail-open 1.0 over a cosmetic field.
+        reason = str(result.get("reason") or "")[:_MAX_REASON_CHARS]
         # max(0.0, min(1.0, score)) is the standard two-step "clamp" idiom:
         # min(1.0, score) caps the value at 1.0 from above; max(0.0, ...)
         # then floors THAT result at 0.0 from below. Net effect: whatever
         # `score` was, the returned value is guaranteed to sit inside
         # [0.0, 1.0], even if the judge returned something out of range
         # like 1.5 or -3.
-        return max(0.0, min(1.0, score))
+        clamped = max(0.0, min(1.0, score))
+        if on_scored is not None:
+            on_scored(clamped, reason)
+        return clamped
     except Exception as exc:  # noqa: BLE001
         # Anything going wrong here — the judge erroring, the JSON not
         # parsing, "score" being some non-numeric value that float() can't
@@ -180,7 +224,15 @@ def score_answer(judge: ChatClient, request_messages: List[Message], answer: str
         # explains WHY this returns 1.0 (fail-open) rather than 0.0
         # (fail-closed): a broken scoring call should never be allowed to
         # accidentally reject a perfectly good answer.
-        log_event(logger, "quality.score_failed", reason=type(exc).__name__)
+        # D-110: the status code where there is one. `reason` alone said
+        # "HTTPStatusError" and nothing more, which across five runs was
+        # not enough to tell a dead judge from a busy one. httpx puts the
+        # response on the exception; getattr twice rather than importing
+        # httpx here, so this stays true for any client that raises
+        # something response-shaped and harmless for one that does not.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        log_event(logger, "quality.score_failed", reason=type(exc).__name__,
+                  judge=getattr(judge, "name", None), status=status)
         if on_score_failed is not None:
             on_score_failed()
         return 1.0

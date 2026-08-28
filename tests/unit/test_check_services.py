@@ -245,3 +245,83 @@ def test_discovery_degrades_silently_when_the_server_cannot_list(cs):
     assert cs._discover_tools(
         _ToolsBridge(raises=RuntimeError("no tools/list")), "search", 5.0) == ("", "")
     assert cs._discover_tools(_ToolsBridge([]), "search", 5.0) == ("", "")
+
+
+# ---------------------------------------------------------------------------
+# D-111 -- the fallback providers are checked too
+# ---------------------------------------------------------------------------
+
+
+def test_an_unconfigured_provider_is_skipped_not_failed():
+    """FallbackRouter omits a keyless provider from the chain entirely, so
+    its absence is a choice rather than an outage."""
+    status = _load().check_llm_fallback("gemini", "http://x", "", "some-model")
+
+    assert status.skipped is True
+    assert status.ok is True
+
+
+def test_a_4xx_reports_the_status_and_the_body(monkeypatch):
+    """The whole reason this check exists: 404 (retired model name),
+    401/403 (bad key) and 429 (quota) need different fixes, and the run
+    logs could not tell them apart."""
+    mod = _load()
+    import httpx
+
+    def fake_post(url, **kw):
+        return httpx.Response(404, text='{"error": {"message": "model not found"}}')
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    status = mod.check_llm_fallback("gemini", "http://x", "k", "gemini-9.9-flash")
+
+    assert status.ok is False
+    assert "404" in status.detail
+    assert "model not found" in status.detail
+    assert "gemini-9.9-flash" in status.detail
+
+
+def test_a_working_provider_passes_and_names_the_model(monkeypatch):
+    mod = _load()
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: httpx.Response(
+        200, json={"choices": [{"message": {"content": "pong"}}]}))
+    status = mod.check_llm_fallback("mistral", "http://x", "k", "mistral-small")
+
+    assert status.ok is True and status.skipped is False
+    assert "mistral-small" in status.detail
+
+
+def test_a_transport_failure_is_reported_not_raised(monkeypatch):
+    """Same posture as every other check here: report, never traceback."""
+    mod = _load()
+    import httpx
+
+    def boom(url, **kw):
+        raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "post", boom)
+    status = mod.check_llm_fallback("gemini", "http://x", "k", "m")
+
+    assert status.ok is False
+    assert "ConnectError" in status.detail
+
+
+def test_the_probe_is_a_chat_completion_not_a_models_listing(monkeypatch):
+    """A /models listing can succeed against a good key while the
+    CONFIGURED model name is retired -- which is one of the failures this
+    check exists to catch."""
+    mod = _load()
+    import httpx
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        seen["model"] = kw.get("json", {}).get("model")
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    mod.check_llm_fallback("gemini", "http://x/v1", "k", "the-model")
+
+    assert seen["url"].endswith("/chat/completions")
+    assert seen["model"] == "the-model"

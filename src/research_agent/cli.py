@@ -85,6 +85,54 @@ def _fmt_hitl_wall_time_line(hitl_triggered: bool, elapsed_s: float) -> str:
     return f"{status} | Total wall time: {int(minutes)}min {seconds:.2f}secs"
 
 
+def _fmt_judge_line(telemetry: dict) -> str:
+    """One line describing what the quality judge actually said (D-108).
+
+    CALLED BY   _fmt_result_summary below, and covered by its own tests
+                because the three states it distinguishes are the whole
+                point and each is a different sentence.
+
+    D-106 recorded the mean, the rejections and the distribution, and
+    routed them to the agent_runs row and the cross-run report -- but the
+    RESULT block a human reads after EVERY run still showed only
+    "0/2 quality check(s) failed", i.e. the failure ratio and nothing
+    about the judgement. That is the same shape of defect this whole
+    series keeps finding: PHASE5-HONESTY 14.6 and 16.5 both record a
+    signal that existed where nobody looked. Recording the distribution
+    and then not showing it here would have been the third instance.
+
+    Three distinguishable states, deliberately worded so they cannot be
+    confused with each other:
+      - the judge scored things       -> mean, rejections, distribution
+      - the judge was asked and failed every time -> say THAT, and point
+        at the counter that explains it, because a fail-open run looks
+        identical to a clean one in every other number on screen
+      - the judge was never asked     -> the common case (a single
+        provider, or a chain that never needed a second opinion)
+    """
+    judged = int(telemetry.get("llm_quality_scores_judged") or 0)
+    attempted = int(telemetry.get("llm_quality_calls") or 0)
+    failed = int(telemetry.get("llm_quality_calls_failed") or 0)
+    if judged:
+        bands = telemetry.get("llm_quality_bands") or {}
+        band_text = ", ".join(f"{name} {count}"
+                              for name, count in bands.items()) or "none"
+        return (f"Quality judge: {judged} judgement(s), mean "
+                f"{telemetry.get('llm_quality_score_mean')}, "
+                f"{int(telemetry.get('llm_quality_rejections') or 0)} below "
+                f"threshold  [{band_text}]"
+                + (f"   ({failed} scoring call(s) failed open)"
+                   if failed else ""))
+    if attempted:
+        # The state D-53's WARNING exists for, stated here in the summary
+        # rather than only in a log line -- a run whose judge failed every
+        # time had NO quality gate, and every other number on this screen
+        # looks exactly as it would have if the gate had passed everything.
+        return (f"Quality judge: no judgement -- all {attempted} scoring "
+                f"call(s) failed open (the gate was inert this run)")
+    return "Quality judge: not asked (no fallback hop needed a second opinion)"
+
+
 def _fmt_result_summary(telemetry: dict, report: str) -> str:
     """Render the human-readable verdict block printed after the report.
 
@@ -161,6 +209,11 @@ def _fmt_result_summary(telemetry: dict, report: str) -> str:
         f"Providers    : {num('llm_provider_calls')} call(s), "
         f"{num('llm_fallback_hops')} fallback hop(s), "
         f"{num('llm_quality_calls_failed')}/{num('llm_quality_calls')} quality check(s) failed",
+        # D-108: the line above counts how often the judge was ASKED and
+        # how often asking failed. It says nothing about what the judge
+        # decided -- which, across five live runs, is the thing that
+        # actually determined which answer shipped.
+        _fmt_judge_line(telemetry),
         f"Search       : {num('search_calls')} call(s), {num('search_failures')} failed",
     ]
     if telemetry.get("planning_error"):
@@ -322,9 +375,9 @@ def main(argv=None) -> int:
         #
         # stderr, not stdout: on the crash path stdout may hold a
         # half-written report, and this is diagnostic output.
-        crash_trace_path = tracer.flush()
-        if crash_trace_path:
-            print(f"[debug trace written to {crash_trace_path}]", file=sys.stderr)
+        trace_path = tracer.flush()
+        if trace_path:
+            print(f"[debug trace written to {trace_path}]", file=sys.stderr)
 
 
 def _failure_record(exc: BaseException) -> dict:
@@ -499,9 +552,25 @@ def _run(app, settings, args, thread_id, tracer) -> int:
             result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
                                 config=config)
 
-        trace_path = tracer.flush()
-        if trace_path:
-            print(f"[debug trace written to {trace_path}]")
+        # D-113: the flush that used to sit here has moved into main()'s
+        # finally block, which is now the SINGLE flush site. D-100 added
+        # the finally flush and left this one in place, reasoning that
+        # flush_narrative POPS the buffer so a second call finds nothing.
+        # That is true only if nothing is buffered BETWEEN the two calls
+        # -- and the finally block deliberately emits events
+        # (checkpointer.closed, llm.close_failed, mcp.bridge_closed),
+        # which is the very reason D-100 put its flush last.
+        #
+        # So on a SUCCESSFUL run this one wrote the complete narrative and
+        # the finally one reopened the file in "w" mode and overwrote it
+        # with the single close event. Live (runs p205.260/.261): both
+        # logs/run-*.txt were 25 lines containing nothing but
+        # "Checkpointer closed", and the console printed the same trace
+        # path twice. D-100 fixed the failure path and broke the success
+        # path in the same change; the two halves of its own comment
+        # contradicted each other and neither test caught it, because
+        # every test used a fake tracer that counted calls instead of a
+        # real buffer that could be emptied.
 
         # .get(), not [] — an interrupted-then-abandoned run, or any path that
         # ends without reaching telemetry_node, left these keys absent and

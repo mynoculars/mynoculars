@@ -152,7 +152,7 @@ class FallbackRouter:
         # hops, and quality-scoring calls happened underneath a single
         # node's complete()/complete_json() call — node-level counters
         # (agents/*.py's "llm_node_calls") only ever counted NODE
-        # executions, invisible to fallback hops and self-scoring calls
+        # executions, invisible to fallback hops and quality-scoring calls
         # made entirely inside this class. Accumulated here, then drained
         # by each calling node into its own returned counters dict (see
         # drain_counters below) — never written to ResearchState directly,
@@ -189,6 +189,55 @@ class FallbackRouter:
         """Internal: add `amount` to one accumulated counter."""
         counters = self._counters
         counters[key] = counters.get(key, 0.0) + amount
+
+    # D-106: fixed bands for the score distribution, as (exclusive upper
+    # bound, counter suffix) in ascending order. Bands rather than a
+    # min/max pair because counters are MERGED BY ADDITION across parallel
+    # nodes (state.py::merge_counters) -- a running minimum would be
+    # silently wrong the first time two nodes judged in the same superstep,
+    # while a histogram sums correctly by construction.
+    #
+    # The bands are fixed and INDEPENDENT of llm_quality_threshold, which
+    # is the point: they show where the threshold sits inside the observed
+    # distribution. A band set that moved with the threshold could never
+    # answer "is 0.6 in the right place".
+    QUALITY_BANDS = ((0.2, "very_low"), (0.4, "low"), (0.6, "mid"),
+                     (0.8, "high"), (1.01, "very_high"))
+
+    def _record_quality_score(self, score: float, reason: str,
+                              provider: str, judge: str) -> None:
+        """Fold one REAL judgement into this thread's counters (D-106).
+
+        CALLED BY   _score_quality's on_scored callback below, and never
+                    on the fail-open path -- score_answer only invokes
+                    on_scored when the judge actually answered. The
+                    fabricated 1.0 of a broken judge is not a judgement,
+                    and counting it would make a dead judge look like a
+                    generous one, which is the exact confusion P2-11's
+                    llm_quality_calls_failed was added to end.
+
+        llm_quality_scores_judged is deliberately NOT llm_quality_calls:
+        the latter counts judging ATTEMPTS, including the ones that
+        failed open. Only the former is a safe denominator for the mean.
+
+        The reason is logged, not counted -- it is text, and counters are
+        float-valued by contract (merge_counters). That means a run's
+        justifications live in logs/run-<id>.txt and Langfuse, not in its
+        agent_runs row; see D-106's note on what that does and does not
+        make answerable.
+        """
+        self._bump("llm_quality_scores_judged")
+        self._bump("llm_quality_score_sum", float(score))
+        for upper, name in self.QUALITY_BANDS:
+            if score < upper:
+                self._bump(f"llm_quality_band_{name}")
+                break
+        passed = score >= self.quality_threshold
+        if not passed:
+            self._bump("llm_quality_rejections")
+        log_event(logger, "llm.quality_scored", provider=provider, judge=judge,
+                  score=score, threshold=self.quality_threshold,
+                  passed=passed, reason=reason or None)
 
     # D-93: slack between the estimate and the limit before skipping a
     # hop. estimate_prompt_tokens is ~4 chars/token -- good enough to tell
@@ -438,8 +487,15 @@ class FallbackRouter:
         bumps llm_quality_calls_failed ONLY on that fail-open path — a
         genuinely low score never touches this counter.
         """
-        score = score_answer(judge, messages, answer,
-                             on_score_failed=lambda: self._bump("llm_quality_calls_failed"))
+        score = score_answer(
+            judge, messages, answer,
+            on_score_failed=lambda: self._bump("llm_quality_calls_failed"),
+            # D-106: every real judgement, not only the rejections. An
+            # accepted 0.61 says as much about where the threshold belongs
+            # as a rejected 0.59 does, and only one of the two was ever
+            # recorded.
+            on_scored=lambda s, why: self._record_quality_score(
+                s, why, provider.name, judge.name))
         # D-86: a judging call is a real provider request that
         # burns real tokens -- llm_quality_calls already counts
         # that it happened; this counts what it cost. Draining it

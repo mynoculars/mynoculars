@@ -167,6 +167,59 @@ def check_llm_primary(base_url: str) -> ServiceStatus:
                               time.time() - t0)
 
 
+def check_llm_fallback(name: str, base_url: str, api_key: str,
+                       model: str) -> ServiceStatus:
+    """One configured fallback provider, probed the way the agent uses it.
+
+    D-111. Until this existed the only LLM row was `check_llm_primary`, so
+    two of the three providers in the default chain were never checked by
+    the script whose entire job is "which services are actually reachable
+    right now". Live (runs p205.260/.261) gemini failed on every call it
+    was given for at least five consecutive runs and nothing here would
+    have said so.
+
+    A real `/chat/completions` POST, not the `/models` listing
+    `check_llm_primary` uses, and the difference is the point: a listing
+    can succeed against a perfectly good key while the CONFIGURED model
+    name is retired, which is one of the failures this is meant to catch.
+    One token of output is enough to prove the model answers.
+
+    Reports the status code on a 4xx/5xx, which is what separates the
+    three realistic causes -- 404 a wrong or retired model name,
+    401/403 a bad key or a disabled API, 429 an exhausted quota.
+
+    A provider with no API key is SKIPPED, not failed: FallbackRouter
+    omits it from the chain entirely (see from_settings), so an
+    unconfigured provider is a choice rather than an outage.
+    """
+    label = f"LLM {name}"
+    if not api_key:
+        return ServiceStatus(label, True, "no API key set -- not in the chain",
+                             None, skipped=True)
+    t0 = time.time()
+    try:
+        import httpx
+        resp = httpx.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": model, "max_tokens": 1,
+                  "messages": [{"role": "user", "content": "ping"}]},
+            timeout=15)
+        if resp.status_code >= 400:
+            # The provider's own error text, capped. This is the line that
+            # answers "why is it failing"; without it the caller is back
+            # to guessing from an exception class name.
+            return ServiceStatus(
+                label, False,
+                f"{model} -- HTTP {resp.status_code}: {resp.text[:200]}",
+                time.time() - t0)
+        return ServiceStatus(label, True, f"{model} -- answered",
+                             time.time() - t0)
+    except Exception as e:  # noqa: BLE001 -- report, never traceback
+        return ServiceStatus(label, False, f"{model} -- {type(e).__name__}: {e}",
+                             time.time() - t0)
+
+
 def _discover_tools(bridge, configured: str, timeout: float):
     """Ask a bridge what tools its server exposes (D-89).
 
@@ -399,6 +452,13 @@ def main() -> int:
                           settings.opensearch_verify_certs),
         check_postgres(settings.postgres_dsn),
         check_llm_primary(settings.llm_primary_base_url),
+        # D-111: the same two rows FallbackRouter.from_settings builds the
+        # chain from, in the same order, so this table and the chain can
+        # never disagree about who is configured.
+        check_llm_fallback("mistral", settings.llm_mistral_base_url,
+                           settings.llm_mistral_api_key, settings.llm_mistral_model),
+        check_llm_fallback("gemini", settings.llm_fallback_base_url,
+                           settings.llm_fallback_api_key, settings.llm_fallback_model),
         check_mcp(settings),
         check_web_search(settings),
     ]

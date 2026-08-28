@@ -228,3 +228,75 @@ def test_a_run_with_no_web_evidence_at_all_is_not_flagged():
     ])
 
     assert facts["runs_listing_no_cited_web_sources"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D-106 -- judgements accumulate across runs, which is what makes
+# "is 0.6 in the right place" answerable at all
+# ---------------------------------------------------------------------------
+
+
+def test_judgements_accumulate_across_runs():
+    facts = _load().summarize([
+        _run(llm_quality_scores_judged=2, llm_quality_score_mean=0.5,
+             llm_quality_rejections=2,
+             llm_quality_bands={"mid": 2}),
+        _run(llm_quality_scores_judged=1, llm_quality_score_mean=0.9,
+             llm_quality_rejections=0,
+             llm_quality_bands={"very_high": 1}),
+    ])
+
+    assert facts["quality_runs"] == 2
+    assert facts["quality_judgements"] == 3
+    assert facts["quality_rejections"] == 2
+    assert facts["quality_bands"] == {"mid": 2, "very_high": 1}
+
+
+def test_the_cross_run_mean_is_weighted_by_judgements_not_by_run():
+    """A run with four judgements should not carry the same weight as a
+    run with one. (0.5x2 + 0.9x1) / 3 = 0.633, not (0.5 + 0.9) / 2."""
+    facts = _load().summarize([
+        _run(llm_quality_scores_judged=2, llm_quality_score_mean=0.5),
+        _run(llm_quality_scores_judged=1, llm_quality_score_mean=0.9),
+    ])
+
+    assert facts["mean_quality_score"] == 0.633
+
+
+def test_bands_are_reported_in_distribution_order_not_by_count():
+    """The shape should read as a distribution -- sorting by count would
+    hide where the mass sits."""
+    facts = _load().summarize([
+        _run(llm_quality_scores_judged=9,
+             llm_quality_bands={"very_high": 5, "very_low": 3, "mid": 1}),
+    ])
+
+    assert list(facts["quality_bands"]) == ["very_low", "mid", "very_high"]
+
+
+def test_a_run_the_judge_never_scored_is_not_counted():
+    """A run whose judge failed open every time recorded no judgement.
+    Counting it as a scored run with a mean of 0.0 would invent the one
+    number this whole section exists to measure honestly."""
+    facts = _load().summarize([
+        _run(llm_quality_calls=2, llm_quality_calls_failed=2),
+        _run(),  # a row predating D-106 entirely
+    ])
+
+    assert facts["quality_runs"] == 0
+    assert facts["quality_judgements"] == 0
+    assert facts["mean_quality_score"] is None
+    assert facts["quality_bands"] == {}
+
+
+def test_a_failed_run_contributes_no_judgements():
+    """Same separation as every other rate: a D-103 row has no telemetry
+    to aggregate."""
+    facts = _load().summarize([
+        _run(llm_quality_scores_judged=1, llm_quality_score_mean=0.4,
+             llm_quality_bands={"low": 1}),
+        _failed(),
+    ])
+
+    assert facts["quality_judgements"] == 1
+    assert facts["quality_bands"] == {"low": 1}

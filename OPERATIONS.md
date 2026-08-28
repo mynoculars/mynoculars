@@ -1234,6 +1234,13 @@ echo $PYTHONPATH          # must print: src
 #    plus the MCP and web-search subprocesses when those are enabled.
 
 #    Clear PASS/FAIL per service, nonzero exit code if anything's down.
+#    Since D-111 this includes EVERY configured LLM provider, not only the
+#    local primary -- each fallback is probed with a real one-token
+#    completion against its configured model, and a 4xx prints the status
+#    code and the provider's own error text. That is the fastest way to
+#    tell a retired model name (404) from a bad key (401/403) from an
+#    exhausted quota (429); a provider with no API key shows as SKIP,
+#    because FallbackRouter leaves it out of the chain entirely.
 
 #    Both subprocess rows report SKIPPED when disabled -- that is a pass,
 
@@ -2500,6 +2507,15 @@ unchanged — `3` writes nothing because nothing ran.
 counts them by exception type and by which provider failed how, and every
 rate in the rest of that report divides by completed runs only.
 
+The same report's **Quality judge** block (D-106) accumulates what the
+fallback quality gate actually scored — every judgement, not only the
+rejections — as a fixed-band distribution plus a mean weighted by
+judgement. Read it before changing `LLM_QUALITY_THRESHOLD`: the bands do
+not move with that setting, precisely so they can show whether it sits in
+the right place. A run that scored nothing is not counted as a run that
+scored zero — if this block stays empty, the judge is failing open, and
+`llm_quality_calls_failed` is the number to look at instead.
+
 ## Writing Your Own Test Corpus
 
 The sample corpus is 10 docs on one topic. To test other questions, replace or
@@ -2880,11 +2896,16 @@ POSTGRES_DSN=postgresql://agent:agent@localhost:5432/research_agent
 **One table worth knowing about once you're in DBeaver**: alongside
 LangGraph's own `checkpoints`/`checkpoint_blobs`/`checkpoint_writes`
 tables, this codebase's own `record_run()` creates and writes an
-`agent_runs` table — one row per completed run (CLI or API), with
-`thread_id`, `query`, `recall`, `telemetry` (JSONB), and a timestamp.
-Nothing in this codebase reads it back; it exists purely for you and
-DBeaver to inspect post-hoc run history. See README.md's Storage
-Contracts section for the full column list. You may see either
+`agent_runs` table — one row per **CLI** run, with `thread_id`, `query`,
+`recall`, `telemetry` (JSONB), and a timestamp. Since D-103 a FAILED run
+gets a row too (`recall` NULL, `telemetry`
+`{"run_outcome": "failed", "failure": {...}}`); a completed run's row
+carries no `run_outcome` key, so "absent means completed" reads the whole
+history correctly including every row written before D-103. API-driven
+runs are still never recorded — a known asymmetry since P2-08.
+`scripts/analyze_runs.py` (D-92) reads this table back; it is no longer
+inspection-only. See README.md's Storage Contracts section for the full
+column list. You may see either
 `checkpointer.postgres_active` or `checkpointer.pool_active` at startup —
 both are healthy signs.
 

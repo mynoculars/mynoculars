@@ -186,6 +186,12 @@ class NarrativeFormatter(logging.Formatter):
                      f"({f.get('llm_fallback_hops')} fallback hops)")
         lines.append(f"Quality checks   : {f.get('llm_quality_calls')} "
                      f"({f.get('llm_quality_calls_failed')} failed)")
+        # D-108: what the judge DECIDED, not just how often it was asked.
+        # Imported at call time rather than at module import: cli.py
+        # already imports this module (for Tracer -> narrative logging),
+        # and a module-level import back into cli would be circular.
+        from research_agent.cli import _fmt_judge_line
+        lines.append(_fmt_judge_line(f))
         lines.append("\nCritique")
         lines.append(self._THIN)
         status = "PASSED" if f.get("critique_passed") else "FAILED"
@@ -328,7 +334,14 @@ class NarrativeFormatter(logging.Formatter):
         "llm.fallback": "Provider fallback",
         "llm.served_by_fallback": "Served by fallback provider",
         "llm.truncated_runaway_generation": "Truncated a runaway generation",
+        "llm.truncated_by_token_limit": "Generation cut off at a token limit",
         "llm.quality_reject": "Quality gate rejected the response",
+        "llm.quality_scored": "Quality gate scored the response",
+        "llm.last_provider_worse": "Last provider scored worse, kept earlier answer",
+        "llm.skipped_for_context": "Provider skipped (prompt exceeds its context window)",
+        "llm.context_overflow": "Provider refused the prompt (context overflow)",
+        "quality.judge_unreliable": "Quality judge failed on every attempt",
+        "run_history.skipped": "Run-history row skipped (Postgres unreachable)",
         "llm.chain_exhausted_low_quality": "Fallback chain exhausted (low quality)",
         "llm.chain_built": "LLM fallback chain built",
         "escalation.raised": "Escalation raised",

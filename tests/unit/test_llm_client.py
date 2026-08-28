@@ -10,6 +10,7 @@ no other natural home.
 """
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -357,3 +358,147 @@ def test_token_estimation_is_roughly_four_characters_per_token():
     assert 900 <= estimate_prompt_tokens(
         [{"role": "user", "content": "x" * 4000}]) <= 1100
     assert estimate_prompt_tokens([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# D-107 -- a routine sentinel trim is not a runaway
+#
+# p205.254-check logged this at WARNING on all five local-primary calls,
+# discarding 10, 10, 11, 11 and 11 characters. Five WARNINGs a run for a
+# non-event is how a real one gets scrolled past.
+# ---------------------------------------------------------------------------
+
+
+def _sentinel_handler(tail):
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "the real answer<|im_end|>" + tail},
+                         "finish_reason": "stop"}]})
+    return handler
+
+
+def test_a_bare_sentinel_trim_logs_at_info_not_warning(caplog):
+    """The observed shape: the model emits its own end-of-turn token as
+    literal text and nothing follows it."""
+    client = _client_with_mock_transport(_sentinel_handler(""))
+
+    with caplog.at_level(logging.INFO):
+        assert client.complete([{"role": "user", "content": "x"}]) == "the real answer"
+
+    events = [r for r in caplog.records
+              if "llm.truncated_runaway_generation" in r.message]
+    assert events and all(r.levelno == logging.INFO for r in events)
+
+
+def test_a_real_runaway_still_warns(caplog):
+    """What the guard was built for: an entire fabricated continuation."""
+    client = _client_with_mock_transport(_sentinel_handler("z" * 400))
+
+    with caplog.at_level(logging.INFO):
+        client.complete([{"role": "user", "content": "x"}])
+
+    events = [r for r in caplog.records
+              if "llm.truncated_runaway_generation" in r.message]
+    assert events and all(r.levelno == logging.WARNING for r in events)
+
+
+def test_the_level_follows_the_discarded_size_not_the_response_size():
+    """An absolute threshold, not a ratio. The live trims ran 1% to 18%
+    of the response depending only on how SHORT the response was, so a
+    ratio would have flagged the 54-character classify call and cleared
+    the identical 1,084-character one."""
+    from research_agent.llm.client import _RUNAWAY_WARN_CHARS
+
+    assert _RUNAWAY_WARN_CHARS > len("<|im_end|>"), "a bare sentinel is quiet"
+    assert _RUNAWAY_WARN_CHARS < 400, "a fabricated continuation is not"
+
+
+def test_an_untrimmed_response_logs_nothing_at_all(caplog):
+    """Unchanged: the overwhelming majority of calls trim nothing."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "a clean answer"},
+                         "finish_reason": "stop"}]})
+
+    client = _client_with_mock_transport(handler)
+    with caplog.at_level(logging.INFO):
+        client.complete([{"role": "user", "content": "x"}])
+
+    assert not [r for r in caplog.records
+                if "llm.truncated_runaway_generation" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# D-110 -- a 4xx that is not a context overflow is still worth reading
+#
+# Runs p205.260/.261: gemini returned 4xx on every call it was given, and
+# the entire run record said "HTTPStatusError". A retired model name
+# (404), a bad key (401/403) and an exhausted quota (429) were
+# indistinguishable, and the quality gate had been inert for five runs
+# with no way to learn why from the logs.
+# ---------------------------------------------------------------------------
+
+
+def _status_handler(status, body):
+    def handler(request):
+        return httpx.Response(status, text=body)
+    return handler
+
+
+def test_a_plain_4xx_logs_its_status_and_body(caplog):
+    client = _client_with_mock_transport(
+        _status_handler(404, '{"error": {"message": "model not found"}}'))
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.complete([{"role": "user", "content": "x"}])
+
+    rec = [r for r in caplog.records if "llm.http_error" in r.message]
+    assert rec, "a 4xx must not vanish into a bare exception class name"
+    # log_event puts the payload on record.event_fields (extra=), never
+    # in the formatted message -- see logging_setup.py::log_event.
+    fields = rec[0].event_fields
+    assert fields["status"] == 404
+    assert "model not found" in fields["body"]
+    assert fields["provider"] == "primary" and fields["model"] == "model-x"
+
+
+def test_the_status_code_is_what_separates_the_realistic_causes(caplog):
+    """404 wrong model, 401/403 bad key, 429 quota. The point of logging
+    the number is that these need different fixes."""
+    for status in (401, 403, 429, 500):
+        caplog.clear()
+        client = _client_with_mock_transport(_status_handler(status, "nope"))
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(httpx.HTTPStatusError):
+                client.complete([{"role": "user", "content": "x"}])
+        assert any(r.event_fields["status"] == status for r in caplog.records
+                   if "llm.http_error" in r.message)
+
+
+def test_a_context_overflow_still_gets_its_own_specific_event(caplog):
+    """D-93's event carries the estimated/configured token fields that the
+    generic one cannot. The new branch must not swallow it."""
+    client = _client_with_mock_transport(
+        _status_handler(400, "the request exceeds the maximum context length"),
+        context_tokens=1536)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.complete([{"role": "user", "content": "x"}])
+
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "llm.context_overflow" in msgs
+    assert "llm.http_error" not in msgs, "one event per failure, not two"
+
+
+def test_a_2xx_logs_no_http_error_at_all(caplog):
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "fine"}, "finish_reason": "stop"}]})
+
+    client = _client_with_mock_transport(handler)
+    with caplog.at_level(logging.WARNING):
+        client.complete([{"role": "user", "content": "x"}])
+
+    assert not [r for r in caplog.records if "llm.http_error" in r.message]

@@ -12,7 +12,8 @@ Its own file rather than appended to a sibling, for the delivery reason
 recorded in DECISIONS.md D-62/D-63.
 """
 
-from research_agent.cli import _fmt_result_summary
+from research_agent.cli import (_fmt_judge_line,
+                                 _fmt_result_summary)
 
 
 # Telemetry as actually emitted by run p205.212, trimmed to the keys the
@@ -132,3 +133,79 @@ def test_summary_invents_no_numbers_of_its_own():
     allowed |= {str(v) for v in _P205_212["evidence_by_source"].values()}
     allowed |= {"3", str(len(_REPORT)), f"{len(_REPORT):,}", "0"}
     assert shown <= allowed, f"unexplained figures in summary: {shown - allowed}"
+
+
+# ---------------------------------------------------------------------------
+# D-108 -- what the judge DECIDED reaches the block a human reads
+#
+# D-106 recorded the mean, the rejections and the distribution and routed
+# them to agent_runs and the cross-run report. The RESULT block printed
+# after EVERY run still showed only "0/2 quality check(s) failed" -- the
+# failure ratio, and nothing about the judgement. Recording a signal and
+# then not showing it is the defect PHASE5-HONESTY 14.6 and 16.5 both
+# record; this is the third instance, closed.
+# ---------------------------------------------------------------------------
+
+
+def test_the_judge_line_reports_mean_rejections_and_distribution():
+    line = _fmt_judge_line({
+        "llm_quality_scores_judged": 3, "llm_quality_score_mean": 0.5,
+        "llm_quality_rejections": 2,
+        "llm_quality_bands": {"very_low": 1, "mid": 1, "very_high": 1},
+        "llm_quality_calls": 3, "llm_quality_calls_failed": 0})
+
+    assert "3 judgement(s)" in line
+    assert "mean 0.5" in line
+    assert "2 below threshold" in line
+    assert "very_low 1" in line and "very_high 1" in line
+
+
+def test_a_run_whose_judge_failed_every_time_says_the_gate_was_inert():
+    """The state D-53's WARNING exists for, said in the summary rather
+    than only in a log line: a run with no working judge had NO quality
+    gate, and every other number on that screen looks exactly as it would
+    have if the gate had passed everything."""
+    line = _fmt_judge_line({"llm_quality_calls": 2, "llm_quality_calls_failed": 2})
+
+    assert "no judgement" in line
+    assert "inert" in line
+    assert "mean" not in line, "there is no mean to report"
+
+
+def test_a_run_that_never_needed_a_second_opinion_says_so():
+    """The common case -- a single-provider chain, or a first answer that
+    cleared the gate with no hop. It must not read as a failure."""
+    line = _fmt_judge_line({})
+
+    assert "not asked" in line
+    assert "failed" not in line
+
+
+def test_partial_judge_failure_is_reported_alongside_the_scores():
+    """Some scored, some failed open. Both facts matter and neither
+    replaces the other."""
+    line = _fmt_judge_line({
+        "llm_quality_scores_judged": 1, "llm_quality_score_mean": 0.9,
+        "llm_quality_rejections": 0, "llm_quality_bands": {"very_high": 1},
+        "llm_quality_calls": 3, "llm_quality_calls_failed": 2})
+
+    assert "1 judgement(s)" in line
+    assert "2 scoring call(s) failed open" in line
+
+
+def test_the_result_summary_carries_the_judge_line():
+    summary = _fmt_result_summary(
+        {"llm_quality_scores_judged": 1, "llm_quality_score_mean": 0.4,
+         "llm_quality_rejections": 1, "llm_quality_bands": {"low": 1},
+         "llm_quality_calls": 1, "llm_quality_calls_failed": 0},
+        "# A report")
+
+    assert "Quality judge:" in summary
+    # The pre-existing attempt/failure line must still be there -- the two
+    # answer different questions and neither replaces the other.
+    assert "quality check(s) failed" in summary
+
+
+def test_a_telemetry_dict_with_no_quality_keys_at_all_still_formats():
+    """Every pre-D-106 row, and every stub run."""
+    assert "Quality judge:" in _fmt_result_summary({}, "")

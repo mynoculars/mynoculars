@@ -222,7 +222,8 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
         # complete() (not complete_json) is the only free-text path, so this
         # is the one node whose drained counters can include
-        # llm_quality_calls (the self-scoring gate only runs on free text).
+        # llm_quality_calls (the quality gate only runs on free text; it
+        # is cross-provider, not self-scoring -- P2-11).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
                     **citation_counters, **hedge_counters, **source_counters,
                     **dedup_counters, **grounding_counters}
@@ -789,6 +790,22 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         # session, not merely lenient.
         llm_quality_calls = int(c.get("llm_quality_calls", 0))
         llm_quality_calls_failed = int(c.get("llm_quality_calls_failed", 0))
+        # D-106. Read from the SAME counter dict as everything else here,
+        # so D-12 holds unchanged: this aggregates what the router
+        # recorded and derives one ratio from it, inventing nothing.
+        llm_quality_scores_judged = int(c.get("llm_quality_scores_judged", 0))
+        llm_quality_score_mean = (
+            round(float(c.get("llm_quality_score_sum", 0.0))
+                  / llm_quality_scores_judged, 3)
+            if llm_quality_scores_judged else None)
+        # Emitted only for bands that actually occurred -- a run with one
+        # judgement should not report four zeroes as though it had
+        # measured them. Ordered by the router's own band order rather
+        # than by count, so the shape reads as a distribution.
+        llm_quality_bands = {
+            name: int(c[f"llm_quality_band_{name}"])
+            for _upper, name in FallbackRouter.QUALITY_BANDS
+            if c.get(f"llm_quality_band_{name}")}
         llm_quality_failure_ratio = (
             round(llm_quality_calls_failed / llm_quality_calls, 3)
             if llm_quality_calls else 0.0
@@ -917,6 +934,17 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             "llm_quality_calls_failed": int(c.get("llm_quality_calls_failed", 0)),
             # Guardrail G4.
             "llm_quality_failure_ratio": llm_quality_failure_ratio,
+            # D-106: what the judge actually SAID, not just how often it
+            # was asked. `judged` counts real judgements only (a fail-open
+            # 1.0 is not one), which is why it is a different number from
+            # llm_quality_calls above and the only safe denominator for
+            # the mean. The mean is None rather than 0.0 when nothing was
+            # judged -- 0.0 is a score, and no run should be able to
+            # report one it never received.
+            "llm_quality_scores_judged": llm_quality_scores_judged,
+            "llm_quality_score_mean": llm_quality_score_mean,
+            "llm_quality_rejections": int(c.get("llm_quality_rejections", 0)),
+            "llm_quality_bands": llm_quality_bands,
             "retrieval_dense_calls": int(c.get("retrieval_dense_calls", 0)),
             "retrieval_keyword_calls": int(c.get("retrieval_keyword_calls", 0)),
             "retrieval_leg_unavailable": int(c.get("retrieval_leg_unavailable", 0)),

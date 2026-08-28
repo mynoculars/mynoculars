@@ -105,3 +105,51 @@ def test_flush_narrative_writes_a_file_and_returns_its_path(tmp_path):
         assert (tmp_path / "run-run-x.txt").exists()
     finally:
         mod._narrative_handler = original
+
+
+# ---------------------------------------------------------------------------
+# D-108 / D-109 -- the narrative shows the judge, and names its own events
+# ---------------------------------------------------------------------------
+
+
+def test_the_telemetry_block_reports_what_the_judge_decided():
+    """The execution narrative is the OTHER per-run surface, and it had
+    the same gap as the RESULT block: attempts and failures, never the
+    judgement."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    rendered = NarrativeFormatter()._render_telemetry({
+        "llm_quality_calls": 3, "llm_quality_calls_failed": 0,
+        "llm_quality_scores_judged": 3, "llm_quality_score_mean": 0.5,
+        "llm_quality_rejections": 2,
+        "llm_quality_bands": {"very_low": 1, "mid": 1, "very_high": 1}})
+
+    assert "Quality checks" in rendered, "the attempt count stays"
+    assert "Quality judge:" in rendered
+    assert "mean 0.5" in rendered
+
+
+def test_the_telemetry_block_still_renders_for_a_pre_D_106_run():
+    """Older rows carry no judgement keys at all."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    rendered = NarrativeFormatter()._render_telemetry({"llm_quality_calls": 0})
+
+    assert "Quality judge:" in rendered
+
+
+def test_every_event_this_codebase_warns_on_has_a_prose_label():
+    """D-109. The _PROSE table falls back to a raw dotted code for an
+    unlisted event -- deliberate, and honest, but a WARNING an operator
+    is meant to act on should not be the thing that reads as an internal
+    identifier next to prose neighbours."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    prose = NarrativeFormatter._PROSE
+    for event in ("llm.quality_scored", "llm.quality_reject",
+                  "llm.truncated_by_token_limit",
+                  "llm.truncated_runaway_generation",
+                  "llm.skipped_for_context", "llm.context_overflow",
+                  "quality.judge_unreliable", "run_history.skipped"):
+        assert event in prose, f"{event} renders as a raw dotted code"
+        assert not prose[event].startswith("llm."), "a label, not the code"

@@ -10,7 +10,11 @@ Responsibilities:
     - get_checkpointer(): PostgresSaver when Postgres is reachable,
       in-memory MemorySaver otherwise — same graceful-degradation policy as
       the other storage modules, so the agent runs with zero infrastructure.
-    - record_run(): one row per completed run (query, recall, telemetry).
+    - record_run(): one row per COMPLETED run (query, recall, telemetry).
+    - record_failed_run(): one row per FAILED run (D-103) -- recall NULL,
+      telemetry {"run_outcome": "failed", "failure": {...}}. Both go
+      through the same private _insert_run.
+    Read back by scripts/analyze_runs.py (D-92); CLI-only, never the API.
 
 Design decision (why degradation instead of hard dependency):
     A learner's first run should succeed on a bare laptop. Durability is an

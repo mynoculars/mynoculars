@@ -294,3 +294,94 @@ def test_failure_record_truncates_an_unbounded_provider_message():
     record = cli._failure_record(RuntimeError("x" * 5000))
 
     assert len(record["message"]) == 500
+
+
+# ---------------------------------------------------------------------------
+# D-113 -- one flush site, and a REAL buffer to prove it
+#
+# D-100 added a flush to main()'s finally and left _run's in place,
+# reasoning that flush_narrative pops the buffer so the second call finds
+# nothing. It does -- unless something is buffered BETWEEN them, which
+# the finally block deliberately does. On a successful run the second
+# flush reopened the file in "w" mode and overwrote a complete narrative
+# with the single close event. Every D-100 test passed throughout,
+# because every one used a fake tracer that counted calls instead of a
+# real buffer that could be emptied. These use the real one.
+# ---------------------------------------------------------------------------
+
+
+def test_a_successful_run_keeps_its_whole_narrative(monkeypatch, settings,
+                                                    tmp_path):
+    """The live symptom (runs p205.260/.261): a 25-line logs/run-*.txt
+    containing nothing but "Checkpointer closed"."""
+    import logging as _logging
+    from research_agent.logging_setup import log_event
+    from research_agent.tracing import Tracer
+
+    marker = "node.a_real_event_from_the_run"
+
+    class _FinishingApp(_FakeApp):
+        def invoke(self, *args, **kwargs):
+            log_event(_logging.getLogger("research_agent.agents.planning"),
+                      marker, node="classify")
+            return {"telemetry": {"goals": 1}, "final_report": "r"}
+
+    tracer = Tracer("real-buffer", log_dir=str(tmp_path))
+    monkeypatch.setattr(cli, "Tracer", lambda _t: tracer)
+    monkeypatch.setattr(
+        cli, "build_app_and_settings",
+        lambda tracer=None: AppBundle(app=_FinishingApp(None), settings=settings,
+                                      durable=True, checkpointer=None))
+    monkeypatch.setattr(cli, "record_run", lambda *a, **kw: None)
+    # The teardown block EMITS events -- checkpointer.closed is the one
+    # that appeared in both live logs. Without one buffered here the
+    # buffer is empty when the second flush runs, it returns None, and
+    # this test would pass against the very bug it exists to catch.
+    monkeypatch.setattr(
+        cli, "close_checkpointer",
+        lambda _cp: log_event(
+            _logging.getLogger("research_agent.storage.postgres"),
+            "checkpointer.closed"))
+
+    cli.main(["a query", "--thread-id", "real-buffer", "--debug"])
+
+    written = tmp_path / "run-real-buffer.txt"
+    assert written.exists(), "a --debug run must write its narrative"
+    assert marker in written.read_text(encoding="utf-8"), (
+        "the run's own events were overwritten by a later flush")
+
+
+def test_the_trace_path_is_reported_exactly_once(monkeypatch, settings,
+                                                 tmp_path, capsys):
+    """Two flush sites printed the same path twice. One site, one line."""
+    from research_agent.tracing import Tracer
+
+    import logging as _logging
+    from research_agent.logging_setup import log_event
+
+    class _FinishingApp(_FakeApp):
+        def invoke(self, *args, **kwargs):
+            # A run with NO buffered events flushes to None and prints
+            # nothing, which is correct and would make this test pass for
+            # the wrong reason.
+            log_event(_logging.getLogger("research_agent.agents.planning"),
+                      "node.enter", node="classify")
+            return {"telemetry": {"goals": 1}, "final_report": "r"}
+
+    monkeypatch.setattr(cli, "Tracer",
+                        lambda _t: Tracer("once", log_dir=str(tmp_path)))
+    monkeypatch.setattr(
+        cli, "build_app_and_settings",
+        lambda tracer=None: AppBundle(app=_FinishingApp(None), settings=settings,
+                                      durable=True, checkpointer=None))
+    monkeypatch.setattr(cli, "record_run", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        cli, "close_checkpointer",
+        lambda _cp: log_event(
+            _logging.getLogger("research_agent.storage.postgres"),
+            "checkpointer.closed"))
+
+    cli.main(["a query", "--thread-id", "once", "--debug"])
+
+    out = capsys.readouterr()
+    assert (out.out + out.err).count("[debug trace written to") == 1

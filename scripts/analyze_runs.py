@@ -18,11 +18,17 @@ WHY THIS EXISTS, AND WHY IT IS NOT "STRATEGY MEMORY":
     But the data already exists. `storage/postgres.py::record_run` has
     been writing one `agent_runs` row per completed run since P2-08 --
     thread_id, query, recall, and the FULL telemetry dict as JSONB -- and
-    that table's own docstring says plainly that "nothing else in this
-    codebase reads that table back afterward". After D-85..D-91 that
-    telemetry carries `tier_answers`, `corpus_recall`, `grounded_score`,
-    token totals, `grounding_notice_shipped` and
-    `cited_figures_unsupported`.
+    that table's own docstring said plainly, until this script existed,
+    that "nothing else in this codebase reads that table back
+    afterward". After D-85..D-91 that telemetry carries `tier_answers`,
+    `corpus_recall`, `grounded_score`, token totals,
+    `grounding_notice_shipped` and `cited_figures_unsupported`.
+
+    Since then the table has grown two more things this script reads:
+    D-103 added a row per FAILED run (recall NULL, `run_outcome`
+    "failed"), and D-106 added what the quality judge actually scored.
+    Both are aggregated below -- see the Failures and Quality judge
+    blocks in main()'s report.
 
     So the cheapest honest version of strategy memory is a READER, not a
     writer. Everything below is a query over rows that were already
@@ -132,6 +138,16 @@ def summarize(runs) -> dict:
     failures = Counter()             # failure type -> count
     failure_chains = Counter()       # "provider outcome" -> count
     failed_runs = 0
+    # D-106. The judge has been decisive across five live runs and
+    # explicable in none: the only thing ever recorded was that a score
+    # was below the threshold, so "is 0.6 in the right place" had no data
+    # behind it. Accumulated here, which is what makes the question
+    # answerable at all -- one run's two judgements never could.
+    quality_bands = Counter()
+    quality_score_total = 0.0
+    quality_judged = 0
+    quality_rejections = 0
+    quality_runs = 0         # runs where the judge scored anything at all
     # D-105. Section 14.6's open follow-up: web_sources_listed 0 against a
     # non-zero web_sources_suppressed is the loudest possible statement
     # that a report cited nothing the Sources block could attribute. Run
@@ -154,6 +170,20 @@ def summarize(runs) -> dict:
                     failure_chains[f"{pair[0]} {pair[1]}"] += 1
             # Nothing below applies to a row with no telemetry in it.
             continue
+        judged = int(t.get("llm_quality_scores_judged") or 0)
+        if judged:
+            quality_runs += 1
+            quality_judged += judged
+            quality_rejections += int(t.get("llm_quality_rejections") or 0)
+            # The run recorded a MEAN, so the run's total is mean x judged
+            # -- reconstructed rather than stored, because a per-run sum
+            # would be a second number that could disagree with the mean
+            # already there. Rounding is the mean's own 3 decimals.
+            mean_score = t.get("llm_quality_score_mean")
+            if mean_score is not None:
+                quality_score_total += float(mean_score) * judged
+            for name, count in (t.get("llm_quality_bands") or {}).items():
+                quality_bands[str(name)] += int(count)
         listed = int(t.get("web_sources_listed") or 0)
         suppressed = int(t.get("web_sources_suppressed") or 0)
         if listed == 0 and suppressed > 0:
@@ -193,6 +223,15 @@ def summarize(runs) -> dict:
         "failed_runs": failed_runs,
         "failures_by_type": dict(failures.most_common()),
         "failed_provider_outcomes": dict(failure_chains.most_common()),
+        # D-106
+        "quality_runs": quality_runs,
+        "quality_judgements": quality_judged,
+        "quality_rejections": quality_rejections,
+        "mean_quality_score": (round(quality_score_total / quality_judged, 3)
+                               if quality_judged else None),
+        "quality_bands": {name: quality_bands[name]
+                          for _upper, name in _BAND_ORDER
+                          if quality_bands[name]},
         "runs_listing_no_cited_web_sources": silent_source_runs,   # D-105
         "intents": dict(intents.most_common()),
         "tier_answers": dict(tiers.most_common()),
@@ -209,6 +248,15 @@ def summarize(runs) -> dict:
             round((prompt_tokens + completion_tokens) / token_runs)
             if token_runs else None),
     }
+
+
+# D-106: the router's own band order, restated here rather than imported.
+# This script is loaded BY FILE PATH (see its tests) and deliberately
+# depends on nothing in research_agent except config and logging -- and a
+# report over historical rows must keep working against band names those
+# rows were written with, not against whatever the current router defines.
+_BAND_ORDER = ((0.2, "very_low"), (0.4, "low"), (0.6, "mid"),
+               (0.8, "high"), (1.01, "very_high"))
 
 
 def is_failed(telemetry) -> bool:
@@ -319,6 +367,24 @@ def main(argv=None) -> int:
               f"{facts['runs_listing_no_cited_web_sources']} / {done}")
         print("     (web_sources_listed 0 with web_sources_suppressed > 0 --"
               " the D-99 shape: a report whose citations nothing could read)")
+    print()
+    print("Quality judge")
+    print("-" * 62)
+    if facts["quality_judgements"]:
+        print(f"  runs the judge scored   : {facts['quality_runs']} / {done}")
+        print(f"  judgements              : {facts['quality_judgements']}"
+              f"   (mean {facts['mean_quality_score']})")
+        print(f"  below threshold         : {facts['quality_rejections']}"
+              f" / {facts['quality_judgements']}"
+              f"  ({_pct(facts['quality_rejections'], facts['quality_judgements'])})")
+        print(f"  distribution            : {facts['quality_bands']}")
+        print("  Bands are fixed (<0.2 / <0.4 / <0.6 / <0.8 / rest) and do")
+        print("  NOT move with LLM_QUALITY_THRESHOLD -- that is what lets")
+        print("  them show whether the threshold sits in the right place.")
+    else:
+        print("  no run has recorded a judgement yet (D-106 and later only).")
+        print("  A run records nothing here when the judge failed open every")
+        print("  time -- check llm_quality_calls_failed, not this section.")
     print()
     print("Cost")
     print("-" * 62)

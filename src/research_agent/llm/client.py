@@ -74,6 +74,16 @@ logger = logging.getLogger(__name__)
 Message = Dict[str, str]  # {"role": ..., "content": ...}
 
 
+# D-107: how much discarded tail makes a sentinel trim worth a WARNING.
+# 64 characters is several times the longest sentinel this codebase knows
+# (`<|im_end|>` is ten) with room for surrounding whitespace and a partial
+# token, and far below any real runaway -- the generation this guard was
+# built for produced an entire fabricated conversation. Deliberately a
+# constant and not a setting, for D-98's stated reason: a knob nobody has
+# evidence to tune is a knob that ships mis-set.
+_RUNAWAY_WARN_CHARS = 64
+
+
 class TruncatedGenerationError(RuntimeError):
     """A provider reported its own generation was cut off at the token limit.
 
@@ -561,16 +571,43 @@ class OpenAICompatibleClient:
         # raise_for_status() raises an httpx.HTTPStatusError if the response
         # code is 4xx or 5xx (i.e. the server reported an error) — it does
         # nothing (returns None) for a normal 2xx success response.
-        if resp.status_code >= 400 and looks_like_context_overflow(resp.text):
-            # D-93: the SAME exception the caller already handles (the
-            # router hops on any Exception) -- this only makes the log say
-            # which KIND of failure it was. Logged here, where the body is
-            # still in hand, rather than left for the router to guess.
-            log_event(logger, "llm.context_overflow", level=logging.WARNING,
-                      provider=self.name, node=self._trace_node,
-                      estimated_prompt_tokens=estimate_prompt_tokens(messages),
-                      configured_context_tokens=self.context_tokens,
-                      status=resp.status_code, body=resp.text[:200])
+        if resp.status_code >= 400:
+            if looks_like_context_overflow(resp.text):
+                # D-93: the SAME exception the caller already handles (the
+                # router hops on any Exception) -- this only makes the log say
+                # which KIND of failure it was. Logged here, where the body is
+                # still in hand, rather than left for the router to guess.
+                log_event(logger, "llm.context_overflow", level=logging.WARNING,
+                          provider=self.name, node=self._trace_node,
+                          estimated_prompt_tokens=estimate_prompt_tokens(messages),
+                          configured_context_tokens=self.context_tokens,
+                          status=resp.status_code, body=resp.text[:200])
+            else:
+                # D-110: every OTHER 4xx/5xx, which until now was recorded
+                # nowhere at all. The branch above was the only place a
+                # status code or a response body was ever logged, so a
+                # provider failing for any other reason surfaced as the
+                # bare string "HTTPStatusError" and nothing else.
+                #
+                # Live cost of that (runs p205.260/.261): gemini returned
+                # 4xx on every call it was ever given -- always as the
+                # quality judge, since D-93's context skips mean it is
+                # never reached as an answerer -- and the logs could not
+                # distinguish a retired model name (404) from a bad key
+                # (401/403) from an exhausted quota (429). The quality
+                # gate had been inert for five consecutive runs and the
+                # reason was unknowable from the run record.
+                #
+                # The body is the PROVIDER's error text, capped at 300
+                # characters: enough for a JSON error envelope's message
+                # field, short enough that one bad call cannot flood a
+                # log. It is not request content and does not carry the
+                # API key -- the key travels in an Authorization header,
+                # which is never read here.
+                log_event(logger, "llm.http_error", level=logging.WARNING,
+                          provider=self.name, node=self._trace_node,
+                          model=self._model, status=resp.status_code,
+                          body=resp.text[:300])
         resp.raise_for_status()
         data = resp.json()
         latency = time.perf_counter() - started
@@ -682,9 +719,31 @@ class OpenAICompatibleClient:
                 + f"); cap was {whose}; the answer is "
                 f"incomplete and must not be used")
         if text != raw_text:
-            log_event(logger, "llm.truncated_runaway_generation", level=logging.WARNING,
+            # D-107: the level is now proportional to what was actually
+            # discarded. Live (p205.254-check) this fired at WARNING on
+            # ALL FIVE local-primary calls, discarding 10, 10, 11, 11 and
+            # 11 characters -- 54->44, 694->684, 790->779, 1084->1073.
+            # That is the model emitting its own end-of-turn sentinel as
+            # literal text, a chat-template quirk of this build, and not
+            # the thing _truncate_at_sentinel exists to catch. Five
+            # WARNINGs a run for a non-event is how a real one gets
+            # scrolled past.
+            #
+            # An absolute threshold, not a ratio: the observed trims
+            # ranged from 1% to 18% of the response depending only on how
+            # short the response was, so a ratio would have flagged the
+            # 54-character classify call and cleared the identical
+            # 1,084-character one. What separates the two cases is the
+            # SIZE of the discarded tail -- a genuine runaway hallucinates
+            # an entire further conversation, hundreds to thousands of
+            # characters, while a bare sentinel is a token.
+            discarded = len(raw_text) - len(text)
+            level = (logging.WARNING if discarded > _RUNAWAY_WARN_CHARS
+                     else logging.INFO)
+            log_event(logger, "llm.truncated_runaway_generation", level=level,
                       provider=self.name, node=self._trace_node,
-                      raw_chars=len(raw_text), kept_chars=len(text))
+                      raw_chars=len(raw_text), kept_chars=len(text),
+                      discarded_chars=discarded)
         # ONE instrumentation call for this LLM call, not two: prompt_messages/
         # response used to go to a SEPARATE recorder (self._tracer.record_llm,
         # below this comment until this change) with its own file format.

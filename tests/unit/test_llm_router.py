@@ -14,6 +14,7 @@ nothing else).
 """
 
 import json
+import logging as _logging
 
 import pytest
 
@@ -679,3 +680,118 @@ def test_the_node_name_is_absent_rather_than_guessed_when_never_set():
         chain.complete([{"role": "user", "content": "x"}])
     assert exc.value.node is None
     assert "at the" not in str(exc.value)
+
+
+
+# ---------------------------------------------------------------------------
+# D-106 -- the score distribution the threshold can finally be judged against
+# ---------------------------------------------------------------------------
+
+
+def _judged_once(judge_score):
+    """Run one free-text call producing EXACTLY ONE judgement, and return
+    the drained counters.
+
+    The second provider judges normally but cannot answer (_Fixed checks
+    for TASK=quality before its error flag). That matters: in a plain
+    two-provider chain a REJECTED first answer falls through, and the
+    second provider's answer is then judged in turn by the first -- two
+    judgements, and a sum that is the total of both. Making the second
+    provider unable to answer collapses it to one for every score, high
+    or low, which is what lets these assertions be exact.
+
+    It is also p205.254-check's own shape: one provider answered, the
+    next died, and _best() shipped the scored-but-rejected answer.
+    """
+    chain = FallbackRouter(
+        [_Fixed("primary", answer="A"),
+         _Fixed("mistral", judge_score=judge_score, error=True)], 0.6)
+    chain.set_node("compiler")
+    chain.complete([{"role": "user", "content": "x"}])
+    return chain.drain_counters()
+
+
+def test_a_judgement_lands_in_exactly_one_band():
+    only = _judged_once(0.1)
+    assert only["llm_quality_scores_judged"] == 1
+    assert [k for k in only if k.startswith("llm_quality_band_")] == \
+        ["llm_quality_band_very_low"]
+    assert _judged_once(0.1)["llm_quality_band_very_low"] == 1
+    assert _judged_once(0.3)["llm_quality_band_low"] == 1
+    assert _judged_once(0.5)["llm_quality_band_mid"] == 1
+    assert _judged_once(0.7)["llm_quality_band_high"] == 1
+    assert _judged_once(0.9)["llm_quality_band_very_high"] == 1
+
+
+def test_a_perfect_score_is_not_lost_off_the_top_band():
+    """The last band's bound is 1.01, not 1.0, precisely so a judge that
+    answers 1.0 is counted rather than silently dropped."""
+    counters = _judged_once(1.0)
+
+    assert counters["llm_quality_band_very_high"] == 1
+    assert counters["llm_quality_scores_judged"] == 1
+
+
+def test_the_sum_and_count_support_a_mean():
+    counters = _judged_once(0.4)
+
+    assert counters["llm_quality_score_sum"] == 0.4
+    assert counters["llm_quality_scores_judged"] == 1
+
+
+def test_only_scores_below_the_threshold_count_as_rejections():
+    assert _judged_once(0.5).get("llm_quality_rejections") == 1
+    # 0.6 is the threshold itself, and the router accepts on >=.
+    assert "llm_quality_rejections" not in _judged_once(0.6)
+
+
+def test_an_accepted_score_is_still_recorded():
+    """An accepted 0.61 says as much about where the threshold belongs as
+    a rejected 0.59 does, and only one of the two was ever recorded."""
+    counters = _judged_once(0.9)
+
+    assert counters["llm_quality_scores_judged"] == 1
+    assert counters["llm_quality_score_sum"] == 0.9
+
+
+def test_a_judge_that_fails_open_contributes_nothing_to_the_distribution():
+    """llm_quality_calls counts ATTEMPTS and would include this one;
+    llm_quality_scores_judged must not, or the mean has a fabricated 1.0
+    in it and a dead judge reads as a generous one."""
+    chain = FallbackRouter(
+        [_Fixed("primary", answer="A"),
+         _Typed("mistral", RuntimeError("judge down"))], 0.6)
+
+    chain.complete([{"role": "user", "content": "x"}])
+    counters = chain.drain_counters()
+
+    assert counters["llm_quality_calls"] == 1
+    assert counters["llm_quality_calls_failed"] == 1
+    assert "llm_quality_scores_judged" not in counters
+    assert "llm_quality_score_sum" not in counters
+    assert not any(k.startswith("llm_quality_band_") for k in counters)
+
+
+def test_the_bands_do_not_move_with_the_threshold():
+    """Fixed bands are what make 'is 0.6 in the right place' answerable.
+    A band set that tracked the threshold could never answer it."""
+    chain = FallbackRouter(
+        [_Fixed("primary", answer="A"),
+         _Fixed("mistral", answer="B", judge_score=0.5)],
+        quality_threshold=0.3)          # 0.5 now PASSES
+    chain.complete([{"role": "user", "content": "x"}])
+    counters = chain.drain_counters()
+
+    assert counters["llm_quality_band_mid"] == 1, "still the 0.4-0.6 band"
+    assert "llm_quality_rejections" not in counters, "but no longer rejected"
+
+
+def test_the_scored_event_carries_the_reason_and_the_verdict(caplog):
+    chain = FallbackRouter(
+        [_Fixed("primary", answer="A"),
+         _Fixed("mistral", answer="B", judge_score=0.9)], 0.6)
+
+    with caplog.at_level(_logging.INFO):
+        chain.complete([{"role": "user", "content": "x"}])
+
+    assert any("llm.quality_scored" in r.message for r in caplog.records)
