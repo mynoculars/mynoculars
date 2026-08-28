@@ -59,7 +59,7 @@ from research_agent.assembly import (AppBundle, build_app_and_settings,
                                      reject_if_thread_in_use)
 from research_agent.config import get_settings
 from research_agent.llm.router import ProviderChainExhausted
-from research_agent.logging_setup import run_id_var
+from research_agent.logging_setup import drain_problems, run_id_var
 from research_agent.reporting.metrics import count_sections
 from research_agent.state import ResearchState
 from research_agent.tracing import NullTracer, Tracer
@@ -83,6 +83,58 @@ def _fmt_hitl_wall_time_line(hitl_triggered: bool, elapsed_s: float) -> str:
     minutes, seconds = divmod(elapsed_s, 60)
     status = "HITL triggered" if hitl_triggered else "HITL Not triggered"
     return f"{status} | Total wall time: {int(minutes)}min {seconds:.2f}secs"
+
+
+def _fmt_problems(records, dropped: int) -> str:
+    """The run's WARNINGs and ERRORs, once, in plain text (D-118).
+
+    CALLED BY   main()'s finally block, so it prints on the normal path,
+                the diagnosable-failure paths (exit 2/4) and the
+                unrecognised-exception path alike -- the requirement is
+                that the same diagnostic is available wherever the
+                failure propagates, and a summary that only prints on
+                success would fail exactly the case it exists for.
+
+    Returns "" when the run logged nothing above INFO, so a clean run
+    prints no section at all rather than an empty banner.
+
+    Repeats are collapsed: three identical context skips are one problem
+    seen three times, and listing them separately would push a singular
+    failure off the screen. `provider`, `status`, `kind` and `hint` are
+    named first and in a fixed order because they are what an operator
+    acts on; `body` prints last and whole, because that is the field that
+    said "this team has no credits" in run p205.265-check while the
+    status alone said only 403.
+    """
+    if not records:
+        return ""
+    order, groups = [], {}
+    for level, name, fields in records:
+        if name not in groups:
+            order.append(name)
+            groups[name] = [level, fields, 0]
+        groups[name][2] += 1
+
+    lines = ["", "=== PROBLEMS ===",
+             f"{len(records)} warning(s)/error(s) logged during this run"
+             + (f"; {dropped} more not shown (collector cap)" if dropped else "")]
+    for name in order:
+        level, fields, count = groups[name]
+        lines.append("")
+        lines.append(f"[{level}] {name}" + (f"  (x{count})" if count > 1 else ""))
+        shown = {k: v for k, v in fields.items() if k != "run_id"}
+        width = max([len("detail")] + [len(k) for k in shown])
+        for key in ("provider", "model", "node", "status", "kind", "hint",
+                    "effect"):
+            if shown.get(key) not in (None, ""):
+                lines.append(f"    {key:<{width}} : {shown.pop(key)}")
+        body = shown.pop("body", None)
+        rest = "  ".join(f"{k}={v}" for k, v in shown.items())
+        if rest:
+            lines.append(f"    {'detail':<{width}} : {rest}")
+        if body:
+            lines.append(f"    {'body':<{width}} : {body}")
+    return "\n".join(lines)
 
 
 def _fmt_judge_line(telemetry: dict) -> str:
@@ -373,6 +425,19 @@ def main(argv=None) -> int:
         # finds nothing and returns None. NullTracer.flush() returns None
         # unconditionally, so a non-debug run pays nothing here.
         #
+        # D-118: BEFORE the tracer flush below, so the last line on the
+        # console stays the trace path rather than a wall of problems,
+        # and AFTER every close above, so a failure while closing a
+        # resource is included rather than missed by one line.
+        #
+        # Drained HERE, in the finally, means it prints exactly once per
+        # run on every path -- success, exit 2, exit 3, exit 4, or an
+        # exception nobody recognised. A summary that only printed on
+        # success would fail exactly the case it exists for.
+        problems, problems_dropped = drain_problems()
+        problem_text = _fmt_problems(problems, problems_dropped)
+        if problem_text:
+            print(problem_text, file=sys.stderr)
         # stderr, not stdout: on the crash path stdout may hold a
         # half-written report, and this is diagnostic output.
         trace_path = tracer.flush()

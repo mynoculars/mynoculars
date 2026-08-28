@@ -502,3 +502,50 @@ def test_a_2xx_logs_no_http_error_at_all(caplog):
         client.complete([{"role": "user", "content": "x"}])
 
     assert not [r for r in caplog.records if "llm.http_error" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# D-119 -- a status is a number; an operator needs the failure CLASS
+#
+# Run p205.265-check: a 403 from xAI meant "this team has no credits" -- an
+# account problem, not a bug, not transient, and not fixable by a retry.
+# ---------------------------------------------------------------------------
+
+
+def test_the_statuses_an_operator_acts_on_are_each_named():
+    from research_agent.llm.client import classify_http_failure
+
+    assert classify_http_failure(401)[0] == "auth_failed"
+    assert classify_http_failure(403)[0] == "permission_denied"
+    assert classify_http_failure(404)[0] == "model_or_endpoint_not_found"
+    assert classify_http_failure(429)[0] == "quota_or_rate_limit"
+    for status in (500, 502, 503):
+        assert classify_http_failure(status)[0] == "provider_unavailable"
+
+
+def test_an_unmapped_status_gets_no_invented_advice():
+    """An unrecognised status still reports its number and its body. What
+    it must not do is guess at a remedy."""
+    from research_agent.llm.client import classify_http_failure
+
+    kind, hint = classify_http_failure(418)
+    assert kind == "http_error"
+    assert hint == ""
+
+
+def test_the_403_that_started_this_is_logged_with_kind_hint_and_body(caplog):
+    """The exact shape of run p205.265-check's failure, end to end."""
+    body = ('{"code":"permission-denied","error":"Your newly created team '
+            'doesn\'t have any credits or licenses yet."}')
+    client = _client_with_mock_transport(
+        lambda request: httpx.Response(403, text=body))
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.complete([{"role": "user", "content": "compile"}])
+
+    f = [r for r in caplog.records if "llm.http_error" in r.message][0].event_fields
+    assert f["status"] == 403
+    assert f["kind"] == "permission_denied"
+    assert "credits" in f["hint"]
+    assert "no credits" in f["body"] or "credits or licenses" in f["body"]

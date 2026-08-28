@@ -219,3 +219,54 @@ def test_a_judge_failure_with_no_response_object_still_logs(caplog):
 
     rec = [r for r in caplog.records if "quality.score_failed" in r.message]
     assert rec and rec[0].event_fields["status"] is None
+
+
+# ---------------------------------------------------------------------------
+# D-119 -- the judge failure explains itself where the consequence lands
+# ---------------------------------------------------------------------------
+
+
+def test_a_judge_403_names_the_cause_and_the_consequence(caplog):
+    """A reader of quality.score_failed must not have to go and find the
+    matching llm.http_error to learn why the gate was inert."""
+    import logging
+
+    class _Resp:
+        status_code = 403
+        text = ('{"code":"permission-denied","error":"Your newly created team '
+                'doesn\'t have any credits or licenses yet."}')
+
+    class _Boom:
+        name = "grok"
+
+        def complete_json(self, messages, temperature=0.0):
+            exc = RuntimeError("nope")
+            exc.response = _Resp()
+            raise exc
+
+    with caplog.at_level(logging.WARNING):
+        assert score_answer(_Boom(), [{"role": "user", "content": "q"}], "a") == 1.0
+
+    f = [r for r in caplog.records
+         if "quality.score_failed" in r.message][0].event_fields
+    assert f["status"] == 403 and f["kind"] == "permission_denied"
+    assert "credits" in f["body"]
+    assert "fail-open" in f["effect"]
+
+
+def test_the_judge_failure_is_a_warning_not_an_info(caplog):
+    """It was INFO. A run whose quality gate never ran is an operational
+    event, and INFO is where operational events go to be scrolled past."""
+    import logging
+
+    class _Boom:
+        name = "grok"
+
+        def complete_json(self, messages, temperature=0.0):
+            raise TimeoutError("slow")
+
+    with caplog.at_level(logging.INFO):
+        score_answer(_Boom(), [{"role": "user", "content": "q"}], "a")
+
+    rec = [r for r in caplog.records if "quality.score_failed" in r.message][0]
+    assert rec.levelno == logging.WARNING

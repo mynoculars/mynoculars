@@ -78,6 +78,22 @@ from research_agent.logging_setup import log_event, run_id_var
 logger = logging.getLogger(__name__)
 
 
+# D-114: vendor names for the trace banner, for the two providers this
+# codebase has actually been run against in the cloud-fallback slot. An
+# unlisted name falls back to its own uppercase form -- an honest
+# "GROK-NEXT (model)" beats a guessed vendor, the same rule
+# reporting/narrative.py::_PROSE applies to unlisted event names.
+_FALLBACK_DISPLAY_NAMES = {
+    "gemini": "GOOGLE GEMINI",
+    "grok": "XAI GROK",
+}
+
+
+def _display_label(name: str) -> str:
+    """Human name for the trace banner. See _FALLBACK_DISPLAY_NAMES."""
+    return _FALLBACK_DISPLAY_NAMES.get(name, name.upper())
+
+
 class ProviderChainExhausted(RuntimeError):
     """Every provider in the chain failed; there is no answer to return.
 
@@ -440,8 +456,15 @@ class FallbackRouter:
         for name, base, key, model, label in (
             ("mistral", s.llm_mistral_base_url, s.llm_mistral_api_key,
              s.llm_mistral_model, f"MISTRAL ({s.llm_mistral_model})"),
-            ("gemini", s.llm_fallback_base_url, s.llm_fallback_api_key,
-             s.llm_fallback_model, f"GOOGLE GEMINI ({s.llm_fallback_model})"),
+            # D-114: named from settings, not hardwired. Everything
+            # downstream -- log lines, telemetry, pricing, the D-111
+            # health-check row -- keys off this name, so switching the
+            # three URL/key/model settings to another OpenAI-compatible
+            # provider now renames it everywhere instead of leaving
+            # "gemini" on calls to something else.
+            (s.llm_fallback_name, s.llm_fallback_base_url,
+             s.llm_fallback_api_key, s.llm_fallback_model,
+             f"{_display_label(s.llm_fallback_name)} ({s.llm_fallback_model})"),
         ):
             if key:
                 chain.append(OpenAICompatibleClient(

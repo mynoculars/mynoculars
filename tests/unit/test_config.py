@@ -295,3 +295,65 @@ def test_warn_on_likely_env_typos_covers_every_d76_removed_setting(
               and r.event_fields.get("set_key") == wrong]
     assert matches, f"{wrong} was not flagged"
     assert matches[0].event_fields["probably_meant"] == right
+
+
+# ---------------------------------------------------------------------------
+# D-114 -- pricing follows the configured fallback name
+# ---------------------------------------------------------------------------
+
+
+def test_grok_has_a_pricing_row_like_every_other_provider():
+    from research_agent.langfuse.pricing import (_PROVIDER_RATE_FIELDS,
+                                                 TokenUsage, calculate_cost)
+    assert "grok" in _PROVIDER_RATE_FIELDS
+
+    s = Settings(_env_file=None, langfuse_price_grok_in_per_1m=0.20,
+                 langfuse_price_grok_out_per_1m=0.50)
+    cost = calculate_cost(s, "grok", TokenUsage(1_000_000, 1_000_000))
+
+    assert cost is not None and round(cost.total_usd, 4) == 0.70
+
+
+def test_an_unpriced_fallback_provider_warns_at_startup(caplog):
+    """Same shape as the two inert-setting warnings: a thing that silently
+    does nothing is worse than a thing that fails."""
+    import logging
+    from research_agent.config import warn_on_unpriced_fallback
+
+    s = Settings(_env_file=None, llm_fallback_name="typoed",
+                 llm_fallback_api_key="k")
+    with caplog.at_level(logging.WARNING):
+        warn_on_unpriced_fallback(s)
+
+    rec = [r for r in caplog.records
+           if "config.fallback_provider_unpriced" in r.message]
+    assert rec and rec[0].event_fields["value"] == "typoed"
+
+
+def test_a_known_provider_does_not_warn(caplog):
+    import logging
+    from research_agent.config import warn_on_unpriced_fallback
+
+    for name in ("gemini", "grok"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            warn_on_unpriced_fallback(
+                Settings(_env_file=None, llm_fallback_name=name,
+                         llm_fallback_api_key="k"))
+        assert not [r for r in caplog.records
+                    if "config.fallback_provider_unpriced" in r.message]
+
+
+def test_a_keyless_provider_never_warns_however_it_is_named(caplog):
+    """With no key the provider is not in the chain at all, so its price
+    is irrelevant and a warning would be noise."""
+    import logging
+    from research_agent.config import warn_on_unpriced_fallback
+
+    with caplog.at_level(logging.WARNING):
+        warn_on_unpriced_fallback(
+            Settings(_env_file=None, llm_fallback_name="typoed",
+                     llm_fallback_api_key=""))
+
+    assert not [r for r in caplog.records
+                if "config.fallback_provider_unpriced" in r.message]

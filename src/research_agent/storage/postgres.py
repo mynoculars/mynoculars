@@ -14,7 +14,10 @@ Responsibilities:
     - record_failed_run(): one row per FAILED run (D-103) -- recall NULL,
       telemetry {"run_outcome": "failed", "failure": {...}}. Both go
       through the same private _insert_run.
-    Read back by scripts/analyze_runs.py (D-92); CLI-only, never the API.
+    Read back by scripts/analyze_runs.py (D-92). BOTH interfaces call
+    record_run: cli.py unconditionally after printing the report, and
+    api/server.py::_respond on its "done" branch (P2-08). Only
+    record_failed_run is CLI-only -- see D-121.
 
 Design decision (why degradation instead of hard dependency):
     A learner's first run should succeed on a bare laptop. Durability is an
@@ -229,10 +232,22 @@ def record_run(dsn: str, thread_id: str, query: str,
     """Insert one COMPLETED run's history row; id, or None when degraded.
 
     CALLED BY   cli.py::_run, exactly once, right after a run finishes and
-                its report/telemetry have already been printed. NEVER
-                called from api/server.py — API-driven runs get no history
-                row in agent_runs, a known asymmetry between the two
-                interfaces.
+                its report/telemetry have already been printed, AND
+                api/server.py::_respond on its "done" branch (P2-08).
+
+                D-121: this docstring said "NEVER called from
+                api/server.py — API-driven runs get no history row", which
+                was false when it was written and had been for some time:
+                `_respond` imports and calls this function, and says so in
+                its own CALLS section. The claim was then copied into
+                README, OPERATIONS and LEARNING_GUIDE by D-109 in the
+                belief it was the correction. §14.3's rule caught its own
+                author: a comment asserting a property the code does not
+                have is the thing a reviewer trusts instead of checking.
+
+                The asymmetry that IS real: only the CLI records FAILED
+                runs. api/server.py never calls record_failed_run, so an
+                API run that raises leaves no row at all.
     WRITES      one row into the agent_runs table described by _RUNS_DDL
                 above. Read back by scripts/analyze_runs.py (D-92).
 

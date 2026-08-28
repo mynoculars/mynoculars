@@ -42,14 +42,23 @@ class CostBreakdown(NamedTuple):
 
 
 # Maps the same provider names FallbackRouter already uses internally
-# ("primary", "mistral", "gemini" -- see llm/router.py's provider list)
-# to the pair of Settings fields that carry that provider's rate. Adding
-# a fourth provider later means adding one line here and two fields in
-# config.py -- never a new code path in the SDK-facing modules.
+# ("primary", "mistral", and whatever LLM_FALLBACK_NAME sets the cloud
+# fallback slot to -- see llm/router.py's provider list) to the pair of
+# Settings fields that carry that provider's rate. Adding a further
+# provider means adding one line here and two fields in config.py --
+# never a new code path in the SDK-facing modules.
+#
+# D-114 took that path for grok: the fallback slot is now named rather
+# than hardwired, so both names it can hold have a row. A name with no
+# row here is not an error -- calculate_cost returns None, which is the
+# same honest "not configured" an unset rate produces -- but
+# config.py::warn_on_unpriced_fallback says so at startup rather than
+# letting a run's cost figure quietly lose a provider.
 _PROVIDER_RATE_FIELDS = {
     "primary": ("langfuse_price_primary_in_per_1m", "langfuse_price_primary_out_per_1m"),
     "mistral": ("langfuse_price_mistral_in_per_1m", "langfuse_price_mistral_out_per_1m"),
     "gemini": ("langfuse_price_gemini_in_per_1m", "langfuse_price_gemini_out_per_1m"),
+    "grok": ("langfuse_price_grok_in_per_1m", "langfuse_price_grok_out_per_1m"),
 }
 
 

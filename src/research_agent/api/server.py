@@ -27,7 +27,9 @@ Relationship to cli.py's HITL loop:
     "interrupted" look identical regardless of which endpoint produced
     them — a caller only needs to branch on the one status field.
 
-Run history: _respond() calls record_run() on every completed run (P2-08),
+Run history: _respond() calls record_run() on every completed run (P2-08) --
+FAILED API runs are still not recorded, because nothing here calls
+record_failed_run (D-103's CLI-only half; see D-121),
 so API-driven runs get an agent_runs row exactly like CLI runs do. (This
 paragraph previously claimed the opposite -- it predated P2-08 and was
 never updated.) Checkpointing itself, the thing that makes /resume work,
@@ -287,8 +289,15 @@ def _respond(thread_id: str, result: dict) -> dict:
     # (recursion limit, an aborted resume) would otherwise raise KeyError
     # here and turn a degraded run into a 500 with no diagnostic.
     telemetry = result.get("telemetry") or {}
+    # D-121: .get("recall") without a default, matching cli.py. D-103
+    # removed the 0.0 fallback there -- a run that reached this line with
+    # no recall in its telemetry wrote a literal 0.0, a number nothing
+    # measured and indistinguishable in the column from a run that
+    # genuinely retrieved nothing -- and did not touch this call site,
+    # which had the identical defect. The column is nullable; NULL is what
+    # "not measured" looks like.
     record_run(_settings.postgres_dsn, thread_id, result.get("raw_query", ""),
-              telemetry.get("recall", 0.0), telemetry)
+              telemetry.get("recall"), telemetry)
     return {"thread_id": thread_id, "status": "done",
             "report": result.get("final_report", ""),
             "telemetry": telemetry}

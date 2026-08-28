@@ -335,6 +335,7 @@ class NarrativeFormatter(logging.Formatter):
         "llm.served_by_fallback": "Served by fallback provider",
         "llm.truncated_runaway_generation": "Truncated a runaway generation",
         "llm.truncated_by_token_limit": "Generation cut off at a token limit",
+        "llm.http_error": "Provider rejected the request (HTTP error)",
         "llm.quality_reject": "Quality gate rejected the response",
         "llm.quality_scored": "Quality gate scored the response",
         "llm.last_provider_worse": "Last provider scored worse, kept earlier answer",
@@ -401,6 +402,67 @@ class NarrativeFormatter(logging.Formatter):
 
     # ---- whole-run rendering (single pass, this is what flush_narrative calls) --
 
+    def render_problems(self, events: list) -> str:
+        """Every WARNING and above in one block, for the top of the file.
+
+        D-117. D-116 put the warnings back into the narrative, but in
+        their chronological place -- which for run p205.265-check meant a
+        403 saying "this team has no credits" sitting on line ~900 of a
+        2,300-line file. Being present is not the same as being found.
+
+        This is a SUMMARY, not a second copy of the truth: every entry
+        here also appears in full, in order, in the body below. It exists
+        so an administrator opening the file sees what went wrong before
+        deciding whether to read the rest.
+
+        Renders positively when there is nothing to report. "No warnings"
+        is a real result, and its absence would be indistinguishable from
+        a section that failed to render.
+        """
+        alerts = [e for e in events
+                  if e.level in ("WARNING", "ERROR", "CRITICAL")]
+        lines = [self._BANNER, f"PROBLEMS ({len(alerts)})", self._BANNER]
+        if not alerts:
+            lines.append("")
+            lines.append("None. No WARNING or ERROR was logged during this run.")
+            return "\n".join(lines)
+        lines.append("")
+        lines.append("Every entry below also appears in full, in order, in the")
+        lines.append("narrative body. Listed here so it is not missed.")
+        # Grouped by event name and kept in first-seen order: three
+        # identical context skips are one problem seen three times, and
+        # collapsing them stops a repeated event from burying a singular
+        # one further down.
+        seen: dict = {}
+        for e in alerts:
+            seen.setdefault(e.msg, []).append(e)
+        for msg, group in seen.items():
+            first = group[0]
+            label = self._PROSE.get(msg, msg)
+            count = f"  (x{len(group)})" if len(group) > 1 else ""
+            lines.append("")
+            lines.append(f"  [{first.level}] {label}{count}")
+            # The fields an operator acts on, named first and in a fixed
+            # order, then everything else. `body` last because it is the
+            # long one and reads better as the tail of the entry.
+            shown = {k: v for k, v in first.fields.items() if k != "run_id"}
+            # Width from the widest key actually present, the same way
+            # _render_alert sizes its own column -- a fixed width lines up
+            # "model" and misaligns "provider", which is the sort of thing
+            # that makes a summary look untrustworthy.
+            width = max([len("event")] + [len(k) for k in shown])
+            lines.append(f"      {'event':<{width}} : {msg}")
+            for key in ("provider", "model", "node", "status", "kind",
+                        "hint", "effect"):
+                if shown.get(key) not in (None, ""):
+                    lines.append(f"      {key:<{width}} : {shown.pop(key)}")
+            body = shown.pop("body", None)
+            for k, v in shown.items():
+                lines.append(f"      {k:<{width}} : {v}")
+            if body:
+                lines.append(f"      {'body':<{width}} : {body}")
+        return "\n".join(lines)
+
     def render_all(self, events: list) -> str:
         """One pass over a whole run's buffered events -> the full
         narrative file body. See class docstring for the grouping rules.
@@ -417,6 +479,9 @@ class NarrativeFormatter(logging.Formatter):
             out.append(self.render_event(events[i]))
             i += 1
 
+        # D-117: rendered from the WHOLE event list, and placed before the
+        # execution plan so it is the first thing after the header.
+        out.append(self.render_problems(events))
         plan_index = len(out)
         out.append(None)  # placeholder — filled in below once `timeline` exists,
                           # but positioned here so the condensed overview reads
@@ -508,7 +573,29 @@ class NarrativeFormatter(logging.Formatter):
                 for e in gevents:
                     if e is decision_ev or e is route_ev or e.msg == "node.enter":
                         continue
-                    if e.msg in ("llm.call", "retrieval.raw") or e.msg.startswith("graph."):
+                    # D-116: the allowlist here was ("llm.call",
+                    # "retrieval.raw") plus graph.* -- three event names,
+                    # and EVERYTHING else inside a node span was silently
+                    # dropped from the human-readable narrative. That
+                    # included every WARNING the run produced.
+                    #
+                    # Measured on run p205.265-check: 12 warnings were
+                    # logged, 10 of them never reached logs/run-*.txt --
+                    # among them the two llm.http_error lines carrying a
+                    # 403 whose body said, in plain English, that the
+                    # provider account had no credits. render_event has
+                    # routed WARNING and above to _render_alert's banner
+                    # since the file was written; nothing ever called it
+                    # for a warning raised inside a node.
+                    #
+                    # An allowlist of event NAMES cannot stay correct as
+                    # events are added -- D-110's llm.http_error did not
+                    # exist when this list was written. Severity does not
+                    # have that problem: a warning is a warning whatever
+                    # it is called.
+                    if (e.level in ("WARNING", "ERROR", "CRITICAL")
+                            or e.msg in ("llm.call", "retrieval.raw")
+                            or e.msg.startswith("graph.")):
                         lines.append("")
                         lines.append(self.render_event(e))
                 decision_text = None

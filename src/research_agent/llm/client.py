@@ -74,6 +74,66 @@ logger = logging.getLogger(__name__)
 Message = Dict[str, str]  # {"role": ..., "content": ...}
 
 
+# D-119: an HTTP status is a number; an administrator needs the CLASS of
+# failure and what to do about it. Live (run p205.265-check) a 403 from
+# xAI meant "this team has no credits" -- an account/billing problem, not
+# a bug, not a transient, and not something a retry or a code change can
+# help. The status alone could not say that; the body could, and did.
+#
+# Mapped rather than guessed: each entry is (kind, what an operator does
+# about it). Anything unmapped reports kind "http_error" and no hint,
+# which is honest -- an unrecognised status gets its number and its body
+# and no invented advice.
+_HTTP_FAILURE_KINDS = {
+    400: ("bad_request",
+          "the request itself was rejected -- check the model name and payload"),
+    401: ("auth_failed",
+          "the API key is missing, malformed or rejected -- check "
+          "LLM_*_API_KEY for this provider"),
+    403: ("permission_denied",
+          "the key is recognised but not permitted -- check the account's "
+          "credits, billing, plan or per-model access"),
+    404: ("model_or_endpoint_not_found",
+          "the model name or base URL does not exist for this key -- names "
+          "get retired; run scripts/check_services.py"),
+    408: ("provider_timeout", "the provider timed out on its own side"),
+    422: ("bad_request", "the provider rejected the request payload"),
+    429: ("quota_or_rate_limit",
+          "quota exhausted or rate limited -- the body names which; check "
+          "the plan's per-minute and per-day limits"),
+}
+
+
+def classify_http_failure(status: int) -> tuple:
+    """(kind, operator hint) for one HTTP status. See _HTTP_FAILURE_KINDS.
+
+    5xx collapses to one kind deliberately: every 5xx means the same thing
+    to an operator of THIS system -- the provider broke, nothing here is
+    misconfigured, and the router has already fallen through.
+    """
+    if status in _HTTP_FAILURE_KINDS:
+        return _HTTP_FAILURE_KINDS[status]
+    if 500 <= status < 600:
+        return ("provider_unavailable",
+                "the provider failed on its own side -- nothing to fix here")
+    return ("http_error", "")
+
+
+# D-115: how much of a failing provider's error body to keep. 300 was the
+# original guess and it was measurably too short: Google's 429 spends its
+# first ~300 characters on boilerplate and a documentation URL, then names
+# the quota metric and its limit -- so run p205.262's log ended, exactly,
+# at "...head to: https://ai.dev/rate-limit. \n* Quota e", one word before
+# the only part anyone needed. A cap chosen to keep logs small hid the
+# answer the log existed to give.
+#
+# 1000 fits a full JSON error envelope from every provider observed here
+# and is still an order of magnitude below a real payload. This is a
+# constant rather than a setting for D-98's reason: a knob nobody has
+# evidence to tune is a knob that ships mis-set.
+_ERROR_BODY_CHARS = 1000
+
+
 # D-107: how much discarded tail makes a sentinel trim worth a WARNING.
 # 64 characters is several times the longest sentinel this codebase knows
 # (`<|im_end|>` is ten) with room for surrounding whitespace and a partial
@@ -604,10 +664,16 @@ class OpenAICompatibleClient:
                 # log. It is not request content and does not carry the
                 # API key -- the key travels in an Authorization header,
                 # which is never read here.
+                # D-119: kind and hint alongside the number, so the log
+                # line names the failure class an operator has to act on
+                # (credentials, permission, quota, model name, outage)
+                # instead of leaving them to decode a status by hand.
+                kind, hint = classify_http_failure(resp.status_code)
                 log_event(logger, "llm.http_error", level=logging.WARNING,
                           provider=self.name, node=self._trace_node,
                           model=self._model, status=resp.status_code,
-                          body=resp.text[:300])
+                          kind=kind, hint=hint,
+                          body=resp.text[:_ERROR_BODY_CHARS])
         resp.raise_for_status()
         data = resp.json()
         latency = time.perf_counter() - started

@@ -457,7 +457,10 @@ def main() -> int:
         # never disagree about who is configured.
         check_llm_fallback("mistral", settings.llm_mistral_base_url,
                            settings.llm_mistral_api_key, settings.llm_mistral_model),
-        check_llm_fallback("gemini", settings.llm_fallback_base_url,
+        # D-114: named from settings, so this row cannot say "gemini"
+        # while probing something else.
+        check_llm_fallback(settings.llm_fallback_name,
+                           settings.llm_fallback_base_url,
                            settings.llm_fallback_api_key, settings.llm_fallback_model),
         check_mcp(settings),
         check_web_search(settings),

@@ -130,6 +130,63 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+class ProblemCollector(logging.Handler):
+    """Keeps every WARNING-and-above record of this process, for D-118.
+
+    WHY THIS EXISTS: the narrative file (D-117) shows an operator what
+    went wrong, but it is written only under --debug/DEBUG_TRACE. A
+    normal run's warnings go past in a JSON stream -- run
+    p205.265-check's 403, the one saying the provider account had no
+    credits, was one line among six hundred. An administrator watching a
+    scheduled run sees stdout and an exit code, and that is all.
+
+    Deliberately NOT a second logging path: this stores the records the
+    existing log_event calls already produce, changing nothing about what
+    is logged or how. cli.py drains it once at the end of a run and
+    prints a summary.
+
+    BOUNDED at _MAX_PROBLEMS. A run that somehow warns in a loop must not
+    turn a diagnostic aid into a memory leak; past the cap the overflow
+    is counted, and the count is reported, so the summary never claims to
+    be complete when it is not.
+    """
+
+    _MAX_PROBLEMS = 200
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list = []
+        self.dropped = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if len(self.records) >= self._MAX_PROBLEMS:
+            self.dropped += 1
+            return
+        self.records.append(
+            (record.levelname, record.getMessage(),
+             dict(getattr(record, "event_fields", None) or {})))
+
+
+_problem_collector: "ProblemCollector | None" = None
+
+
+def drain_problems() -> tuple:
+    """Return (records, dropped) collected so far, and reset (D-118).
+
+    CALLED BY   cli.py, once, at the end of a run -- both the normal path
+                and the failure path. Draining rather than peeking keeps
+                a long-lived process (the API server) from reporting one
+                request's warnings against the next.
+    RETURNS     ([(level, event_name, fields), ...], overflow_count), or
+                ([], 0) when logging was never configured.
+    """
+    if _problem_collector is None:
+        return [], 0
+    records, dropped = _problem_collector.records, _problem_collector.dropped
+    _problem_collector.records, _problem_collector.dropped = [], 0
+    return records, dropped
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Install the JSON formatter on the root logger. Safe to call twice.
 
@@ -181,7 +238,17 @@ def configure_logging(level: str = "INFO") -> None:
     # is holding a reference to the old list.
     from research_agent.reporting.narrative import NarrativeBufferHandler
     narrative = [h for h in root.handlers if isinstance(h, NarrativeBufferHandler)]
-    root.handlers[:] = [handler, *narrative]
+    # D-118: built into the replacement list, NOT addHandler'd before it.
+    # That assignment REPLACES the whole handler list -- which is exactly
+    # why `narrative` is re-collected and passed through above, and the
+    # collector needs the same treatment or it is silently discarded one
+    # line after being attached. (It was, on the first attempt: the
+    # collector existed, held no records, and the console summary printed
+    # nothing at all.)
+    global _problem_collector
+    if _problem_collector is None:
+        _problem_collector = ProblemCollector()
+    root.handlers[:] = [handler, *narrative, _problem_collector]
     root.setLevel(level.upper())
     root._agent_configured = True  # type: ignore[attr-defined]
 

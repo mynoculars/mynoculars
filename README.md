@@ -109,7 +109,7 @@ content; the harness controls execution.
 
 | Harness role | This project | Where |
 |---|---|---|
-| **Frontier / Foundation LLM** | Local Cogito (primary) → Mistral → Gemini Flash, quality-gated fallback, per-hop timeout isolation | `llm/router.py::FallbackRouter`, `llm/client.py` |
+| **Frontier / Foundation LLM** | Local Cogito (primary) → Mistral → cloud fallback, quality-gated, per-hop timeout isolation. The third slot is **named by `LLM_FALLBACK_NAME`** (D-114) — Gemini by default, Grok by uncommenting a block in `.env`; every "Gemini Flash" elsewhere in this document is that default, not a hardwire | `llm/router.py::FallbackRouter`, `llm/client.py` |
 | **Planner / Reasoner** | Query classification → goal decomposition → task expansion → iterative gap-driven gathering → self-critique → compilation | `agents/planning.py`, `agents/gathering.py`, `agents/compilation.py` |
 | **Memory** | Cross-run semantic memory, Qdrant-backed, volatility-aware decay, namespaced by goal | `memory/semantic_memory.py` |
 | **Tool Router** | 5-tier retrieval ladder (corpus → reformulated → MCP → web → model knowledge); a task's `tool_hint` can route straight to a named specialist | `tools/retrieval_chain.py`, `agents/task_utils.py` |
@@ -1042,7 +1042,8 @@ LangGraph's own parallel `Send` dispatch, so `search_worker`'s fan-out
 inherits the correct session with no special-casing.
 
 **Cost** (`langfuse/pricing.py`) maps `FallbackRouter`'s own provider names
-(`"primary"`, `"mistral"`, `"gemini"`) to Settings-configured `$/1M`-token
+(`"primary"`, `"mistral"`, and whichever of `"gemini"`/`"grok"`
+`LLM_FALLBACK_NAME` selects — D-114) to Settings-configured `$/1M`-token
 rates — an unconfigured provider costs `$0` (correct for a free local model,
 honest "unknown" for cloud), and a misconfigured negative rate clamps to
 zero rather than reporting negative dollars.
@@ -1090,7 +1091,7 @@ when something is in the wrong place.
 | `checkpoints` | same | LangGraph, once per superstep | Serialized `ResearchState` channel values keyed by `thread_id`. This is what makes `interrupt()`/resume and `--thread-id` replay work (D-8/D-20). |
 | `checkpoint_blobs` | same | LangGraph | Out-of-line channel values too large to inline. |
 | `checkpoint_writes` | same | LangGraph | Pending per-task writes for a superstep — including the interrupt resume payload. |
-| `agent_runs` | **our code**, via `CREATE TABLE IF NOT EXISTS` on *every* `record_run`/`record_failed_run` call | **our code**, one row per CLI run — completed *and*, since D-103, failed. **Never the API**, a known asymmetry since P2-08 | Post-hoc run history: `id BIGSERIAL PK`, `thread_id TEXT`, `query TEXT`, `recall REAL`, `telemetry JSONB`, `created_at TIMESTAMPTZ DEFAULT now()`. A failed run's row carries `recall` NULL and `telemetry` `{"run_outcome": "failed", "failure": {...}}`; a completed run's row has no `run_outcome` key at all, so "absent means completed" classifies the whole history including every pre-D-103 row. Read back by `scripts/analyze_runs.py` (D-92) — and by you and DBeaver. |
+| `agent_runs` | **our code**, via `CREATE TABLE IF NOT EXISTS` on *every* `record_run`/`record_failed_run` call | **our code**, one row per completed run from **either** interface — `cli.py` and `api/server.py::_respond` alike (P2-08) — plus, since D-103, one per FAILED run. Failed runs are **CLI-only**: nothing in the API calls `record_failed_run` (D-121). An earlier revision of this row said the API never recorded anything; that was wrong | Post-hoc run history: `id BIGSERIAL PK`, `thread_id TEXT`, `query TEXT`, `recall REAL`, `telemetry JSONB`, `created_at TIMESTAMPTZ DEFAULT now()`. A failed run's row carries `recall` NULL and `telemetry` `{"run_outcome": "failed", "failure": {...}}`; a completed run's row has no `run_outcome` key at all, so "absent means completed" classifies the whole history including every pre-D-103 row. Read back by `scripts/analyze_runs.py` (D-92) — and by you and DBeaver. |
 
 Plus three LangGraph indexes: `checkpoints_thread_id_idx`,
 `checkpoint_blobs_thread_id_idx`, `checkpoint_writes_thread_id_idx`.

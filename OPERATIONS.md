@@ -1187,11 +1187,35 @@ curl http://127.0.0.1:8080/v1/models
 
 
 
-### Step 4b — (optional) a Gemini key for fallback
+### Step 4b — (optional) a cloud-fallback key
 
-Get a Google AI Studio API key for `gemini-2.0-flash`. If you skip this, the
-agent still runs on the primary alone; it just won't have a fallback when the
-local model errors or scores low.
+Gemini by default: get a Google AI Studio API key. If you skip this, the agent
+still runs on the primary alone; it just won't have a fallback when the local
+model errors or scores low — and it will have **no quality judge at all**,
+since the judge is always the next provider in the chain.
+
+**Switching providers is `.env` only** (D-114). The third slot is named by
+`LLM_FALLBACK_NAME`, and that name travels into every log line, telemetry
+counter, health-check row and pricing lookup — so nothing downstream ends up
+reporting `gemini` while calling something else. `.env.example` ships both
+blocks; comment one, uncomment the other:
+
+```
+LLM_FALLBACK_NAME=grok
+LLM_FALLBACK_BASE_URL=https://api.x.ai/v1
+LLM_FALLBACK_API_KEY=...
+LLM_FALLBACK_MODEL=...
+```
+
+Any OpenAI-compatible provider works with no code change. A name with no
+pricing row still runs — it just reports no cost, and says so at startup
+(`config.fallback_provider_unpriced`).
+
+Model names get retired. Confirm whichever you set with
+`python scripts/check_services.py`, which since D-111 probes every configured
+provider with a real one-token completion and prints the status code and the
+provider's own error body (D-115 keeps 1000 characters of it, because 300 cut
+Google's 429 off one word before it named the quota metric).
 
 ### Step 4c — Flip `.env` to live
 
@@ -2472,6 +2496,39 @@ anyone driving the graph directly — the guard lives in `cli.py`'s `main()`
 only, not in `assembly.py` or the graph itself, so the API's `/research`
 endpoint has no equivalent check today.
 
+## Reading a Failed Run
+
+Every run now ends with a **`=== PROBLEMS ===`** block on stderr listing
+every WARNING and ERROR it logged — printed on every exit path, including
+the ones that end in a non-zero code (D-118). It prints nothing on a run
+that logged nothing above INFO, so its presence is itself a signal.
+
+For a provider failure the entry names the class, not just the number
+(D-119):
+
+```
+[WARNING] llm.http_error  (x2)
+    provider : grok
+    model    : grok-4.6
+    status   : 403
+    kind     : permission_denied
+    hint     : the key is recognised but not permitted -- check the
+               account's credits, billing, plan or per-model access
+    body     : {"code":"permission-denied","error":"Your newly created
+               team doesn't have any credits or licenses yet. ..."}
+```
+
+`kind` is what tells you where to go: `auth_failed` (401) means the key,
+`permission_denied` (403) means the account's credits or plan,
+`model_or_endpoint_not_found` (404) means the model name — they get
+retired — `quota_or_rate_limit` (429) means the plan's limits, and
+`provider_unavailable` (5xx) means nothing local is wrong. `body` is the
+provider's own message, kept whole enough to be useful (D-115).
+
+Under `--debug` the same list also opens `logs/run-<run_id>.txt` as a
+**PROBLEMS** section (D-117), ahead of the execution plan, and each entry
+appears again in full at the point in the run where it happened (D-116).
+
 ## CLI Exit Codes
 
 `main()` returns a distinct code per failure class, so a script or CI step
@@ -2896,13 +2953,16 @@ POSTGRES_DSN=postgresql://agent:agent@localhost:5432/research_agent
 **One table worth knowing about once you're in DBeaver**: alongside
 LangGraph's own `checkpoints`/`checkpoint_blobs`/`checkpoint_writes`
 tables, this codebase's own `record_run()` creates and writes an
-`agent_runs` table — one row per **CLI** run, with `thread_id`, `query`,
-`recall`, `telemetry` (JSONB), and a timestamp. Since D-103 a FAILED run
-gets a row too (`recall` NULL, `telemetry`
+`agent_runs` table — one row per completed run from **either** interface,
+the CLI and the API alike (P2-08), with `thread_id`, `query`, `recall`,
+`telemetry` (JSONB), and a timestamp. Since D-103 a FAILED run gets a row
+too (`recall` NULL, `telemetry`
 `{"run_outcome": "failed", "failure": {...}}`); a completed run's row
 carries no `run_outcome` key, so "absent means completed" reads the whole
-history correctly including every row written before D-103. API-driven
-runs are still never recorded — a known asymmetry since P2-08.
+history correctly including every row written before D-103. **Failed runs
+are CLI-only** — nothing in `api/server.py` calls `record_failed_run`, so
+an API run that raises leaves no row (D-121). An earlier revision of this
+note said API runs were never recorded at all; that was wrong.
 `scripts/analyze_runs.py` (D-92) reads this table back; it is no longer
 inspection-only. See README.md's Storage Contracts section for the full
 column list. You may see either

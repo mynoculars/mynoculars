@@ -385,3 +385,98 @@ def test_the_trace_path_is_reported_exactly_once(monkeypatch, settings,
 
     out = capsys.readouterr()
     assert (out.out + out.err).count("[debug trace written to") == 1
+
+
+# ---------------------------------------------------------------------------
+# D-118 -- the same summary on the console, without --debug
+#
+# The narrative file (D-117) is written only under --debug. An
+# administrator watching a scheduled run sees stdout and an exit code.
+# ---------------------------------------------------------------------------
+
+
+def _problem(name="llm.http_error", **over):
+    fields = {"provider": "grok", "model": "grok-4.6", "status": 403,
+              "kind": "permission_denied",
+              "hint": "check the account's credits, billing or plan",
+              "body": '{"error":"team has no credits or licenses yet"}'}
+    fields.update(over)
+    return ("WARNING", name, fields)
+
+
+def test_the_console_summary_carries_status_kind_hint_and_body():
+    from research_agent.cli import _fmt_problems
+
+    out = _fmt_problems([_problem()], 0)
+
+    assert "=== PROBLEMS ===" in out
+    assert "403" in out and "permission_denied" in out
+    assert "credits, billing" in out
+    assert "team has no credits" in out, "the body is the actionable part"
+
+
+def test_a_clean_run_prints_no_section_at_all():
+    """A banner with nothing under it is noise on every healthy run."""
+    from research_agent.cli import _fmt_problems
+
+    assert _fmt_problems([], 0) == ""
+
+
+def test_repeats_collapse_and_the_count_is_reported():
+    from research_agent.cli import _fmt_problems
+
+    out = _fmt_problems([_problem(), _problem()], 0)
+
+    assert "2 warning(s)/error(s)" in out
+    assert "(x2)" in out
+    assert out.count("permission_denied") == 1, "one entry, not two"
+
+
+def test_an_overflowing_collector_says_the_summary_is_incomplete():
+    """The cap protects memory; a summary that hid the cap would claim to
+    be complete when it is not."""
+    from research_agent.cli import _fmt_problems
+
+    out = _fmt_problems([_problem()], 17)
+
+    assert "17 more not shown" in out
+
+
+def test_the_collector_is_bounded_and_counts_what_it_drops():
+    import logging
+    from research_agent.logging_setup import ProblemCollector
+
+    c = ProblemCollector()
+    for _ in range(c._MAX_PROBLEMS + 5):
+        c.emit(logging.LogRecord("x", logging.WARNING, "f", 1, "boom", None, None))
+
+    assert len(c.records) == c._MAX_PROBLEMS
+    assert c.dropped == 5
+
+
+def test_problems_print_on_the_failure_path_too(wired, capsys):
+    """A summary that only printed on success would fail exactly the case
+    it exists for. Drained in main()'s finally, so exit 4 reaches it."""
+    import logging
+    from research_agent.logging_setup import (configure_logging, drain_problems,
+                                              log_event)
+
+    # The collector is attached by configure_logging, which the `settings`
+    # fixture (a direct Settings(...) construction) never triggers.
+    configure_logging("INFO")
+    drain_problems()          # start from a clean slate, not another test's
+    log_event(logging.getLogger("research_agent.llm.client"),
+              "llm.http_error", level=logging.WARNING, provider="grok",
+              status=403, kind="permission_denied",
+              body="team has no credits or licenses yet")
+
+    code, _ = wired(_exhausted())
+    err = capsys.readouterr().err
+
+    assert code == 4, "the exit code is unchanged by the summary"
+    assert "=== PROBLEMS ===" in err
+    assert "permission_denied" in err
+    assert "team has no credits" in err
+    # The chain summary must still be there -- the two answer different
+    # questions and neither replaces the other.
+    assert "providers in the chain failed" in err

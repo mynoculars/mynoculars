@@ -111,6 +111,24 @@ class Settings(BaseSettings):
     llm_mistral_base_url: str = "https://api.mistral.ai/v1"
     llm_mistral_api_key: str = ""
     llm_mistral_model: str = "mistral-small-latest"
+    # D-114: the THIRD chain position is "the cloud fallback", not "Gemini".
+    # Its base URL, key and model have always been generic -- only the
+    # NAME was hardwired, which meant pointing these three at another
+    # OpenAI-compatible provider produced a working chain whose every log
+    # line, telemetry counter, health-check row and D-110 error message
+    # said "gemini" while calling something else. A label that asserts a
+    # property the code does not have is the defect this project keeps
+    # finding (D-99 14.3, D-109); naming the slot is what stops this
+    # switch from creating one.
+    #
+    # The name is used verbatim as the provider name everywhere: the
+    # `llm.*` log lines, `llm.chain_built`, the D-110 `llm.http_error`,
+    # `quality.score_failed`'s judge field, D-111's health-check row, and
+    # pricing.py's rate lookup. Free-form rather than a Literal so a
+    # fourth provider needs no code change here either -- an unknown name
+    # costs only its pricing row, and warn_on_unpriced_fallback below says
+    # so at startup rather than leaving the cost silently absent.
+    llm_fallback_name: str = "gemini"
     llm_fallback_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = "gemini-2.0-flash"
@@ -472,6 +490,11 @@ class Settings(BaseSettings):
     langfuse_price_mistral_out_per_1m: float = 0.0
     langfuse_price_gemini_in_per_1m: float = 0.0
     langfuse_price_gemini_out_per_1m: float = 0.0
+    # D-114: the second provider that can occupy the cloud-fallback slot.
+    # Exactly the extension path pricing.py's own comment describes --
+    # "one line there and two fields in config.py, never a new code path".
+    langfuse_price_grok_in_per_1m: float = 0.0
+    langfuse_price_grok_out_per_1m: float = 0.0
 
 
 # P2-09: known-typo list. Each key here is a plausible mistyped env var name
@@ -608,6 +631,36 @@ def warn_on_inert_coverage_gate(s: "Settings") -> None:
                   effect="every dense hit enters fusion regardless of relevance")
 
 
+def warn_on_unpriced_fallback(s: "Settings") -> None:
+    """WARN when the configured fallback provider has no pricing row (D-114).
+
+    Same shape and same reason as the two inert-setting warnings above: a
+    thing that silently does nothing is worse than a thing that fails.
+    LLM_FALLBACK_NAME is free-form so a fourth provider needs no code
+    change, but a name pricing.py does not know -- a typo, or a genuinely
+    new provider -- means calculate_cost returns None for every call it
+    makes and the run's cost figure quietly loses a provider.
+
+    Only fires when that provider is actually IN the chain: with no API
+    key set, FallbackRouter.from_settings omits it entirely and its price
+    is irrelevant. Nothing here fails a run -- an unpriced provider is a
+    reporting gap, not an outage, exactly as LANGFUSE_PRICE_* defaulting
+    to 0.0 has always been.
+    """
+    # Imported here, not at module import: pricing.py imports nothing from
+    # config, and keeping it that way means this warning cannot introduce
+    # a cycle between the two.
+    from research_agent.langfuse.pricing import _PROVIDER_RATE_FIELDS
+    if s.llm_fallback_api_key and s.llm_fallback_name not in _PROVIDER_RATE_FIELDS:
+        log_event(logger, "config.fallback_provider_unpriced",
+                  level=logging.WARNING,
+                  setting="LLM_FALLBACK_NAME", value=s.llm_fallback_name,
+                  known=sorted(_PROVIDER_RATE_FIELDS),
+                  effect="this provider's calls report no cost; add a row to "
+                         "pricing.py::_PROVIDER_RATE_FIELDS and two "
+                         "LANGFUSE_PRICE_* fields to Settings")
+
+
 def warn_on_web_search_band(s: "Settings") -> None:
     """Log a WARNING when the web-search score band is misconfigured.
 
@@ -679,4 +732,5 @@ def get_settings() -> Settings:
     warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     warn_on_inert_coverage_gate(settings)
     warn_on_web_search_band(settings)
+    warn_on_unpriced_fallback(settings)  # D-114
     return settings

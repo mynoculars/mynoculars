@@ -153,3 +153,94 @@ def test_every_event_this_codebase_warns_on_has_a_prose_label():
                   "quality.judge_unreliable", "run_history.skipped"):
         assert event in prose, f"{event} renders as a raw dotted code"
         assert not prose[event].startswith("llm."), "a label, not the code"
+
+
+# ---------------------------------------------------------------------------
+# D-116 / D-117 -- warnings reach the human-readable narrative
+#
+# Run p205.265-check logged 12 warnings; 10 never reached logs/run-*.txt.
+# The span renderer allow-listed three event NAMES ("llm.call",
+# "retrieval.raw", "graph.*") and silently dropped everything else --
+# including the two llm.http_error lines whose body said, in plain
+# English, that the provider account had no credits.
+# ---------------------------------------------------------------------------
+
+
+def _events(*specs):
+    from research_agent.reporting.narrative import _Event
+    return [_Event(1.0 + i, "mod::fn:1", msg, fields, level)
+            for i, (msg, fields, level) in enumerate(specs)]
+
+
+_HTTP_403 = ("llm.http_error",
+             {"provider": "grok", "model": "grok-4.6", "node": "compiler",
+              "status": 403, "kind": "permission_denied",
+              "hint": "check the account's credits, billing or plan",
+              "body": '{"error":"team has no credits or licenses yet"}'},
+             "WARNING")
+
+
+def test_a_warning_inside_a_node_span_is_rendered():
+    """The regression itself: an allowlist of event NAMES cannot stay
+    correct as events are added -- llm.http_error did not exist when that
+    list was written."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    out = NarrativeFormatter().render_all(_events(
+        ("node.enter", {"node": "compiler"}, "INFO"),
+        _HTTP_403,
+        ("node.compiled", {"sections": 6, "evidence_cited": 4,
+                           "output_chars": 100}, "INFO")))
+
+    assert "permission_denied" in out
+    assert "team has no credits" in out, "the body is the actionable part"
+
+
+def test_an_info_event_that_is_not_allow_listed_stays_out_of_the_span():
+    """D-116 widens the filter by SEVERITY, not to everything. The span
+    stays readable; only warnings were being lost."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    out = NarrativeFormatter().render_all(_events(
+        ("node.enter", {"node": "compiler"}, "INFO"),
+        ("some.chatty.info", {"detail": "UNIQUE-INFO-MARKER"}, "INFO"),
+        ("node.compiled", {"sections": 1, "evidence_cited": 0,
+                           "output_chars": 1}, "INFO")))
+
+    assert "UNIQUE-INFO-MARKER" not in out
+
+
+def test_the_problems_section_leads_the_file():
+    """Being present is not the same as being found: in a 2,300-line
+    narrative the 403 sat around line 900."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    out = NarrativeFormatter().render_all(_events(
+        ("node.enter", {"node": "compiler"}, "INFO"), _HTTP_403))
+
+    assert out.index("PROBLEMS (1)") < out.index("EXECUTION PLAN")
+    assert "permission_denied" in out[:out.index("EXECUTION PLAN")]
+
+
+def test_repeats_are_collapsed_with_a_count():
+    """Three identical context skips are one problem seen three times;
+    listing them separately buries a singular failure."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    out = NarrativeFormatter().render_problems(_events(
+        _HTTP_403, _HTTP_403, _HTTP_403))
+
+    assert "PROBLEMS (3)" in out
+    assert "(x3)" in out
+
+
+def test_a_clean_run_says_so_rather_than_rendering_nothing():
+    """An absent section is indistinguishable from one that failed to
+    render. "No warnings" is a real result."""
+    from research_agent.reporting.narrative import NarrativeFormatter
+
+    out = NarrativeFormatter().render_problems(_events(
+        ("node.enter", {"node": "compiler"}, "INFO")))
+
+    assert "PROBLEMS (0)" in out
+    assert "None." in out

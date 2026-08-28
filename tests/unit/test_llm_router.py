@@ -795,3 +795,71 @@ def test_the_scored_event_carries_the_reason_and_the_verdict(caplog):
         chain.complete([{"role": "user", "content": "x"}])
 
     assert any("llm.quality_scored" in r.message for r in caplog.records)
+
+
+
+# ---------------------------------------------------------------------------
+# D-114 -- the cloud fallback slot is named, not hardwired
+#
+# Its base URL, key and model were always generic; only the NAME was
+# hardwired, so pointing the three at another OpenAI-compatible provider
+# produced a working chain whose every log line, counter, health-check row
+# and D-110 error said "gemini" while calling something else.
+# ---------------------------------------------------------------------------
+
+
+def _live(**over):
+    from research_agent.config import Settings
+    base = dict(_env_file=None, llm_mode="live", llm_mistral_api_key="k",
+                llm_fallback_api_key="k")
+    base.update(over)
+    return Settings(**base)
+
+
+def test_the_slot_defaults_to_gemini_unchanged():
+    """Every existing .env leaves LLM_FALLBACK_NAME unset. That must build
+    exactly the chain it built before this setting existed."""
+    chain = FallbackRouter.from_settings(_live())
+
+    assert [p.name for p in chain.providers] == ["primary", "mistral", "gemini"]
+
+
+def test_switching_the_name_renames_the_provider_everywhere():
+    chain = FallbackRouter.from_settings(
+        _live(llm_fallback_name="grok",
+              llm_fallback_base_url="https://api.x.ai/v1",
+              llm_fallback_model="grok-x"))
+    slot = chain.providers[2]
+
+    assert slot.name == "grok"
+    assert "XAI GROK" in slot._label and "grok-x" in slot._label
+    assert "api.x.ai" in str(slot._http.base_url)
+
+
+def test_an_unknown_vendor_name_keeps_its_own_name_in_the_label():
+    """An honest uppercase name beats a guessed vendor -- the same rule
+    narrative.py::_PROSE applies to unlisted event names."""
+    chain = FallbackRouter.from_settings(_live(llm_fallback_name="something-new"))
+
+    assert "SOMETHING-NEW" in chain.providers[2]._label
+
+
+def test_a_keyless_fallback_is_still_omitted_from_the_chain():
+    """Naming the slot must not change from_settings' own rule: no key,
+    not in the chain."""
+    chain = FallbackRouter.from_settings(
+        _live(llm_fallback_name="grok", llm_fallback_api_key=""))
+
+    assert [p.name for p in chain.providers] == ["primary", "mistral"]
+
+
+def test_the_name_reaches_a_chain_exhaustion_report():
+    """D-101's chain summary is one of the places that used to say
+    "gemini" regardless of what was actually called."""
+    chain = FallbackRouter(
+        [_Typed("primary", RuntimeError("x")), _Typed("grok", RuntimeError("y"))], 0.6)
+
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete([{"role": "user", "content": "x"}])
+
+    assert [n for n, _ in exc.value.attempts] == ["primary", "grok"]

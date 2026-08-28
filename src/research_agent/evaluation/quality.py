@@ -44,7 +44,8 @@ Limitation (stated, not hidden):
 import logging
 from typing import Callable, List, Optional
 
-from research_agent.llm.client import ChatClient, Message
+from research_agent.llm.client import (ChatClient, Message,
+                                       classify_http_failure)
 from research_agent.logging_setup import log_event
 
 logger = logging.getLogger(__name__)
@@ -230,9 +231,28 @@ def score_answer(judge: ChatClient, request_messages: List[Message], answer: str
         # response on the exception; getattr twice rather than importing
         # httpx here, so this stays true for any client that raises
         # something response-shaped and harmless for one that does not.
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        log_event(logger, "quality.score_failed", reason=type(exc).__name__,
-                  judge=getattr(judge, "name", None), status=status)
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        # D-119: the same classification the provider call itself records,
+        # repeated HERE because this is where the consequence lands. A
+        # reader of `quality.score_failed` should not have to go and find
+        # the matching llm.http_error to learn that the gate was inert
+        # because an account has no credits. The body excerpt is short --
+        # the full one is on the llm.http_error line -- but enough to name
+        # the cause without a second lookup.
+        kind = hint = None
+        body = None
+        if isinstance(status, int):
+            kind, hint = classify_http_failure(status)
+            text = getattr(response, "text", None)
+            if isinstance(text, str) and text:
+                body = text[:300]
+        log_event(logger, "quality.score_failed", level=logging.WARNING,
+                  reason=type(exc).__name__,
+                  judge=getattr(judge, "name", None), status=status,
+                  kind=kind, hint=hint, body=body,
+                  effect="the quality gate did not run for this call "
+                         "(fail-open: the answer was kept unscored)")
         if on_score_failed is not None:
             on_score_failed()
         return 1.0
