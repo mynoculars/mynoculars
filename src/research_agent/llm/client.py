@@ -196,6 +196,62 @@ class ChatClient(Protocol):
         ...
 
 
+# D-93: response-body fragments that mean "your prompt did not fit",
+# lower-cased for matching. llama.cpp, vLLM and the OpenAI-compatible
+# servers built on them phrase this differently; these are the shapes
+# observed or documented rather than a guess at a standard, because there
+# is no standard -- the HTTP status is a plain 400 either way.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "exceed context",
+    "exceeds context",
+    "context length",
+    "context window",
+    "too many tokens",
+    "maximum context",
+    "prompt is too long",
+)
+
+
+def looks_like_context_overflow(body: str) -> bool:
+    """Does this error body say the PROMPT did not fit?
+
+    D-93. Without this, a context rejection is indistinguishable from a
+    429, a 500 or a dead port -- every one arrives as
+    `llm.fallback reason=HTTPStatusError` and reads as flakiness. It is
+    not flakiness: it is deterministic, it recurs on every run with a
+    prompt that size, and the remedy (raise `-c`, or configure
+    LLM_PRIMARY_CONTEXT_TOKENS so the hop is skipped) is entirely
+    different from the remedy for a transient error.
+
+    Substring matching on the response body, deliberately: there is no
+    standard error code for this across OpenAI-compatible servers and the
+    HTTP status is a plain 400 in every case. A false negative simply
+    restores today's behaviour -- an unlabelled fallback -- so being
+    wrong here costs nothing.
+    """
+    lowered = (body or "").lower()
+    return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def estimate_prompt_tokens(messages: List[Message]) -> int:
+    """A deliberately crude token estimate for a message list.
+
+    ~4 characters per token is the long-standing rule of thumb for
+    English through BPE tokenizers. It is APPROXIMATE and this function
+    does not pretend otherwise -- the alternative is a real tokenizer
+    dependency to answer a question whose only consumer is "is this
+    prompt obviously far too big for a 1536-token window".
+
+    Used ONLY to skip a hop configured as unable to take the prompt
+    (llm/router.py). Because an OVER-estimate would skip a provider that
+    would have worked, the router applies a safety margin on top rather
+    than trusting this exactly -- see _skips_for_context there.
+    """
+    total = sum(len(m.get("content") or "") + len(m.get("role") or "")
+                for m in messages)
+    return total // 4
+
+
 def strip_code_fence(text: str) -> str:
     r"""Remove one leading/trailing markdown code fence, any language tag.
 
@@ -364,7 +420,8 @@ class OpenAICompatibleClient:
 
     def __init__(self, name: str, base_url: str, api_key: str, model: str,
                  timeout: float = 60.0, tracer: Any = None, display_label: str = "",
-                 max_tokens: Optional[int] = None):
+                 max_tokens: Optional[int] = None,
+                 context_tokens: int = 0):
         """Parameters map directly to Settings fields; see config.py.
 
         `tracer` (a Tracer, optional) receives the exact prompt/response/tokens/
@@ -401,6 +458,11 @@ class OpenAICompatibleClient:
         # it per-worker, since one client is shared across the parallel
         # search_worker fan-out.
         self._raw = threading.local()
+        # D-93: 0 means "unknown", which is what every provider except a
+        # deliberately-configured primary reports. Read by llm/router.py
+        # via getattr -- the same duck-typed optional-capability pattern
+        # drain_usage and drain_retrieval_counts already use.
+        self.context_tokens = int(context_tokens or 0)
         self._label = display_label or model
         # A leading underscore (self._trace_node, self._http, etc.) is a
         # Python NAMING CONVENTION, not an enforced access restriction —
@@ -499,6 +561,16 @@ class OpenAICompatibleClient:
         # raise_for_status() raises an httpx.HTTPStatusError if the response
         # code is 4xx or 5xx (i.e. the server reported an error) — it does
         # nothing (returns None) for a normal 2xx success response.
+        if resp.status_code >= 400 and looks_like_context_overflow(resp.text):
+            # D-93: the SAME exception the caller already handles (the
+            # router hops on any Exception) -- this only makes the log say
+            # which KIND of failure it was. Logged here, where the body is
+            # still in hand, rather than left for the router to guess.
+            log_event(logger, "llm.context_overflow", level=logging.WARNING,
+                      provider=self.name, node=self._trace_node,
+                      estimated_prompt_tokens=estimate_prompt_tokens(messages),
+                      configured_context_tokens=self.context_tokens,
+                      status=resp.status_code, body=resp.text[:200])
         resp.raise_for_status()
         data = resp.json()
         latency = time.perf_counter() - started
@@ -515,6 +587,16 @@ class OpenAICompatibleClient:
         text = _truncate_at_sentinel(raw_text)
         usage = data.get("usage", {})
         pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        # D-102: reasoning models spend the output budget on tokens that
+        # `completion_tokens` does not report. The OpenAI-compatible field
+        # for them is usage.completion_tokens_details.reasoning_tokens;
+        # providers that have no such concept simply omit it, and this
+        # stays None. Read here, used ONLY by the truncation branch below
+        # -- it is deliberately NOT added to _bump_usage's totals, which
+        # count what the provider billed as prompt/completion and must not
+        # start meaning something else.
+        _details = usage.get("completion_tokens_details") or {}
+        reasoning_tokens = _details.get("reasoning_tokens")
         # D-86: stash this call's token usage for FallbackRouter to drain
         # (llm/router.py::_bump_usage) one line after this method returns.
         #
@@ -552,13 +634,52 @@ class OpenAICompatibleClient:
         # not the answer. Only an untrimmed response is genuinely cut off.
         finish_reason = (data.get("choices") or [{}])[0].get("finish_reason")
         if finish_reason == "length" and text == raw_text:
+            # D-102: WHOSE ceiling was hit. As first written this line
+            # reported max_tokens unconditionally, which reads as "we hit
+            # our own limit" and sends you to .env. Live (p205.254-check)
+            # that was false both times it fired: gemini-3.5-flash
+            # reported finish_reason=length at completion_tokens 616 and
+            # 2150 against max_tokens 8192. Our generation budget was
+            # demonstrably NOT the binding constraint -- the ceiling came
+            # from the provider side (its own output cap, a gateway limit,
+            # or reasoning tokens spending a budget completion_tokens does
+            # not report). Raising LLM_MAX_TOKENS would not have helped,
+            # and the log line said to go and try.
+            #
+            # cap_source is DERIVED, never guessed: "ours" only when the
+            # provider actually reached the number we sent. Anything short
+            # of it means something else stopped the generation, and the
+            # only honest thing to say is that it was not us.
+            # reasoning_tokens counts toward the budget where a provider
+            # reports it, so it is added before the comparison; where it
+            # is absent this is exactly the old completion_tokens check.
+            billed = (ct or 0) + (reasoning_tokens or 0)
+            if self._max_tokens is None:
+                cap_source = "provider"      # we sent no cap at all
+            elif ct is None:
+                cap_source = "unknown"       # nothing to compare against
+            elif billed >= self._max_tokens:
+                cap_source = "ours"
+            else:
+                cap_source = "provider"
             log_event(logger, "llm.truncated_by_token_limit", level=logging.WARNING,
                       provider=self.name, node=self._trace_node,
-                      completion_tokens=ct, max_tokens=self._max_tokens,
+                      completion_tokens=ct, reasoning_tokens=reasoning_tokens,
+                      max_tokens=self._max_tokens, cap_source=cap_source,
                       kept_chars=len(text))
+            # The same attribution in the exception text, because on the
+            # chain-exhaustion path this string is what a human actually
+            # reads (D-101 puts it in main()'s message).
+            whose = {"ours": f"OUR max_tokens={self._max_tokens}",
+                     "provider": "the PROVIDER's own ceiling, not our "
+                                 f"max_tokens={self._max_tokens}",
+                     "unknown": "an unattributable ceiling"}[cap_source]
             raise TruncatedGenerationError(
                 f"{self.name}/{self._model} stopped at the token limit "
-                f"(finish_reason=length, completion_tokens={ct}); the answer is "
+                f"(finish_reason=length, completion_tokens={ct}"
+                + (f", reasoning_tokens={reasoning_tokens}"
+                   if reasoning_tokens is not None else "")
+                + f"); cap was {whose}; the answer is "
                 f"incomplete and must not be used")
         if text != raw_text:
             log_event(logger, "llm.truncated_runaway_generation", level=logging.WARNING,

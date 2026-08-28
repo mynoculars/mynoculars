@@ -400,7 +400,92 @@ class ResumeRequest(BaseModel):
     guidance: str = ""
 
 
+@app.get("/state/{thread_id}")
+def read_state(thread_id: str) -> dict:
+    """Inspect a thread's current state without running anything (D-94).
+
+    READS   the checkpointer, via _graph.get_state(config) -- the SAME
+            call assembly.py::reject_if_thread_in_use already makes, so
+            this adds no new mechanism, only a way to see what it sees.
+    RETURNS a BOUNDED PROJECTION, never the raw state. See below.
+    RAISES  503 if the app bundle failed to build (D-78); 404 if the
+            thread holds no run.
+
+    WHY A PROJECTION AND NOT THE WHOLE STATE: `ResearchState.evidence` is
+    unbounded -- a live run reached 37 items of up to 800 characters each,
+    and every one of them is verbatim corpus or third-party web text.
+    Returning it would make this endpoint an unauthenticated full-text
+    export of the operator's ingested corpus, over an interface the README
+    already flags as having no auth. Counts and identifiers answer "where
+    is this run, and what has it found" without becoming an exfiltration
+    route; anyone who needs the evidence itself has the report, the
+    narrative log and the database.
+
+    ⚠ PUBLIC API SURFACE. D-37 names the HTTP shapes as this repo's
+    declared public interface, owed a MAJOR bump if they change. This
+    endpoint is part of that surface from the moment it ships -- it is a
+    versioned commitment, not a debugging convenience that can be
+    reshaped later.
+
+    ⚠ NO AUTH, like every other endpoint here (see README's Limitations).
+    Behind a gateway that terminates auth, this is a progress view; open
+    to the internet it is a live feed of what a caller is researching.
+    """
+    _ensure_built()
+    snapshot = _graph.get_state(_config(thread_id))
+    values = getattr(snapshot, "values", None) or {}
+    if not values.get("raw_query"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"thread_id '{thread_id}' holds no run. A thread exists "
+                   f"only once /research has been called with it.")
+
+    # `next` is LangGraph's own "which node(s) would run next" -- empty on
+    # a finished run, populated on one paused at an interrupt().
+    pending = list(getattr(snapshot, "next", ()) or ())
+    goals = values.get("goals") or []
+    evidence = values.get("evidence") or []
+    by_source: dict = {}
+    for item in evidence:
+        source = getattr(item, "source", None) or "?"
+        by_source[source] = by_source.get(source, 0) + 1
+
+    return {
+        "thread_id": thread_id,
+        "raw_query": values.get("raw_query"),
+        "status": "interrupted" if pending else "idle",
+        "next": pending,
+        "iteration_depth": values.get("iteration_depth", 0),
+        "recall_score": values.get("recall_score", 0.0),
+        "grounded_score": values.get("grounded_score", 0.0),
+        "revision_count": values.get("revision_count", 0),
+        "critique_passed": values.get("critique_passed", False),
+        "escalation_trigger": values.get("escalation_trigger"),
+        # Trigger/action pairs only -- the human's free-text guidance is
+        # deliberately omitted for the same reason the evidence is.
+        "escalations": [
+            {"trigger": h.get("trigger"), "action": h.get("action")}
+            for h in (values.get("escalation_history") or [])
+        ],
+        # Identifiers and coverage flags, never the descriptions' evidence.
+        "goals": [
+            {"goal_id": getattr(g, "goal_id", None),
+             "description": getattr(g, "description", None),
+             "covered": getattr(g, "covered", False),
+             "contested": getattr(g, "contested", False)}
+            for g in goals
+        ],
+        "evidence_items": len(evidence),
+        "evidence_by_source": by_source,
+        "report_chars": len(values.get("final_report") or ""),
+        # Present only once telemetry_node has run; it is already a
+        # counts-only dict by construction (D-12).
+        "telemetry": values.get("telemetry") or {},
+    }
+
+
 @app.post("/research")
+
 def research(req: ResearchRequest) -> dict:
     """Start a new run (or restart under a caller-supplied thread_id).
 

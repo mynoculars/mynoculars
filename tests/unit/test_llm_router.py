@@ -17,7 +17,8 @@ import json
 
 import pytest
 
-from research_agent.llm.router import FallbackRouter
+from research_agent.llm.client import TruncatedGenerationError
+from research_agent.llm.router import FallbackRouter, ProviderChainExhausted
 
 # ---------------------------------------------------------------------------
 # Basic fallback: error -> next provider, first success wins
@@ -463,3 +464,218 @@ def test_usage_is_drained_once_per_call_so_it_cannot_be_counted_twice():
 
     assert provider.drained == 2
     assert counters["llm_prompt_tokens"] == 50.0
+
+
+# ---------------------------------------------------------------------------
+# D-93: skipping a hop whose context window cannot take the prompt
+# ---------------------------------------------------------------------------
+
+
+class _CtxClient(_UsageClient):
+    def __init__(self, name, context_tokens=0, **kw):
+        super().__init__(name, **kw)
+        self.context_tokens = context_tokens
+        self.calls = 0
+
+    def complete_json(self, messages, temperature=0.0):
+        self.calls += 1
+        return {"served_by": self.name}
+
+    def complete(self, messages, temperature=0.2):
+        self.calls += 1
+        return f"answer from {self.name}"
+
+
+_BIG = [{"role": "user", "content": "x" * 40000}]    # ~10k estimated tokens
+_SMALL = [{"role": "user", "content": "x" * 400}]    # ~100 estimated tokens
+
+
+def test_a_prompt_far_over_the_window_skips_that_provider():
+    """The live shape: a 1536-token window and a 7,198-token prompt. The
+    primary rejected it in 29ms every run -- deterministic, not flaky."""
+    primary = _CtxClient("primary", context_tokens=1536)
+    fallback = _CtxClient("mistral")
+    router = FallbackRouter([primary, fallback], 0.6)
+
+    result = router.complete_json(_BIG)
+    counters = router.drain_counters()
+
+    assert result == {"served_by": "mistral"}
+    assert primary.calls == 0, "the doomed call must not be made at all"
+    assert counters["llm_context_skips"] == 1.0
+    assert counters["llm_provider_calls"] == 1.0, (
+        "a hop never attempted must not be counted as an attempt")
+
+
+def test_a_prompt_that_fits_still_goes_to_the_primary():
+    primary = _CtxClient("primary", context_tokens=1536)
+    router = FallbackRouter([primary, _CtxClient("mistral")], 0.6)
+
+    assert router.complete_json(_SMALL) == {"served_by": "primary"}
+    assert primary.calls == 1
+    assert "llm_context_skips" not in router.drain_counters()
+
+
+def test_an_unconfigured_provider_is_never_skipped():
+    """context_tokens defaults to 0 everywhere. With no configuration the
+    routing decision must be byte-identical to before D-93 existed."""
+    primary = _CtxClient("primary")  # no window configured
+    router = FallbackRouter([primary, _CtxClient("mistral")], 0.6)
+
+    assert router.complete_json(_BIG) == {"served_by": "primary"}
+    assert primary.calls == 1
+
+
+def test_the_last_provider_is_never_skipped():
+    """Skipping is an optimisation that only makes sense when there is
+    somewhere to fall through TO. Skipping the sole provider would leave
+    complete() with no candidate AND no exception, tripping its own
+    `assert last_exc is not None` -- a crash instead of a run."""
+    solo = _CtxClient("primary", context_tokens=1536)
+    router = FallbackRouter([solo], 0.6)
+
+    assert router.complete_json(_BIG) == {"served_by": "primary"}
+    assert solo.calls == 1
+    assert "llm_context_skips" not in router.drain_counters()
+
+
+def test_a_prompt_near_the_boundary_is_still_attempted():
+    """estimate_prompt_tokens is ~4 chars/token and says so. The 1.1x
+    margin means a mis-estimate near the limit costs one recovered failed
+    call, never a silently discarded working provider -- a false skip is
+    invisible and permanent, a false attempt is one log line."""
+    primary = _CtxClient("primary", context_tokens=1536)
+    router = FallbackRouter([primary, _CtxClient("mistral")], 0.6)
+    near = [{"role": "user", "content": "x" * (1536 * 4)}]  # ~1536 tokens
+
+    router.complete_json(near)
+
+    assert primary.calls == 1
+
+
+def test_the_free_text_path_skips_the_same_way():
+    primary = _CtxClient("primary", context_tokens=1536)
+    router = FallbackRouter([primary, _CtxClient("mistral")], 0.6)
+
+    assert router.complete(_BIG) == "answer from mistral"
+    assert primary.calls == 0
+
+
+
+# ---------------------------------------------------------------------------
+# D-101 -- ProviderChainExhausted
+#
+# Diagnosed from run p205.254-check's fifth compile: primary
+# HTTPStatusError, mistral ReadTimeout, gemini TruncatedGenerationError,
+# nothing to ship. The bare `raise last_exc` handed cli.py only the LAST
+# provider's exception, which says nothing about the other two.
+# ---------------------------------------------------------------------------
+
+
+class _Typed:
+    """Raises a NAMED exception type, so a test can assert the chain
+    summary reports each provider's OWN failure and not just the last."""
+
+    def __init__(self, name, exc):
+        self.name = name
+        self._exc = exc
+
+    def complete(self, messages, temperature=0.2):
+        raise self._exc
+
+    def complete_json(self, messages, temperature=0.0):
+        raise self._exc
+
+
+def _dead_chain():
+    return FallbackRouter(
+        [_Typed("primary", RuntimeError("400")),
+         _Typed("mistral", TimeoutError("read timeout")),
+         _Typed("gemini", TruncatedGenerationError("cut off"))], 0.6)
+
+
+def test_exhaustion_names_every_provider_and_how_each_one_failed():
+    chain = _dead_chain()
+    chain.set_node("compiler")
+
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete([{"role": "user", "content": "x"}])
+
+    assert exc.value.attempts == [
+        ("primary", "RuntimeError"),
+        ("mistral", "TimeoutError"),
+        ("gemini", "TruncatedGenerationError")]
+    assert exc.value.node == "compiler"
+    assert exc.value.mode == "text"
+
+
+def test_exhaustion_keeps_the_last_real_failure_as_the_cause():
+    """`raise ... from last_exc` -- cli.py prints __cause__ for the
+    detail the chain summary cannot carry (which ceiling truncated it),
+    and a traceback must still show the real failure underneath."""
+    chain = _dead_chain()
+
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete([{"role": "user", "content": "x"}])
+
+    assert isinstance(exc.value.__cause__, TruncatedGenerationError)
+
+
+def test_exhaustion_is_still_a_runtime_error():
+    """The containment property this change depends on: every existing
+    caller catches Exception broadly and the two pre-existing exhaustion
+    tests assert RuntimeError. Subclassing keeps both true."""
+    chain = _dead_chain()
+    with pytest.raises(RuntimeError):
+        chain.complete_json([{"role": "user", "content": "x"}])
+
+
+def test_the_json_path_reports_its_own_mode():
+    chain = _dead_chain()
+    chain.set_node("critic")
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete_json([{"role": "user", "content": "x"}])
+    assert exc.value.mode == "json"
+    assert exc.value.node == "critic"
+
+
+def test_a_context_skipped_hop_is_reported_as_skipped_not_as_a_failure():
+    """D-93 skips a hop it never attempted. Calling that a failure would
+    be a lie; omitting it would make the chain look shorter than it is."""
+    chain = FallbackRouter(
+        [_CtxClient("primary", context_tokens=1536),
+         _Typed("mistral", TimeoutError("read timeout")),
+         _Typed("gemini", RuntimeError("500"))], 0.6)
+
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete(_BIG)
+
+    assert exc.value.attempts == [
+        ("primary", "skipped_for_context"),
+        ("mistral", "TimeoutError"),
+        ("gemini", "RuntimeError")]
+
+
+def test_a_chain_that_produced_any_answer_never_raises():
+    """The boundary this exception must NOT cross. p205.254-check's
+    FOURTH compile had two providers fail and one return a 0.1-scored
+    report; _best() shipped it and the run continued. Only a chain with
+    nothing at all to ship is exhausted."""
+    chain = FallbackRouter(
+        [_Typed("primary", RuntimeError("400")),
+         _Fixed("mistral", answer="A BAD BUT REAL REPORT", judge_score=0.1),
+         _Typed("gemini", TruncatedGenerationError("cut off"))], 0.6)
+
+    assert chain.complete([{"role": "user", "content": "x"}]) == \
+        "A BAD BUT REAL REPORT"
+
+
+def test_the_node_name_is_absent_rather_than_guessed_when_never_set():
+    """set_node is called by every real node and by almost no test
+    router. An unset node reports None; the message simply omits the
+    'at the ... node' clause rather than inventing one."""
+    chain = _dead_chain()
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete([{"role": "user", "content": "x"}])
+    assert exc.value.node is None
+    assert "at the" not in str(exc.value)

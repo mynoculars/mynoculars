@@ -50,7 +50,7 @@ deliberately does not duplicate them:
 | Document | Owns |
 |---|---|
 | `OPERATIONS.md` | Install, the L1/L2/L3 run ladder, service startup, ingest, manual test recipes |
-| `internal/LEARNING_GUIDE.md` | Pedagogy — follow-one-query walkthrough, concept teaching, interview framing (note: `internal/` is gitignored, so it ships only in archives) |
+| `internal/LEARNING_GUIDE.md` | Pedagogy — follow-one-query walkthrough, concept teaching, technical-evaluation framing (note: `internal/` is gitignored, so it ships only in archives) |
 | `design/Research_Agent_Design.md` | The full target architecture and D-1…D-30 rationale — a strict superset of this build |
 | **`README.md`** (this file) | What exists, how it is wired, what each store actually holds, and what is broken |
 
@@ -1508,6 +1508,7 @@ describe is now closed, on both the LLM side and the retrieval side:
 | `web_sources_listed` / `web_sources_suppressed` *(D-57)* | from `compiler_node`’s `append_web_sources` pass: how many web pages the report actually attributed in its `## Sources` section, versus how many were retrieved but belonged to goals the compiler never cited. A high suppressed count against a low listed count is the signature of the web tier doing work that never reached the report | `guardrails/sources.py` |
 | `cited_figures_checked` / `cited_figures_unsupported` / `unsupported_figures` *(D-91)* | the claim-level check. `checked` is how many cited figures the shipped report stated at all; `unsupported` how many appear in no evidence under the goal the sentence cites; `unsupported_figures` is a capped sample naming WHICH, so the number is actionable without re-running anything. **`0 / 0` means the report stated no cited figures — not that it passed.** Read against `corpus_recall` and `grounding_notice_shipped`: a run answering from the web with unsupported figures in its prose is a very different artifact from one answering from the corpus with none | `guardrails/claims.py` |
 | `grounding_notice_shipped` *(D-85)* | whether the SHIPPED report carries the deterministic provenance notice. Derived from `state.final_report`, never from a counter — D-59's rule, because `compiler_node` runs once per revision and its counters merge additively. Read together with `corpus_recall`: `corpus_recall 0.0` with this `true` is a run that answered from the web or from recollection **and told its reader so**; the same pair reading `false` is a deliverable that claimed nothing about its own provenance, which `report.shipped_ungrounded` now WARNs about | `guardrails/grounding.py` |
+| `llm_context_skips` *(D-93)* | provider hops SKIPPED because the prompt clearly could not fit that provider's configured context window. `0` unless `LLM_PRIMARY_CONTEXT_TOKENS` is set. A nonzero value is the count of guaranteed-failed provider calls this run did **not** make — read against `llm_provider_calls`, which no longer includes them | `llm/router.py::_skips_for_context` |
 | `llm_prompt_tokens` / `llm_completion_tokens` / `llm_total_tokens` *(D-86)* | what the run actually COST, as opposed to how many requests it made. `llm_provider_calls` cannot distinguish three cheap `classify` calls from three 7,000-token `compiler` calls; these can. Counted at the router boundary from the usage each provider reports, judge calls included. Tokens rather than dollars deliberately: every `LANGFUSE_PRICE_*` defaults to `0.0`, so a spend figure built on them would be structurally zero, while tokens are real whether or not a rate was ever configured | `llm/router.py::_bump_usage` |
 | `tier_answers` / `chain_tier_failures` / `chain_exhausted` *(D-87)* | WHICH tier of the D-38 ladder actually answered, as `{tier: count}` — previously readable only by grepping `chain.answered` out of a debug trace. Read against `corpus_recall`: `{"corpus": 6}` at `corpus_recall 1.0` is a healthy corpus run; `{"web": 6}` at `corpus_recall 0.0` is the p205.246-check shape, now one field instead of three inferred ones. A tier that answered nothing is omitted rather than reported as `0`. Note `chain_tier_failures` counts TIER attempts, not tasks — tiers 1 and 2 are the same tool, so one dead corpus fails both | `tools/retrieval_chain.py` |
 | `model_sourced_items` *(D-38)* | count of `state.evidence` entries with `source == "model"` — the LLM's own knowledge, retrieved deliberately because no document served that goal. Read together with `corpus_recall`: `corpus_recall: 0.0, model_sourced_items: 24` means the whole report rests on recollection, attributed as such in the prose (D-40) | same |
@@ -1645,6 +1646,11 @@ research-agent-dmp/
 │                                    (P2-13, off by default via MCP_ENABLED=false)
 ├── scripts/mcp_web_search_server.py  # Phase 4 MCP server exposing web search
 │                                    (D-57, off by default via WEB_SEARCH_ENABLED=false)
+├── scripts/analyze_runs.py       # read-only: cross-run analysis over agent_runs
+│                                 (D-92) — which tier answers, how often the
+│                                 corpus grounds anything, what a run costs.
+│                                 The reader that made a separate "strategy
+│                                 memory" store unnecessary
 ├── scripts/inspect_memory.py     # read-only: what long-term memory holds, and
 │                                 what it would recall for a given question (D-90).
 │                                 The only read path into memory that does not
@@ -2009,7 +2015,10 @@ visible rather than deleted, so the history stays auditable.
     post-Tier-3 session.** Now surfaced in `telemetry["escalations"]`.
 27. ~~CLI exit code was always 0~~ — **fixed, post-Tier-3 session.**
     `main()` now returns 2 on `GraphRecursionError` and 1 when a run ends
-    with no telemetry, instead of unconditionally 0.
+    with no telemetry, instead of unconditionally 0. Extended since: 3
+    when the `--thread-id` already holds a run (D-20), and 4 on
+    provider-chain exhaustion (D-101). Full table under **CLI Exit
+    Codes** in `OPERATIONS.md`.
 28. ~~Compiler free-text output could leak a wrapping code fence, or echo
     the evidence-fencing tag literally~~ — **fixed, post-Tier-3 session.**
     `strip_code_fence()` (tested against 15 edge cases, including

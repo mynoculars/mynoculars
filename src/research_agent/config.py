@@ -124,6 +124,27 @@ class Settings(BaseSettings):
     llm_primary_timeout_seconds: float = Field(120.0, gt=0.0)   # local Cogito
     llm_timeout_seconds: float = Field(90.0, gt=0.0)            # Mistral, Gemini
     llm_max_tokens: int = Field(4096, ge=1)  # D-54: request-level generation cap
+    # D-93: the PRIMARY provider's context window, in tokens -- the
+    # `-c` value llama-server was started with. 0 (the default) means
+    # "not configured", and with it every routing decision is
+    # byte-identical to before this setting existed.
+    #
+    # WHY ONLY THE PRIMARY: this is the constrained hop. Live
+    # (p205.246-check) the local model served 216- and 444-token
+    # prompts and rejected 4,023- and 7,198-token ones with an
+    # HTTPStatusError in 95ms and 29ms -- an immediate server-side
+    # refusal, not a slow response, against a 120s timeout.
+    # OPERATIONS.md's own recommended invocation for that machine is
+    # `-c 1536`. So on that deployment the primary can NEVER serve
+    # compiler or critic, and every run burns two guaranteed-failed
+    # provider calls before falling back. Cloud fallbacks have
+    # context windows orders of magnitude larger and have never been
+    # observed to refuse on size, so giving them a knob would be
+    # configuration nobody needs.
+    #
+    # Note this ALSO makes llm_max_tokens (4096) legible: a
+    # generation cap larger than the whole context window is inert.
+    llm_primary_context_tokens: int = Field(0, ge=0)
 
 
     # --- Storage endpoints -------------------------------------------------
@@ -228,6 +249,25 @@ class Settings(BaseSettings):
     # build sets). Turning this on is what makes E2 reachable in a real
     # run for the first time.
     contradiction_detection_enabled: bool = False
+    # D-95: the D-91-triggered semantic judge in critic_node. Off by
+    # default, exactly like contradiction_detection_enabled above and for
+    # the same reasons.
+    #
+    # COSTS at most ONE extra LLM call per critique pass, and only when
+    # guardrails/claims.py has already flagged a figure -- a clean report
+    # never pays for it. When it fires and CONFIRMS, the critique fails
+    # with notes naming the specific figures, which the compiler can
+    # actually act on by dropping or hedging them.
+    #
+    # WHY THIS ONE MAY ENFORCE WHEN D-85's NOTICE MAY NOT: a rewrite
+    # genuinely can fix an unsupported figure. It cannot fix ungrounded
+    # evidence, which is a property of what retrieval found -- that
+    # asymmetry is the whole reason D-85 is a notice and this is a gate.
+    #
+    # Still OFF by default because the false-positive rate has not been
+    # measured on real reports (D-54). Turn it on once
+    # cited_figures_unsupported has a track record you trust.
+    claim_verification_enabled: bool = False
 
     # --- Memory decay (D-24/D-27) -------------------------------------------
     memory_top_k: int = Field(5, ge=1)

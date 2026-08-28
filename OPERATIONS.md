@@ -2465,6 +2465,33 @@ anyone driving the graph directly — the guard lives in `cli.py`'s `main()`
 only, not in `assembly.py` or the graph itself, so the API's `/research`
 endpoint has no equivalent check today.
 
+## CLI Exit Codes
+
+`main()` returns a distinct code per failure class, so a script or CI step
+can tell them apart without parsing stderr. Every non-zero code below
+prints a diagnosable message rather than a raw traceback — the policy
+stated in `cli.py`'s `GraphRecursionError` handler and argued again for
+the API in D-78.
+
+| Code | Meaning | Where to look |
+|---|---|---|
+| `0` | Run finished and produced telemetry | — |
+| `1` | Run finished but reached no `telemetry_node` (interrupted then abandoned, or a degraded path) | the escalation record; `logs/run-<id>.txt` |
+| `2` | `GraphRecursionError` — the graph did not terminate within `RECURSION_LIMIT` (D-8) | the graph's budgets: `MAX_DEPTH`, `MAX_REVISIONS`, `RECURSION_LIMIT` |
+| `3` | `--thread-id` already holds a run (D-20) | use a fresh `--thread-id`, or omit the flag |
+| `4` | Provider chain exhausted — every provider failed on one call (D-101) | the providers. The message names each one and how it failed; a second line carries the last provider's own error, which is where D-102's cap attribution appears |
+
+Code `4` means **no** provider returned anything at all. A chain where one
+provider answered badly does not reach it — `FallbackRouter._best` ships
+the best candidate it has and the run continues, logging
+`llm.chain_exhausted_low_quality`. If you see `4`, read the chain summary
+first: a `skipped_for_context` entry there is D-93 correctly declining a
+prompt too large for `LLM_PRIMARY_CONTEXT_TOKENS`, not a failure.
+
+As of D-100, `logs/run-<id>.txt` is written on the failure paths too, not
+only on a clean finish — so there is a narrative to read for every code in
+this table.
+
 ## Writing Your Own Test Corpus
 
 The sample corpus is 10 docs on one topic. To test other questions, replace or

@@ -142,6 +142,29 @@ def test_compiler_node_strips_a_fence_the_model_added_despite_instructions():
     assert "```" not in result["final_report"]
 
 
+def test_compiler_node_normalises_the_citation_form_before_anything_reads_it():
+    """P205 regression (run p205.253-check), at the pipeline level rather
+    than the function level. Order is the whole point: D-99 has to run
+    before clean_citations, the Sources block, the D-66 gate and the D-91
+    audit, because every one of those reads citations through
+    `cited_goal_ids` and sees `(g1)` as no citation at all. If this ever
+    moves later in the chain, this test is what says so."""
+    router = _FakeRouter("## 1. Personnel (g1)\n\nChina fields more troops.")
+    node = build_compiler_node(router, _SETTINGS)
+    state = ResearchState(
+        raw_query="q",
+        goals=[Goal(goal_id="g1", description="personnel")],
+        evidence=[Evidence(task_key="t", goal_id="g1", source="corpus",
+                           content="China fields many troops.", score=0.9)])
+
+    result = node(state)
+
+    assert "[g1]" in result["final_report"]
+    assert "(g1)" not in result["final_report"]
+    assert result["last_compile_guardrails"][
+        "citations_form_normalised"] == 1.0
+
+
 def test_compiler_node_leaves_clean_markdown_unchanged():
     router = _FakeRouter("# Report\n\nRedis is fast. [g1 | corpus | score=0.90]")
     node = build_compiler_node(router, _SETTINGS)
@@ -169,7 +192,8 @@ def test_compiler_node_abort_path_is_unaffected_by_fence_stripping():
 # D-43: deterministic citation repair
 # ---------------------------------------------------------------------------
 
-from research_agent.guardrails.citations import clean_citations  # noqa: E402
+from research_agent.guardrails.citations import (  # noqa: E402
+    clean_citations, normalise_citation_form, residual_paste_sites)
 
 
 def _g(goal_id):
@@ -433,6 +457,207 @@ def test_properly_separated_evidence_text_is_never_stripped():
         report, [_g("g3")], [_e("g3", body)])
     assert cleaned == report
     assert counters == {}
+
+
+def test_a_parenthesised_goal_id_is_normalised_to_a_bracket():
+    """P205 regression (run p205.253-check, "Compare Armies of China and
+    India"). The compiler wrote its goal ids in PARENTHESES -- "## 1.
+    Military Personnel Strength (g1)" through "(g4)" -- and because every
+    reader of citations matches `[gN]` and nothing else, that report had
+    no citations at all as far as the system was concerned. The D-66 gate
+    failed it twice, two revision cycles and an E4 escalation were spent,
+    the Sources block listed 0 of 78 web items, and D-91 audited nothing.
+    Normalising the form recovers all four."""
+    report = ("## 1. Personnel (g1)\n\nChina fields more troops.\n"
+              "## 2. Budgets (g2)\n\nChina spends more.\n")
+
+    fixed, counters = normalise_citation_form(report, [_g("g1"), _g("g2")])
+
+    assert "[g1]" in fixed and "[g2]" in fixed
+    assert "(g1)" not in fixed
+    assert counters["citations_form_normalised"] == 2.0
+
+
+def test_a_multi_goal_citation_becomes_one_marker_per_goal():
+    """`[g1, g4]` is one of the four forms live runs produced. Splitting
+    rather than dropping matters: the sentence really does cite both, and
+    the Sources block attributes per goal."""
+    fixed, counters = normalise_citation_form(
+        "Both forces grew [g1, g4]. Spending rose (g2; g3).",
+        [_g("g1"), _g("g2"), _g("g3"), _g("g4")])
+
+    assert fixed == "Both forces grew [g1] [g4]. Spending rose [g2] [g3]."
+    assert counters["citations_form_normalised"] == 2.0
+
+
+def test_a_citation_carrying_its_own_metadata_is_reduced_to_the_goal_id():
+    """`[g1 | corpus | score=0.50]` was live-observed too, and it is the
+    shape D-91 has to strip figures out of afterwards. Reducing it here
+    means that defence is a backstop rather than the only thing standing
+    between a score and the figure audit."""
+    fixed, _ = normalise_citation_form(
+        "The PLA is large [g1 | corpus | score=0.50].", [_g("g1")])
+
+    assert fixed == "The PLA is large [g1]."
+
+
+def test_prose_that_merely_looks_like_a_citation_is_left_alone():
+    """The whole safety property. A delimiter only counts when what is
+    inside it is goal ids end to end -- otherwise this would rewrite the
+    model's sentences."""
+    for text in ("(g1 is the largest force)",
+                 "see section (g1 and the rest)",
+                 "the g1 goal covers personnel"):
+        fixed, counters = normalise_citation_form(text, [_g("g1")])
+        assert fixed == text, text
+        assert counters == {}
+
+
+def test_a_goal_that_does_not_exist_in_this_run_is_not_invented():
+    """A block naming no known goal is left entirely alone. Rewriting it
+    would manufacture a citation out of prose, and it would buy nothing:
+    clean_citations drops markers for goals with no evidence anyway."""
+    fixed, counters = normalise_citation_form("(g9)", [_g("g1")])
+
+    assert fixed == "(g9)"
+    assert counters == {}
+
+
+def test_an_already_correct_citation_is_a_no_op():
+    fixed, counters = normalise_citation_form(
+        "Redis is in-memory [g1]. It shards [g2].", [_g("g1"), _g("g2")])
+
+    assert fixed == "Redis is in-memory [g1]. It shards [g2]."
+    assert counters == {}
+
+
+def test_residual_paste_sites_counts_what_the_guard_left_behind():
+    """`citations_pasted_evidence_removed` says what came out; it says
+    nothing about what stayed. Live (run p205.253-check) 21 runs were
+    removed and four glued pastes still shipped, and no number in the run
+    record distinguished that from a clean report."""
+    body = ("Redis is an in-memory data store supporting rich data "
+            "structures: strings, hashes, lists, sets.")
+    report = f"Sessions map to hashes{body}"
+
+    assert residual_paste_sites(report, [_e("g1", body)]) == 1
+
+    cleaned, _ = clean_citations(report, [_g("g1")], [_e("g1", body)])
+    assert residual_paste_sites(cleaned, [_e("g1", body)]) == 0, \
+        "a report the guard fully cleaned must report zero residue"
+
+
+def test_residual_paste_sites_does_not_count_a_delimited_quotation():
+    """Same detector as the remover, so the two numbers can never
+    disagree about what a paste is -- including the p205.107 case the
+    remover deliberately leaves alone."""
+    body = ("Redis supports primary-replica replication, Sentinel failover, "
+            "and Redis Cluster sharding out of the box.")
+
+    assert residual_paste_sites(f"### Failover\n\n{body} Memcached has none.",
+                                [_e("g3", body)]) == 0
+
+
+def test_a_span_lifted_out_of_a_long_snippet_is_stripped():
+    """P205 regression (run p205.251-check, "Compare Armies of China and
+    India"). EVERY paragraph of the shipped report carried glued source
+    text -- "...and strategic support forcesChina's armed forces have
+    over 2.1 million active personnel." -- and this function removed
+    nothing at all: citations_pasted_evidence_removed never appeared in
+    the telemetry.
+
+    The cause was the whole-body exact match (D-45). It required an
+    evidence item's ENTIRE content to appear in the prose, which holds
+    for short corpus chunks and essentially never for a web snippet: the
+    model lifts a SPAN out of the middle of a long snippet, not the whole
+    snippet. D-96 matches any verbatim run of six or more words."""
+    snippet = ("Military Strength: China vs India China (ranked #2 globally) "
+               "holds a stronger overall military position than India. "
+               "China fields 2,535,000 active troops vs 3,068,000 for India, "
+               "backed by 1,155,000 reserves and 1,616,050 paramilitary.")
+    report = ("The PLA maintains roughly 2.1 million active personnel across "
+              "all servicesChina fields 2,535,000 active troops vs 3,068,000 "
+              "for India.")
+
+    cleaned, counters = clean_citations(
+        report, [_g("g1")], [_e("g1", snippet)])
+
+    assert "China fields 2,535,000" not in cleaned
+    assert cleaned.endswith("across all services.")
+    assert counters["citations_pasted_evidence_removed"] == 1.0
+
+
+def test_a_run_of_pasted_sentences_is_stripped_not_just_the_glued_one():
+    """P205 regression (run p205.251-check). The model does not paste once
+    and stop -- it emitted "...support forces" + <source sentence A> + " "
+    + <source sentence B>. Only A is glued to the claim, so a check that
+    anchored on glue alone removed A and shipped B, leaving the report
+    barely more readable than before."""
+    a = "China's armed forces have over 2.1 million active personnel."
+    b = "China fields 2,535,000 active troops for the ground component."
+    report = f"The PLA spans all services{a} {b} India differs."
+
+    cleaned, counters = clean_citations(
+        report, [_g("g1")], [_e("g1", f"{a} {b}")])
+
+    assert a not in cleaned and b not in cleaned
+    assert cleaned == "The PLA spans all services. India differs."
+    assert counters["citations_pasted_evidence_removed"] == 1.0, \
+        "one RUN, not one per span"
+
+
+def test_a_paste_run_is_only_absorbed_after_a_confirmed_glue():
+    """The continuation rule above is what makes D-96 safe rather than a
+    second p205.107-check. It can only ever start from a glue site, so an
+    evidence sentence quoted with proper delimiters anywhere else in the
+    report is never reached."""
+    body = ("Redis supports primary-replica replication, Sentinel failover, "
+            "and Redis Cluster sharding out of the box.")
+    report = f"### Failover\n\n{body} Memcached has none."
+
+    cleaned, counters = clean_citations(report, [_g("g3")], [_e("g3", body)])
+
+    assert cleaned == report
+    assert counters == {}
+
+
+def test_a_short_verbatim_collision_is_not_treated_as_a_paste():
+    """Six words is the floor. Ordinary prose collides with evidence over
+    short runs all the time, and a guardrail that deletes on those is
+    worse than no guardrail."""
+    report = "Sessions map to hashesRedis is fast for that."
+
+    cleaned, counters = clean_citations(
+        report, [_g("g1")], [_e("g1", "Redis is fast for that. " + "x" * 60)])
+
+    assert cleaned == report
+    assert counters == {}
+
+
+def test_removing_a_paste_never_welds_two_sentences_together():
+    """The removed run took its own terminal '.' with it, so the claim
+    would otherwise run straight into whatever followed. The punctuation
+    is carried over from the run rather than invented -- and only where
+    the next character actually opens a new sentence."""
+    paste = "The PLAGF is estimated to have a deployed force of 975,000 troops."
+    ev = [_e("g1", paste)]
+
+    welded, _ = clean_citations(
+        f"It deploys forces in operational units{paste} India differs.",
+        [_g("g1")], ev)
+    assert welded == "It deploys forces in operational units. India differs."
+
+    # The claim's own punctuation already follows: nothing is added.
+    doubled, _ = clean_citations(
+        f"It deploys forces in operational units{paste}.",
+        [_g("g1")], ev)
+    assert doubled == "It deploys forces in operational units."
+
+    # The sentence continues in lowercase: it was never two sentences.
+    flowing, _ = clean_citations(
+        f"It deploys forces in operational units{paste} and holds them.",
+        [_g("g1")], ev)
+    assert flowing == "It deploys forces in operational units and holds them."
 
 
 def test_evidence_text_glued_to_a_claim_is_still_stripped():
@@ -885,3 +1110,132 @@ def test_the_figure_audit_is_gated_off_in_stub_mode(caplog):
     assert telemetry["cited_figures_unsupported"] == 0
     assert not [r for r in caplog.records
                 if "report.unsupported_cited_figures" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# D-95: the D-91-triggered semantic judge in critic_node
+# ---------------------------------------------------------------------------
+
+
+class _JudgeRouter(_FakeRouter):
+    """A router whose complete_json answers the verify_figures call."""
+
+    def __init__(self, unsupported=None, raises=None):
+        super().__init__("unused")
+        self._unsupported = unsupported or []
+        self._raises = raises
+        self.json_calls = 0
+
+    def complete_json(self, messages, temperature=0.0):
+        self.json_calls += 1
+        # Raise on the JUDGE call only (the first). A fake that
+        # raised on every call would also break the ordinary
+        # critique that follows a fail-open, and the test would be
+        # asserting on its own fake rather than on the code.
+        if self._raises and self.json_calls == 1:
+            raise self._raises
+        if self.json_calls == 1:
+            return {"unsupported": self._unsupported}
+        return {"passed": True, "notes": []}
+
+
+def _figure_critic_state():
+    """A draft claiming 2,300,000 against evidence that says 2,000,000."""
+    return ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1")],
+        evidence=[_e("g1", "desc g1 -- the PLA fields about 2,000,000 "
+                     "personnel", source="corpus", score=0.9)],
+        final_report="# R\n\nThe PLA fields 2,300,000 personnel [g1].\n")
+
+
+def _settings(**kw):
+    base = dict(_env_file=None, llm_mode="live", max_revisions=2,
+                claim_verification_enabled=True)
+    base.update(kw)
+    return Settings(**base)
+
+
+def test_a_confirmed_unsupported_figure_fails_the_critique():
+    """A rewrite CAN fix this -- the compiler can drop or hedge the figure
+    -- which is exactly why this may gate where D-85's notice may not."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _JudgeRouter(unsupported=["2300000"])
+    result = build_critic_node(router, _settings())(_figure_critic_state())
+
+    assert result["critique_passed"] is False
+    assert "2300000" in result["critique_notes"][0]
+    assert result["counters"]["claim_figures_confirmed"] == 1.0
+    assert router.json_calls == 1, "the judge call, and not the main critique"
+
+
+def test_a_cleared_figure_falls_through_to_the_normal_critique():
+    """The judge exists to REDUCE false positives: evidence saying "about
+    2,000,000" may well support "2,300,000" badly, but evidence saying
+    "roughly a seventh" genuinely supports "14.7%". Anything the judge
+    does not name is treated as supported."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _JudgeRouter(unsupported=[])
+    result = build_critic_node(router, _settings())(_figure_critic_state())
+
+    # Two JSON calls: the judge cleared it, then the real critique ran.
+    assert router.json_calls == 2
+    assert "critique_passed" in result
+
+
+def test_the_gate_is_off_by_default():
+    """D-54: the false-positive rate has not been measured on real
+    reports, so this ships inert -- the same posture
+    contradiction_detection_enabled takes."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _JudgeRouter(unsupported=["2300000"])
+    settings = _settings(claim_verification_enabled=False)
+
+    build_critic_node(router, settings)(_figure_critic_state())
+
+    assert router.json_calls == 1, "only the ordinary critique call"
+
+
+def test_a_judge_that_raises_fails_open(caplog):
+    """A verification call that goes wrong must never manufacture a
+    failure -- the same posture score_answer takes."""
+    import logging as _logging
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _JudgeRouter(raises=RuntimeError("provider down"))
+    with caplog.at_level(_logging.WARNING):
+        result = build_critic_node(router, _settings())(_figure_critic_state())
+
+    # Fail open: nothing confirmed, and the run proceeds to the
+    # ORDINARY critique rather than dying on a verification call.
+    assert "claim_figures_confirmed" not in (result.get("counters") or {})
+    assert result["critique_passed"] is True
+    assert router.json_calls == 2
+    assert [r for r in caplog.records
+            if "critic.claim_verification_failed" in r.message]
+
+
+def test_the_judge_cannot_invent_a_finding_of_its_own():
+    """The deterministic pass owns WHAT MAY BE ACCUSED; the judge may only
+    confirm or clear. Letting it add findings would hand an LLM the power
+    to fail a report over something no mechanical check ever saw -- the
+    exact inversion of this package's own rule."""
+    from research_agent.agents.compilation import _confirm_unsupported_figures
+
+    router = _JudgeRouter(unsupported=["9999", "2300000"])
+    flagged = [{"figure": "2300000", "goals": ["g1"], "sentence": "s"}]
+
+    assert _confirm_unsupported_figures(router, flagged, []) == ["2300000"]
+
+
+def test_nothing_flagged_means_no_judge_call_at_all():
+    """A clean report never pays for this gate."""
+    from research_agent.agents.compilation import _confirm_unsupported_figures
+
+    router = _JudgeRouter(unsupported=["x"])
+
+    assert _confirm_unsupported_figures(router, [], []) == []
+    assert router.json_calls == 0

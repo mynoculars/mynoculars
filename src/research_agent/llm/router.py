@@ -69,11 +69,60 @@ from typing import Any, Dict, List, Optional, Tuple
 from research_agent.config import Settings
 from research_agent.tracing import NullTracer, Tracer
 from research_agent.evaluation.quality import score_answer
-from research_agent.llm.client import ChatClient, Message, OpenAICompatibleClient, StubClient
+from research_agent.llm.client import (ChatClient, Message,
+                                       OpenAICompatibleClient, StubClient,
+                                       estimate_prompt_tokens)
 from research_agent import langfuse as lf
 from research_agent.logging_setup import log_event, run_id_var
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderChainExhausted(RuntimeError):
+    """Every provider in the chain failed; there is no answer to return.
+
+    RAISED BY   FallbackRouter.complete and complete_json below, in place
+                of the bare `raise last_exc` they used to end on.
+    CAUGHT BY   cli.py::main, which turns it into a diagnosable message
+                and a distinct exit code (4) instead of a raw traceback --
+                the same treatment GraphRecursionError already gets there,
+                for the reason stated in that handler's own comment: an
+                operational event is not a crash.
+
+    WHY A TYPE AT ALL (D-101): main() could not identify chain exhaustion
+    from the exception it received, because that was whatever the LAST
+    provider happened to throw -- three different types across two live
+    runs (TruncatedGenerationError, ReadTimeout, HTTPStatusError), none of
+    which says on its own that the other two also failed, or how. That
+    information exists only here, in the loop that watched all of them.
+
+    Subclasses RuntimeError DELIBERATELY, and this is what keeps the
+    change contained: both loops below already catch Exception broadly, no
+    node catches a provider exception by type, and the two existing tests
+    that assert exhaustion (test_llm_router.py::
+    test_router_raises_when_no_fallback and
+    ::test_all_providers_erroring_still_raises) assert `pytest.raises(
+    RuntimeError)` -- so nothing that used to catch the last provider's
+    own exception stops catching this one.
+
+    `raise ... from last_exc` at both call sites keeps the real underlying
+    failure as __cause__, so a traceback still shows it in full.
+
+    attempts is the WHOLE chain in order, one (provider_name, outcome)
+    pair each, where outcome is an exception type name or the literal
+    "skipped_for_context" -- a hop D-93 never attempted is not a failure
+    and must not be reported as one, but leaving it out entirely would
+    make the chain in the message look shorter than it is.
+    """
+
+    def __init__(self, node, attempts, mode):
+        self.node = node
+        self.attempts = list(attempts)
+        self.mode = mode
+        chain = " -> ".join(f"{name} {how}" for name, how in self.attempts)
+        where = f" at the {node} node" if node else ""
+        super().__init__(
+            f"provider chain exhausted{where} ({mode} call): {chain}")
 
 
 class FallbackRouter:
@@ -129,10 +178,68 @@ class FallbackRouter:
             self._local.counters = counters
         return counters
 
+    @property
+    def _node(self) -> Optional[str]:
+        """This thread's current graph node, or None if set_node was never
+        called on this thread (every real node calls it; hand-written test
+        routers generally do not)."""
+        return getattr(self._local, "node", None)
+
     def _bump(self, key: str, amount: float = 1.0) -> None:
         """Internal: add `amount` to one accumulated counter."""
         counters = self._counters
         counters[key] = counters.get(key, 0.0) + amount
+
+    # D-93: slack between the estimate and the limit before skipping a
+    # hop. estimate_prompt_tokens is ~4 chars/token -- good enough to tell
+    # 7,198 from 216, nowhere near good enough to trust at the boundary.
+    # Skipping only past 1.1x the configured window means a mis-estimate
+    # near the limit still ATTEMPTS the provider (worst case: today's
+    # behaviour, one failed call) rather than silently discarding a hop
+    # that would have worked.
+    #
+    # The asymmetry is deliberate: a false skip is invisible and
+    # permanent, a false attempt is one logged, recovered failure.
+    CONTEXT_SKIP_MARGIN = 1.1
+
+    def _skips_for_context(self, provider: ChatClient,
+                           messages: List[Message]) -> bool:
+        """Would this prompt certainly not fit this provider's window?
+
+        NEVER called for the LAST provider in the chain -- both call
+        sites guard on `i + 1 < len(self.providers)` first. Skipping is
+        an optimisation that only makes sense when there is somewhere
+        to fall through TO; skipping the last option would leave
+        complete() with no candidate and no exception, tripping its own
+        `assert last_exc is not None`. Attempting a call that will
+        probably fail is strictly better than crashing the run.
+
+        Returns False -- attempt the call -- unless BOTH a context window
+        is configured for this provider AND the estimate exceeds it by
+        more than CONTEXT_SKIP_MARGIN. An unconfigured provider
+        (context_tokens 0, the default everywhere) can never be skipped,
+        so with no configuration this changes nothing at all.
+
+        WHY: live (p205.246-check) the local primary answered 216- and
+        444-token prompts and rejected 4,023- and 7,198-token ones with an
+        HTTP error in 95ms and 29ms -- an immediate refusal against a
+        120-second timeout, i.e. deterministic rather than flaky.
+        OPERATIONS.md documents that machine's own invocation as `-c 1536`.
+        Every compile and every critique therefore burned a
+        guaranteed-failed provider call before falling back, twice per run,
+        and the logs read as provider flakiness.
+        """
+        limit = int(getattr(provider, "context_tokens", 0) or 0)
+        if limit <= 0:
+            return False
+        estimated = estimate_prompt_tokens(messages)
+        if estimated <= limit * self.CONTEXT_SKIP_MARGIN:
+            return False
+        self._bump("llm_context_skips")
+        log_event(logger, "llm.skipped_for_context", level=logging.WARNING,
+                  provider=provider.name, estimated_prompt_tokens=estimated,
+                  context_tokens=limit, margin=self.CONTEXT_SKIP_MARGIN)
+        return True
 
     def _bump_usage(self, provider: ChatClient) -> None:
         """Fold one provider call's token usage into this thread's counters.
@@ -197,7 +304,15 @@ class FallbackRouter:
                     call, right before calling router.complete_json(...) or
                     router.complete(...) — e.g. agents/planning.py's
                     classify_node does `router.set_node("classify")` first.
+
+        D-101 also records the name on THIS object, not only on each
+        provider, so ProviderChainExhausted can say which node was being
+        served when the whole chain died. Stored on the same
+        threading.local() the counters use, for the same reason given
+        there: one router instance is shared process-wide, and the
+        search_worker fan-out runs nodes on several threads at once.
         """
+        self._local.node = node
         for p in self.providers:
             # getattr(p, "set_trace_node", None) looks up an ATTRIBUTE (here,
             # a method) on object p BY NAME, returning None instead of
@@ -264,7 +379,10 @@ class FallbackRouter:
             "primary", s.llm_primary_base_url, s.llm_primary_api_key,
             s.llm_primary_model, s.llm_primary_timeout_seconds, tracer,
             display_label=f"LOCAL PRIMARY ({s.llm_primary_model})",
-            max_tokens=s.llm_max_tokens)]
+            max_tokens=s.llm_max_tokens,
+            # D-93: primary only -- see the setting's own comment in
+            # config.py for why the cloud hops get no equivalent knob.
+            context_tokens=s.llm_primary_context_tokens)]
 
         # See the module docstring for exactly what this tuple-of-tuples
         # loop with unpacking is doing. Each row here is one OPTIONAL
@@ -356,10 +474,22 @@ class FallbackRouter:
         LAST provider's error only if every provider in the chain fails.
         """
         last_exc: Optional[Exception] = None
+        # D-101: (provider_name, outcome) for every hop, in chain order.
+        # Built alongside last_exc rather than reconstructed afterwards --
+        # by the time the loop ends, only last_exc survives and it cannot
+        # say what the earlier providers did.
+        outcomes: List[Tuple[str, str]] = []
         # enumerate(self.providers) — see the module docstring — gives us
         # both the position `i` (0, 1, 2...) and the `provider` object on
         # each pass, in the fixed order the chain was built in.
         for i, provider in enumerate(self.providers):
+            # D-93: checked BEFORE llm_provider_calls is bumped -- a hop
+            # never attempted must not be counted as an attempt. Its own
+            # llm_context_skips counter records it instead.
+            if (i + 1 < len(self.providers)
+                    and self._skips_for_context(provider, messages)):
+                outcomes.append((provider.name, "skipped_for_context"))
+                continue
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 result = provider.complete_json(messages)
@@ -375,6 +505,7 @@ class FallbackRouter:
                 # provider, whatever its exact type, should trigger the same
                 # fallback behaviour: try the next one.
                 last_exc = exc
+                outcomes.append((provider.name, type(exc).__name__))  # D-101
                 nxt = (self.providers[i + 1].name
                        if i + 1 < len(self.providers) else None)
                 if nxt is not None:
@@ -390,7 +521,11 @@ class FallbackRouter:
         # last_exc has actually been set — it would only fail if
         # self.providers were somehow empty, which __init__ already forbids.
         assert last_exc is not None
-        raise last_exc
+        # D-101: wrapped, not re-raised bare -- see ProviderChainExhausted
+        # above for why the last provider's own exception cannot carry
+        # this. `from last_exc` keeps it as __cause__, so the traceback
+        # still shows the real failure underneath.
+        raise ProviderChainExhausted(self._node, outcomes, "json") from last_exc
 
     def complete(self, messages: List[Message]) -> str:
         """Free-text call. Step down the chain on error OR low quality.
@@ -430,11 +565,16 @@ class FallbackRouter:
         costs no extra scoring call.
         """
         last_exc: Optional[Exception] = None
+        outcomes: List[Tuple[str, str]] = []                     # D-101
         # (name, answer, score) for every candidate that did not win an
         # immediate return. Fed to _best() once the chain is exhausted.
         candidates: List[Tuple[str, str, Optional[float]]] = []
 
         for i, provider in enumerate(self.providers):
+            if (i + 1 < len(self.providers)                      # D-93
+                    and self._skips_for_context(provider, messages)):
+                outcomes.append((provider.name, "skipped_for_context"))
+                continue
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
                 answer = provider.complete(messages)
@@ -445,6 +585,7 @@ class FallbackRouter:
                 self._bump_usage(provider)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                outcomes.append((provider.name, type(exc).__name__))  # D-101
                 nxt = (self.providers[i + 1].name
                        if i + 1 < len(self.providers) else None)
                 if nxt is not None:
@@ -515,7 +656,13 @@ class FallbackRouter:
                           mode="text")
             return best_answer
         assert last_exc is not None
-        raise last_exc
+        # D-101. Reached ONLY when no provider returned anything at all --
+        # a chain where one provider answered, however badly, returns that
+        # answer above (run p205.254-check's fourth compile did exactly
+        # that with a 0.1-scored report). This line is the fifth compile:
+        # primary HTTPStatusError, mistral ReadTimeout, gemini
+        # TruncatedGenerationError, nothing to ship.
+        raise ProviderChainExhausted(self._node, outcomes, "text") from last_exc
 
     @staticmethod
     def _best(candidates: List[Tuple[str, str, Optional[float]]]

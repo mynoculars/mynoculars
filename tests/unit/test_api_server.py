@@ -545,3 +545,99 @@ def test_a_successful_build_still_reports_ok(monkeypatch):
     with TestClient(server.app) as client:
         resp = client.get("/health")
     assert resp.json() == {"status": "ok", "llm_mode": "stub", "durable": True}
+
+
+# ---------------------------------------------------------------------------
+# D-94: GET /state/{thread_id}
+# ---------------------------------------------------------------------------
+
+
+class _StateGraph:
+    """A graph whose get_state returns a canned snapshot."""
+
+    def __init__(self, values, nxt=()):
+        self._values, self._next = values, nxt
+
+    def get_state(self, config):
+        class _Snap:
+            values = self._values
+            next = self._next
+        return _Snap()
+
+
+def _state_client(monkeypatch, values, nxt=()):
+    import research_agent.api.server as srv
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(srv, "_graph", _StateGraph(values, nxt))
+    monkeypatch.setattr(srv, "_settings", _FakeSettings())
+    monkeypatch.setattr(srv, "_build_error", None)
+    return TestClient(srv.app)
+
+
+def test_state_returns_progress_for_a_live_thread(monkeypatch):
+    from research_agent.state import Evidence, Goal
+
+    client = _state_client(monkeypatch, {
+        "raw_query": "Compare Armies of China and India",
+        "goals": [Goal(goal_id="g1", description="PLA size", covered=True)],
+        "evidence": [Evidence(task_key="t", goal_id="g1", source="web",
+                              content="x", score=0.7)],
+        "iteration_depth": 2, "recall_score": 1.0, "grounded_score": 0.0,
+        "final_report": "# R\n",
+    })
+
+    body = client.get("/state/demo").json()
+
+    assert body["thread_id"] == "demo"
+    assert body["status"] == "idle"
+    assert body["iteration_depth"] == 2
+    assert body["goals"][0]["goal_id"] == "g1"
+    assert body["evidence_items"] == 1
+    assert body["evidence_by_source"] == {"web": 1}
+
+
+def test_state_never_returns_evidence_content(monkeypatch):
+    """Load-bearing, not tidiness. Evidence is unbounded verbatim corpus
+    and third-party web text, and this interface has no auth -- returning
+    it would make the endpoint a full-text export of the operator's
+    ingested corpus. Counts answer the question; content would be an
+    exfiltration route."""
+    from research_agent.state import Evidence
+
+    secret = "PROPRIETARY-CORPUS-SENTENCE"
+    client = _state_client(monkeypatch, {
+        "raw_query": "q",
+        "evidence": [Evidence(task_key="t", goal_id="g1", source="corpus",
+                              content=secret, score=0.9)],
+    })
+
+    assert secret not in client.get("/state/demo").text
+
+
+def test_state_reports_a_paused_run_as_interrupted(monkeypatch):
+    client = _state_client(monkeypatch, {"raw_query": "q"},
+                           nxt=("human_escalation",))
+
+    body = client.get("/state/demo").json()
+
+    assert body["status"] == "interrupted"
+    assert body["next"] == ["human_escalation"]
+
+
+def test_state_404s_for_a_thread_that_holds_no_run(monkeypatch):
+    client = _state_client(monkeypatch, {})
+
+    resp = client.get("/state/never-used")
+
+    assert resp.status_code == 404
+    assert "holds no run" in resp.json()["detail"]
+
+
+def test_state_503s_when_the_bundle_failed_to_build(monkeypatch):
+    """D-78 parity with /research and /resume."""
+    import research_agent.api.server as srv
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(srv, "_build_error", "ValueError: bad config")
+    assert TestClient(srv.app).get("/state/demo").status_code == 503

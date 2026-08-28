@@ -198,6 +198,75 @@ def test_length_truncated_generation_raises_instead_of_returning_a_fragment():
         client.complete([{"role": "user", "content": "compile"}])
 
 
+# ---------------------------------------------------------------------------
+# D-102 -- WHOSE ceiling truncated the generation
+#
+# Diagnosed from run p205.254-check: gemini-3.5-flash reported
+# finish_reason=length at completion_tokens 616 and 2150 against
+# max_tokens 8192, and the log line reported "max_tokens: 8192" both
+# times -- reading as "we hit our own limit" and sending the operator to
+# the wrong config file.
+# ---------------------------------------------------------------------------
+
+
+def _truncating_handler(completion_tokens, reasoning_tokens=None):
+    def handler(request):
+        usage = {"prompt_tokens": 100, "completion_tokens": completion_tokens}
+        if reasoning_tokens is not None:
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": reasoning_tokens}
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "cut off mid-"},
+                         "finish_reason": "length"}],
+            "usage": usage})
+    return handler
+
+
+def test_cap_is_attributed_to_the_provider_when_our_budget_was_not_reached():
+    """The p205.254-check shape: we asked for 8192, the provider stopped
+    at 616. Our budget was demonstrably not the binding constraint, and
+    the message must not send anyone to LLM_MAX_TOKENS."""
+    client = _client_with_mock_transport(_truncating_handler(616),
+                                         max_tokens=8192)
+    with pytest.raises(TruncatedGenerationError) as exc:
+        client.complete([{"role": "user", "content": "compile"}])
+    assert "PROVIDER's own ceiling" in str(exc.value)
+    assert "completion_tokens=616" in str(exc.value)
+
+
+def test_cap_is_attributed_to_us_when_the_provider_reached_our_number():
+    """The other half: when the provider really did stop at the number we
+    sent, raising LLM_MAX_TOKENS IS the right advice and the message must
+    say so."""
+    client = _client_with_mock_transport(_truncating_handler(4096),
+                                         max_tokens=4096)
+    with pytest.raises(TruncatedGenerationError) as exc:
+        client.complete([{"role": "user", "content": "compile"}])
+    assert "OUR max_tokens=4096" in str(exc.value)
+
+
+def test_reasoning_tokens_count_toward_our_budget_when_reported():
+    """A reasoning model spends the output budget on tokens
+    completion_tokens does not report. 600 completion + 3496 reasoning
+    IS our 4096 -- attributing that to the provider would be wrong."""
+    client = _client_with_mock_transport(
+        _truncating_handler(600, reasoning_tokens=3496), max_tokens=4096)
+    with pytest.raises(TruncatedGenerationError) as exc:
+        client.complete([{"role": "user", "content": "compile"}])
+    assert "OUR max_tokens=4096" in str(exc.value)
+    assert "reasoning_tokens=3496" in str(exc.value)
+
+
+def test_reasoning_tokens_are_absent_from_the_message_when_unreported():
+    """Providers with no reasoning concept omit the field entirely. The
+    message must not invent a zero for them."""
+    client = _client_with_mock_transport(_truncating_handler(616),
+                                         max_tokens=8192)
+    with pytest.raises(TruncatedGenerationError) as exc:
+        client.complete([{"role": "user", "content": "compile"}])
+    assert "reasoning_tokens" not in str(exc.value)
+
+
 def test_stop_finish_reason_is_returned_normally():
     def handler(request):
         return httpx.Response(200, json={
@@ -253,3 +322,38 @@ def test_truncated_generation_error_makes_the_router_fall_back():
     chain = FallbackRouter([_client_with_mock_transport(truncating), _Good()],
                            quality_threshold=0.6)
     assert chain.complete([{"role": "user", "content": "x"}]) == "complete answer"
+
+
+# ---------------------------------------------------------------------------
+# D-93: recognising a context-overflow rejection
+# ---------------------------------------------------------------------------
+
+from research_agent.llm.client import (estimate_prompt_tokens,  # noqa: E402
+                                       looks_like_context_overflow)
+
+
+def test_context_overflow_bodies_are_recognised():
+    """Without this every one of these arrives as
+    `llm.fallback reason=HTTPStatusError`, indistinguishable from a 429 or
+    a dead port -- and reads as flakiness when it is deterministic."""
+    for body in ("the request exceeds context length of 1536",
+                 "This model's maximum context length is 1536 tokens",
+                 "prompt is too long",
+                 "ERROR: too many tokens in prompt"):
+        assert looks_like_context_overflow(body), body
+
+
+def test_unrelated_errors_are_not_mistaken_for_overflow():
+    """A false positive here would mislabel a transient failure as a
+    permanent one and send someone to change `-c` for nothing."""
+    for body in ("rate limit exceeded", "internal server error",
+                 "invalid api key", "", None):
+        assert not looks_like_context_overflow(body)
+
+
+def test_token_estimation_is_roughly_four_characters_per_token():
+    """Approximate on purpose -- the alternative is a tokenizer dependency
+    to answer "is this obviously too big for a 1536-token window"."""
+    assert 900 <= estimate_prompt_tokens(
+        [{"role": "user", "content": "x" * 4000}]) <= 1100
+    assert estimate_prompt_tokens([]) == 0

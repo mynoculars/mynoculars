@@ -27,7 +27,9 @@ from typing import Any, Dict
 from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
 from research_agent.config import Settings
-from research_agent.guardrails.citations import clean_citations
+from research_agent.guardrails.citations import (clean_citations,
+                                                 normalise_citation_form,
+                                                 residual_paste_sites)
 from research_agent.guardrails.claims import audit_cited_figures
 from research_agent.guardrails.dedup import dedupe_evidence
 from research_agent.guardrails.grounding import (annotate_ungrounded_report,
@@ -140,12 +142,23 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # llm/client.py::strip_code_fence for why this exists and what it
         # deliberately does NOT attempt to fix.
         report = strip_code_fence(report)
+        # D-99: normalise the citation FORM before anything reads
+        # citations. This has to come first: clean_citations below, the
+        # Sources block, the D-66 gate and the D-91 audit all read
+        # citations through sources.py::cited_goal_ids, which matches
+        # `[gN]` and nothing else -- so a report written with `(gN)` is
+        # not a report with malformed citations to them, it is a report
+        # with NO citations, and they all fail silently together. See
+        # guardrails/citations.py::normalise_citation_form for the live
+        # run that made this necessary.
+        report, form_counters = normalise_citation_form(report, state.goals)
         # D-43: deterministic citation repair. The ATTRIBUTION RULE (D-40)
         # asks the model for correct citations; compliance across live runs
         # was roughly two in three. This enforces the half that can be
         # enforced without reading meaning.
         report, citation_counters = clean_citations(
             report, state.goals, state.evidence)
+        citation_counters = {**form_counters, **citation_counters}
         # Guardrail G3 enforcement half (P205.135 follow-up): same call
         # site, same shape of check as clean_citations above -- see
         # guardrails/hedging.py for why this exists (the compiler
@@ -232,7 +245,51 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
     return compiler_node
 
 
+def _confirm_unsupported_figures(router: FallbackRouter, flagged: list,
+                                 evidence: list) -> list:
+    """Ask one judge which flagged figures are GENUINELY unsupported (D-95).
+
+    CALLED BY   critic_node, only when the gate is enabled and
+                audit_cited_figures already flagged something.
+    RETURNS     the subset of flagged figures the judge confirms, in the
+                order they were flagged. Empty list means "nothing
+                confirmed" -- including every failure path.
+
+    FAILS OPEN, in three separate ways, all deliberate:
+      - nothing flagged        -> no call, empty result
+      - the judge raises       -> empty result, counted, run continues
+      - the judge names a
+        figure that was never
+        flagged                -> ignored
+
+    The third matters as much as the second. The deterministic pass owns
+    WHAT MAY BE ACCUSED; the judge may only confirm or clear. Letting it
+    add findings would hand an LLM the power to fail a report over
+    something no mechanical check ever saw -- the exact inversion of this
+    codebase's "deterministic where possible, model only where it cannot"
+    rule (guardrails/__init__.py).
+
+    A fail-open judge means the gate can only ever be MORE lenient than
+    D-91's raw count, never harsher -- so turning it on cannot make a
+    previously-passing report fail for a reason nobody can inspect.
+    """
+    if not flagged:
+        return []
+    router.set_node("claim_verifier")
+    try:
+        result = router.complete_json(
+            templates.verify_figures(flagged, evidence))
+        named = {str(f) for f in (result.get("unsupported") or [])}
+    except Exception as exc:  # noqa: BLE001 -- fail open, never crash a run
+        log_event(logger, "critic.claim_verification_failed",
+                  level=logging.WARNING, reason=type(exc).__name__,
+                  error=str(exc)[:300], flagged=len(flagged))
+        return []
+    return [f["figure"] for f in flagged if str(f["figure"]) in named]
+
+
 def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = False):
+
     """Build the report critic (bounded self-critique loop, D-22)."""
 
     def critic_node(state: ResearchState) -> Dict[str, Any]:
@@ -325,7 +382,49 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             lf.score(run_id_var.get(), "critique_passed", passed,
                     comment=f"revision={revision}")
             return update
+        # D-95: the claim-verification gate. Deterministic pass first --
+        # cheap, whole-report, no call -- and the model is asked only
+        # about what it flagged. Shaped after D-66's zero-citation gate
+        # directly above: when the answer is already known to fail, fail
+        # here rather than spending the large critique call to rediscover
+        # it.
+        #
+        # Ordered AFTER D-66 deliberately: a report citing nothing has no
+        # cited figures to audit, so that gate must get first refusal.
+        if settings.claim_verification_enabled and state.evidence:
+            flagged, _ = audit_cited_figures(
+                state.final_report, state.goals, state.evidence)
+            confirmed = _confirm_unsupported_figures(router, flagged,
+                                                     state.evidence)
+            if confirmed:
+                revision = state.revision_count + 1
+                notes = [
+                    f"Figure {f} appears in no evidence cited by its own "
+                    f"sentence, and a verification pass confirmed the "
+                    f"evidence does not support it in any form. Remove it, "
+                    f"or attribute it to evidence that does."
+                    for f in confirmed]
+                update = {
+                    "critique_passed": False,
+                    "revision_count": revision,
+                    "critique_notes": notes,
+                    "counters": {"revision_cycles": 1,
+                                 "claim_figures_confirmed": float(len(confirmed)),
+                                 **router.drain_counters()},
+                }
+                if revision >= settings.max_revisions:
+                    update.update(raise_or_log(
+                        state, settings, "E4",
+                        reason="unsupported_figures_confirmed",
+                        revisions=revision, figures=confirmed))
+                log_event(logger, "critic.unsupported_figures_gate",
+                          level=logging.WARNING, revision=revision,
+                          figures=confirmed, flagged=len(flagged))
+                lf.score(run_id_var.get(), "critique_passed", False,
+                        comment=f"revision={revision}")
+                return update
         router.set_node("critic")
+
         # FIX-5, same pass as compiler_node. D-46 exists because the critic
         # was being asked to verify claims against evidence it could not
         # see; templates.critique caps its evidence block at the last 60
@@ -639,6 +738,20 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                       # the field above; telemetry carries the same
                       # capped sample for the run record.
                       examples=figure_findings[:5])
+        # D-99: what the paste guard LEFT, not what it removed. A run
+        # reporting 21 removals and a run reporting 21 removals with four
+        # pastes still standing are indistinguishable in telemetry
+        # otherwise -- and live (run p205.253-check) the second one is
+        # what shipped.
+        residual_pastes = 0
+        if settings.llm_mode != "stub":
+            residual_pastes = residual_paste_sites(state.final_report,
+                                                   state.evidence)
+        if residual_pastes:
+            log_event(logger, "report.residual_pasted_evidence",
+                      level=logging.WARNING, sites=residual_pastes,
+                      removed=int(state.last_compile_guardrails.get(
+                          "citations_pasted_evidence_removed", 0)))
         if (settings.llm_mode != "stub" and state.evidence and state.goals
                 and corpus_recall < settings.grounded_recall_target):
             log_event(logger, "report.shipped_ungrounded",
@@ -776,6 +889,7 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # not that it passed. A nonzero `unsupported` is the first
             # claim-level (rather than report-level or evidence-set-level)
             # honesty signal this harness has had.
+            "citations_residual_paste_sites": residual_pastes,
             "cited_figures_checked": int(
                 figure_counters.get("cited_figures_checked", 0)),
             "cited_figures_unsupported": int(
@@ -817,6 +931,13 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             "llm_completion_tokens": int(c.get("llm_completion_tokens", 0)),
             "llm_total_tokens": int(c.get("llm_prompt_tokens", 0)
                                     + c.get("llm_completion_tokens", 0)),
+            # D-93: hops skipped because the prompt could not fit the
+            # provider's configured context window. 0 unless
+            # LLM_PRIMARY_CONTEXT_TOKENS is set. A nonzero value is the
+            # count of guaranteed-failed provider calls this run did NOT
+            # make -- read against llm_provider_calls, which no longer
+            # includes them.
+            "llm_context_skips": int(c.get("llm_context_skips", 0)),
             # D-87: which tier of the D-38 ladder actually answered, and
             # how often a tier failed outright. Previously readable only
             # by grepping `chain.answered` out of a debug trace. Read

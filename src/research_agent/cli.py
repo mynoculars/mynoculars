@@ -58,6 +58,7 @@ from research_agent import langfuse as lf
 from research_agent.assembly import (AppBundle, build_app_and_settings,
                                      reject_if_thread_in_use)
 from research_agent.config import get_settings
+from research_agent.llm.router import ProviderChainExhausted
 from research_agent.logging_setup import run_id_var
 from research_agent.reporting.metrics import count_sections
 from research_agent.state import ResearchState
@@ -245,6 +246,33 @@ def main(argv=None) -> int:
               f"the graph did not terminate within budget: {exc}]",
               file=sys.stderr)
         return 2
+    except ProviderChainExhausted as exc:
+        # D-101: the SAME class of event as GraphRecursionError above, and
+        # this file already states the policy in that handler's comment --
+        # an operational event gets a diagnosable message and a non-zero
+        # exit code, never a raw traceback. D-78 made the identical
+        # argument for the API. Provider-chain exhaustion had no such
+        # handler, so run p205.254-check ended in 40 lines of LangGraph
+        # internals whose only real content was the last provider's
+        # exception -- which by itself does not say the other two failed,
+        # or how they failed.
+        #
+        # Exit codes in this file: 0 success, 1 ran but produced no
+        # telemetry, 2 recursion limit, 3 thread-id already in use,
+        # 4 provider chain exhausted. Distinct from 2 because the
+        # operator action differs: 2 means look at the graph's budgets,
+        # 4 means look at the providers.
+        chain = " → ".join(f"{name} {how}" for name, how in exc.attempts)
+        where = f" at the {exc.node} node" if exc.node else ""
+        print(f"[all {len(exc.attempts)} providers in the chain failed"
+              f"{where} ({exc.mode} call):\n  {chain}]", file=sys.stderr)
+        # The last provider's own message carries the detail the chain
+        # summary cannot (which ceiling truncated it, D-102; what the HTTP
+        # status was), and __cause__ is where `raise ... from` put it.
+        if exc.__cause__ is not None:
+            print(f"[last failure: {type(exc.__cause__).__name__}: "
+                  f"{exc.__cause__}]", file=sys.stderr)
+        return 4
     finally:
         # P2-08: close whatever connection get_checkpointer opened, even if
         # _run raised — a CLI process is short-lived, but leaving this to
@@ -271,6 +299,31 @@ def main(argv=None) -> int:
         # pattern as every other closeable resource above -- a no-op
         # when observability is disabled or was never reachable.
         lf.shutdown()
+        # D-100: the tracer was the ONE resource this block did not
+        # release. tracer.flush() sits at the end of _run's HAPPY path
+        # (below), so the run that most needs a debug trace -- one that
+        # raised -- was precisely the one that never wrote one. Live
+        # (p205.254-check): a provider-chain exhaustion at the compiler
+        # produced a 40-line traceback and no logs/run-*.txt at all.
+        # Same oversight and same shape as close_checkpointer's own
+        # comment above describes for itself: leaving this to the process
+        # exiting was never a design decision.
+        #
+        # LAST in this block, after every close above, because those
+        # closes emit real events (checkpointer.closed, llm.close_failed,
+        # mcp.bridge_closed) that belong in the narrative this writes.
+        #
+        # Safe on the happy path too, where _run already flushed:
+        # flush_narrative POPS the run's buffered events
+        # (reporting/narrative.py::flush_narrative), so a second call
+        # finds nothing and returns None. NullTracer.flush() returns None
+        # unconditionally, so a non-debug run pays nothing here.
+        #
+        # stderr, not stdout: on the crash path stdout may hold a
+        # half-written report, and this is diagnostic output.
+        crash_trace_path = tracer.flush()
+        if crash_trace_path:
+            print(f"[debug trace written to {crash_trace_path}]", file=sys.stderr)
 
 
 def _run(app, settings, args, thread_id, tracer) -> int:
