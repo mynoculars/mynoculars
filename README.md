@@ -1671,7 +1671,18 @@ research-agent-dmp/
 │                                 MCP/web-search/API (D-33). The web-search row is
 │                                 the ONLY live verification of that path — the
 │                                 test suite is entirely offline by design
+├── scripts/eval_suite.py       # golden-set regression harness (D-136):
+│                                 runs sample_data/golden_queries.jsonl against
+│                                 THIS deployment and checks each run's telemetry
+│                                 against bands written down in advance. NOT a
+│                                 pytest test and never becomes one — D-33 keeps
+│                                 the suite offline; this needs every service up
 ├── sample_data/corpus.jsonl # 10 docs, Redis-vs-Memcached theme
+├── sample_data/golden_queries.jsonl  # 8 eval cases: in-corpus, off-corpus,
+│                                 partial, nonsense, cost canary. Each states WHY
+│                                 it is in the set; expectations are bands over
+│                                 telemetry the graph already records, never a
+│                                 judged score (D-136)
 ├── design/Research_Agent_Design.md
 ├── OPERATIONS.md   internal/LEARNING_GUIDE.md   internal/PHASE-2_PLAN.md
 ├── docker-compose.yml       # optional: Postgres + Qdrant + OpenSearch
@@ -1788,7 +1799,8 @@ depends on you:
 
 ```text
   research_agent.assembly     build_app_and_settings(), AppBundle
-  research_agent.api.server   /research, /resume, /health request+response shapes
+  research_agent.api.server   /research, /resume, /health, /state/{thread_id},
+                              /result/{thread_id} request+response shapes
   the `research-agent` console script's arguments
   the .env setting NAMES in config.py
 ```
@@ -2166,12 +2178,19 @@ visible rather than deleted, so the history stays auditable.
    for not building against an unobserved failure mode applies directly.
    Revisit if provider errors ever become a *majority* of
    `llm_fallback_hops` rather than the occasional one.
-7. **The HTTP API is unauthenticated by design.** `api/server.py` exposes
-   `POST /research`, `POST /resume` and `GET /health` with no auth, no CORS
-   policy and no rate limiting. Resolved deliberately in
-   `internal/PHASE-2_PLAN.md`: *"Production concerns — auth, multi-tenancy,
-   scaling | Out of scope for a reference implementation."* That remains the
-   right call and this entry does not reopen it.
+7. **The HTTP API is unauthenticated BY DEFAULT — and now optionally is not
+   (D-133).** `api/server.py` exposes `POST /research`, `POST /resume`,
+   `GET /state/{thread_id}`, `GET /result/{thread_id}` (D-134) and
+   `GET /health`. Setting `API_KEY` guards everything except `/health`
+   (`X-API-Key` or `Authorization: Bearer`, compared in constant time); leaving it unset keeps the original open posture and logs
+   `api.unauthenticated` at WARNING on startup so the choice is visible.
+   There is still no CORS policy (FastAPI sends no CORS headers by default,
+   which is the restrictive state) and no rate limiting. `internal/PHASE-2_PLAN.md`
+   scoped this out: *"Production concerns — auth, multi-tenancy, scaling | Out
+   of scope for a reference implementation."* D-133 narrows that rather than
+   reopening it — one shared key is deployment hygiene, not multi-tenancy: there
+   is still no per-caller identity, no scopes and no rotation, and the graph
+   itself remains unaware of who is asking.
    It is recorded here only because of a tension worth naming: the module
    docstring calls the endpoint a demonstration, but D-37 packages this repo
    as an installable artifact whose declared public surface includes those
@@ -2179,6 +2198,33 @@ visible rather than deleted, so the history stays auditable.
    this anywhere reachable, put it behind a gateway that terminates auth and
    rate-limits.** The graph has no notion of a caller identity, so there is
    nothing inside the application to fall back on.
+8. **Async mode's job state is in-process (D-134).** `POST /research` with
+   `{"wait": false}` returns `202` and runs on a bounded background pool
+   (`API_ASYNC_WORKERS`, `0` = off and the feature is refused with a `501`);
+   `GET /result/{thread_id}` polls it. There is deliberately **no job
+   table** — the checkpointer is the authoritative record, so a finished
+   run is readable after a restart and from any worker. What is NOT durable
+   is the in-memory overlay: `running`, `failed`, and an interrupted run's
+   review payload live in the accepting process only. With
+   `uvicorn --workers N` a poll can land elsewhere and see `running` with no
+   payload; with a degraded `MemorySaver` checkpointer nothing survives a
+   restart. **A single worker plus durable Postgres is the configuration
+   this is built for** — the same constraint `/resume` has carried since
+   P2-08. Shutdown waits for in-flight runs, so pair it with
+   `RUN_DEADLINE_SECONDS` (D-132), which is what bounds that wait.
+9. **The test suite proves mechanics, never answer quality — and the golden
+   set only narrows that gap (D-136).** `python -m pytest -q` is entirely
+   offline (D-33) and can say nothing about whether a report is any good;
+   `scripts/analyze_runs.py` (D-92) counts real runs but has no notion of what
+   one SHOULD have produced. `scripts/eval_suite.py --run` sits between them:
+   fixed queries, run against a live deployment, checked against bands over
+   telemetry the graph already records. **It is not a quality measure and does
+   not pretend to be one** — there is deliberately no LLM judge and no
+   similarity-to-a-reference-answer here, because a harness whose own verdict
+   is as arguable as the thing it measures settles nothing. A case can assert
+   "the corpus answered this", "the provenance notice shipped", "no cited
+   figure was unsupported", "this did not cost more than N tokens". It cannot
+   assert that the prose is correct, and nothing in this repo can.
 
 ## Documentation Corrections and Roadmap History
 

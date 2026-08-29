@@ -33,6 +33,17 @@ the alternative is a measurement that does not survive the resume this
 project's whole HITL story depends on. cli.py keeps using monotonic for
 the wall-time line it prints, where nothing is checkpointed.
 
+That epoch's RESOLUTION is platform-dependent, which is worth knowing
+before reading a small number here: time.time() is
+GetSystemTimeAsFileTime on Windows, resolution 15.625 ms, against 1 ns
+on Linux (`time.get_clock_info("time").resolution` reports both). A
+pause or an elapsed span shorter than one tick therefore reads as
+exactly 0.0 on Windows. Immaterial to a budget denominated in seconds --
+and the reason a `paused_seconds > 0` assertion that passed on Linux
+failed on Windows against an instantaneous test pause. That was a
+property of the clock, not of the credit; the test now pauses long
+enough to clear a tick (D-135).
+
 HUMAN REVIEW TIME IS NOT RESEARCH TIME. `paused_seconds` accumulates
 every interrupt() pause (agents/escalation.py) and is subtracted here.
 Without it, a reviewer who takes four minutes to type "approve" spends

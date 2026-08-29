@@ -344,6 +344,28 @@ class Settings(BaseSettings):
     # cited_figures_unsupported has a track record you trust.
     claim_verification_enabled: bool = False
 
+    # --- HTTP API (api/server.py) -----------------------------------------
+    # D-133 (P6-5): the shared secret /research, /resume and
+    # /state/{thread_id} require. EMPTY (the default) means NO
+    # AUTHENTICATION, exactly as this project has always shipped -- the
+    # README has said "put it behind a gateway that terminates auth"
+    # since the API existed, and that stays the right answer for a
+    # reference implementation. What changes is that the repo now offers
+    # a lock for the person who clones it and skips that step.
+    #
+    # Empty is not silent: api/server.py logs `api.unauthenticated` at
+    # WARNING on startup. Deliberately logged THERE and not in
+    # get_settings(), because a CLI run has no HTTP surface to protect
+    # and a warning it can do nothing about is how real ones get
+    # scrolled past (D-107).
+    #
+    # ONE key, no rotation, no per-caller identity, no scopes. That is
+    # honest about what this is: a deployment-hygiene lock, not an
+    # authorization model. The graph still has no notion of a caller, so
+    # anything needing per-tenant isolation needs a gateway in front,
+    # unchanged.
+    api_key: str = ""
+
     # --- Memory decay (D-24/D-27) -------------------------------------------
     memory_top_k: int = Field(5, ge=1)
     decay_half_life_days_semi_stable: float = 90.0
@@ -576,6 +598,8 @@ _KNOWN_ENV_TYPOS = {
     "RUN_DEADLINE": "RUN_DEADLINE_SECONDS",
     "RUN_TIMEOUT": "RUN_DEADLINE_SECONDS",
     "TOKEN_BUDGET": "RUN_TOKEN_BUDGET",
+    "API_TOKEN": "API_KEY",
+    "RESEARCH_API_KEY": "API_KEY",
     "DEBUG": "DEBUG_TRACE",
     "MEMORY_TOPK": "MEMORY_TOP_K",
     "PROMPT_EVIDENCE_MAX": "PROMPT_EVIDENCE_MAX_CHARS",

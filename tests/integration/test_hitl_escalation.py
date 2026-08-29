@@ -322,11 +322,23 @@ def test_a_pause_is_stamped_while_paused_and_credited_back_on_resume(
     assert paused_state["paused_seconds"] == 0.0, (
         "nothing is credited until the human actually answers")
 
+    # A REAL pause, not an instantaneous one -- and the sleep is load-
+    # bearing rather than lazy. time.time() is GetSystemTimeAsFileTime on
+    # Windows, whose resolution is 15.625 ms
+    # (`time.get_clock_info("time").resolution`, 1 ns on Linux); two
+    # reads inside one tick return the IDENTICAL float, so an
+    # instantaneous pause credits exactly 0.0 there and 30 microseconds
+    # on Linux. The first version of this test asserted `> 0` and passed
+    # on Linux for that reason alone. 50 ms clears three Windows ticks,
+    # which makes a nonzero credit true on every platform rather than on
+    # the one it was written on.
     before_resume = time.time()
+    time.sleep(0.05)
     result = graph.invoke(_resume("approve"), config=cfg)
     wall_clock_gap = time.time() - before_resume
 
-    assert result["paused_seconds"] > 0
+    assert result["paused_seconds"] > 0, (
+        "a measurable pause must be credited back to the run budget")
     assert result["paused_seconds"] <= wall_clock_gap + 1.0, (
         "the credited pause can never exceed the time actually spent "
         "between the two invokes")

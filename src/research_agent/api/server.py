@@ -7,6 +7,23 @@ Purpose:
     this file adds zero new wiring, it only adds HTTP verbs on top of the
     exact same _graph.invoke() calls cli.py makes.
 
+Authentication (D-133):
+    POST /research, POST /resume and GET /state/{thread_id} require
+    API_KEY when one is configured -- sent as `X-API-Key: <key>` or
+    `Authorization: Bearer <key>`, compared in constant time. With no
+    key configured every endpoint is open, exactly as this project has
+    always shipped, and startup logs `api.unauthenticated` at WARNING so
+    the posture is stated rather than assumed. GET /health stays open
+    either way; it withholds only its build-error detail from an
+    unauthenticated caller, and only when a key is set.
+
+    ONE key, no rotation, no caller identity, no scopes, no rate
+    limiting, and no CORS middleware -- FastAPI sends no CORS headers by
+    default, which is the RESTRICTIVE state; adding a policy here could
+    only loosen it. This is deployment hygiene for a repo that gets
+    cloned and run, not an authorization model. The graph still has no
+    notion of a caller, so per-tenant isolation still needs a gateway.
+
 Responsibilities:
     - POST /research {"query": "..."} -> {"report": ..., "telemetry": ...}
       or, if the graph pauses for a human, {"status": "interrupted", ...}.
@@ -36,12 +53,13 @@ never updated.) Checkpointing itself, the thing that makes /resume work,
 comes from the graph's own checkpointer, not from this app.
 """
 
+import hmac
 import logging
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -106,6 +124,95 @@ def _ensure_built() -> None:
                    f"server. GET /health reports this same detail.")
 
 
+def _configured_key() -> str:
+    """The API key this process was started with, or "" for none (D-133).
+
+    getattr, not attribute access: a FAILED build leaves _settings as
+    None, and this must answer "no key configured" then rather than
+    raising. Nothing is left unprotected by that answer -- every
+    endpoint the key guards returns 503 in that state without touching
+    the graph, the checkpointer or any run (see _ensure_built).
+    """
+    return getattr(_settings, "api_key", "") or ""
+
+
+def _presented_key(x_api_key: Optional[str], authorization: Optional[str]) -> str:
+    """The key the caller sent, from either accepted header.
+
+    TWO HEADERS, ONE SECRET. `X-API-Key` is the conventional shape for a
+    shared key; `Authorization: Bearer` is what most HTTP clients reach
+    for by habit, and refusing it would produce a 401 that looks like a
+    wrong key rather than a wrong header. Accepting both costs three
+    lines and removes a whole class of support question.
+
+    Anything else -- a Basic credential, a malformed Authorization
+    value -- yields "" and is rejected by the comparison, never parsed
+    further. This function does not authenticate; it only reads.
+    """
+    if x_api_key:
+        return x_api_key
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _key_is_valid(presented: str) -> bool:
+    """Constant-time comparison against the configured key (D-133).
+
+    hmac.compare_digest, never `==`: a plain string comparison returns
+    as soon as two bytes differ, and that timing difference is
+    measurable across enough requests. This is a shared secret sent on
+    every call -- exactly the shape that comparison mode is for. It is
+    cheap here and the alternative is a real, if slow, oracle.
+
+    A configured key is required for anything to be valid: with none
+    set, callers are not authenticated, they are UNGATED, and the two
+    states must not be confused (see require_api_key).
+    """
+    configured = _configured_key()
+    if not configured or not presented:
+        return False
+    return hmac.compare_digest(presented, configured)
+
+
+def require_api_key(
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+        authorization: Optional[str] = Header(default=None),
+) -> None:
+    """FastAPI dependency guarding /research, /resume and /state (D-133).
+
+    A NO-OP WHEN NO KEY IS CONFIGURED, which is the default and which
+    keeps this repo's documented posture unchanged: the README has
+    always said to put the API behind a gateway that terminates auth,
+    and that is still the right answer. This adds a lock for the person
+    who clones the repo and skips that step -- it does not pretend to be
+    an authorization model. There is one key, no rotation, no caller
+    identity, and no scopes; the graph still has no notion of who is
+    asking.
+
+    Runs BEFORE the handler, and therefore before _ensure_built's 503:
+    an unauthenticated caller should not learn whether this deployment's
+    app bundle built, what its MCP configuration is, or that it exists
+    in a degraded state at all.
+
+    401 rather than 403 -- the caller has not identified itself, which
+    is precisely what 401 means. No WWW-Authenticate challenge is sent:
+    this is not HTTP Basic and there is no interactive flow to invite.
+    """
+    if not _configured_key():
+        return
+    if _key_is_valid(_presented_key(x_api_key, authorization)):
+        return
+    log_event(logger, "api.rejected_unauthenticated", level=logging.WARNING,
+              presented=bool(_presented_key(x_api_key, authorization)),
+              effect="401 returned; the request never reached the graph")
+    raise HTTPException(
+        status_code=401,
+        detail="Missing or invalid API key. Send it as 'X-API-Key: <key>' "
+               "or 'Authorization: Bearer <key>'. This deployment sets "
+               "API_KEY; a deployment that does not is open by design.")
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Build the app bundle at STARTUP (not import time, D-78 — see the
@@ -156,6 +263,17 @@ async def _lifespan(_app: FastAPI):
         _build_error = f"{type(exc).__name__}: {exc}"
         log_event(logger, "api.startup_build_failed", level=logging.ERROR,
                   error=_build_error)
+    # D-133: say plainly which posture this process started in. Logged
+    # HERE, at API startup, and never in get_settings() -- a CLI run has
+    # no HTTP surface to protect, and a warning it can do nothing about
+    # is how the ones that matter get scrolled past (D-107).
+    if _configured_key():
+        log_event(logger, "api.authenticated", key_configured=True)
+    else:
+        log_event(logger, "api.unauthenticated", level=logging.WARNING,
+                  effect="/research, /resume and /state/{thread_id} accept "
+                         "any caller; set API_KEY, or put this behind a "
+                         "gateway that terminates auth")
     yield
     if _checkpointer is not None:
         close_checkpointer(_checkpointer)
@@ -200,7 +318,10 @@ class ResearchRequest(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict:
+def health(
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+        authorization: Optional[str] = Header(default=None),
+) -> dict:
     """Liveness probe — proves the process is up, and reports whether the
     app bundle actually finished building.
 
@@ -216,6 +337,14 @@ def health() -> dict:
             at build_app_and_settings() time, and degrades silently if
             unreachable — see storage/qdrant_store.py and
             storage/opensearch_store.py for that behaviour.
+    ⚠ DELIBERATELY UNAUTHENTICATED, even when API_KEY is set (D-133): a
+            liveness probe that needs credentials is a liveness probe
+            that fails for the wrong reason, and every orchestrator that
+            calls this expects an open endpoint. `llm_mode` and
+            `durable` stay visible for the same reason -- they are what
+            a readiness check reads and they name nothing secret. Only
+            the build-error `detail` is gated, and only when a key is
+            configured; see the branch below.
     RETURNS on a successful build:
                 {"status": "ok", "llm_mode": "stub"|"live", "durable": bool}
             P2-08: `durable` — False means checkpointing degraded to
@@ -229,6 +358,17 @@ def health() -> dict:
             restarted with a corrected config.
     """
     if _build_error is not None:
+        # D-133: the DETAIL is the only part of this response that can
+        # quote a configured value back at a stranger -- it is
+        # f"{type(exc).__name__}: {exc}", and the exceptions that reach
+        # it name MCP URLs, DSN fragments and file paths. Withheld from
+        # an unauthenticated caller when, and only when, this deployment
+        # actually set a key: with none set, D-78's diagnosability is
+        # exactly as it was, because that is the posture that deployment
+        # chose. The full detail is always in the startup log either way.
+        if _configured_key() and not _key_is_valid(
+                _presented_key(x_api_key, authorization)):
+            return {"status": "error"}
         return {"status": "error", "detail": _build_error}
     return {"status": "ok", "llm_mode": _settings.llm_mode, "durable": _durable}
 
@@ -409,7 +549,7 @@ class ResumeRequest(BaseModel):
     guidance: str = ""
 
 
-@app.get("/state/{thread_id}")
+@app.get("/state/{thread_id}", dependencies=[Depends(require_api_key)])
 def read_state(thread_id: str) -> dict:
     """Inspect a thread's current state without running anything (D-94).
 
@@ -493,7 +633,7 @@ def read_state(thread_id: str) -> dict:
     }
 
 
-@app.post("/research")
+@app.post("/research", dependencies=[Depends(require_api_key)])
 
 def research(req: ResearchRequest) -> dict:
     """Start a new run (or restart under a caller-supplied thread_id).
@@ -557,7 +697,7 @@ def research(req: ResearchRequest) -> dict:
         return response
 
 
-@app.post("/resume")
+@app.post("/resume", dependencies=[Depends(require_api_key)])
 def resume(req: ResumeRequest) -> dict:
     """Continue a run that /research (or a prior /resume) reported as
     "interrupted" — the HTTP equivalent of cli.py's input() prompt.

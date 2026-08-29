@@ -68,6 +68,7 @@ shown.
 - **[Part 4 — Reference & debugging](#part-4-reference-debugging)**
   - [Which Software Runs, And Why (the whole inventory)](#which-software-runs-and-why-the-whole-inventory)
   - [Running and Interpreting the Test Suite](#running-and-interpreting-the-test-suite)
+  - [Running the Golden-Set Eval Sweep (D-136)](#running-the-golden-set-eval-sweep-d-136)
   - [Using Debug Mode](#using-debug-mode)
   - [Understanding and Interpreting the Debug Logs — Node by Node](#understanding-and-interpreting-the-debug-logs-node-by-node)
   - [Debugging a Workflow Execution](#debugging-a-workflow-execution)
@@ -1359,6 +1360,14 @@ revision, what was fixed, and one honest caveat about which trigger a real
 escalation has actually been confirmed on, see README.md's
 [The HITL Investigation](../README.md#the-hitl-investigation) section.
 
+**A fourth sense, once you are at L3: the golden-set eval sweep.** The three
+above verify that YOUR setup works. `python scripts/eval_suite.py --run`
+answers a different question -- whether this deployment still behaves the way
+it did before you changed a prompt or moved a threshold -- by running eight
+fixed queries and checking each run's telemetry against bands written down in
+advance. It needs every service up, so come back to it after Step 4: see
+[Running the Golden-Set Eval Sweep](#running-the-golden-set-eval-sweep-d-136).
+
 **Note on which trigger you'll actually see:** in practice, real
 escalations observed so far have been **E3** (cannot-converge) or **E1**
 (zero goals). **E2** (contested goals) is wired correctly end-to-end — the
@@ -1392,7 +1401,7 @@ re-run the example query after each so you can attribute any change.
 
 Everything above uses the CLI (`python -m research_agent.cli`). This
 codebase ALSO ships a FastAPI app (`api/server.py`) with `/health`,
-`/research`, and `/resume` — a genuinely separate, optional way to run
+`/research`, `/resume`, `/state/{thread_id}` and `/result/{thread_id}` — a genuinely separate, optional way to run
 this codebase, not required for L1/L2/L3 or for anything else in this
 manual. Skip this section entirely if you only ever use the CLI.
 
@@ -1457,6 +1466,103 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/research -Method Post -ContentType 
 A run through the API writes an `agent_runs` row exactly like a CLI run
 does (P2-08 — before this, only the CLI did), and closes its checkpointer
 connection on FastAPI shutdown, not per-request.
+
+**Locking it down (D-133, optional).** With `API_KEY` unset — the default,
+and what every command above assumes — `/research`, `/resume` and
+`/state/{thread_id}` accept any caller, and the server says so at startup:
+
+```text
+{"msg": "api.unauthenticated", "level": "WARNING", "effect": "/research, /resume
+ and /state/{thread_id} accept any caller; set API_KEY, or put this behind a
+ gateway that terminates auth"}
+```
+
+Set one in `.env` and restart the server (it is read once, at startup, like
+every other setting):
+
+```powershell
+# .env
+API_KEY=pick-something-long-and-random
+```
+
+Every call then needs it, in either header:
+
+```powershell
+$headers = @{ "X-API-Key" = "pick-something-long-and-random" }
+Invoke-RestMethod -Uri http://127.0.0.1:8000/research -Method Post -Headers $headers `
+  -ContentType "application/json" -Body $body
+
+# or, equivalently
+curl -H "Authorization: Bearer pick-something-long-and-random" `
+  http://127.0.0.1:8000/state/api-test-1
+```
+
+Without it you get a `401` naming both accepted headers, and the request
+never reaches the graph.
+
+`GET /health` stays open either way — a liveness probe that needs
+credentials fails for the wrong reason, and `scripts/check_services.py`
+only ever calls `/health`, so its `FastAPI server` row keeps working
+unchanged with a key set. The one thing that changes there: when a key IS
+configured and startup's build failed, `/health` returns `{"status":
+"error"}` with NO `detail` to an unauthenticated caller, because that
+detail quotes the failing configuration back (an MCP URL, a DSN fragment).
+Authenticate, or read the `api.startup_build_failed` line in the server's
+own log, which always carries it in full.
+
+**What this is not:** one key, no rotation, no per-caller identity, no
+scopes, no rate limiting, and no CORS policy (FastAPI sends no CORS headers
+by default, which is the restrictive state — adding one here could only
+loosen it). It is deployment hygiene for a repo that gets cloned and run.
+Anything needing per-tenant isolation still belongs behind a gateway, which
+is what the README has always said.
+
+**Not waiting for the answer (D-134, optional).** A research run takes
+minutes -- `p205.267-check` took 237 seconds -- and `POST /research` holds
+the HTTP connection open for all of it. Set a pool size to allow the
+non-blocking form:
+
+```powershell
+# .env
+API_ASYNC_WORKERS=2
+RUN_DEADLINE_SECONDS=600   # strongly recommended alongside; see below
+```
+
+```powershell
+# 1. Accept the job -- returns immediately, HTTP 202
+$body = @{ query = "Compare Redis and Memcached"; thread_id = "job-1"; wait = $false } | ConvertTo-Json
+Invoke-RestMethod -Uri http://127.0.0.1:8000/research -Method Post `
+  -ContentType "application/json" -Body $body
+#   thread_id  status    status_url
+#   job-1      accepted  /result/job-1
+
+# 2. Poll until it settles
+Invoke-RestMethod -Uri http://127.0.0.1:8000/result/job-1
+#   status: running -> done         (report + telemetry)
+#                   -> interrupted  (review payload; then POST /resume as usual)
+#                   -> failed       (error names what raised)
+```
+
+`API_ASYNC_WORKERS=0` (the default) refuses `wait: false` with a `501`
+naming the setting, rather than silently running it synchronously and
+returning a shape you did not ask for. Omitting `wait` entirely behaves
+exactly as it always has.
+
+> **⚠ Run this with ONE uvicorn worker and a durable Postgres
+> checkpointer.** There is no job table, deliberately: the checkpointer is
+> the authoritative record, which is why a finished run stays readable
+> after a restart. But `running`, `failed` and an interrupted run's review
+> payload live in the accepting process's memory only. With
+> `uvicorn --workers 4` a poll can land on a worker that never saw the job
+> and will report `running` with no payload; with Postgres unreachable
+> (`durable: false` in `/health`) nothing survives a restart at all. Same
+> constraint `/resume` has always had, for the same reason.
+>
+> **Shutdown waits for in-flight runs.** Ctrl-C drains the pool rather
+> than tearing the checkpointer out from under a running superstep, so a
+> server with a 4-minute run in flight takes up to 4 minutes to stop.
+> `RUN_DEADLINE_SECONDS` (D-132) is what bounds that wait -- which is why
+> the two settings belong together.
 
 ## Enabling Web Search (Phase 4, optional)
 
@@ -2028,6 +2134,154 @@ $env:PYTHONPATH = "src"
 Remove-Item Env:\HITL_ENABLED -ErrorAction SilentlyContinue
 $env:PYTHONPATH = "src"
 ```
+
+## Running the Golden-Set Eval Sweep (D-136)
+
+The test suite proves the graph's **mechanics** and is offline by design
+(D-33). `scripts/analyze_runs.py` (D-92) counts what real runs **did**.
+Neither one knows what a run **should** have produced — so every threshold in
+this project (`MIN_SIMILARITY`, `MIN_EVIDENCE_SCORE`, `GROUNDED_RECALL_TARGET`,
+and now `PROMPT_EVIDENCE_MAX_CHARS`, `RUN_DEADLINE_SECONDS`,
+`RUN_TOKEN_BUDGET`) has been tuned against a handful of remembered runs, with
+nothing re-checking the ones that used to work.
+
+`scripts/eval_suite.py` closes that. Fixed queries, run against **this**
+deployment, each checked against a band written down in advance.
+
+> **This needs a full L3 setup** — Qdrant, OpenSearch, Postgres and a live
+> model, exactly as [Step 4](#step-4-full-l3-real-report-text-from-a-real-model)
+> leaves you. It is **not** a pytest test and must never become one: a check
+> that needs four services has no business silently skipping (or silently
+> running) inside a suite whose whole guarantee is that it needs none.
+
+### What it checks, and what it deliberately does not
+
+Every expectation reads a telemetry field the graph **already** records
+(D-12) and compares it to a band:
+
+| Expectation key | Telemetry field it reads |
+| --- | --- |
+| `min_recall` / `max_recall` | `recall` |
+| `min_corpus_recall` / `max_corpus_recall` | `corpus_recall` |
+| `min_grounded_score` / `max_grounded_score` | `grounded_score` |
+| `min_grounding_ratio` | `grounding_ratio` |
+| `min_evidence_items` | `evidence_items` |
+| `max_unsupported_figures` | `cited_figures_unsupported` |
+| `max_total_tokens` | `llm_total_tokens` |
+| `max_provider_calls` | `llm_provider_calls` |
+| `max_elapsed_seconds` | `run_elapsed_seconds` |
+| `expect_tiers` | `tier_answers` — the answering tiers must be a SUBSET of the listed ones |
+| `require_grounding_notice` | `grounding_notice_shipped` |
+| `require_critique_passed` | `critique_passed` |
+| `require_truncation_notice` | `truncation_notice_shipped` |
+
+**There is no LLM judge here, and there will not be one.** No
+similarity-to-a-reference-answer, no scored rubric. A harness whose own
+verdict is as arguable as the thing it measures settles nothing — and this
+project already has one fail-open judge whose own docstring says not to trust
+it alone. So a case cannot assert *"the report is good"*. It asserts *"the
+corpus answered this one"*, *"this one shipped the provenance notice"*, *"no
+cited figure was unsupported"*, *"this did not cost more than N tokens"*.
+Mechanical, reproducible, and honest about being narrower than quality.
+
+A telemetry field that is **absent** fails its check rather than passing it —
+"not measured" is not "fine", the same confusion D-103 removed from the recall
+column.
+
+### The eight cases, and why each is in the set
+
+Every case in `sample_data/golden_queries.jsonl` carries its own `why` field —
+`--list` prints them. In outline:
+
+| Case | What it is there to catch |
+| --- | --- |
+| `in-corpus-comparison` | The shipped corpus is about exactly this. If THIS cannot be answered from documents, retrieval is broken — not the corpus |
+| `in-corpus-narrow-fact` | One document answers it. Where the D-39 topical gate and the reformulation retry either help or get in the way |
+| `in-corpus-operational` | Multi-goal, two documents. Does it still land on the corpus rather than escalating down the D-38 ladder |
+| `off-corpus-must-say-so` | `p205.267-check`'s own query. The requirement is NOT that it answers — it is that `corpus_recall` reads 0 and the report SAYS so (D-85) |
+| `off-corpus-numeric-bait` | Invites exactly what D-91 audits: a confident figure with a citation and nothing behind it |
+| `partial-corpus-healthcare` | One document covers it partially. The case most likely to drift when a threshold moves |
+| `nonsense-query` | Nothing can honestly serve it. The expectation is that the harness DEGRADES rather than fabricating |
+| `cost-ceiling-canary` | The cheapest run this harness does, with `max_total_tokens` set well above what P6-1/P6-2 measured — it fires on prompt growth, not on ordinary variation |
+
+### Running it
+
+```powershell
+$env:PYTHONPATH = "src"
+
+# see the cases without running anything
+python scripts/eval_suite.py --list
+
+# the sweep (eight live runs -- budget several minutes)
+python scripts/eval_suite.py --run
+
+# one case while you tune a threshold
+python scripts/eval_suite.py --run --case partial-corpus-healthcare
+```
+
+Exit codes: **0** every case met its expectations, **1** at least one missed,
+**2** the harness could not run at all (unreadable golden file, bad config,
+unreachable services, `HITL_ENABLED=true`).
+
+**It refuses to grade in stub mode.** `LLM_MODE=stub` produces a fixed
+placeholder report; grading it would measure `StubClient`. The sweep still
+RUNS there — a useful smoke test of the harness itself — prints `grading
+SKIPPED (stub mode)`, and still exits **1** if any case failed to complete,
+because "grading was skipped" is not "nothing went wrong".
+
+**It refuses to run with `HITL_ENABLED=true`** and says so. An eval sweep
+cannot answer its own escalations, and auto-approving them would measure a
+system nobody runs.
+
+### Baselines — catching the drift a pass/fail cannot
+
+An expectation is a band. A number can move a long way inside its band and
+still pass, which is exactly how a slow regression hides:
+
+```powershell
+# once, on a deployment you are happy with
+python scripts/eval_suite.py --run --save-baseline eval-baseline.json
+
+# after any change to a prompt, a threshold or the retrieval ladder
+python scripts/eval_suite.py --run --baseline eval-baseline.json
+```
+
+The `=== VS BASELINE ===` block prints **only fields that moved**, per case,
+with the delta — plus `(new)` for a case the baseline never saw and
+`(missing)` for one the baseline has and this sweep did not run, so a golden
+set that grew or shrank says so rather than silently comparing fewer cases
+than you think.
+
+`--json <path>` writes the full result set (telemetry included) for anything
+you would rather read in a spreadsheet.
+
+### The one thing to know before your first sweep
+
+**An eval run writes to long-term memory, and memory feeds the NEXT run's
+goals.** `memory_writer` stores a passed run's fresh evidence (D-24) and
+`memory_retrieve` feeds it back into goal composition later — so a sweep
+pointed at the production collection changes the conditions the next sweep is
+measured under, and a drift the harness CAUSED reads exactly like one it
+detected. D-42 exists because that happened once, unintentionally.
+
+So the script redirects memory to its own collection, **`agent_eval_memory`**,
+before settings are read. You do not have to do anything for this — it is the
+default. Two consequences worth knowing:
+
+- The first sweeps run against an empty memory. That is the point: repeatable.
+- `scripts/inspect_memory.py` and `scripts/gc_memory.py` read
+  `MEMORY_COLLECTION`, so they will not show you the eval collection unless
+  you point them at it.
+
+To deliberately measure production memory's influence, pass it explicitly:
+
+```powershell
+python scripts/eval_suite.py --run --memory-collection agent_memory
+```
+
+Each case also gets its own fresh `thread_id` (`eval-<sweep>-<case-id>`), so a
+sweep is greppable in the logs and in `agent_runs`, and no case inherits the
+previous one's evidence (D-20).
 
 ## Using Debug Mode
 

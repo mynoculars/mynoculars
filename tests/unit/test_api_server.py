@@ -73,6 +73,10 @@ class _FakeSettings:
     llm_mode = "stub"
     recursion_limit = 60
     postgres_dsn = "postgresql://x:x@127.0.0.1:1/x"
+    # D-133: "" is the shipped default -- every test above this line
+    # exercises the UNGATED posture, which is the one that must stay
+    # byte-identical.
+    api_key = ""
 
 
 class _FakeBridge:
@@ -641,3 +645,179 @@ def test_state_503s_when_the_bundle_failed_to_build(monkeypatch):
 
     monkeypatch.setattr(srv, "_build_error", "ValueError: bad config")
     assert TestClient(srv.app).get("/state/demo").status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# D-133 (P6-5) -- the optional API key
+# ---------------------------------------------------------------------------
+
+
+class _KeyedSettings(_FakeSettings):
+    api_key = "s3cret-key"
+
+
+def _keyed_bundle(**overrides):
+    return _bundle(settings=_KeyedSettings(), **overrides)
+
+
+def test_with_no_key_configured_every_endpoint_stays_open(monkeypatch):
+    """THE property that makes this safe to ship: the default is
+    unchanged, and it is the posture this repo has always documented."""
+    graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {}})
+    server = _import_server(_bundle(app=graph), monkeypatch)
+
+    with TestClient(server.app) as client:
+        assert client.post("/research", json={"query": "q"}).status_code == 200
+    assert graph.invocations == 1
+
+
+def test_a_configured_key_rejects_a_caller_that_sends_none(monkeypatch):
+    graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {}})
+    server = _import_server(_keyed_bundle(app=graph), monkeypatch)
+
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "q"})
+
+    assert resp.status_code == 401
+    assert "X-API-Key" in resp.json()["detail"]
+    assert graph.invocations == 0, "the request must not reach the graph"
+
+
+def test_a_wrong_key_is_rejected(monkeypatch):
+    graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {}})
+    server = _import_server(_keyed_bundle(app=graph), monkeypatch)
+
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "q"},
+                           headers={"X-API-Key": "not-the-key"})
+
+    assert resp.status_code == 401
+    assert graph.invocations == 0
+
+
+def test_the_right_key_is_accepted_in_either_header(monkeypatch):
+    """Two accepted shapes, one secret -- refusing the Bearer form
+    produces a 401 that looks like a wrong key rather than a wrong
+    header."""
+    for headers in ({"X-API-Key": "s3cret-key"},
+                    {"Authorization": "Bearer s3cret-key"}):
+        graph = _ScriptedGraph(result={"final_report": "r", "telemetry": {}})
+        server = _import_server(_keyed_bundle(app=graph), monkeypatch)
+        with TestClient(server.app) as client:
+            resp = client.post("/research", json={"query": "q"},
+                               headers=headers)
+        assert resp.status_code == 200, headers
+        assert graph.invocations == 1
+
+
+def test_a_malformed_authorization_header_is_not_parsed_further(monkeypatch):
+    """A Basic credential is not a bearer token and must not be treated
+    as one -- it yields "" and is rejected by the comparison."""
+    server = _import_server(_keyed_bundle(), monkeypatch)
+
+    with TestClient(server.app) as client:
+        resp = client.post("/research", json={"query": "q"},
+                           headers={"Authorization": "Basic czNjcmV0"})
+
+    assert resp.status_code == 401
+
+
+def test_resume_and_state_are_guarded_too(monkeypatch):
+    """All three endpoints that touch a run, not just the one that
+    starts it -- /state/{thread_id} is a live feed of what a caller is
+    researching (its own docstring says so)."""
+    # _ScriptedGraph, not _FakeGraph: the authenticated call below is
+    # meant to REACH the handler, which reads get_state().
+    server = _import_server(_keyed_bundle(app=_ScriptedGraph()), monkeypatch)
+
+    with TestClient(server.app) as client:
+        assert client.post("/resume", json={"thread_id": "t",
+                                            "action": "approve"}).status_code == 401
+        assert client.get("/state/t").status_code == 401
+        # 404: authenticated, reached the handler, and that thread holds
+        # no run -- which is the endpoint working, not the guard.
+        assert client.get("/state/t",
+                          headers={"X-API-Key": "s3cret-key"}).status_code == 404
+
+
+def test_health_stays_open_when_a_key_is_configured(monkeypatch):
+    """A liveness probe that needs credentials is a liveness probe that
+    fails for the wrong reason."""
+    server = _import_server(_keyed_bundle(durable=False), monkeypatch)
+
+    with TestClient(server.app) as client:
+        body = client.get("/health").json()
+
+    assert body == {"status": "ok", "llm_mode": "stub", "durable": False}
+
+
+def test_a_failed_build_withholds_its_detail_from_a_stranger(monkeypatch):
+    """The detail is f"{type}: {exc}", and the exceptions that reach it
+    name MCP URLs, DSN fragments and file paths."""
+    server = _import_server(_keyed_bundle(), monkeypatch)
+    monkeypatch.setattr(server, "_build_error",
+                        "ValueError: MCPBridge requires a url http://internal:8765/mcp")
+
+    with TestClient(server.app) as client:
+        anonymous = client.get("/health").json()
+        authenticated = client.get(
+            "/health", headers={"X-API-Key": "s3cret-key"}).json()
+
+    assert anonymous == {"status": "error"}
+    assert "internal:8765" in authenticated["detail"]
+
+
+def test_a_failed_build_still_reports_its_detail_when_no_key_is_set(monkeypatch):
+    """D-78's diagnosability is unchanged for a deployment that chose the
+    open posture -- gating it there would take away something this
+    project deliberately built, in exchange for nothing."""
+    server = _import_server(_bundle(), monkeypatch)
+    monkeypatch.setattr(server, "_build_error", "ValueError: boom")
+
+    with TestClient(server.app) as client:
+        assert client.get("/health").json() == {"status": "error",
+                                                "detail": "ValueError: boom"}
+
+
+def test_auth_is_checked_before_the_failed_build_503(monkeypatch):
+    """An unauthenticated caller must not learn whether this deployment
+    built, what its configuration is, or that it is degraded at all."""
+    server = _import_server(_keyed_bundle(), monkeypatch)
+    monkeypatch.setattr(server, "_build_error", "ValueError: boom")
+
+    with TestClient(server.app) as client:
+        assert client.post("/research", json={"query": "q"}).status_code == 401
+        assert client.post("/research", json={"query": "q"},
+                           headers={"X-API-Key": "s3cret-key"}).status_code == 503
+
+
+def test_startup_says_which_posture_the_process_started_in(monkeypatch, caplog):
+    """Empty is not silent. Logged at API startup and never in
+    get_settings(), because a CLI run has no HTTP surface to protect."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _import_server(_bundle(), monkeypatch)
+    assert [r for r in caplog.records if "api.unauthenticated" in r.message]
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        _import_server(_keyed_bundle(), monkeypatch)
+    assert [r for r in caplog.records if "api.authenticated" in r.message]
+    assert not [r for r in caplog.records if "api.unauthenticated" in r.message]
+
+
+def test_the_key_comparison_is_constant_time(monkeypatch):
+    """hmac.compare_digest, never `==`: a shared secret sent on every
+    call is exactly the shape a timing oracle is built from. Asserted
+    structurally -- timing cannot be tested reliably, but the call can."""
+    import inspect
+
+    server = _import_server(_keyed_bundle(), monkeypatch)
+    source = inspect.getsource(server._key_is_valid)
+
+    assert "compare_digest" in source
+    assert server._key_is_valid("s3cret-key")
+    assert not server._key_is_valid("s3cret-ke")     # prefix
+    assert not server._key_is_valid("s3cret-keys")   # extension
+    assert not server._key_is_valid("")
