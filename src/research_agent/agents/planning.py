@@ -43,6 +43,7 @@ an inner function before returning it.
 """
 
 import logging
+import time
 from typing import Any, Callable, Dict
 
 from pydantic import BaseModel, Field, ValidationError
@@ -119,7 +120,13 @@ def build_classify_node(router: FallbackRouter, debug: bool = False) -> NodeFn:
         # hops, quality-scoring calls) THIS call actually made underneath —
         # see llm/router.py::FallbackRouter.drain_counters.
         counters = {"llm_node_calls": 1, **router.drain_counters()}
-        return {"classification": result, "counters": counters}
+        # D-132: the run clock starts HERE, in the first node, and only
+        # here -- `or state.run_started_at` keeps a resumed run's original
+        # stamp rather than restarting the budget every time the graph is
+        # re-entered. An EPOCH, not a monotonic reading, because a paused
+        # run resumes in a different process; see limits.py.
+        return {"classification": result, "counters": counters,
+                "run_started_at": state.run_started_at or time.time()}
 
     return classify_node
 
@@ -243,6 +250,12 @@ def build_goal_manager_node(router: FallbackRouter, settings: Settings,
                 # D-23: the CHECK sets the trigger — routing functions are
                 # read-only in LangGraph and cannot write state.
                 update["escalation_trigger"] = "E1"
+                # D-132: when this pause started, so human_escalation can
+                # subtract the reviewer's time from the run budget on
+                # resume. Stamped by the RAISING node because nothing may
+                # be written before interrupt() (D-28) -- raise_or_log
+                # does the same for E2/E3/E4.
+                update["escalation_started_at"] = time.time()
             elif settings.hitl_enabled:
                 log_event(logger, "escalation.suppressed", level=logging.WARNING,
                           trigger="E1", reason="max_escalations_reached",

@@ -125,10 +125,11 @@ class ProviderChainExhausted(RuntimeError):
     failure as __cause__, so a traceback still shows it in full.
 
     attempts is the WHOLE chain in order, one (provider_name, outcome)
-    pair each, where outcome is an exception type name or the literal
-    "skipped_for_context" -- a hop D-93 never attempted is not a failure
-    and must not be reported as one, but leaving it out entirely would
-    make the chain in the message look shorter than it is.
+    pair each, where outcome is an exception type name or one of the
+    literals "skipped_for_context" (D-93) / "skipped_disabled" (D-130) --
+    a hop that was never attempted is not a failure and must not be
+    reported as one, but leaving it out entirely would make the chain in
+    the message look shorter than it is.
     """
 
     def __init__(self, node, attempts, mode):
@@ -304,6 +305,42 @@ class FallbackRouter:
         log_event(logger, "llm.skipped_for_context", level=logging.WARNING,
                   provider=provider.name, estimated_prompt_tokens=estimated,
                   context_tokens=limit, margin=self.CONTEXT_SKIP_MARGIN)
+        return True
+
+    def _skips_for_disabled(self, provider: ChatClient) -> bool:
+        """Has this provider already answered with a failure that cannot
+        recover on its own (D-130)?
+
+        NEVER called for the LAST provider in the chain -- both call sites
+        guard on `i + 1 < len(self.providers)` first, exactly as
+        _skips_for_context does and for the same reason: skipping is only
+        meaningful when there is somewhere to fall through TO, and
+        attempting a probably-doomed call beats leaving complete() with no
+        candidate and no exception.
+
+        The DECISION lives in llm/client.py (see _NON_TRANSIENT_KINDS
+        there): that is where the status code and the provider's own error
+        body are in hand, and it is the only place that also catches a
+        failure suffered while the provider was acting as the quality
+        JUDGE -- evaluation/quality.py's fail-open path swallows that
+        exception before this class could ever see it. This method only
+        READS the verdict, the same way _skips_for_context reads
+        context_tokens.
+
+        getattr, not an attribute access: `disabled_reason` is an optional
+        duck-typed capability, so StubClient and every hand-written test
+        fake are unaffected.
+        """
+        reason = getattr(provider, "disabled_reason", None)
+        if not reason:
+            return False
+        self._bump("llm_disabled_skips")
+        # INFO, not WARNING: the WARNING was already logged once, at the
+        # transition, by the client. D-107's rule -- a level is a claim
+        # about significance, and repeating a known fact at WARNING is how
+        # the unknown ones get scrolled past.
+        log_event(logger, "llm.skipped_disabled_provider",
+                  provider=provider.name, reason=reason)
         return True
 
     def _bump_usage(self, provider: ChatClient) -> None:
@@ -562,6 +599,16 @@ class FallbackRouter:
         # both the position `i` (0, 1, 2...) and the `provider` object on
         # each pass, in the fixed order the chain was built in.
         for i, provider in enumerate(self.providers):
+            # D-130 before D-93: a provider already known to be dead is
+            # not "skipped for context", and reporting it that way would
+            # send an operator to the wrong setting. Checked first, and --
+            # like the context skip below -- BEFORE llm_provider_calls is
+            # bumped, since a hop never attempted must not be counted as
+            # an attempt. Its own llm_disabled_skips counter records it.
+            if (i + 1 < len(self.providers)
+                    and self._skips_for_disabled(provider)):
+                outcomes.append((provider.name, "skipped_disabled"))
+                continue
             # D-93: checked BEFORE llm_provider_calls is bumped -- a hop
             # never attempted must not be counted as an attempt. Its own
             # llm_context_skips counter records it instead.
@@ -650,6 +697,10 @@ class FallbackRouter:
         candidates: List[Tuple[str, str, Optional[float]]] = []
 
         for i, provider in enumerate(self.providers):
+            if (i + 1 < len(self.providers)                      # D-130
+                    and self._skips_for_disabled(provider)):
+                outcomes.append((provider.name, "skipped_disabled"))
+                continue
             if (i + 1 < len(self.providers)                      # D-93
                     and self._skips_for_context(provider, messages)):
                 outcomes.append((provider.name, "skipped_for_context"))

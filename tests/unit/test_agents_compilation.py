@@ -1239,3 +1239,298 @@ def test_nothing_flagged_means_no_judge_call_at_all():
 
     assert _confirm_unsupported_figures(router, [], []) == []
     assert router.json_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# D-130 (P6-3) -- the disabled-provider skip reaches the run record
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_reports_hops_skipped_for_a_dead_provider():
+    """The counter exists at the router boundary; this is the half that
+    makes it readable in an agent_runs row and the RESULT block. A signal
+    recorded where nobody looks is the defect D-105 and D-108 both were.
+
+    Pure pass-through, per D-12: this node adds up what the router
+    recorded and invents nothing."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(raw_query="q",
+                          goals=[Goal(goal_id="g1", description="d")],
+                          counters={"llm_disabled_skips": 2.0,
+                                    "llm_context_skips": 1.0})
+
+    telemetry = node(state)["telemetry"]
+    assert telemetry["llm_disabled_skips"] == 2
+    assert telemetry["llm_context_skips"] == 1, (
+        "the two skips are different facts and must not be merged")
+
+
+def test_telemetry_reports_zero_disabled_skips_on_a_healthy_run():
+    """0 is the every-run value, and it has to be present rather than
+    absent -- an omitted key reads as "not measured", which is what D-103
+    made recall NULL to say honestly."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    telemetry = node(ResearchState(raw_query="q"))["telemetry"]
+    assert telemetry["llm_disabled_skips"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D-131 (P6-2) -- the evidence budget is applied where prompts are built
+# ---------------------------------------------------------------------------
+
+
+def _many_evidence(n, goal_ids=("g1", "g2"), chars=500):
+    # DISTINCT content per item, deliberately: dedupe_evidence runs first
+    # in both nodes and would collapse identical text to one item per
+    # goal, leaving nothing for the budget to do.
+    return [Evidence(task_key=f"t{i}", goal_id=goal_ids[i % len(goal_ids)],
+                     source="web", score=0.7,
+                     content=f"item {i}: " + "x" * chars)
+            for i in range(n)]
+
+
+class _PromptCapturingRouter:
+    """Records the transcript each node actually sent."""
+
+    def __init__(self, json_payload=None, text="# Report\n\nBody [g1]."):
+        self.prompts = {}
+        self._json = json_payload or {"passed": True, "score": 0.9, "notes": []}
+        self._text = text
+
+    def set_node(self, node):
+        self._node = node
+
+    def drain_counters(self):
+        return {}
+
+    def complete(self, messages):
+        self.prompts["compile"] = messages
+        return self._text
+
+    def complete_json(self, messages):
+        self.prompts["critique"] = messages
+        return self._json
+
+
+def _evidence_chars(messages):
+    """Characters of the <evidence> block in a built prompt."""
+    body = messages[-1]["content"]
+    start = body.index("<evidence>")
+    return len(body[start:body.index("</evidence>", start)])
+
+
+def test_compiler_node_bounds_the_evidence_it_sends():
+    """Run p205.267-check put 30,199 characters of evidence into one
+    compile prompt. compile_report has no bound of its own -- this node
+    is where the budget is applied."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    settings = Settings(_env_file=None, llm_mode="live",
+                        prompt_evidence_max_chars=4000)
+    node = build_compiler_node(router, settings)
+    state = ResearchState(
+        raw_query="q",
+        goals=[Goal(goal_id="g1", description="d1"),
+               Goal(goal_id="g2", description="d2")],
+        evidence=_many_evidence(60))
+
+    out = node(state)
+
+    assert _evidence_chars(router.prompts["compile"]) < 5000
+    assert out["counters"]["evidence_prompt_dropped"] > 0
+    # D-88: the same number, scoped to the report that actually shipped.
+    assert out["last_compile_guardrails"]["evidence_prompt_dropped"] > 0
+
+
+def test_the_compiler_prompt_still_carries_every_goal_after_budgeting():
+    """A budget that dropped a goal entirely would trade a token problem
+    for a coverage one."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live",
+                                                prompt_evidence_max_chars=4000))
+    node(ResearchState(raw_query="q",
+                       goals=[Goal(goal_id="g1", description="d1"),
+                              Goal(goal_id="g2", description="d2")],
+                       evidence=_many_evidence(60)))
+
+    block = router.prompts["compile"][-1]["content"]
+    assert "[g1 |" in block and "[g2 |" in block
+
+
+def test_critic_node_is_bounded_by_the_same_rule():
+    """templates.critique used to keep `evidence[-60:]` -- a tail slice
+    that, after a third gather lap, keeps the lap that found least. D-46
+    is what that costs: a critic judging a report against evidence it was
+    never shown."""
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_critic_node(router, Settings(_env_file=None, llm_mode="live",
+                                              prompt_evidence_max_chars=4000))
+    state = ResearchState(
+        raw_query="q", final_report="# R\n\nclaim [g1]",
+        goals=[Goal(goal_id="g1", description="d1"),
+               Goal(goal_id="g2", description="d2")],
+        evidence=_many_evidence(60))
+
+    node(state)
+
+    assert _evidence_chars(router.prompts["critique"]) < 5000
+
+
+def test_a_disabled_budget_leaves_the_compile_prompt_unbounded():
+    """0 restores the pre-D-131 prompt exactly -- the documented escape
+    hatch, so it must genuinely change nothing."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live",
+                                                prompt_evidence_max_chars=0))
+    out = node(ResearchState(raw_query="q",
+                             goals=[Goal(goal_id="g1", description="d1")],
+                             evidence=_many_evidence(60, goal_ids=("g1",))))
+
+    assert _evidence_chars(router.prompts["compile"]) > 25000
+    assert "evidence_prompt_dropped" not in out["counters"]
+
+
+def test_a_small_run_is_byte_identical_with_the_budget_on():
+    """Every guardrail in this codebase carries this test: with nothing to
+    trim, the pass must be invisible."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    state = ResearchState(raw_query="q",
+                          goals=[Goal(goal_id="g1", description="d1")],
+                          evidence=_many_evidence(3, goal_ids=("g1",)))
+
+    bounded = _PromptCapturingRouter()
+    build_compiler_node(bounded, Settings(_env_file=None, llm_mode="live",
+                                          prompt_evidence_max_chars=12000))(state)
+    unbounded = _PromptCapturingRouter()
+    build_compiler_node(unbounded, Settings(_env_file=None, llm_mode="live",
+                                            prompt_evidence_max_chars=0))(state)
+
+    assert bounded.prompts["compile"] == unbounded.prompts["compile"]
+
+
+# ---------------------------------------------------------------------------
+# D-132 (P6-4) -- the compiler's own budget check, the notice, the record
+# ---------------------------------------------------------------------------
+
+
+def test_compiler_node_flags_a_budget_spent_in_the_revision_loop():
+    """The case progress_checker cannot see: a run that converged in one
+    lap and then spent its budget compiling and re-compiling."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    settings = Settings(_env_file=None, llm_mode="live",
+                        run_deadline_seconds=1.0)
+    node = build_compiler_node(router, settings)
+    state = ResearchState(raw_query="q", run_started_at=1.0,
+                          goals=[Goal(goal_id="g1", description="d")],
+                          evidence=_many_evidence(3, goal_ids=("g1",)))
+
+    out = node(state)
+
+    assert out["budget_exhausted"] == "deadline"
+
+
+def test_a_truncated_run_says_so_in_the_report():
+    """D-85's argument in a second place: telemetry is read by whoever
+    runs the agent, the report by whoever asked the question."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live"))
+    state = ResearchState(raw_query="q", budget_exhausted="deadline",
+                          goals=[Goal(goal_id="g1", description="d")],
+                          evidence=_many_evidence(3, goal_ids=("g1",)))
+
+    out = node(state)
+
+    assert out["final_report"].startswith("> **Run stopped early")
+    assert out["last_compile_guardrails"]["truncation_notice_inserted"] == 1
+
+
+def test_the_stopped_early_notice_sits_above_the_provenance_one():
+    """Ordering is deliberate -- "this run was stopped early" changes how
+    a reader weighs everything below it, the provenance notice
+    included."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live"))
+    # Ungrounded (web-only evidence) AND truncated -> both notices apply.
+    state = ResearchState(raw_query="q", budget_exhausted="tokens",
+                          goals=[Goal(goal_id="g1", description="d")],
+                          evidence=_many_evidence(3, goal_ids=("g1",)))
+
+    report = node(state)["final_report"]
+
+    assert report.index("Run stopped early") < report.index("Provenance notice")
+
+
+def test_a_run_inside_its_budget_ships_no_notice():
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None, llm_mode="live"))
+    out = node(ResearchState(raw_query="q",
+                             goals=[Goal(goal_id="g1", description="d")],
+                             evidence=_many_evidence(3, goal_ids=("g1",))))
+
+    assert "Run stopped early" not in out["final_report"]
+    assert "truncation_notice_inserted" not in out["last_compile_guardrails"]
+
+
+def test_telemetry_records_what_stopped_the_run_and_what_it_spent():
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(
+        raw_query="q", goals=[Goal(goal_id="g1", description="d")],
+        budget_exhausted="tokens", run_started_at=1.0, paused_seconds=68.0,
+        final_report="> **Run stopped early — inserted automatically.**\n\n# R")
+
+    telemetry = node(state)["telemetry"]
+
+    assert telemetry["run_budget_exhausted"] == "tokens"
+    assert telemetry["run_paused_seconds"] == 68.0
+    assert telemetry["run_elapsed_seconds"] > 0
+    # D-59: read from the ARTIFACT, not from a counter that would sum
+    # every compile attempt.
+    assert telemetry["truncation_notice_shipped"] is True
+
+
+def test_telemetry_on_an_ordinary_run_reports_no_budget_stop():
+    """None, not a string -- "finished on its own terms" must be
+    distinguishable from "stopped by something" at a glance."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    telemetry = node(ResearchState(raw_query="q"))["telemetry"]
+
+    assert telemetry["run_budget_exhausted"] is None
+    assert telemetry["run_elapsed_seconds"] == 0.0
+    assert telemetry["truncation_notice_shipped"] is False

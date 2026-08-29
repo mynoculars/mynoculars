@@ -30,7 +30,10 @@ Topology (core build):
 
     Termination is guaranteed by four independent bounds (design §6.3):
     depth counter, dedup-finite task supply, empty-backlog fallthrough,
-    and the invoke-time recursion_limit backstop.
+    and the invoke-time recursion_limit backstop. D-132 adds an OPTIONAL
+    fifth, off by default: a run budget (wall clock or tokens) whose flag
+    all three routing functions below read. The four above bound a run in
+    STEPS; that one bounds it in TIME or SPEND.
 
 This file is the single best place to start reading this codebase, because
 it is a literal, executable version of the ASCII diagram above: every node
@@ -183,6 +186,13 @@ def dispatch_tasks(state: ResearchState, hint_to_node: dict, from_node: str = "t
     """
     if state.escalation_trigger in ("E2", "E3"):
         to_node, reason = "human_escalation", f"{state.escalation_trigger} raised (task supply exhausted)"
+    elif state.budget_exhausted:
+        # D-132: a spent run budget stops the NEXT wave of retrieval, not
+        # the run -- the backlog is dropped on the floor and the compiler
+        # writes from what was already gathered. Checked after the
+        # escalation branch above deliberately: a human already asked to
+        # look at this run outranks a clock.
+        to_node, reason = "compiler", f"run budget spent ({state.budget_exhausted}); not dispatching {len(state.pending_tasks)} further task(s)"
     elif not state.pending_tasks:
         to_node, reason = "compiler", "empty backlog (D-1)"
     else:
@@ -255,6 +265,14 @@ def route_convergence(state: ResearchState, settings: Settings
     """
     if state.escalation_trigger in ("E2", "E3"):
         to_node, reason = "human_escalation", f"{state.escalation_trigger} raised by progress_checker"
+    elif state.budget_exhausted:
+        # D-132: a FIFTH termination signal, alongside the four this
+        # graph already had (depth, dedup-finite task supply, empty
+        # backlog, recursion_limit). Those bound a run in STEPS; this one
+        # bounds it in TIME or SPEND, which is the unit an operator is
+        # actually held to. Same soft landing as every other bound here:
+        # compile what exists, never cancel mid-node.
+        to_node, reason = "compiler", f"run budget spent ({state.budget_exhausted}) at depth {state.iteration_depth}/{settings.max_depth}, recall {state.recall_score:.2f}"
     elif state.iteration_depth >= settings.max_depth:
         to_node, reason = "compiler", f"depth {state.iteration_depth}/{settings.max_depth} budget spent, recall {state.recall_score:.2f} (grounded {state.grounded_score:.2f})"
     elif (state.recall_score >= settings.recall_target
@@ -274,6 +292,7 @@ def route_convergence(state: ResearchState, settings: Settings
         to_node, reason = "gap_generator", f"recall {state.recall_score:.2f} below target {settings.recall_target:.2f}, depth {state.iteration_depth}/{settings.max_depth} remains"
     log_event(logger, "route.decision", from_node="progress_checker", to_node=to_node,
               reason=reason, escalation_trigger=state.escalation_trigger,
+              budget_exhausted=state.budget_exhausted,
               recall=round(state.recall_score, 3), grounded=round(state.grounded_score, 3),
               depth=state.iteration_depth, max_depth=settings.max_depth,
               recall_target=settings.recall_target,
@@ -302,6 +321,15 @@ def route_after_critique(state: ResearchState, settings: Settings
         to_node, reason = "human_escalation", "E4 raised by critic"
     elif state.critique_passed:
         to_node, reason = "memory_writer", "critique passed"
+    elif state.budget_exhausted:
+        # D-132: a failed critique with the run budget spent goes STRAIGHT
+        # to telemetry rather than spending a revision it has no budget
+        # for. Ordered after critique_passed above, deliberately: a run
+        # that passed earned its memory write, and stopping early is not
+        # a reason to take that back. Same destination and same posture
+        # as the revision-exhausted branch below -- ship the report
+        # unreviewed, never feed it to memory (D-24).
+        to_node, reason = "telemetry", f"critique failed and the run budget is spent ({state.budget_exhausted}); shipping without a further revision (report NOT sent to memory_writer, D-24)"
     elif state.revision_count < settings.max_revisions:
         to_node, reason = "compiler", f"critique failed, revision {state.revision_count}/{settings.max_revisions} budget remains"
     else:

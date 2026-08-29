@@ -374,6 +374,31 @@ class ResearchState(BaseModel):
     # below-target measurement.
     grounded_score_prev: float = -1.0
 
+    # Run budget (D-132) -- wall clock and tokens, both OFF by default.
+    # run_started_at is an EPOCH (time.time()), stamped once by
+    # classify_node, deliberately not a monotonic reading: a run can pause
+    # at an interrupt() and resume in a DIFFERENT PROCESS, and this field
+    # is checkpointed to Postgres across that gap. See limits.py for the
+    # full argument and for what the epoch costs.
+    run_started_at: float = 0.0
+    # Seconds this run spent waiting for a human, accumulated by
+    # human_escalation in its RESUME update only (D-28's idempotency
+    # rule, the same placement escalation_history uses). Subtracted from
+    # elapsed time, so a reviewer's reading time is never charged to the
+    # research budget.
+    paused_seconds: float = 0.0
+    # When the CURRENT escalation began, stamped by the node that raised
+    # the trigger -- never by human_escalation itself, which cannot write
+    # anything before interrupt() (D-28). 0.0 when no escalation is in
+    # flight.
+    escalation_started_at: float = 0.0
+    # "deadline" | "tokens" | None. Set by progress_checker_node or
+    # compiler_node -- the nodes whose CHECK fired -- and read by all
+    # three routing functions, exactly the split escalation_trigger
+    # already uses: routers are pure reads and cannot set this
+    # themselves. Reported as `run_budget_exhausted` in telemetry.
+    budget_exhausted: Optional[str] = None
+
     # Human-in-the-loop escalation (D-23/D-28)
     escalation_trigger: Optional[str] = None      # E1/E2/E3/E4; set by the
     #   node whose check fired (routing fns are read-only and cannot set it)

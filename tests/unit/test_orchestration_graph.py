@@ -299,3 +299,66 @@ def test_build_graph_with_mcp_tool_registers_the_specialist_node():
     node_names = set(g.get_graph().nodes.keys())
     assert "mcp_search_worker" in node_names
     assert "search_worker" in node_names
+
+
+# ---------------------------------------------------------------------------
+# D-132 (P6-4) -- the run budget is a FIFTH termination signal
+# ---------------------------------------------------------------------------
+
+
+def test_a_spent_budget_stops_the_gather_loop(settings):
+    """The four existing bounds are all step-shaped (depth, task supply,
+    empty backlog, recursion_limit). This one is time/spend-shaped, and
+    lands in the same place: compile what exists."""
+    state = ResearchState(raw_query="q", recall_score=0.0,
+                          iteration_depth=1, budget_exhausted="deadline")
+
+    assert route_convergence(state, settings) == "compiler"
+
+
+def test_a_human_review_outranks_a_clock(settings):
+    """Ordered after the escalation branch deliberately: someone already
+    asked to look at this run."""
+    state = ResearchState(raw_query="q", recall_score=0.0, iteration_depth=1,
+                          escalation_trigger="E3", budget_exhausted="deadline")
+
+    assert route_convergence(state, settings) == "human_escalation"
+
+
+def test_a_spent_budget_drops_the_pending_backlog():
+    """The tasks gap_generator just produced are dropped on the floor --
+    dispatching them would spend the budget the run has already run out
+    of."""
+    state = ResearchState(
+        raw_query="q", budget_exhausted="tokens",
+        pending_tasks=[SearchTask(key="k", query="q", goal_id="g1")])
+
+    assert dispatch_tasks(state, {}) == "compiler"
+
+
+def test_a_spent_budget_refuses_a_further_revision(settings):
+    state = ResearchState(raw_query="q", critique_passed=False,
+                          revision_count=0, budget_exhausted="deadline")
+
+    assert route_after_critique(state, settings) == "telemetry"
+
+
+def test_a_passed_critique_still_earns_its_memory_write(settings):
+    """Stopping early is not a reason to take back a write the run
+    earned -- the budget branch sits AFTER critique_passed."""
+    state = ResearchState(raw_query="q", critique_passed=True,
+                          revision_count=1, budget_exhausted="deadline")
+
+    assert route_after_critique(state, settings) == "memory_writer"
+
+
+def test_no_budget_flag_leaves_every_routing_decision_unchanged(settings):
+    """With both settings at 0 nothing ever sets the flag, and these are
+    the pre-D-132 answers."""
+    converging = ResearchState(raw_query="q", recall_score=0.0,
+                               iteration_depth=1)
+    assert route_convergence(converging, settings) == "gap_generator"
+
+    revising = ResearchState(raw_query="q", critique_passed=False,
+                             revision_count=0)
+    assert route_after_critique(revising, settings) == "compiler"

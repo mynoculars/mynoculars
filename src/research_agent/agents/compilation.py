@@ -39,11 +39,16 @@ from research_agent.guardrails.retrieval import has_grounded_evidence
 from research_agent.guardrails.sources import (append_web_sources,
                                                 cited_goal_ids,
                                                 count_listed_sources)
+from research_agent.guardrails.truncation import (annotate_truncated_run,
+                                                  report_carries_truncation_notice)
+from research_agent.limits import (elapsed_seconds, run_budget_exhausted,
+                                   tokens_used)
 from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
+from research_agent.prompts.budget import budget_evidence
 from research_agent.reporting.metrics import count_sections
 from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import ResearchState
@@ -133,6 +138,14 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # PROMPT's copy, never state.evidence -- every telemetry figure
         # below still counts what was genuinely retrieved.
         prompt_evidence, dedup_counters = dedupe_evidence(state.evidence)
+        # D-131: and THEN bound what is left. Dedup first is the right
+        # order and not an accident -- collapsing 26 copies of one
+        # sentence frees budget for 25 other facts, where budgeting first
+        # would spend it on the copies. Same prompt-only copy, same rule
+        # as dedup: state.evidence is untouched, so every telemetry figure
+        # still counts what was actually retrieved.
+        prompt_evidence, budget_counters = budget_evidence(
+            prompt_evidence, state.goals, settings.prompt_evidence_max_chars)
         report = router.complete(templates.compile_report(
             state.raw_query, state.goals, prompt_evidence, state.critique_notes))
         # A model under fallback can still wrap its answer in a code fence
@@ -204,6 +217,14 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
                 settings.min_evidence_score, settings.grounded_recall_target)
         else:
             grounding_counters = {}
+        # D-132: LAST of all the report passes, which puts this notice
+        # ABOVE D-85's provenance one in the shipped text. Deliberate --
+        # "this run was stopped early" changes how a reader should weigh
+        # everything below it, the provenance notice included. A no-op
+        # returning the report byte-identical whenever no budget was
+        # spent, which is every run while both settings sit at 0.
+        report, truncation_counters = annotate_truncated_run(
+            report, state.budget_exhausted)
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,
@@ -226,7 +247,8 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # is cross-provider, not self-scoring -- P2-11).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
                     **citation_counters, **hedge_counters, **source_counters,
-                    **dedup_counters, **grounding_counters}
+                    **dedup_counters, **budget_counters, **grounding_counters,
+                    **truncation_counters}
         # D-88: the SAME guardrail numbers, carried a second way -- scoped
         # to THIS compile pass instead of summed across every revision.
         # See ResearchState.last_compile_guardrails for why both views
@@ -239,9 +261,32 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # and have no per-report meaning.
         last_compile = {**citation_counters, **hedge_counters,
                         **source_counters, **dedup_counters,
-                        **grounding_counters}
-        return {"final_report": report, "counters": counters,
-                "last_compile_guardrails": last_compile}
+                        **budget_counters, **grounding_counters,
+                        **truncation_counters}
+        update: Dict[str, Any] = {"final_report": report, "counters": counters,
+                                  "last_compile_guardrails": last_compile}
+        # D-132: the SECOND of the two check sites (progress_checker is
+        # the other). This one catches a run that converged quickly and
+        # then spent its budget in the compile/critique loop, where no
+        # gather lap runs to notice. route_after_critique reads the flag
+        # and refuses another revision; the notice above then ships on
+        # the NEXT compile if one happens, or this one already carries it
+        # when an earlier lap set the flag.
+        if not state.budget_exhausted:
+            spent = run_budget_exhausted(state, settings)
+            if spent:
+                update["budget_exhausted"] = spent
+                log_event(logger, "run.budget_exhausted", level=logging.WARNING,
+                          budget=spent, node="compiler",
+                          elapsed_s=round(elapsed_seconds(state), 1),
+                          paused_s=round(state.paused_seconds, 1),
+                          tokens=tokens_used(state),
+                          deadline_s=settings.run_deadline_seconds,
+                          token_budget=settings.run_token_budget,
+                          revision=state.revision_count,
+                          effect="no further revision will be attempted; "
+                                 "the report ships as compiled")
+        return update
 
     return compiler_node
 
@@ -435,6 +480,18 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         # evidence_deduplicated figure stays one number about one report
         # rather than double-counting the same duplicates twice per cycle.
         prompt_evidence, _ = dedupe_evidence(state.evidence)
+        # D-131: the critic is budgeted by the SAME rule as the compiler,
+        # which is the point -- templates.critique used to bound itself
+        # with a bare `evidence[-60:]` tail slice, and a critic shown the
+        # last 60 items of 97 is judging a report against evidence it was
+        # never given (D-46's defect, arriving silently). Round-robin
+        # across goals keeps every goal's strongest item instead.
+        #
+        # Counted in compiler_node only, exactly as dedup already is: the
+        # run's figure describes the prompt behind the REPORT, not the
+        # sum of two prompts per cycle.
+        prompt_evidence, _ = budget_evidence(
+            prompt_evidence, state.goals, settings.prompt_evidence_max_chars)
         result = router.complete_json(templates.critique(
             state.raw_query, state.final_report, state.goals,
             prompt_evidence))
@@ -899,6 +956,25 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # which is the state every run was in before D-85, and which
             # report.shipped_ungrounded now WARNs about.
             "grounding_notice_shipped": grounding_notice_shipped,
+            # D-132: what stopped this run, and what it spent getting
+            # there. `run_budget_exhausted` is None on every run that
+            # finished on its own terms -- read it FIRST when a report
+            # looks thin, because a deadline stop and a genuinely empty
+            # corpus produce the same low recall and are not the same
+            # finding. Elapsed EXCLUDES time paused for a human
+            # (limits.py); `run_paused_seconds` reports that separately
+            # rather than hiding it, so a 300-second run that waited 240
+            # seconds for a reviewer reads honestly.
+            "run_budget_exhausted": state.budget_exhausted,
+            "run_elapsed_seconds": round(elapsed_seconds(state), 3),
+            "run_paused_seconds": round(state.paused_seconds, 3),
+            # Derived from the SHIPPED report (D-59's rule), never from a
+            # counter -- compiler_node runs once per revision and its
+            # counters merge additively, so a counter would describe the
+            # attempts rather than the artifact. Same shape, and the same
+            # reasoning, as grounding_notice_shipped above.
+            "truncation_notice_shipped": report_carries_truncation_notice(
+                state.final_report),
             # D-91. Read as a pair: `checked` is how many cited figures
             # the shipped report stated at all, `unsupported` how many of
             # those appear in no evidence under the goal the sentence
@@ -966,6 +1042,17 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # make -- read against llm_provider_calls, which no longer
             # includes them.
             "llm_context_skips": int(c.get("llm_context_skips", 0)),
+            # D-130: hops skipped because that provider already answered
+            # with a failure that cannot recover on its own (a rejected
+            # key, a refused permission, a retired model name). 0 on every
+            # healthy run. Read against llm_provider_calls, which -- like
+            # llm_context_skips above -- no longer includes them, and
+            # against the ONE llm.provider_disabled WARNING that names
+            # which provider and why. A nonzero value here with a normal
+            # report is the chain absorbing a dead provider correctly; a
+            # nonzero value alongside a thin report says the run was down
+            # to fewer providers than the operator thinks it configured.
+            "llm_disabled_skips": int(c.get("llm_disabled_skips", 0)),
             # D-87: which tier of the D-38 ladder actually answered, and
             # how often a tier failed outright. Previously readable only
             # by grepping `chain.answered` out of a debug trace. Read

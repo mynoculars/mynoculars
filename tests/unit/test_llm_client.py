@@ -549,3 +549,94 @@ def test_the_403_that_started_this_is_logged_with_kind_hint_and_body(caplog):
     assert f["kind"] == "permission_denied"
     assert "credits" in f["hint"]
     assert "no credits" in f["body"] or "credits or licenses" in f["body"]
+
+
+# ---------------------------------------------------------------------------
+# D-130 (P6-3) -- a failure that cannot recover takes the provider out
+#
+# Run p205.267-check: grok answered 403 "your newly created team doesn't have
+# any credits" to three compiler calls AND three judge calls in one run. Six
+# guaranteed-failed requests, six log lines, and the quality gate inert on
+# every attempt.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fresh_client_starts_enabled():
+    client = OpenAICompatibleClient("primary", "http://x", "key", "model-x")
+    assert client.disabled_reason is None
+
+
+def test_a_403_disables_the_provider_and_says_so_once(caplog):
+    client = _client_with_mock_transport(
+        _status_handler(403, '{"error":"no credits"}'))
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            with pytest.raises(httpx.HTTPStatusError):
+                client.complete([{"role": "user", "content": "x"}])
+
+    assert client.disabled_reason == "403 permission_denied"
+    disabled = [r for r in caplog.records if "llm.provider_disabled" in r.message]
+    assert len(disabled) == 1, "the transition is logged once, not per failure"
+    f = disabled[0].event_fields
+    assert f["provider"] == "primary" and f["status"] == 403
+    assert f["kind"] == "permission_denied"
+    assert "restart" in f["effect"]
+
+
+def test_401_and_404_disable_it_too():
+    """A rejected key and a retired model name are the same shape of fact
+    as a refused permission: the next call gets the identical answer."""
+    for status, kind in ((401, "auth_failed"),
+                         (404, "model_or_endpoint_not_found")):
+        client = _client_with_mock_transport(_status_handler(status, "nope"))
+        with pytest.raises(httpx.HTTPStatusError):
+            client.complete([{"role": "user", "content": "x"}])
+        assert client.disabled_reason == f"{status} {kind}"
+
+
+def test_a_429_or_a_5xx_never_disables_the_provider(caplog):
+    """THE judgement in this change. A quota refills and an outage ends --
+    disabling over either would turn a rate limit into an outage for the
+    rest of the run, which is strictly worse than today's hop."""
+    for status in (429, 500, 503):
+        client = _client_with_mock_transport(_status_handler(status, "later"))
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(httpx.HTTPStatusError):
+                client.complete([{"role": "user", "content": "x"}])
+        assert client.disabled_reason is None, f"{status} must stay retryable"
+
+    assert not [r for r in caplog.records if "llm.provider_disabled" in r.message]
+
+
+def test_a_plain_400_does_not_disable_the_provider():
+    """bad_request is a property of the PROMPT, not of the account -- and
+    D-93's context overflow arrives as one. Disabling here would take a
+    provider out over one oversized call."""
+    client = _client_with_mock_transport(_status_handler(400, "malformed"))
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([{"role": "user", "content": "x"}])
+    assert client.disabled_reason is None
+
+
+def test_a_context_overflow_does_not_disable_the_provider():
+    """The same 400, down D-93's own branch. That hop is skipped by SIZE,
+    per call, and must stay available for a prompt that fits."""
+    client = _client_with_mock_transport(
+        _status_handler(400, "the request exceeds the maximum context length"),
+        context_tokens=1536)
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([{"role": "user", "content": "x"}])
+    assert client.disabled_reason is None
+
+
+def test_a_transport_error_leaves_the_provider_enabled():
+    """A timeout or a connection reset carries no status at all -- it says
+    nothing about the account, and D-54's hop is the right response."""
+    def handler(request):
+        raise httpx.ConnectError("connection reset")
+
+    client = _client_with_mock_transport(handler)
+    with pytest.raises(httpx.ConnectError):
+        client.complete([{"role": "user", "content": "x"}])
+    assert client.disabled_reason is None

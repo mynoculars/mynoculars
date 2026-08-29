@@ -104,6 +104,30 @@ _HTTP_FAILURE_KINDS = {
 }
 
 
+# D-130 (P6-3): the failure kinds that CANNOT come back on their own.
+#
+# A key that is rejected, a permission that is refused and a model name
+# that does not exist are properties of the ACCOUNT or the CONFIGURATION,
+# not of this request -- every later call in the same process gets the
+# identical answer. Live (p205.267-check): grok answered 403 "your newly
+# created team doesn't have any credits" to three compiler calls and
+# three judge calls in ONE run, six guaranteed-failed requests whose only
+# effect was latency and six log lines.
+#
+# DELIBERATELY EXCLUDED, and this is the whole judgement in this list:
+#   429  a quota can refill, and a per-minute limit refills by waiting.
+#        Disabling a provider over one 429 would turn a rate limit into
+#        an outage for the rest of the run.
+#   5xx  the provider broke on its own side; the next call may well work.
+#   400  bad_request is a property of the PROMPT (D-93's context overflow
+#        arrives as one), so it says nothing about the next, smaller call.
+#   timeouts / transport errors  carry no status at all.
+# Everything excluded here keeps exactly its existing behaviour: the
+# router hops, and tries this provider again on the next node (D-54).
+_NON_TRANSIENT_KINDS = ("auth_failed", "permission_denied",
+                        "model_or_endpoint_not_found")
+
+
 def classify_http_failure(status: int) -> tuple:
     """(kind, operator hint) for one HTTP status. See _HTTP_FAILURE_KINDS.
 
@@ -533,6 +557,21 @@ class OpenAICompatibleClient:
         # via getattr -- the same duck-typed optional-capability pattern
         # drain_usage and drain_retrieval_counts already use.
         self.context_tokens = int(context_tokens or 0)
+        # D-130: None until this provider answers with a non-transient
+        # failure kind, then the short string the router reports when it
+        # skips this hop. Read by llm/router.py via getattr -- the same
+        # duck-typed optional-capability pattern as context_tokens above,
+        # drain_usage and set_trace_node, so StubClient and every
+        # hand-written test fake keep working untouched.
+        #
+        # A PLAIN ATTRIBUTE, not threading.local(), and the difference is
+        # the point: _trace_local and _raw hold per-CALL state that two
+        # threads must not share, while this describes the ACCOUNT behind
+        # the endpoint -- a fact every thread should see the moment any
+        # one of them learns it. The write is a single idempotent
+        # assignment of a short string, so the worst a race can do is
+        # write the same value twice.
+        self.disabled_reason: Optional[str] = None
         self._label = display_label or model
         # A leading underscore (self._trace_node, self._http, etc.) is a
         # Python NAMING CONVENTION, not an enforced access restriction —
@@ -674,6 +713,32 @@ class OpenAICompatibleClient:
                           model=self._model, status=resp.status_code,
                           kind=kind, hint=hint,
                           body=resp.text[:_ERROR_BODY_CHARS])
+                # D-130: a kind that cannot recover on its own takes this
+                # provider out of the chain for the rest of the PROCESS.
+                # Recorded here, where the status and the body are already
+                # in hand, rather than in the router, which sees only an
+                # exception -- and recorded on the CLIENT rather than on
+                # the router so it holds however this provider was reached:
+                # as an answerer, or as evaluation/quality.py's judge,
+                # whose exception the fail-open path swallows before the
+                # router could ever see it.
+                #
+                # Logged ONCE, at WARNING, on the transition only. The
+                # per-skip lines the router then emits are INFO, for
+                # D-107's reason: a level is a claim about significance,
+                # and five WARNINGs for one already-reported fact is how a
+                # real one gets scrolled past.
+                if kind in _NON_TRANSIENT_KINDS and self.disabled_reason is None:
+                    self.disabled_reason = f"{resp.status_code} {kind}"
+                    log_event(logger, "llm.provider_disabled",
+                              level=logging.WARNING, provider=self.name,
+                              model=self._model, status=resp.status_code,
+                              kind=kind, hint=hint,
+                              effect="this provider is skipped for the rest "
+                                     "of this process (it is never skipped "
+                                     "as the LAST hop, which has nowhere to "
+                                     "fall through to); restart after fixing "
+                                     "the account or the model name")
         resp.raise_for_status()
         data = resp.json()
         latency = time.perf_counter() - started

@@ -863,3 +863,128 @@ def test_the_name_reaches_a_chain_exhaustion_report():
         chain.complete([{"role": "user", "content": "x"}])
 
     assert [n for n, _ in exc.value.attempts] == ["primary", "grok"]
+
+
+# ---------------------------------------------------------------------------
+# D-130 (P6-3) -- a provider already known to be dead is not called again
+# ---------------------------------------------------------------------------
+
+
+class _DeadClient(_CtxClient):
+    """A client that has already recorded a non-transient failure -- the
+    state llm/client.py sets on a 401/403/404. Constructed directly here
+    rather than driven through a real HTTP failure: this file tests the
+    ROUTER's reaction to the verdict; test_llm_client.py owns the verdict
+    itself."""
+
+    def __init__(self, name, reason="403 permission_denied", **kw):
+        super().__init__(name, **kw)
+        self.disabled_reason = reason
+
+
+def test_a_disabled_provider_is_skipped_and_never_counted_as_an_attempt():
+    dead = _DeadClient("primary")
+    live = _CtxClient("mistral")
+    router = FallbackRouter([dead, live], 0.6)
+
+    result = router.complete_json(_SMALL)
+    counters = router.drain_counters()
+
+    assert result == {"served_by": "mistral"}
+    assert dead.calls == 0, "a provider known to be dead must not be called"
+    assert counters["llm_disabled_skips"] == 1.0
+    assert counters["llm_provider_calls"] == 1.0
+    assert "llm_fallback_hops" not in counters, (
+        "a hop never attempted did not fall back from anything")
+
+
+def test_the_free_text_path_skips_a_disabled_provider_too():
+    dead = _DeadClient("primary")
+    live = _CtxClient("mistral")
+    router = FallbackRouter([dead, live], 0.6)
+
+    assert router.complete(_SMALL) == "answer from mistral"
+    assert dead.calls == 0
+    assert router.drain_counters()["llm_disabled_skips"] == 1.0
+
+
+def test_the_last_provider_is_never_skipped_even_when_disabled():
+    """Same rule D-93 already applies: skipping is only meaningful when
+    there is somewhere to fall through TO. Attempting a probably-doomed
+    call beats leaving complete() with no candidate and no exception."""
+    dead = _DeadClient("primary")
+    router = FallbackRouter([dead], 0.6)
+
+    assert router.complete_json(_SMALL) == {"served_by": "primary"}
+    assert dead.calls == 1
+    assert "llm_disabled_skips" not in router.drain_counters()
+
+
+def test_a_disabled_hop_is_reported_as_skipped_not_as_a_failure():
+    """D-101's chain summary must stay honest: a hop nobody attempted is
+    not a failure, and omitting it would make the chain look shorter than
+    it is."""
+    chain = FallbackRouter(
+        [_DeadClient("primary"),
+         _Typed("mistral", TimeoutError("read timeout")),
+         _Typed("grok", RuntimeError("500"))], 0.6)
+
+    with pytest.raises(ProviderChainExhausted) as exc:
+        chain.complete(_SMALL)
+
+    assert exc.value.attempts == [
+        ("primary", "skipped_disabled"),
+        ("mistral", "TimeoutError"),
+        ("grok", "RuntimeError")]
+
+
+def test_disabled_is_checked_before_context():
+    """A dead provider reported as "skipped_for_context" would send an
+    operator to LLM_PRIMARY_CONTEXT_TOKENS to fix a billing problem. Both
+    conditions are true of this hop; only one of them is the reason."""
+    dead = _DeadClient("primary", context_tokens=1536)      # dead AND too small
+    router = FallbackRouter([dead, _CtxClient("mistral")], 0.6)
+
+    assert router.complete_json(_BIG) == {"served_by": "mistral"}
+    counters = router.drain_counters()
+
+    assert counters["llm_disabled_skips"] == 1.0
+    assert "llm_context_skips" not in counters, (
+        "the hop was skipped once, for the reason an operator must act on")
+
+
+def test_a_judge_that_dies_takes_the_provider_out_of_the_answering_chain():
+    """The reason the verdict lives on the CLIENT and not on the router.
+    evaluation/quality.py swallows the judge's exception (fail-open), so
+    the router never sees it -- but the client that suffered it is the
+    same object the router later asks to ANSWER. Live shape: grok 403'd
+    three times as the judge and three times as an answerer in one run."""
+    import httpx as _httpx
+    from research_agent.llm.client import OpenAICompatibleClient
+
+    def _dead_handler(request):
+        return _httpx.Response(403, text='{"error":"no credits"}')
+
+    judge = OpenAICompatibleClient("grok", "http://x", "k", "grok-4.6")
+    judge._http = _httpx.Client(transport=_httpx.MockTransport(_dead_handler),
+                                base_url="http://x")
+    first = _CtxClient("primary")
+    last = _CtxClient("mistral")
+    router = FallbackRouter([first, judge, last], 0.6)
+
+    # 1. A free-text call: `first` answers, `judge` is asked to score it
+    #    and 403s. Fail-open keeps the answer (P2-11's contract).
+    assert router.complete(_SMALL) == "answer from primary"
+    assert judge.disabled_reason == "403 permission_denied"
+    assert router.drain_counters()["llm_quality_calls_failed"] == 1.0
+
+    # 2. The next call has `first` fail. The chain must now go straight
+    #    past the dead judge to `mistral` instead of spending a request
+    #    on a provider whose account has already refused three times.
+    router = FallbackRouter([_Typed("primary", RuntimeError("boom")),
+                             judge, last], 0.6)
+    assert router.complete_json(_SMALL) == {"served_by": "mistral"}
+    counters = router.drain_counters()
+    assert counters["llm_disabled_skips"] == 1.0
+    assert counters["llm_provider_calls"] == 2.0, (
+        "primary attempted, grok skipped, mistral attempted")

@@ -142,6 +142,29 @@ class Settings(BaseSettings):
     llm_primary_timeout_seconds: float = Field(120.0, gt=0.0)   # local Cogito
     llm_timeout_seconds: float = Field(90.0, gt=0.0)            # Mistral, Gemini
     llm_max_tokens: int = Field(4096, ge=1)  # D-54: request-level generation cap
+    # D-131 (P6-2): how many characters of EVIDENCE may enter one prompt.
+    # The other half of llm_max_tokens above -- that one bounds what a
+    # provider may GENERATE, this bounds what we may SEND, and until it
+    # existed nothing did: compile_report inlined every evidence item and
+    # critique kept a bare `evidence[-60:]` tail slice.
+    #
+    # 12000 IS DERIVED, NOT GUESSED. Measured on a p205.267-check-shaped
+    # request (4 goals, 97 items): the evidence block alone is 30,199 of
+    # 32,873 characters. p205.246's compile that actually SUCCEEDED ran
+    # at 4,023 prompt tokens; 12,000 characters of evidence is ~3,000
+    # estimated tokens, which with compile_report's own ~2,700-character
+    # instruction body lands a compile prompt at roughly that same shape.
+    # Re-derive it for your own corpus and provider the way
+    # OPERATIONS.md's floor-calibration section does for min_similarity --
+    # a 32k-context cloud model and a `-c 1536` local one do not want the
+    # same number.
+    #
+    # 0 DISABLES the budget entirely and restores the pre-D-131 prompt,
+    # the same documented escape hatch MIN_SIMILARITY=0.0 and
+    # WEB_SEARCH_MAX_PER_DOMAIN=0 already provide --
+    # warn_on_unbounded_prompt_budget below says so at startup rather
+    # than letting a config value silently undo a code fix.
+    prompt_evidence_max_chars: int = Field(12000, ge=0)
     # D-93: the PRIMARY provider's context window, in tokens -- the
     # `-c` value llama-server was started with. 0 (the default) means
     # "not configured", and with it every routing decision is
@@ -258,6 +281,40 @@ class Settings(BaseSettings):
     # entirely without needing to also flip hitl_enabled.
     max_escalations: int = Field(2, ge=0)
     recursion_limit: int = Field(60, ge=10)   # D-8: invoke-time backstop
+    # D-132 (P6-4): the two bounds this graph did not have. max_depth,
+    # max_revisions, max_escalations and recursion_limit above all bound
+    # a run in STEPS; neither TIME nor SPEND had a bound anywhere. Live
+    # (p205.267-check): a run inside every one of those four took 237
+    # seconds and 9 provider calls with nothing misbehaving.
+    #
+    # 0 DISABLES each, and both ship disabled -- the same posture
+    # hitl_enabled, mcp_enabled, contradiction_detection_enabled and
+    # claim_verification_enabled all take, and it matters more here than
+    # for any of them: this is the first setting in this codebase that
+    # can end a run early. With both at 0 the graph is byte-identical to
+    # before D-132.
+    #
+    # WHAT HAPPENS WHEN ONE IS SPENT: a soft stop, never a cancellation.
+    # The checking node sets state.budget_exhausted, routing sends the
+    # run to the compiler instead of another gather lap or another
+    # revision, and the report says it was cut short
+    # (guardrails/truncation.py). Every path still reaches telemetry and
+    # still produces an answer, which is what D-1/D-21/D-22 already do
+    # for every other stop condition here.
+    #
+    # Wall-clock seconds of RESEARCH time -- time spent paused for a
+    # human review is subtracted (limits.py), so a reviewer who takes
+    # four minutes to answer does not spend the run's budget. 600 is a
+    # sensible starting point against the 237-second run above; there is
+    # no measured "right" value and this one is deliberately not
+    # defaulted to it.
+    run_deadline_seconds: float = Field(0.0, ge=0.0)
+    # Prompt + completion tokens across every provider call, the SAME
+    # total telemetry reports as llm_total_tokens (D-86). The honest
+    # complement to run_call_budget_warn, which counts REQUESTS and only
+    # warns: three cheap classify calls and three 7,000-token compiles
+    # are the same number of requests and not remotely the same spend.
+    run_token_budget: int = Field(0, ge=0)
     run_call_budget_warn: int = Field(40, ge=1)  # D-54: observational only
     # D-18/P2-12: LLM-based contradiction detection in merger_node. Off by
     # default — costs one extra LLM call per merger execution (up to
@@ -516,8 +573,13 @@ _KNOWN_ENV_TYPOS = {
     "FANOUT": "MAX_FANOUT",
     "DEPTH": "MAX_DEPTH",
     "REVISIONS": "MAX_REVISIONS",
+    "RUN_DEADLINE": "RUN_DEADLINE_SECONDS",
+    "RUN_TIMEOUT": "RUN_DEADLINE_SECONDS",
+    "TOKEN_BUDGET": "RUN_TOKEN_BUDGET",
     "DEBUG": "DEBUG_TRACE",
     "MEMORY_TOPK": "MEMORY_TOP_K",
+    "PROMPT_EVIDENCE_MAX": "PROMPT_EVIDENCE_MAX_CHARS",
+    "EVIDENCE_MAX_CHARS": "PROMPT_EVIDENCE_MAX_CHARS",
     "CONTRADICTION_DETECTION": "CONTRADICTION_DETECTION_ENABLED",
     "SERVER_SIDE_DECAY": "MEMORY_SERVER_SIDE_DECAY",
     "MCP": "MCP_ENABLED",
@@ -661,6 +723,29 @@ def warn_on_unpriced_fallback(s: "Settings") -> None:
                          "LANGFUSE_PRICE_* fields to Settings")
 
 
+def warn_on_unbounded_prompt_budget(s: "Settings") -> None:
+    """WARN when the D-131 evidence budget is switched off.
+
+    CALLED BY   get_settings(), below, once per process -- same shape and
+                same posture as the three checks around it.
+
+    0 stays legal: it is the documented way to reproduce the pre-D-131
+    prompt deliberately. What it must not be is SILENT. An unbounded
+    evidence block is what put 30,199 characters into one compile prompt
+    on run p205.267-check, and a run configured back into that state
+    looks, from every other number on screen, exactly like one that was
+    not -- the same class of config-undoing-code defect
+    warn_on_inert_coverage_gate exists for.
+    """
+    if s.prompt_evidence_max_chars <= 0:
+        log_event(logger, "config.prompt_budget_unbounded", level=logging.WARNING,
+                  setting="PROMPT_EVIDENCE_MAX_CHARS",
+                  value=s.prompt_evidence_max_chars,
+                  effect="every evidence item enters the compile and critique "
+                         "prompts; one run measured 30,199 characters of "
+                         "evidence in a single compile call")
+
+
 def warn_on_web_search_band(s: "Settings") -> None:
     """Log a WARNING when the web-search score band is misconfigured.
 
@@ -732,5 +817,6 @@ def get_settings() -> Settings:
     warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     warn_on_inert_coverage_gate(settings)
     warn_on_web_search_band(settings)
+    warn_on_unbounded_prompt_budget(settings)  # D-131
     warn_on_unpriced_fallback(settings)  # D-114
     return settings

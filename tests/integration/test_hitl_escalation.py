@@ -294,3 +294,59 @@ def test_e4_redirect_reaches_retrieval_not_just_the_compiler(off_memory,
     graph.invoke(_resume("redirect", "consult the UN democracy index"), config=cfg)
     assert len(calls) > before, (
         "a redirect asking for new evidence must trigger new searches")
+
+
+# ---------------------------------------------------------------------------
+# D-132 (P6-4) -- a reviewer's reading time is not the run's research time
+# ---------------------------------------------------------------------------
+
+
+def test_a_pause_is_stamped_while_paused_and_credited_back_on_resume(
+        off_memory, fake_tool, hitl_settings):
+    """The D-28-safe half of the run budget. human_escalation cannot
+    write anything BEFORE interrupt(), so the node that RAISES the
+    trigger stamps escalation_started_at, and the resume update -- the
+    same place escalation_history is appended, for the same reason --
+    turns that stamp into paused_seconds."""
+    import time
+
+    router = FallbackRouter([ZeroGoalsStub()], 0.6)
+    graph = build_graph(router, fake_tool, off_memory, hitl_settings,
+                        MemorySaver())
+    cfg = _cfg(hitl_settings, "hitl-budget-pause")
+
+    graph.invoke(ResearchState(raw_query="q"), config=cfg)
+    paused_state = graph.get_state(cfg).values
+    assert paused_state["escalation_started_at"] > 0, (
+        "the raising node must stamp when the pause began")
+    assert paused_state["paused_seconds"] == 0.0, (
+        "nothing is credited until the human actually answers")
+
+    before_resume = time.time()
+    result = graph.invoke(_resume("approve"), config=cfg)
+    wall_clock_gap = time.time() - before_resume
+
+    assert result["paused_seconds"] > 0
+    assert result["paused_seconds"] <= wall_clock_gap + 1.0, (
+        "the credited pause can never exceed the time actually spent "
+        "between the two invokes")
+    assert result["escalation_started_at"] == 0.0, (
+        "the stamp is cleared -- this pause is over")
+
+
+def test_the_run_clock_survives_a_pause_and_resume(off_memory, stub_router,
+                                                   hitl_settings):
+    """run_started_at is an EPOCH precisely so it survives being
+    checkpointed across an interrupt (limits.py). A monotonic reading
+    would be meaningless on the far side of this."""
+    graph = build_graph(stub_router, BrokenTool(), off_memory, hitl_settings,
+                        MemorySaver())
+    cfg = _cfg(hitl_settings, "hitl-budget-clock")
+
+    graph.invoke(ResearchState(raw_query="q"), config=cfg)
+    stamped = graph.get_state(cfg).values["run_started_at"]
+    assert stamped > 0
+
+    result = graph.invoke(_resume("approve"), config=cfg)
+    assert result["run_started_at"] == stamped, (
+        "a resumed run continues its original budget, it does not restart it")

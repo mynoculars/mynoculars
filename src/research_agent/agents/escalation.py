@@ -58,6 +58,7 @@ Python mechanics used in this file, if any of this is new to you:
 """
 
 import logging
+import time
 from typing import Any, Dict, Literal
 
 from langgraph.types import Command, interrupt
@@ -137,7 +138,16 @@ def raise_or_log(state: ResearchState, settings, trigger: str, reason: str,
     """
     if escalation_allowed(state, settings):
         log_event(logger, "escalation.raised", trigger=trigger, reason=reason, **ctx)
-        return {"escalation_trigger": trigger}
+        # D-132: stamp when this pause begins. It has to happen HERE, in
+        # the node whose check fired, because human_escalation may not
+        # write anything before interrupt() -- an update computed above
+        # that line is discarded when the graph pauses and recomputed on
+        # resume, which is the D-28 invariant escalation_history is
+        # placed to respect. The resume update subtracts this from the
+        # run budget, so a reviewer's reading time is never charged to
+        # the research clock.
+        return {"escalation_trigger": trigger,
+                "escalation_started_at": time.time()}
     if settings.hitl_enabled:
         log_event(logger, "escalation.suppressed", level=logging.WARNING,
                   trigger=trigger, reason="max_escalations_reached",
@@ -240,10 +250,22 @@ def build_escalation_node(settings, debug: bool = False):
         log_event(logger, "escalation.resumed", trigger=trigger, action=action)
         # History lands in the RESUME update — never before interrupt() —
         # so re-execution can't double-append (D-28.1).
+        # D-132: credit this pause back to the run budget. Computed in
+        # the RESUME update, never before interrupt() -- the same
+        # placement, and the same reason, as escalation_history just
+        # below: a write above that line fires twice for one human
+        # decision. `escalation_started_at` was stamped by the node that
+        # RAISED the trigger (raise_or_log, or goal_manager for E1); 0.0
+        # means no stamp exists and nothing is credited, which is the
+        # honest answer rather than a guessed one.
+        paused = (max(0.0, time.time() - state.escalation_started_at)
+                  if state.escalation_started_at else 0.0)
         base: Dict[str, Any] = {
             "escalation_trigger": None,  # clear, or routing re-fires the check
             "escalation_history": [{"trigger": trigger, "action": action,
                                     "guidance": guidance}],
+            "paused_seconds": state.paused_seconds + paused,
+            "escalation_started_at": 0.0,   # this pause is over
         }
 
         if trigger == "E1":

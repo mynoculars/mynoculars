@@ -47,6 +47,8 @@ from typing import Any, Callable, Dict, List
 
 from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
+from research_agent.limits import (elapsed_seconds, run_budget_exhausted,
+                                   tokens_used)
 from research_agent.agents.task_utils import cap_and_filter
 from research_agent.config import Settings
 from research_agent.guardrails.retrieval import (SINGLE_LEG_SCORE_CEILING,
@@ -461,6 +463,34 @@ def build_progress_checker_node(settings: Settings, debug: bool = False):
             update.update(raise_or_log(state, settings, trigger,
                                        reason="depth_exhausted",
                                        recall=round(recall, 3)))
+        # D-132: the run-budget check, at the end of a gather lap -- one
+        # of exactly two places it runs (compiler_node is the other).
+        # Here rather than inside search_worker deliberately: a check
+        # that fired mid-fan-out would abandon retrieval already paid
+        # for, and the lap ends microseconds later anyway.
+        #
+        # Sets a FLAG; route_convergence reads it and sends the run to
+        # the compiler instead of another lap. The CHECK writes and the
+        # ROUTER reads, exactly as D-23 splits escalation_trigger --
+        # routing functions are pure and cannot write.
+        #
+        # `not state.budget_exhausted` keeps this idempotent: the first
+        # lap to notice records WHICH budget was spent, and a later lap
+        # cannot overwrite "deadline" with "tokens".
+        if not state.budget_exhausted:
+            spent = run_budget_exhausted(state, settings)
+            if spent:
+                update["budget_exhausted"] = spent
+                log_event(logger, "run.budget_exhausted",
+                          level=logging.WARNING, budget=spent, node="progress_checker",
+                          elapsed_s=round(elapsed_seconds(state), 1),
+                          paused_s=round(state.paused_seconds, 1),
+                          tokens=tokens_used(state),
+                          deadline_s=settings.run_deadline_seconds,
+                          token_budget=settings.run_token_budget,
+                          depth=depth, recall=round(recall, 3),
+                          effect="stopping the gather loop and compiling "
+                                 "from the evidence gathered so far")
         return update
 
     return progress_checker_node

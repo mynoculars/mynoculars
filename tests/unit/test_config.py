@@ -357,3 +357,70 @@ def test_a_keyless_provider_never_warns_however_it_is_named(caplog):
 
     assert not [r for r in caplog.records
                 if "config.fallback_provider_unpriced" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# D-131 (P6-2) -- the evidence budget, and the warning when it is switched off
+# ---------------------------------------------------------------------------
+
+
+def test_the_prompt_evidence_budget_ships_bounded_by_default():
+    """An observability or safety feature that ships INERT is the mistake
+    MIN_EVIDENCE_SCORE=0.0 was. The default has to actually bound."""
+    assert Settings(_env_file=None).prompt_evidence_max_chars == 12000
+
+
+def test_a_zero_prompt_budget_warns_at_startup(caplog):
+    from research_agent.config import warn_on_unbounded_prompt_budget
+
+    s = Settings(_env_file=None, prompt_evidence_max_chars=0)
+    with caplog.at_level(logging.WARNING):
+        warn_on_unbounded_prompt_budget(s)
+
+    matches = [r for r in caplog.records
+               if "config.prompt_budget_unbounded" in r.message]
+    assert matches
+    assert matches[0].event_fields["setting"] == "PROMPT_EVIDENCE_MAX_CHARS"
+    assert "30,199" in matches[0].event_fields["effect"], (
+        "the warning cites the measured run, not a hypothetical")
+
+
+def test_a_configured_prompt_budget_is_silent(caplog):
+    from research_agent.config import warn_on_unbounded_prompt_budget
+
+    with caplog.at_level(logging.WARNING):
+        warn_on_unbounded_prompt_budget(Settings(_env_file=None))
+
+    assert not [r for r in caplog.records
+                if "config.prompt_budget" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# D-132 (P6-4) -- the run budget ships OFF
+# ---------------------------------------------------------------------------
+
+
+def test_both_run_budgets_ship_disabled():
+    """This is the first setting in this codebase that can END a run
+    early, so it is opt-in like HITL_ENABLED and MCP_ENABLED -- not
+    on-by-default like the guardrail thresholds, which only ever measure
+    or annotate."""
+    s = Settings(_env_file=None)
+    assert s.run_deadline_seconds == 0.0
+    assert s.run_token_budget == 0
+
+
+def test_a_mistyped_deadline_is_flagged_like_every_other_known_typo(
+        isolated_from_dotenv, monkeypatch, caplog):
+    """D-84's fixture is not optional here -- see this file's own header
+    for why a typo test without it passes or fails on the developer's
+    .env rather than on the code."""
+    monkeypatch.setenv("RUN_DEADLINE", "600")
+    monkeypatch.delenv("RUN_DEADLINE_SECONDS", raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        warn_on_likely_env_typos()
+
+    hits = [r for r in caplog.records if "config.likely_typo" in r.message]
+    assert any(r.event_fields["probably_meant"] == "RUN_DEADLINE_SECONDS"
+               for r in hits)

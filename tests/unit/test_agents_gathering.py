@@ -697,3 +697,67 @@ def test_gap_generator_still_calls_the_llm_for_a_human_redirect():
     router = _CapturingRouter()
     build_gap_generator_node(router, settings, debug=False)(state)
     assert router.messages is not None
+
+
+# ---------------------------------------------------------------------------
+# D-132 (P6-4) -- progress_checker is one of the two budget check sites
+# ---------------------------------------------------------------------------
+
+
+def _budget_state(**kw):
+    return ResearchState(raw_query="q",
+                         goals=[Goal(goal_id="g1", description="d")], **kw)
+
+
+def test_progress_checker_flags_a_spent_deadline(caplog):
+    import logging
+    from research_agent.agents.gathering import build_progress_checker_node
+
+    settings = Settings(_env_file=None, run_deadline_seconds=1.0)
+    node = build_progress_checker_node(settings)
+    # Stamped far enough in the past that the budget is provably spent
+    # without the test having to sleep.
+    state = _budget_state(run_started_at=1.0)
+
+    with caplog.at_level(logging.WARNING):
+        update = node(state)
+
+    assert update["budget_exhausted"] == "deadline"
+    rec = [r for r in caplog.records if "run.budget_exhausted" in r.message]
+    assert rec and rec[0].event_fields["node"] == "progress_checker"
+    assert "compiling" in rec[0].event_fields["effect"]
+
+
+def test_progress_checker_flags_a_spent_token_budget():
+    from research_agent.agents.gathering import build_progress_checker_node
+
+    settings = Settings(_env_file=None, run_token_budget=100)
+    node = build_progress_checker_node(settings)
+    state = _budget_state(counters={"llm_prompt_tokens": 500.0})
+
+    assert node(state)["budget_exhausted"] == "tokens"
+
+
+def test_progress_checker_adds_no_flag_with_the_budgets_off():
+    """Both settings default to 0, so this is what every existing run
+    does -- the key must be ABSENT, not None, or the update would
+    overwrite a flag another node set."""
+    from research_agent.agents.gathering import build_progress_checker_node
+
+    node = build_progress_checker_node(Settings(_env_file=None))
+    update = node(_budget_state(run_started_at=1.0,
+                                counters={"llm_prompt_tokens": 10 ** 6}))
+
+    assert "budget_exhausted" not in update
+
+
+def test_an_already_flagged_run_is_not_reflagged():
+    """The first lap to notice records WHICH budget was spent; a later
+    lap must not overwrite "tokens" with "deadline"."""
+    from research_agent.agents.gathering import build_progress_checker_node
+
+    settings = Settings(_env_file=None, run_deadline_seconds=1.0)
+    node = build_progress_checker_node(settings)
+    update = node(_budget_state(run_started_at=1.0, budget_exhausted="tokens"))
+
+    assert "budget_exhausted" not in update
