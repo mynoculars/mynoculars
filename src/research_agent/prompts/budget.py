@@ -81,6 +81,31 @@ def _cost(item: Evidence) -> int:
     return len(item.content) + _PER_ITEM_OVERHEAD
 
 
+# D-142: every memory item lands in ONE bucket, not one per remembered
+# pseudo-goal.
+#
+# P2-02 namespaces recalled evidence as "memory::g1", "memory::g4" and so
+# on, which is correct and must stay -- it is what stops an old run's "g3"
+# satisfying this run's "g3" by string collision. But the round-robin below
+# allocates one slot PER BUCKET PER LAP, so those namespaced ids were being
+# read as several independent goals, each guaranteed a slot in lap 1,
+# ahead of the second item for any real goal.
+#
+# Live (run p205.280-check): five Redis-vs-Memcached memory items at
+# similarity 0.45-0.47 held guaranteed places in a China-vs-India compile
+# prompt while 47 real evidence items were dropped for space. _SOURCE_RANK
+# ranks "memory" last precisely to prevent this -- but it only breaks ties
+# WITHIN a bucket, so with one bucket per memory pseudo-goal it never got
+# to apply. Collapsing them to a single bucket is what makes that existing
+# rank do the job it was written for.
+MEMORY_BUCKET = "memory::*"
+
+
+def _bucket(goal_id: str) -> str:
+    """Which round-robin bucket an item's goal_id belongs to (D-142)."""
+    return MEMORY_BUCKET if goal_id.startswith("memory::") else goal_id
+
+
 def budget_evidence(evidence: Iterable[Evidence], goals: Sequence[Goal],
                     max_chars: int) -> Tuple[List[Evidence], Dict[str, float]]:
     """Return (kept, counters) -- the evidence that fits, in INPUT order.
@@ -102,10 +127,13 @@ def budget_evidence(evidence: Iterable[Evidence], goals: Sequence[Goal],
     letting it happen silently.
 
     ORDERING, in full, because every part of it is load-bearing:
-      - goals are walked in `goals` order (g1, g2, ...), then any goal_id
-        present in the evidence but not in `goals` -- memory items carry
-        "memory::gN" by P2-02 and are real evidence the compiler still
-        sees, just never a CURRENT goal;
+      - goals are walked in `goals` order (g1, g2, ...), then any bucket
+        present in the evidence but not in `goals`. D-142: memory items
+        carry "memory::gN" by P2-02 and are real evidence the compiler
+        still sees, just never a CURRENT goal -- they all share ONE
+        bucket (see _bucket above), so recall competes with itself for a
+        single round-robin slot instead of claiming one per remembered
+        pseudo-goal;
       - within a goal: score descending, then provenance (_SOURCE_RANK),
         then first-seen. Fully deterministic, which matters because
         compiler_node runs again on every revision and two passes over
@@ -124,10 +152,10 @@ def budget_evidence(evidence: Iterable[Evidence], goals: Sequence[Goal],
 
     order = {e_id: i for i, e_id in enumerate(
         dict.fromkeys([g.goal_id for g in goals]
-                      + [e.goal_id for e in items]))}
+                      + [_bucket(e.goal_id) for e in items]))}
     by_goal: Dict[str, List[Tuple[int, Evidence]]] = {}
     for index, item in enumerate(items):
-        by_goal.setdefault(item.goal_id, []).append((index, item))
+        by_goal.setdefault(_bucket(item.goal_id), []).append((index, item))
     for goal_id in by_goal:
         by_goal[goal_id].sort(
             key=lambda pair: (-pair[1].score,

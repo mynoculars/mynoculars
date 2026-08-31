@@ -1799,3 +1799,220 @@ def test_the_zero_citation_gate_still_reads_the_shipped_report():
 
     assert out["critique_passed"] is False
     assert "cites no evidence" in out["critique_notes"][0]
+
+
+# ---------------------------------------------------------------------------
+# D-144 -- the whole attribution repair, at the pipeline level
+#
+# Runs p205.276, p205.277 and p205.280 each shipped a report with ZERO
+# [gN] markers against 35-100 evidence items, and the damage was never
+# confined to the missing markers: three guardrails read attribution
+# through the same function and failed together and silently.
+#
+# p205.280-check, 100 evidence items:
+#     evidence_cited            0
+#     web_sources_listed        0   of 58 items, 33 distinct domains
+#     web_sources_suppressed   58
+#     cited_figures_checked     0   (D-91 audited nothing)
+#     -> E4, approved by a human because the prose read fine
+# ---------------------------------------------------------------------------
+
+_UNCITED_REPORT = (
+    "# Comparative Analysis of China's and India's Armed Forces\n"
+    "\n"
+    "## 1. Size and Composition of Active-Duty Military Forces\n"
+    "\n"
+    "India's active force is reported at approximately 1.45 million "
+    "personnel, while China's active force is significantly larger.\n")
+
+
+def _army_state():
+    goals = [Goal(goal_id="g1",
+                  description="Compare the size and composition of the "
+                              "active-duty military forces of China and India")]
+    evidence = [
+        Evidence(task_key="t1", goal_id="g1", source="web", score=0.75,
+                 content="India Military Strength — India ranks #4 with 1.45 "
+                         "million active military personnel",
+                 url="https://a.example/india", domain="a.example"),
+        Evidence(task_key="t2", goal_id="g1", source="web", score=0.71,
+                 content="China military personnel by type 2023 — active "
+                         "military personnel 2,035,000",
+                 url="https://b.example/china", domain="b.example"),
+    ]
+    return ResearchState(raw_query="Compare the Armies of China and India",
+                         goals=goals, evidence=evidence)
+
+
+def test_an_uncited_report_leaves_the_compiler_cited_and_sourced():
+    """The p205.280-check failure, end to end. Both halves must recover:
+    the markers, and the Sources block that was gated on them."""
+    node = build_compiler_node(_FakeRouter(_UNCITED_REPORT), _SETTINGS)
+
+    result = node(_army_state())
+    report = result["final_report"]
+
+    assert "[g1]" in report, "the attachment pass did not fire"
+    assert "## Sources" in report
+    assert "https://a.example/india" in report
+    assert result["counters"]["citations_attached"] >= 1
+    assert result["counters"]["web_sources_listed"] >= 1
+
+
+def test_the_rescue_is_visible_in_the_per_report_guardrail_block():
+    """D-88's last_compile_guardrails is what a reader consults to tell a
+    report the model cited from one that was repaired. If the rescue were
+    invisible there, this would be a nicer lie rather than a fix."""
+    node = build_compiler_node(_FakeRouter(_UNCITED_REPORT), _SETTINGS)
+
+    result = node(_army_state())
+
+    assert result["last_compile_guardrails"]["citations_attached"] >= 1
+
+
+def test_a_report_the_model_cited_itself_is_not_touched_by_the_pass():
+    """The no-op path, which is the healthy one."""
+    cited = (
+        "## 1. Size and Composition\n"
+        "\n"
+        "India's active force is approximately 1.45 million personnel. [g1]\n")
+    node = build_compiler_node(_FakeRouter(cited), _SETTINGS)
+
+    result = node(_army_state())
+
+    from research_agent.guardrails.claims import (cited_goal_ids_in_prose,
+                                                  report_body)
+
+    assert "citations_attached" not in result["counters"]
+    assert cited_goal_ids_in_prose(result["final_report"]) == {"g1"}
+    # One marker in, one marker out: the pass added nothing to the prose.
+    assert report_body(result["final_report"]).count("[g1]") == 1
+
+
+def test_a_report_nothing_can_be_attached_to_still_lists_its_sources():
+    """The fallback that stops 33 real domains disappearing because of a
+    formatting miss. The prose here shares no distinctive term with any
+    evidence, so attachment correctly declines -- and the Sources block
+    must still ship, labelled for what it is."""
+    from research_agent.guardrails.sources import UNCITED_NOTE
+
+    unrelated = ("## Overview\n"
+                 "\n"
+                 "Several considerations follow from the preceding discussion "
+                 "of the wider topic.\n")
+    node = build_compiler_node(_FakeRouter(unrelated), _SETTINGS)
+
+    result = node(_army_state())
+    report = result["final_report"]
+
+    assert "citations_attached" not in result["counters"]
+    assert "## Sources" in report
+    assert UNCITED_NOTE in report
+    assert result["counters"]["web_sources_listed_uncited"] >= 1
+
+
+def test_evidence_cited_counts_prose_not_the_sources_block():
+    """The latent defect D-144 had to fix first: every Sources entry begins
+    "1. [g1] " by construction, so a whole-report read reported an uncited
+    report as cited -- which would have made this count wrong, the D-66
+    gate silent, and telemetry's backstop agree with both."""
+    from research_agent.guardrails.claims import cited_goal_ids_in_prose
+
+    unrelated = ("## Overview\n"
+                 "\n"
+                 "Several considerations follow from the preceding discussion "
+                 "of the wider topic.\n")
+    node = build_compiler_node(_FakeRouter(unrelated), _SETTINGS)
+
+    report = node(_army_state())["final_report"]
+
+    assert "[g1]" in report, "the Sources block does carry markers"
+    assert cited_goal_ids_in_prose(report) == set(), "but the prose does not"
+
+
+
+# ---------------------------------------------------------------------------
+# D-146 -- telemetry, by concern
+#
+# telemetry_node was 531 lines, of which roughly 350 were one dict literal
+# interleaved with the comments explaining each field. Nothing in it could
+# be tested without running the whole node. These three builders are the
+# part that reads nothing but state.counters.
+# ---------------------------------------------------------------------------
+
+
+def testllm_metrics_reads_only_counters_and_defaults_everything():
+    from research_agent.reporting.telemetry import llm_metrics
+
+    empty = llm_metrics({})
+
+    assert empty["llm_node_calls"] == 0
+    assert empty["llm_total_tokens"] == 0
+    assert set(empty) == {
+        "llm_node_calls", "llm_provider_calls", "llm_fallback_hops",
+        "llm_quality_calls", "llm_quality_calls_failed",
+        "llm_quality_rejections", "llm_prompt_tokens",
+        "llm_completion_tokens", "llm_total_tokens", "llm_context_skips",
+        "llm_disabled_skips"}
+
+
+def test_llm_total_tokens_is_the_sum_of_the_two_halves():
+    from research_agent.reporting.telemetry import llm_metrics
+
+    out = llm_metrics({"llm_prompt_tokens": 19437,
+                        "llm_completion_tokens": 5164})
+
+    assert out["llm_total_tokens"] == 24601, "p205.280-check's own figures"
+
+
+def testretrieval_metrics_derives_tier_answers_from_the_chain_counters():
+    from research_agent.reporting.telemetry import retrieval_metrics
+
+    out = retrieval_metrics({"chain_answered_web": 12,
+                              "chain_answered_corpus": 0,
+                              "retrieval_dense_calls": 24})
+
+    assert out["tier_answers"] == {"web": 12}, "a zero tier is not an answer"
+    assert out["retrieval_dense_calls"] == 24
+
+
+def testrun_metrics_is_the_whole_run_tally():
+    from research_agent.reporting.telemetry import run_metrics
+
+    out = run_metrics({"search_calls": 12, "memory_hits": 5,
+                        "revision_cycles": 2})
+
+    assert out["search_calls"] == 12
+    assert out["search_failures"] == 0
+    assert out["memory_hits"] == 5
+    assert out["revision_cycles"] == 2
+
+
+def test_the_three_builders_emit_disjoint_keys():
+    """They are merged with ** into one dict; overlapping keys would mean a
+    field silently taking whichever builder ran last."""
+    from research_agent.agents.compilation import (llm_metrics,
+                                                   retrieval_metrics,
+                                                   run_metrics)
+
+    keys = [set(fn({})) for fn in (llm_metrics, retrieval_metrics,
+                                   run_metrics)]
+    assert not (keys[0] & keys[1])
+    assert not (keys[0] & keys[2])
+    assert not (keys[1] & keys[2])
+
+
+def test_they_are_pure_and_do_not_mutate_the_counters_they_read():
+    from research_agent.agents.compilation import (llm_metrics,
+                                                   retrieval_metrics,
+                                                   run_metrics)
+
+    counters = {"llm_node_calls": 6, "search_calls": 12,
+                "chain_answered_web": 12}
+    before = dict(counters)
+
+    for fn in (llm_metrics, retrieval_metrics, run_metrics):
+        fn(counters)
+
+    assert counters == before
+

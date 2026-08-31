@@ -289,7 +289,7 @@ def test_build_graph_with_mcp_tool_registers_the_specialist_node():
                        postgres_dsn="postgresql://x:x@127.0.0.1:1/x",
                        opensearch_url="http://127.0.0.1:1")
     router = FallbackRouter([StubClient()], quality_threshold=0.6)
-    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test", probe=False),
                             settings.memory_top_k, 90.0, 14.0)
 
     def fake_tool(task):

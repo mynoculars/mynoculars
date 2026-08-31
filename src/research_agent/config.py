@@ -57,11 +57,12 @@ Python mechanics used in this file, if any of this is new to you:
 import logging
 import os
 import pathlib
+import re
 import sys
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from research_agent.logging_setup import configure_logging, log_event
@@ -71,6 +72,61 @@ logger = logging.getLogger(__name__)
 # The repository root, derived from THIS FILE's location and never from the
 # current working directory. A general path anchor.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+# D-148: every numeric value this process normalised on the way in, as
+# (SETTING, raw, parsed). Drained and logged by get_settings() rather than
+# logged where it happens, for S-11's reason exactly: Settings() is built
+# BEFORE configure_logging(), so a warning emitted inside the validator
+# below would go to an unconfigured root logger and be the one message
+# that got lost.
+_NUMERIC_NORMALISATIONS: list = []
+
+# A number written with thousands separators, and nothing else: an optional
+# sign, then groups of exactly three digits after the first, then an
+# optional decimal part. Both the en-US comma and Python's own numeric
+# underscore, but not mixed within one value.
+#
+# THE GROUPING MUST BE VALID. An earlier, looser version of this stripped
+# every separator and kept the result if it parsed -- which turned "1,2,3"
+# into 123. That is guessing, and this function must never guess: "1,2,3"
+# is not a number anyone meant, so it is handed back untouched for pydantic
+# to reject with its own message. Caught by its own test, not in review.
+_GROUPED_NUMBER_RE = re.compile(
+    r"^[+-]?\d{1,3}(?:(?P<sep>[,_])\d{3})+(?:\.\d+)?$")
+
+# Quotes and whitespace a .env line picks up when a value is copied out of
+# documentation. Stripping these is always safe -- they carry no meaning
+# around a number -- so it happens before the grouping test above.
+_NUMERIC_WRAPPERS = " \t'\""
+
+
+def _normalise_numeric(raw: str) -> str:
+    """Make a human-written number parseable. Pure; returns `raw` unchanged
+    unless the result is unambiguously the same number.
+
+    CALLED BY   Settings._accept_grouped_numbers, for int and float fields
+                only.
+
+    Two steps, in order, and both conservative:
+
+      1. strip surrounding quotes and whitespace -- ' "8 192" ' has picked
+         those up from a copy-paste and they mean nothing;
+      2. remove thousands separators, but ONLY when what is left of them is
+         a validly grouped number.
+
+        "8,876"   -> "8876"      grouped correctly
+        "8_876"   -> "8876"      Python's own separator
+        "1,2,3"   -> "1,2,3"     NOT valid grouping; left for pydantic
+        "8,876.5" -> "8876.5"    decimal part preserved
+        "abc"     -> "abc"       untouched
+        "8192"    -> "8192"      nothing to do
+    """
+    core = raw.strip(_NUMERIC_WRAPPERS).replace(" ", "")
+    match = _GROUPED_NUMBER_RE.match(core)
+    if match:
+        core = core.replace(match.group("sep"), "")
+    return core if core and core != raw else raw
 
 
 class Settings(BaseSettings):
@@ -96,6 +152,44 @@ class Settings(BaseSettings):
     # raising an error — worth knowing if a setting you set doesn't seem to
     # take effect: check the exact field name below first.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_grouped_numbers(cls, values):
+        """Let a numeric setting carry a thousands separator (D-148).
+
+        WHY THIS EXISTS. `LLM_PRIMARY_CONTEXT_TOKENS=8,876` -- a model's
+        real context window, written the way a person writes a number --
+        made Settings() raise, and because 43 tests reach Settings()
+        through get_settings() (see tests/conftest.py::_no_ambient_config)
+        that one line reported as `26 failed, 1087 passed, 17 errors`,
+        none of it near the field in question.
+
+        The isolation fix in conftest is what stops a .env typo reaching
+        the suite at all. This is the other half: for a REAL run, "8,876"
+        is not ambiguous and refusing it teaches nothing. Accepted, and
+        recorded so get_settings() can say it happened -- silently
+        rewriting a person's configuration would be the worse failure.
+
+        Only int and float fields are touched, and only when the cleaned
+        string still parses as a number; anything else falls through to
+        pydantic's own error, unchanged.
+        """
+        if not isinstance(values, dict):
+            return values
+        for name, field in cls.model_fields.items():
+            if field.annotation not in (int, float):
+                continue
+            for key in (name, name.upper()):
+                raw = values.get(key)
+                if not isinstance(raw, str):
+                    continue
+                cleaned = _normalise_numeric(raw)
+                if cleaned != raw:
+                    values[key] = cleaned
+                    _NUMERIC_NORMALISATIONS.append(
+                        (name.upper(), raw, cleaned))
+        return values
 
     # --- LLM providers -----------------------------------------------------
     # Both providers speak the OpenAI-compatible chat API. The primary is a
@@ -368,6 +462,27 @@ class Settings(BaseSettings):
 
     # --- Memory decay (D-24/D-27) -------------------------------------------
     memory_top_k: int = Field(5, ge=1)
+    # D-142: the relevance floor for RECALL. Until this existed, memory had
+    # none: SemanticMemory.retrieve took scored[:top_k] unconditionally, so
+    # every run inherited five remembered items no matter how unrelated
+    # they were. memory_write_min_score below gates what goes IN; nothing
+    # gated what came back OUT.
+    #
+    # Live shape (run p205.280-check, "Compare the Armies of China and
+    # India"): five Redis-vs-Memcached items from an unrelated earlier run
+    # were recalled at similarity 0.45-0.47 and led the compile prompt --
+    # while the CORPUS floor at min_similarity 0.55 dropped 72 of 72 dense
+    # candidates and the prompt budget dropped 47 real items to make room.
+    # The lowest bar in the system was being applied to its least
+    # trustworthy source.
+    #
+    # Defaults to the same 0.60 as min_similarity, for the same corpus and
+    # the same embedding model, because it is the same question asked of
+    # the same vector space. RE-DERIVE IT for your own corpus rather than
+    # copying the number -- OPERATIONS.md's "Calibrate the retrieval floor"
+    # now covers both floors. 0.0 disables it and restores the pre-D-142
+    # behaviour exactly.
+    memory_min_similarity: float = Field(0.60, ge=0.0, le=1.0)
     decay_half_life_days_semi_stable: float = 90.0
     decay_half_life_days_volatile: float = 14.0
     # P2-10: server-side (Qdrant FormulaQuery) decay reranking instead of
@@ -812,6 +927,88 @@ def warn_on_web_search_band(s: "Settings") -> None:
                          "band, but the configured values are not what was meant")
 
 
+def warn_on_primary_context_below_prompt_budget(s: "Settings") -> None:
+    """WARN when the primary can never serve a compile or critique (D-143).
+
+    CALLED BY   get_settings(), below, alongside the other warn_on_* checks
+                it deliberately mirrors in shape and posture.
+
+    THE INCONSISTENCY THIS CATCHES. Two settings decide whether the local
+    model can ever see the two prompts that produce the deliverable, and
+    nothing compared them:
+
+      - PROMPT_EVIDENCE_MAX_CHARS bounds the evidence block (12,000 by
+        default, ~3,000 tokens at this file's ~4 chars/token estimate);
+      - LLM_PRIMARY_CONTEXT_TOKENS declares the window the local server was
+        started with, and OPERATIONS.md recommends `-c 1536` for an 8 GB
+        card, which is what people then configure.
+
+    12,000 characters of evidence cannot fit in 1,536 tokens. Not
+    sometimes -- never, by arithmetic, before a single goal, critique note
+    or instruction is added. So D-93 skips the primary on every compile and
+    every critique, correctly, and the three-provider chain silently
+    becomes a two-provider cloud chain for exactly the two node types that
+    write the report.
+
+    Live (p205.280-check): llm_context_skips 2, llm_fallback_hops 2, and
+    the compiler's answer came from a Gemini hop the local model was never
+    allowed to attempt -- which then hit its own token limit. Every
+    individual number was correct and nothing said the configuration was
+    self-contradictory.
+
+    A WARNING, not a failure, and not a clamp: a deliberately small local
+    window is a legitimate choice (D-93 exists to make it cheap). What it
+    must not be is invisible. The remedy is one of two things and the
+    message says both: raise the server's -c to the model's real window, or
+    lower PROMPT_EVIDENCE_MAX_CHARS to something that fits it.
+    """
+    if s.llm_primary_context_tokens <= 0:
+        return  # unconfigured; D-93 is inert and there is nothing to compare
+    # The same ~4 chars/token estimate llm/client.py::estimate_prompt_tokens
+    # uses, reused rather than reinvented -- a second, subtly different
+    # notion of "how big is this prompt" is exactly the drift D-99 records.
+    evidence_tokens = s.prompt_evidence_max_chars / 4.0
+    if evidence_tokens < s.llm_primary_context_tokens:
+        return
+    log_event(logger, "config.primary_context_below_prompt_budget",
+              level=logging.WARNING,
+              setting="LLM_PRIMARY_CONTEXT_TOKENS",
+              value=s.llm_primary_context_tokens,
+              prompt_evidence_max_chars=s.prompt_evidence_max_chars,
+              evidence_tokens_estimate=int(evidence_tokens),
+              effect="the evidence block alone cannot fit the primary's "
+                     "window, so D-93 will skip it on EVERY compile and "
+                     "critique and the chain is cloud-only for the two "
+                     "nodes that write the report; raise the local "
+                     "server's -c to the model's real window, or lower "
+                     "PROMPT_EVIDENCE_MAX_CHARS to fit it")
+
+
+def warn_on_normalised_numerics() -> None:
+    """Report every numeric value that needed cleaning up (D-148).
+
+    CALLED BY   get_settings(), below, immediately after
+                configure_logging() and before the other warn_on_* checks
+                -- this one describes what was READ, so it belongs ahead
+                of the checks that judge what was read.
+
+    DRAINS the record, so a second Settings() in the same process (every
+    test that builds one) cannot make this report the same line twice.
+
+    A WARNING rather than silence because the alternative is a system that
+    quietly rewrites a person's configuration and never says so. The value
+    IS accepted -- see Settings._accept_grouped_numbers -- and the message
+    shows both forms so the operator can decide whether 8,876 was what
+    they meant.
+    """
+    while _NUMERIC_NORMALISATIONS:
+        setting, raw, parsed = _NUMERIC_NORMALISATIONS.pop(0)
+        log_event(logger, "config.numeric_normalised", level=logging.WARNING,
+                  setting=setting, raw=raw, parsed=parsed,
+                  effect="the value was read as %s; remove the grouping "
+                         "characters from .env to silence this" % parsed)
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Return the process-wide Settings singleton (cached after first load).
@@ -838,9 +1035,11 @@ def get_settings() -> Settings:
     """
     settings = Settings()
     configure_logging(settings.log_level)
+    warn_on_normalised_numerics()  # D-148: what was cleaned up on the way in
     warn_on_likely_env_typos()  # P2-09: surface likely misconfiguration
     warn_on_inert_coverage_gate(settings)
     warn_on_web_search_band(settings)
     warn_on_unbounded_prompt_budget(settings)  # D-131
     warn_on_unpriced_fallback(settings)  # D-114
+    warn_on_primary_context_below_prompt_budget(settings)  # D-143
     return settings

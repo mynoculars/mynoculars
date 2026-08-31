@@ -40,6 +40,11 @@ Scope, deliberately narrow:
     identifiers, not by a URL. Model-tier recollection has no source to
     cite by definition, which is the whole reason D-49/D-51 hedge it
     instead.
+
+    D-144 adds ONE exception, and labels it in the output: with
+    list_when_uncited=True and a report that cites nothing at all, the
+    block is emitted anyway under a note saying these are what the run
+    retrieved rather than support for a claim. See append_web_sources.
 """
 
 import logging
@@ -100,10 +105,20 @@ def cited_goal_ids(report: str) -> set:
     return {f"g{m.group(1)}" for m in _CITATION_RE.finditer(report)}
 
 
+# The line that appears under the heading when the block is listed for an
+# UNCITED report (D-144). It is the whole reason the fallback is honest:
+# the entries below it are what the run drew on, not support for a named
+# claim, and the reader is told which of the two they are looking at.
+UNCITED_NOTE = ("_Retrieved for this report. Its prose carries no `[gN]` "
+                "citations, so these are listed as the web results this run "
+                "drew on -- not as support for any specific claim._")
+
+
 def append_web_sources(report: str,
                        evidence: List[Evidence],
                        goals: Optional[List[Goal]] = None,
                        guidance: str = "",
+                       list_when_uncited: bool = False,
                        ) -> Tuple[str, Dict[str, float]]:
     """Append a Sources section for cited web evidence. Returns (report, counters).
 
@@ -136,8 +151,31 @@ def append_web_sources(report: str,
     if not web_items:
         return report, counters
 
+    # D-144: cited-goal membership is the RULE, not the only rule.
+    #
+    # This filter is correct and stays correct -- a Sources list is a claim
+    # about what backed this report, and listing pages the compiler never
+    # drew on is misattribution. But it is a strict subset of what the
+    # prose cited, so when the prose cites NOTHING it returns nothing, and
+    # one LLM formatting failure takes out attribution twice over. Live
+    # (p205.280-check): 58 web items across 33 distinct domains retrieved,
+    # 0 listed, and the shipped report carried D-85's provenance notice
+    # telling the reader to trust figures "unless a listed source confirms
+    # them" -- above a page with no listed sources.
+    #
+    # guardrails/attribution.py runs first and usually fixes the cause. The
+    # fallback below is for when it cannot: rather than silently dropping
+    # 33 domains, list them under a heading that says exactly what they
+    # are. That does not weaken D-59, whose rule is "do not assert support
+    # that does not exist" -- the note asserts nothing of the kind. The
+    # topical gate below still applies in full, so the nine Redis URLs that
+    # motivated D-59 are still dropped on this path too.
     cited = cited_goal_ids(report)
-    listed = [e for e in web_items if e.goal_id in cited]
+    uncited_fallback = list_when_uncited and not cited
+    if uncited_fallback:
+        listed = list(web_items)
+    else:
+        listed = [e for e in web_items if e.goal_id in cited]
     # D-59: cited-goal membership alone is NOT a claim of support. A
     # drifted gather cycle can retrieve web results about an entirely
     # different subject and tag them with a real, correctly-formed goal id;
@@ -156,6 +194,14 @@ def append_web_sources(report: str,
     if goals:
         goal_terms = {g.goal_id: distinctive_terms(g.description)
                       for g in goals}
+        if uncited_fallback:
+            # On the fallback path an item's own goal_id is not evidence
+            # that the report used it, so the gate is widened from "this
+            # item's goal" to "any goal this run pursued". Still a real
+            # gate: an item sharing no distinctive term with ANY goal is
+            # still dropped, which is what keeps D-59's nine Redis URLs out.
+            every_goal_term = set().union(*goal_terms.values()) if goal_terms else set()
+            goal_terms = {e.goal_id: every_goal_term for e in listed}
         # D-64: the reviewer's redirect guidance counts as on-topic too.
         # WHY: the gate above tests evidence against the goal descriptions
         # composed BEFORE the human intervened. A redirect changes what the
@@ -223,6 +269,8 @@ def append_web_sources(report: str,
     ordered = sorted(best_by_url.values(), key=lambda e: -e.score)
 
     lines = [SOURCES_HEADING, ""]
+    if uncited_fallback:
+        lines += [UNCITED_NOTE, ""]
     for i, item in enumerate(ordered, start=1):
         # The evidence content is "Title — snippet" (see
         # tools/mcp_client.py::make_web_search_tool). Only the title half is
@@ -240,9 +288,16 @@ def append_web_sources(report: str,
     block = "\n".join(lines)
 
     counters["web_sources_listed"] = float(len(ordered))
+    if uncited_fallback:
+        # Counted separately so telemetry, and anyone reading it later, can
+        # always tell "the compiler cited these goals" from "the compiler
+        # cited nothing and we listed what it had". Same reason D-144
+        # counts citations_attached rather than quietly rescuing a report.
+        counters["web_sources_listed_uncited"] = float(len(ordered))
     log_event(logger, "sources.web_sources_appended",
               listed=len(ordered),
-              suppressed=int(counters["web_sources_suppressed"]))
+              suppressed=int(counters["web_sources_suppressed"]),
+              uncited_fallback=uncited_fallback)
     # rstrip then two newlines: the compiler's own output has inconsistent
     # trailing whitespace across providers, and a Sources heading that lands
     # one line below the last paragraph in one run and three in the next is

@@ -104,7 +104,7 @@ mcp = ["mcp>=1.9,<2"]
 websearch = ["mcp>=1.9,<2", "ddgs>=9.0,<10"]
 langfuse = ["langfuse>=4.0"]
 viz = ["grandalf>=0.8"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-xdist>=3.5"]
 # Everything, matching what requirements.txt installs today. This is the
 # extra a consuming project wants if it does not care about install size.
 all = [

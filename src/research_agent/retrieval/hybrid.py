@@ -319,6 +319,68 @@ class HybridRetriever:
             if dropped:
                 log_event(logger, "retrieval.below_floor", query=query,
                           dropped=dropped, floor=self.min_similarity)
+            # D-150: the floor's verdict now binds BOTH legs.
+            #
+            # It only ever gated the dense leg. OpenSearch hits went
+            # straight into fusion, so an off-topic corpus document could
+            # still become Evidence for a query the corpus does not cover
+            # -- exactly what the floor exists to prevent, reached by the
+            # other door. Live (run p205.282-check, "Compare the Armies of
+            # China and India" against a Redis/Memcached corpus):
+            #
+            #     OPENSEARCH (BM25)
+            #     query: "organizational structures command hierarchies
+            #             Chinese People's"
+            #     [hit 1]  bm25=0.92  topic=redis
+            #
+            # BM25 matched on "command" and "structures" -- Redis
+            # vocabulary -- and 42 corpus + 36 mcp items entered a military
+            # run. corpus_recall stayed 0.0 because D-47's topical gate
+            # correctly refused to call them grounded, but they had already
+            # consumed the prompt budget (32 items dropped for space), and
+            # since D-142 ranks corpus above web they would LEAD the prompt
+            # if they survived dedup.
+            #
+            # WHY THIS RULE AND NOT A BM25 THRESHOLD. BM25 scores are
+            # unbounded and corpus-relative; there is no number to
+            # calibrate that transfers. WHY NOT A TERM-OVERLAP GATE,
+            # which was the obvious candidate: measured against this
+            # repo's own golden set, a >=2 distinctive-term bar drops the
+            # Redis hits correctly (they share exactly ONE term) but also
+            # drops `in-corpus-operational`, a query two documents
+            # genuinely answer using different words. Too high a floor
+            # silently discarding real evidence is D-42's stated failure
+            # mode, so that idea was measured and rejected rather than
+            # shipped.
+            #
+            # What IS already calibrated is min_similarity itself, derived
+            # per corpus by OPERATIONS.md's procedure. If every dense
+            # candidate the store returned fell below it, the corpus does
+            # not cover this query -- and that verdict should bind the
+            # keyword leg too, instead of being ignored by it. Embeddings
+            # are also what handle the vocabulary mismatch BM25 cannot, so
+            # `in-corpus-operational` keeps its hits: its dense leg clears
+            # the floor.
+            #
+            # Guarded so it can only fire on a real verdict: the dense
+            # store must have been AVAILABLE and must have RETURNED
+            # candidates. A degraded Qdrant leaves the keyword leg
+            # untouched, which keeps single-leg degradation working
+            # exactly as documented above.
+            # `dropped and not dense_hits` together mean exactly: the
+            # store returned candidates, and every one of them fell below
+            # the floor.
+            if (dropped and not dense_hits and kw_hits
+                    and getattr(self.dense, "available", False)):
+                self._bump_by("retrieval_keyword_dropped_off_topic",
+                              len(kw_hits))
+                log_event(logger, "retrieval.keyword_off_topic",
+                          query=query, dropped=len(kw_hits),
+                          floor=self.min_similarity,
+                          reason="every dense candidate fell below the "
+                                 "floor, so the corpus does not cover this "
+                                 "query")
+                kw_hits = []
 
         # by_id maps a computed "document identity" string to the FULL hit
         # dict (with every field the store returned) so we can look the

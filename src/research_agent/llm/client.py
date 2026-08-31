@@ -128,6 +128,60 @@ _NON_TRANSIENT_KINDS = ("auth_failed", "permission_denied",
                         "model_or_endpoint_not_found")
 
 
+# The two shapes a server uses to say "your prompt did not fit". llama.cpp
+# puts the real window in a machine-readable field; the prose fallback
+# covers a server that reports the same thing only in its message.
+_CONTEXT_LIMIT_KEYS = ("n_ctx", "context_size", "max_context_length")
+_CONTEXT_LIMIT_RE = re.compile(
+    r"(?:available\s+)?context\s+(?:size|length|window)\s*"
+    r"(?:is\s*)?\(?\s*(\d+)", re.IGNORECASE)
+
+
+def parse_context_limit(body: str) -> Optional[int]:
+    """The provider's REAL context window, read out of its 400 body (D-151).
+
+    CALLED BY   OpenAICompatibleClient.complete/complete_json, on the HTTP
+                error branch, for status 400 only.
+
+    WHY THIS EXISTS. D-93 skips a provider whose configured window cannot
+    hold the prompt, and D-143 warns when that window contradicts the
+    evidence budget -- but both trust LLM_PRIMARY_CONTEXT_TOKENS to
+    describe the SERVER. Live (run p205.282-check) it did not:
+
+        LLM_PRIMARY_CONTEXT_TOKENS=8876        (what .env said)
+        "request (3292 tokens) exceeds the available context size
+         (1536 tokens)"   n_ctx: 1536          (what the server said)
+
+    So D-93 stopped skipping and the run made two guaranteed-failed calls
+    instead of two free skips -- strictly worse than before the setting
+    was touched. A configured number can always drift from the process it
+    describes; the 400 body cannot, because the server wrote it.
+
+    Returns None for every other 400 -- a bad model name, a malformed
+    payload -- so nothing is learned from an error that says nothing about
+    context.
+    """
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        for scope in (error if isinstance(error, dict) else {}, payload):
+            for key in _CONTEXT_LIMIT_KEYS:
+                value = scope.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+    match = _CONTEXT_LIMIT_RE.search(body)
+    if match:
+        found = int(match.group(1))
+        if found > 0:
+            return found
+    return None
+
+
 def classify_http_failure(status: int) -> tuple:
     """(kind, operator hint) for one HTTP status. See _HTTP_FAILURE_KINDS.
 
@@ -298,6 +352,19 @@ class ChatClient(Protocol):
 _CONTEXT_OVERFLOW_MARKERS = (
     "exceed context",
     "exceeds context",
+    # D-151: llama.cpp's actual phrasing, which none of the markers above
+    # matched. Live (run p205.282-check) the server answered:
+    #
+    #   "request (3292 tokens) exceeds the available context size
+    #    (1536 tokens), try increasing it"      type: exceed_context_size_error
+    #
+    # "exceeds context" does not appear in that string -- "the available"
+    # sits in between -- so a textbook context rejection was classified as
+    # a generic bad_request and the operator was told to "check the model
+    # name and payload", which was fine. The type field is included too
+    # because it is the one part a server is unlikely to reword.
+    "context size",
+    "exceed_context_size",
     "context length",
     "context window",
     "too many tokens",
@@ -557,6 +624,9 @@ class OpenAICompatibleClient:
         # via getattr -- the same duck-typed optional-capability pattern
         # drain_usage and drain_retrieval_counts already use.
         self.context_tokens = int(context_tokens or 0)
+        # D-151: set once, from the first 400 that reports it, so the
+        # correction is logged once rather than on every later call.
+        self._context_tokens_learned = False
         # D-130: None until this provider answers with a non-transient
         # failure kind, then the short string the router reports when it
         # skips this hop. Read by llm/router.py via getattr -- the same
@@ -644,6 +714,38 @@ class OpenAICompatibleClient:
         """
         self._http.close()
 
+    def _learn_context_limit(self, body: str) -> None:
+        """Adopt the context window the server just reported (D-151).
+
+        CALLED BY   the HTTP-error branch of complete/complete_json, for
+                    status 400 only.
+
+        Once per process per provider. A second identical 400 has nothing
+        new to say, and repeating the WARNING on every call would bury the
+        first one -- the same say-it-once posture D-130's
+        llm.provider_disabled line uses.
+
+        Silent when the body reports no context size (a bad model name, a
+        malformed payload) or when it agrees with what is already
+        configured.
+        """
+        if self._context_tokens_learned:
+            return
+        reported = parse_context_limit(body)
+        if not reported or reported == self.context_tokens:
+            return
+        configured = self.context_tokens
+        self.context_tokens = reported
+        self._context_tokens_learned = True
+        log_event(logger, "llm.context_window_learned", level=logging.WARNING,
+                  provider=self.name, model=self._model,
+                  configured=configured, reported=reported,
+                  effect="the server's own number is used for the rest of "
+                         "this process, so D-93 skips correctly from here; "
+                         "set LLM_PRIMARY_CONTEXT_TOKENS to the value the "
+                         "server was actually started with (-c) to avoid "
+                         "the wasted call entirely")
+
     def complete(self, messages: List[Message], temperature: float = 0.2) -> str:
         """POST the transcript; return assistant text. Raises httpx errors
         upward — the router owns retry/fallback policy, not this class.
@@ -671,6 +773,24 @@ class OpenAICompatibleClient:
         # code is 4xx or 5xx (i.e. the server reported an error) — it does
         # nothing (returns None) for a normal 2xx success response.
         if resp.status_code >= 400:
+            # D-151: believe the server over the configuration, whichever
+            # branch below claims this error.
+            #
+            # LLM_PRIMARY_CONTEXT_TOKENS is a person's description of the
+            # server and can drift from it. Live (p205.282-check) it said
+            # 8876 while the server reported n_ctx 1536, so D-93 stopped
+            # skipping and the run made two guaranteed-failed calls
+            # instead of two free skips -- strictly worse than before the
+            # setting was touched. The 400 body carries the real number
+            # and cannot drift, because the server wrote it. Adopting it
+            # for the rest of THIS process means one wasted call teaches
+            # the chain rather than repeating.
+            #
+            # Never persisted: this is what the running server reports
+            # today, not a configuration change to make on someone's
+            # behalf. Silent unless the body actually names a window.
+            if resp.status_code == 400:
+                self._learn_context_limit(resp.text)
             if looks_like_context_overflow(resp.text):
                 # D-93: the SAME exception the caller already handles (the
                 # router hops on any Exception) -- this only makes the log say
@@ -713,6 +833,24 @@ class OpenAICompatibleClient:
                           model=self._model, status=resp.status_code,
                           kind=kind, hint=hint,
                           body=resp.text[:_ERROR_BODY_CHARS])
+                # D-151: believe the server over the configuration.
+                #
+                # If this 400 says the prompt did not fit, it also says
+                # what WOULD have fit -- and that number came from the
+                # process actually serving requests, where
+                # LLM_PRIMARY_CONTEXT_TOKENS is a person's description of
+                # it and can be wrong. Adopting it for the rest of THIS
+                # process means D-93 skips correctly from the next call
+                # on, so one wasted call teaches the chain instead of
+                # repeating.
+                #
+                # Never persisted and never written back to .env: this is
+                # what the running server reports today, not a
+                # configuration change to make on someone's behalf. The
+                # WARNING names both numbers so the operator can fix the
+                # file themselves.
+                if resp.status_code == 400:
+                    self._learn_context_limit(resp.text)
                 # D-130: a kind that cannot recover on its own takes this
                 # provider out of the chain for the rest of the PROCESS.
                 # Recorded here, where the status and the body are already

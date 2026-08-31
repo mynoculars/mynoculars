@@ -176,7 +176,7 @@ def test_telemetry_surfaces_llm_quality_calls_failed_end_to_end(settings):
                          content=f"fact about {task.query}", score=0.9,
                          volatility=Volatility.SEMI_STABLE)]
 
-    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test", probe=False),
                             settings.memory_top_k, 90.0, 14.0)
 
     g = build_graph(router, fake_tool, memory, settings, MemorySaver())
@@ -220,7 +220,7 @@ def test_telemetry_evidence_by_source_distinguishes_mcp_from_corpus(settings):
                          volatility=Volatility.SEMI_STABLE)]
 
     router = FallbackRouter([StubClient()], quality_threshold=0.6)
-    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+    memory = SemanticMemory(QdrantStore(settings.qdrant_url, "test", probe=False),
                             settings.memory_top_k, 90.0, 14.0)
     graph = build_graph(router, mcp_shaped_tool, memory, settings, MemorySaver())
 

@@ -51,7 +51,7 @@ Python mechanics used in this file, if any of this is new to you:
 
 import logging
 import math
-from typing import Any, List
+from typing import Any, Dict, List
 
 from research_agent import langfuse as lf
 from research_agent.logging_setup import log_event, run_id_var
@@ -114,6 +114,25 @@ def coerce_volatility(raw: Any) -> Volatility:
         return Volatility.SEMI_STABLE
 
 
+def _above_floor(hits: List[Dict[str, Any]], floor: float):
+    """Keep hits whose RAW similarity clears `floor`. -> (kept, dropped_n).
+
+    CALLED BY   SemanticMemory.retrieve, on the Python (default) path,
+                before decay is applied.
+
+    D-142. A pure function rather than an inline comprehension because it
+    is the one place the memory floor is decided, and a named function is
+    what a test can address directly. floor <= 0.0 is the documented
+    disable switch and returns the input untouched -- byte-identical to
+    the pre-D-142 behaviour, in the same spirit as MIN_SIMILARITY=0.0 for
+    the corpus leg.
+    """
+    if floor <= 0.0:
+        return list(hits), 0
+    kept = [h for h in hits if h.get("similarity", 0.0) >= floor]
+    return kept, len(hits) - len(kept)
+
+
 class SemanticMemory:
     """Cross-run memory over a dedicated Qdrant collection.
 
@@ -126,7 +145,8 @@ class SemanticMemory:
 
     def __init__(self, store: QdrantStore, top_k: int,
                  half_life_semi: float, half_life_volatile: float,
-                 server_side_decay: bool = False):
+                 server_side_decay: bool = False,
+                 min_similarity: float = 0.0):
         """store may be degraded — retrieve() then returns [] and
         store_run() no-ops, i.e. the agent silently runs memory-off.
 
@@ -147,6 +167,12 @@ class SemanticMemory:
         self.half_life_semi = half_life_semi
         self.half_life_volatile = half_life_volatile
         self.server_side_decay = server_side_decay
+        # D-142. Defaults to 0.0 -- i.e. OFF -- so this constructor keeps
+        # its old behaviour for any caller that does not pass it; the
+        # real default (0.60) lives on Settings.memory_min_similarity and
+        # is wired in by assembly.py. A default of 0.60 here would silently
+        # change what every existing test's SemanticMemory recalls.
+        self.min_similarity = min_similarity
 
     def retrieve(self, query: str) -> List[Evidence]:
         """Similarity search reranked by similarity x decay — either in
@@ -194,8 +220,28 @@ class SemanticMemory:
             ]
             # Already ranked best-first by Qdrant and already cut to
             # top_k — no Python-side sort/slice needed on this path.
+            #
+            # D-142 CAVEAT, stated rather than hidden: on THIS path
+            # "similarity" is already similarity x decay, because Qdrant
+            # applied the formula. There is no raw similarity to test, so
+            # the floor is applied to the decayed value and is therefore
+            # STRICTER here than on the Python path below, by exactly the
+            # decay multiplier. That is the honest reading of the only
+            # number available; it is also why the Python path stays the
+            # default and the parity oracle. If this matters for your
+            # deployment, leave MEMORY_SERVER_SIDE_DECAY false.
+            scored = [t for t in scored if t[0] >= self.min_similarity]
+            dropped = len(hits) - len(scored)
         else:
             hits = self.store.search(query, top_k=self.top_k * 2)  # over-fetch, rerank, cut
+            # D-142: the floor is tested against RAW similarity, BEFORE the
+            # decay multiply and before the top_k cut. Relevance and
+            # freshness are two different questions and this gate only asks
+            # the first: a stale-but-relevant fact should be DE-RANKED by
+            # decay, not deleted by a relevance gate, and a
+            # fresh-but-irrelevant one must be dropped however new it is.
+            # Testing the product would conflate them.
+            hits, dropped = _above_floor(hits, self.min_similarity)
             scored = []
             for h in hits:
                 # Volatility(h.get(...)) CONSTRUCTS an Enum member from its
@@ -216,6 +262,10 @@ class SemanticMemory:
             # first.
             scored.sort(key=lambda t: t[0], reverse=True)
             scored = scored[: self.top_k]
+
+        if dropped:
+            log_event(logger, "memory.below_floor", dropped=dropped,
+                      floor=self.min_similarity, kept=len(scored))
 
         out: List[Evidence] = []
         # scored is already at most self.top_k items on EITHER path above

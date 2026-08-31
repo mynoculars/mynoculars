@@ -640,3 +640,141 @@ def test_a_transport_error_leaves_the_provider_enabled():
     with pytest.raises(httpx.ConnectError):
         client.complete([{"role": "user", "content": "x"}])
     assert client.disabled_reason is None
+
+
+# ---------------------------------------------------------------------------
+# D-151 -- believe the server over the configuration
+#
+# LLM_PRIMARY_CONTEXT_TOKENS describes the server; it can drift from it.
+# Live (run p205.282-check) it said 8876 while llama-server reported
+# n_ctx 1536, so D-93 stopped skipping and the run made two
+# guaranteed-failed calls instead of two free skips -- strictly worse than
+# before the setting was touched.
+# ---------------------------------------------------------------------------
+
+# The exact body llama-server returned in that run.
+P205_282_BODY = (
+    '{"error":{"code":400,"message":"request (3292 tokens) exceeds the '
+    'available context size (1536 tokens), try increasing it",'
+    '"type":"exceed_context_size_error","n_prompt_tokens":3292,"n_ctx":1536}}')
+
+
+def test_the_real_body_is_finally_classified_as_a_context_overflow():
+    """It was not. "exceeds context" does not appear in that string --
+    "the available" sits in between -- so a textbook context rejection was
+    logged as a generic bad_request and the operator was told to check the
+    model name, which was fine."""
+    from research_agent.llm.client import looks_like_context_overflow
+
+    assert looks_like_context_overflow(P205_282_BODY)
+
+
+def test_the_openai_style_phrasings_still_match():
+    """Widening the marker list must not narrow it."""
+    from research_agent.llm.client import looks_like_context_overflow
+
+    for body in ("This model's maximum context length is 8192 tokens",
+                 "exceeds context window", "prompt is too long",
+                 "too many tokens"):
+        assert looks_like_context_overflow(body), body
+
+
+def test_an_unrelated_error_is_still_not_an_overflow():
+    from research_agent.llm.client import looks_like_context_overflow
+
+    assert not looks_like_context_overflow('{"error":{"message":"model not found"}}')
+
+
+def test_the_real_window_is_read_out_of_the_body():
+    from research_agent.llm.client import parse_context_limit
+
+    assert parse_context_limit(P205_282_BODY) == 1536
+
+
+def test_a_server_that_only_says_it_in_prose_is_still_understood():
+    from research_agent.llm.client import parse_context_limit
+
+    assert parse_context_limit(
+        '{"error":{"message":"exceeds the available context size (4096 tokens)"}}'
+    ) == 4096
+
+
+def test_nothing_is_learned_from_a_400_that_says_nothing_about_context():
+    from research_agent.llm.client import parse_context_limit
+
+    for body in ('{"error":{"message":"model not found","code":400}}',
+                 "Bad Request", "", None):
+        assert parse_context_limit(body) is None, body
+
+
+def _client(context_tokens):
+    from research_agent.llm.client import OpenAICompatibleClient
+
+    return OpenAICompatibleClient(name="primary", base_url="http://x/v1",
+                                  api_key="k", model="m",
+                                  context_tokens=context_tokens)
+
+
+def test_the_server_number_replaces_the_configured_one(caplog):
+    client = _client(8876)
+
+    with caplog.at_level(logging.WARNING):
+        client._learn_context_limit(P205_282_BODY)
+
+    assert client.context_tokens == 1536
+    matches = [r for r in caplog.records
+               if "llm.context_window_learned" in r.message]
+    assert matches
+    assert matches[0].event_fields["configured"] == 8876
+    assert matches[0].event_fields["reported"] == 1536
+
+
+def test_it_says_so_once_not_on_every_call(caplog):
+    """A second identical 400 has nothing new to say, and repeating the
+    WARNING would bury the first one."""
+    client = _client(8876)
+    client._learn_context_limit(P205_282_BODY)
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING):
+        client._learn_context_limit(P205_282_BODY)
+
+    assert not [r for r in caplog.records
+                if "llm.context_window_learned" in r.message]
+
+
+def test_a_configuration_that_already_agrees_is_left_alone(caplog):
+    client = _client(1536)
+
+    with caplog.at_level(logging.WARNING):
+        client._learn_context_limit(P205_282_BODY)
+
+    assert client.context_tokens == 1536
+    assert not [r for r in caplog.records
+                if "llm.context_window_learned" in r.message]
+
+
+def test_an_unconfigured_provider_learns_the_window_too():
+    """context_tokens 0 means "unknown", which is every provider's
+    default. Learning it is how D-93 starts working without anyone
+    editing .env at all."""
+    client = _client(0)
+
+    client._learn_context_limit(P205_282_BODY)
+
+    assert client.context_tokens == 1536
+
+
+def test_the_router_skips_correctly_once_the_window_is_learned():
+    """The whole point: one wasted call teaches the chain, so the NEXT
+    oversized prompt is skipped instead of repeating the failure."""
+    from research_agent.llm.router import FallbackRouter
+
+    client = _client(8876)
+    router = FallbackRouter([client, _client(0)], quality_threshold=0.6)
+    messages = [{"role": "user", "content": "x" * 13000}]  # ~3250 tokens
+
+    assert router._skips_for_context(client, messages) is False
+    client._learn_context_limit(P205_282_BODY)
+    assert router._skips_for_context(client, messages) is True
+

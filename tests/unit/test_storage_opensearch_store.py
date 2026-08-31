@@ -25,13 +25,13 @@ from research_agent.storage.qdrant_store import content_id
 
 
 def _mock_store(index="test_index"):
-    """An OpenSearchStore with a real (degraded, unreachable) __init__
-    pass, then forced "available" with a MagicMock standing in for the
-    real opensearch-py client -- lets the API-CALLING code paths be
+    """An OpenSearchStore constructed already-degraded (probe=False, no
+    socket -- D-140), then forced "available" with a MagicMock standing in
+    for the real opensearch-py client -- lets the API-CALLING code paths be
     tested without a real server, same pattern as
     test_storage_qdrant_store.py's _mock_store."""
-    store = OpenSearchStore("http://127.0.0.1:1", index)
-    assert store.available is False  # sanity: really did fail to connect
+    store = OpenSearchStore("http://127.0.0.1:1", index, probe=False)
+    assert store.available is False  # sanity: constructed degraded
     store.available = True
     store._client = MagicMock()
     return store
@@ -42,23 +42,39 @@ def _mock_store(index="test_index"):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_unreachable_host_degrades_instead_of_raising():
-    store = OpenSearchStore("http://127.0.0.1:1", "test_index")
+    """The ONE test in this suite that still opens a real socket (D-140).
+
+    Every other store construction here uses probe=False, which reaches the
+    same degraded state without any network I/O. This test is the reason
+    that is safe: it proves the real probe path still degrades rather than
+    raising, so the cheap path and the real path agree.
+
+    TEST-NET-1 (RFC 5737) rather than a localhost port: unroutable
+    everywhere, by definition, whereas 127.0.0.1:1's behaviour depends on
+    the OS and (on Windows) on WinNAT port reservations. Marked `slow`
+    because "unroutable" means the client waits out its own timeout -- run
+    it with the suite, skip it with `-m "not slow"` in a tight loop.
+    """
+    from tests.conftest import UNROUTABLE_URL
+
+    store = OpenSearchStore(UNROUTABLE_URL, "test_index")
     assert store.available is False
 
 
 def test_search_returns_empty_list_when_degraded():
-    store = OpenSearchStore("http://127.0.0.1:1", "test_index")
+    store = OpenSearchStore("http://127.0.0.1:1", "test_index", probe=False)
     assert store.search("query", top_k=5) == []
 
 
 def test_ingest_returns_zero_when_degraded():
-    store = OpenSearchStore("http://127.0.0.1:1", "test_index")
+    store = OpenSearchStore("http://127.0.0.1:1", "test_index", probe=False)
     assert store.ingest([{"content": "x"}]) == 0
 
 
 def test_ensure_index_is_a_noop_when_degraded():
-    store = OpenSearchStore("http://127.0.0.1:1", "test_index")
+    store = OpenSearchStore("http://127.0.0.1:1", "test_index", probe=False)
     store.ensure_index()  # must not raise
 
 

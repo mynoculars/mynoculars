@@ -28,31 +28,27 @@ from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
 from research_agent.config import Settings
 from research_agent.guardrails.annotations import strip_machine_annotations
-from research_agent.guardrails.citations import (clean_citations,
-                                                 normalise_citation_form,
-                                                 repair_glued_sentences,
-                                                 residual_glue_sites,
+from research_agent.guardrails.citations import (residual_glue_sites,
                                                  residual_paste_sites)
-from research_agent.guardrails.claims import audit_cited_figures
+from research_agent.guardrails.claims import (audit_cited_figures,
+                                              cited_goal_ids_in_prose)
 from research_agent.guardrails.dedup import dedupe_evidence
-from research_agent.guardrails.grounding import (annotate_ungrounded_report,
-                                                  report_carries_grounding_notice)
-from research_agent.guardrails.hedging import enforce_hedging
+from research_agent.guardrails.grounding import report_carries_grounding_notice
 from research_agent.guardrails.retrieval import has_grounded_evidence
-from research_agent.guardrails.sources import (append_web_sources,
-                                                cited_goal_ids,
-                                                count_listed_sources)
-from research_agent.guardrails.truncation import (annotate_truncated_run,
-                                                  report_carries_truncation_notice)
+from research_agent.guardrails.sources import count_listed_sources
+from research_agent.guardrails.truncation import report_carries_truncation_notice
 from research_agent.limits import (elapsed_seconds, run_budget_exhausted,
                                    tokens_used)
-from research_agent.llm.client import strip_code_fence
 from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
 from research_agent.prompts.budget import budget_evidence, budget_notes
+from research_agent.reporting.confidence import score_report
 from research_agent.reporting.metrics import count_sections
+from research_agent.reporting.pipeline import PassContext, run_report_passes
+from research_agent.reporting.telemetry import (llm_metrics, retrieval_metrics,
+                                                run_metrics)
 from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import ResearchState
 
@@ -164,87 +160,25 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # quality-reject bounced the call off the primary provider. See
         # llm/client.py::strip_code_fence for why this exists and what it
         # deliberately does NOT attempt to fix.
-        report = strip_code_fence(report)
-        # D-99: normalise the citation FORM before anything reads
-        # citations. This has to come first: clean_citations below, the
-        # Sources block, the D-66 gate and the D-91 audit all read
-        # citations through sources.py::cited_goal_ids, which matches
-        # `[gN]` and nothing else -- so a report written with `(gN)` is
-        # not a report with malformed citations to them, it is a report
-        # with NO citations, and they all fail silently together. See
-        # guardrails/citations.py::normalise_citation_form for the live
-        # run that made this necessary.
-        report, form_counters = normalise_citation_form(report, state.goals)
-        # D-43: deterministic citation repair. The ATTRIBUTION RULE (D-40)
-        # asks the model for correct citations; compliance across live runs
-        # was roughly two in three. This enforces the half that can be
-        # enforced without reading meaning.
-        report, citation_counters = clean_citations(
-            report, state.goals, state.evidence)
-        # D-137: the same wound, without the verbatim confirmation.
-        # clean_citations above removes a run of PASTED source text; this
-        # restores the missing sentence boundary where the compiler wrote
-        # its own restatement and welded it to the claim instead. Ordered
-        # AFTER, so a verbatim paste is deleted rather than merely
-        # punctuated -- the stronger verdict gets first refusal at every
-        # site. Before append_web_sources, deliberately: the Sources block
-        # is a list of URLs, and a full stop inserted into one breaks it.
-        report, glue_counters = repair_glued_sentences(report)
-        citation_counters = {**form_counters, **citation_counters,
-                             **glue_counters}
-        # Guardrail G3 enforcement half (P205.135 follow-up): same call
-        # site, same shape of check as clean_citations above -- see
-        # guardrails/hedging.py for why this exists (the compiler
-        # instruction to hedge UNVERIFIED-SPECIFIC claims is not
-        # reliably followed on its own).
-        report, hedge_counters = enforce_hedging(report, state.evidence)
-        # D-57: deterministic attribution for web evidence. LAST, after
-        # both passes above -- each of them searches the report for literal
-        # spans of evidence content, and a Sources block full of titles and
-        # URLs is exactly what could be mistaken for a paste. Appending
-        # afterwards puts it out of their reach entirely.
+        # D-146: the twelve post-processing steps that used to live here as
+        # straight-line code, each separated by a paragraph explaining why
+        # it sat where it sat, are now reporting/pipeline.py's REPORT_PASSES
+        # -- a named, ordered list whose ordering constraints are DATA
+        # (ReportPass.after) rather than prose, and are checked by a test
+        # instead of preserved by nobody moving anything.
         #
-        # Deterministic rather than a prompt instruction, for D-51's reason
-        # verbatim: asking the compiler to carry URLs into prose is the same
-        # bet that produced hedge_specific_items 29 with zero visible
-        # hedging. This also leaves D-40's [gN]-only prose rule fully
-        # intact -- the section sits BELOW the report, so nothing above it
-        # changes.
-        #
-        # No-op returning the report byte-identical whenever there is no
-        # cited web evidence, which is every run with WEB_SEARCH_ENABLED
-        # false (the default).
-        report, source_counters = append_web_sources(
-            report, state.evidence, state.goals, state.human_guidance)
-        # D-85: the provenance notice, LAST of all -- after the three
-        # passes above for the same reason append_web_sources runs after
-        # the first two (see guardrails/grounding.py's own docstring):
-        # clean_citations and enforce_hedging search the report for
-        # literal spans of evidence text, and generated text they were
-        # never meant to inspect belongs out of their reach. Running after
-        # append_web_sources additionally keeps the notice clear of the
-        # Sources block that count_listed_sources (D-59) parses back out.
-        #
-        # Gated OFF in stub mode, exactly like D-66's zero-citation gate
-        # and telemetry_node's report.shipped_with_no_citations backstop:
-        # StubClient's fixed placeholder report (llm/client.py) exists to
-        # prove the graph executes offline, and models nothing at all
-        # about where evidence came from. Annotating it would be noise in
-        # the one mode that is deliberately not a real answer.
-        if settings.llm_mode != "stub":
-            report, grounding_counters = annotate_ungrounded_report(
-                report, state.goals, state.evidence,
-                settings.min_evidence_score, settings.grounded_recall_target)
-        else:
-            grounding_counters = {}
-        # D-132: LAST of all the report passes, which puts this notice
-        # ABOVE D-85's provenance one in the shipped text. Deliberate --
-        # "this run was stopped early" changes how a reader should weigh
-        # everything below it, the provenance notice included. A no-op
-        # returning the report byte-identical whenever no budget was
-        # spent, which is every run while both settings sit at 0.
-        report, truncation_counters = annotate_truncated_run(
-            report, state.budget_exhausted)
+        # Same passes, same order, same arguments, same counters. Read
+        # reporting/pipeline.py for the constraints and DECISIONS.md for
+        # the failures behind them.
+        report, pass_counters = run_report_passes(report, PassContext(
+            goals=state.goals,
+            evidence=state.evidence,
+            guidance=state.human_guidance,
+            budget_exhausted=state.budget_exhausted,
+            llm_mode=settings.llm_mode,
+            min_evidence_score=settings.min_evidence_score,
+            grounded_recall_target=settings.grounded_recall_target,
+        ))
         # New: compiler previously had no summary event of its own — only
         # the raw "llm.call" line, which says nothing about the REPORT
         # itself. sections/evidence_cited/output_chars are all cheap,
@@ -255,10 +189,15 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # -- previously two different regexes (this one counted level-1
         # headings too) reported two different counts for the same report.
         sections = count_sections(report)
-        evidence_cited = len(cited_goal_ids(report))
+        # D-144: PROSE only. cited_goal_ids matches `[gN]` anywhere in the
+        # string, and by this point the report may carry a Sources block
+        # whose every entry begins "1. [g1] " -- which would make an
+        # uncited report report itself as cited. See
+        # claims.py::cited_goal_ids_in_prose.
+        evidence_cited = len(cited_goal_ids_in_prose(report))
         log_event(logger, "node.compiled", sections=sections,
                   evidence_cited=evidence_cited, output_chars=len(report),
-                  hedge_markers_inserted=int(hedge_counters.get(
+                  hedge_markers_inserted=int(pass_counters.get(
                       "hedge_markers_inserted", 0)))
         # P2-07: renamed from "llm_calls" — see telemetry_node's docstring.
         # complete() (not complete_json) is the only free-text path, so this
@@ -266,9 +205,8 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # llm_quality_calls (the quality gate only runs on free text; it
         # is cross-provider, not self-scoring -- P2-11).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
-                    **citation_counters, **hedge_counters, **source_counters,
-                    **dedup_counters, **budget_counters, **note_counters,
-                    **grounding_counters, **truncation_counters}
+                    **pass_counters, **dedup_counters, **budget_counters,
+                    **note_counters}
         # D-88: the SAME guardrail numbers, carried a second way -- scoped
         # to THIS compile pass instead of summed across every revision.
         # See ResearchState.last_compile_guardrails for why both views
@@ -279,10 +217,8 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # Deliberately excludes the router's own counters: those are
         # genuinely run-cumulative (provider calls, fallback hops, tokens)
         # and have no per-report meaning.
-        last_compile = {**citation_counters, **hedge_counters,
-                        **source_counters, **dedup_counters,
-                        **budget_counters, **note_counters,
-                        **grounding_counters, **truncation_counters}
+        last_compile = {**pass_counters, **dedup_counters,
+                        **budget_counters, **note_counters}
         update: Dict[str, Any] = {"final_report": report, "counters": counters,
                                   "last_compile_guardrails": last_compile}
         # D-132: the SECOND of the two check sites (progress_checker is
@@ -416,7 +352,7 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         # reader still receives all of it (see guardrails/annotations.py).
         authored = strip_machine_annotations(state.final_report)
         if (settings.llm_mode != "stub" and state.evidence
-                and not cited_goal_ids(state.final_report)):
+                and not cited_goal_ids_in_prose(state.final_report)):
             # D-66: a report can reach here having cited NOTHING despite
             # evidence being available -- observed live, twice, both times
             # via the same chain: every candidate in FallbackRouter's
@@ -787,7 +723,7 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         # that block's comment) -- StubClient's fixed placeholder report
         # never carries [gN] markers by design.
         if (settings.llm_mode != "stub" and state.evidence
-                and not cited_goal_ids(state.final_report)):
+                and not cited_goal_ids_in_prose(state.final_report)):
             log_event(logger, "report.shipped_with_no_citations",
                       level=logging.WARNING,
                       evidence_items=len(state.evidence))
@@ -1052,11 +988,11 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             "retrieval_dense_candidates": retrieval_dense_candidates,
             "retrieval_dropped_by_floor": retrieval_dropped_by_floor,
             "retrieval_floor_drop_ratio": retrieval_floor_drop_ratio,
-            "llm_node_calls": int(c.get("llm_node_calls", 0)),
-            "llm_provider_calls": int(c.get("llm_provider_calls", 0)),
-            "llm_fallback_hops": int(c.get("llm_fallback_hops", 0)),
-            "llm_quality_calls": int(c.get("llm_quality_calls", 0)),
-            "llm_quality_calls_failed": int(c.get("llm_quality_calls_failed", 0)),
+            # D-146: the counter-only fields, by concern -- see
+            # reporting/telemetry.py.
+            **llm_metrics(c),
+            **retrieval_metrics(c),
+            **run_metrics(c),
             # Guardrail G4.
             "llm_quality_failure_ratio": llm_quality_failure_ratio,
             # D-106: what the judge actually SAID, not just how often it
@@ -1068,54 +1004,7 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # report one it never received.
             "llm_quality_scores_judged": llm_quality_scores_judged,
             "llm_quality_score_mean": llm_quality_score_mean,
-            "llm_quality_rejections": int(c.get("llm_quality_rejections", 0)),
             "llm_quality_bands": llm_quality_bands,
-            "retrieval_dense_calls": int(c.get("retrieval_dense_calls", 0)),
-            "retrieval_keyword_calls": int(c.get("retrieval_keyword_calls", 0)),
-            "retrieval_leg_unavailable": int(c.get("retrieval_leg_unavailable", 0)),
-            "producer_rejects": int(c.get("producer_rejects", 0)),
-            # D-86: what the run actually COST, as opposed to how many
-            # requests it made. llm_provider_calls cannot distinguish
-            # three cheap classify calls from three 7,000-token compile
-            # calls; these can. Additive across the run is correct here --
-            # unlike the compile-scoped guardrail counts below, every
-            # token genuinely was spent.
-            "llm_prompt_tokens": int(c.get("llm_prompt_tokens", 0)),
-            "llm_completion_tokens": int(c.get("llm_completion_tokens", 0)),
-            "llm_total_tokens": int(c.get("llm_prompt_tokens", 0)
-                                    + c.get("llm_completion_tokens", 0)),
-            # D-93: hops skipped because the prompt could not fit the
-            # provider's configured context window. 0 unless
-            # LLM_PRIMARY_CONTEXT_TOKENS is set. A nonzero value is the
-            # count of guaranteed-failed provider calls this run did NOT
-            # make -- read against llm_provider_calls, which no longer
-            # includes them.
-            "llm_context_skips": int(c.get("llm_context_skips", 0)),
-            # D-130: hops skipped because that provider already answered
-            # with a failure that cannot recover on its own (a rejected
-            # key, a refused permission, a retired model name). 0 on every
-            # healthy run. Read against llm_provider_calls, which -- like
-            # llm_context_skips above -- no longer includes them, and
-            # against the ONE llm.provider_disabled WARNING that names
-            # which provider and why. A nonzero value here with a normal
-            # report is the chain absorbing a dead provider correctly; a
-            # nonzero value alongside a thin report says the run was down
-            # to fewer providers than the operator thinks it configured.
-            "llm_disabled_skips": int(c.get("llm_disabled_skips", 0)),
-            # D-87: which tier of the D-38 ladder actually answered, and
-            # how often a tier failed outright. Previously readable only
-            # by grepping `chain.answered` out of a debug trace. Read
-            # against corpus_recall: `{"corpus": 6}` with corpus_recall
-            # 1.0 is a healthy corpus run; `{"web": 6}` with corpus_recall
-            # 0.0 is the p205.246-check shape, and now says so in one
-            # field rather than three inferred ones.
-            "tier_answers": {
-                key[len("chain_answered_"):]: int(value)
-                for key, value in sorted(c.items())
-                if key.startswith("chain_answered_") and value
-            },
-            "chain_tier_failures": int(c.get("chain_tier_failed", 0)),
-            "chain_exhausted": int(c.get("chain_exhausted", 0)),
             # D-88: guardrail work on the SHIPPED report specifically --
             # citation repairs, hedge markers, dedup -- as opposed to the
             # sum across every compile attempt, which is what reading
@@ -1125,11 +1014,6 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                 key: int(value)
                 for key, value in sorted(state.last_compile_guardrails.items())
             },
-            "search_calls": int(c.get("search_calls", 0)),
-            "search_failures": int(c.get("search_failures", 0)),
-            "memory_hits": int(c.get("memory_hits", 0)),
-            "memory_writes": int(c.get("memory_writes", 0)),
-            "revision_cycles": int(c.get("revision_cycles", 0)),
             "critique_passed": state.critique_passed,
             "planning_error": state.planning_error,
             # escalation_history was written by human_escalation on every
@@ -1143,6 +1027,22 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                 for h in state.escalation_history
             ],
         }
+        # D-145: the composed verdict, LAST, so it can read every field
+        # above. Two new raw fields go in first because the score needs
+        # them and telemetry did not carry either:
+        #   evidence_cited     -- how many goals the SHIPPED prose cites,
+        #                         counted the D-59 way (from the artifact
+        #                         the reader received, not summed across
+        #                         compile attempts);
+        #   citations_attached -- how many of those markers this codebase
+        #                         wrote rather than the model (D-144). A
+        #                         rescued report and a self-cited one must
+        #                         never be indistinguishable.
+        telemetry["evidence_cited"] = len(
+            cited_goal_ids_in_prose(state.final_report))
+        telemetry["citations_attached"] = int(c.get("citations_attached", 0))
+        telemetry["abort_reason"] = state.abort_reason or None
+        telemetry["confidence"] = score_report(telemetry)
         log_event(logger, "run.telemetry", **telemetry)
         return {"telemetry": telemetry}
 

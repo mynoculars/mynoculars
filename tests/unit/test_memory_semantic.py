@@ -404,3 +404,124 @@ def test_store_run_never_writes_web_snippets_to_memory():
     ])
     assert written == 1, "corpus is a finding; a web snippet is a live lookup"
     assert "Today's headline" not in str(store.written)
+
+
+# ---------------------------------------------------------------------------
+# D-142 — the recall relevance floor
+#
+# Until this landed, memory had NO floor on the way out: retrieve() took
+# scored[:top_k] unconditionally, so every run inherited five remembered
+# items however unrelated they were. memory_write_min_score gates what goes
+# IN; nothing gated what came back OUT. Live shape (p205.280-check): five
+# Redis-vs-Memcached items recalled at similarity 0.45-0.47 into a
+# China-vs-India military query, leading the compile prompt, while the
+# CORPUS floor at 0.55 dropped 72 of 72 dense candidates.
+# ---------------------------------------------------------------------------
+
+
+def test_above_floor_drops_only_what_is_below_it():
+    from research_agent.memory.semantic_memory import _above_floor
+
+    kept, dropped = _above_floor(
+        [{"similarity": 0.90}, {"similarity": 0.47}, {"similarity": 0.60}], 0.60)
+
+    assert [h["similarity"] for h in kept] == [0.90, 0.60]
+    assert dropped == 1
+
+
+def test_above_floor_is_inclusive_at_the_boundary():
+    """>= not >. The corpus floor (retrieval/hybrid.py) is also inclusive;
+    a second, subtly different boundary rule for the same kind of number is
+    exactly the drift D-99 was written about."""
+    from research_agent.memory.semantic_memory import _above_floor
+
+    kept, dropped = _above_floor([{"similarity": 0.60}], 0.60)
+    assert len(kept) == 1 and dropped == 0
+
+
+def test_a_zero_floor_is_the_documented_disable_switch():
+    """MEMORY_MIN_SIMILARITY=0.0 must reproduce pre-D-142 behaviour exactly,
+    the same escape hatch MIN_SIMILARITY=0.0 already provides for the corpus
+    leg."""
+    from research_agent.memory.semantic_memory import _above_floor
+
+    hits = [{"similarity": 0.01}, {"similarity": 0.0}]
+    kept, dropped = _above_floor(hits, 0.0)
+    assert kept == hits and dropped == 0
+
+
+def test_retrieve_applies_the_floor_before_decay_not_after():
+    """The floor asks about RELEVANCE, decay asks about FRESHNESS, and
+    testing their product would conflate them: a stale-but-relevant fact
+    should be de-ranked by decay, not deleted by a relevance gate.
+
+    The item below is relevant (0.80) but old enough that similarity x decay
+    lands under the floor. It must survive.
+    """
+    store = _FakeDecayStore(search_hits=[
+        {"content": "relevant but old", "similarity": 0.80, "age_days": 180.0,
+         "goal_id": "g1", "volatility": "volatile"},
+    ])
+    memory = SemanticMemory(store, top_k=5, half_life_semi=90.0,
+                            half_life_volatile=14.0, min_similarity=0.60)
+
+    out = memory.retrieve("q")
+
+    assert len(out) == 1, "a relevant item was deleted by decay, not de-ranked"
+    assert out[0].score < 0.60, "decay should still have pushed the score down"
+
+
+def test_retrieve_drops_the_off_topic_recall_that_motivated_this():
+    """The p205.280-check shape, reconstructed: a fresh but unrelated
+    memory item at 0.46 against a 0.60 floor."""
+    store = _FakeDecayStore(search_hits=[
+        {"content": "Memcached scales vertically across many threads",
+         "similarity": 0.46, "age_days": 1.0, "goal_id": "g1",
+         "volatility": "semi_stable"},
+        {"content": "PLA active personnel 2023", "similarity": 0.78,
+         "age_days": 1.0, "goal_id": "g1", "volatility": "semi_stable"},
+    ])
+    memory = SemanticMemory(store, top_k=5, half_life_semi=90.0,
+                            half_life_volatile=14.0, min_similarity=0.60)
+
+    out = memory.retrieve("Compare the Armies of China and India")
+
+    assert [e.content for e in out] == ["PLA active personnel 2023"]
+
+
+def test_the_floor_defaults_off_on_the_constructor():
+    """0.0 on __init__, 0.60 on Settings. A default of 0.60 in the
+    constructor would silently change what every existing test recalls;
+    assembly.py is what wires the real default in."""
+    store = _FakeDecayStore(search_hits=[
+        {"content": "weak", "similarity": 0.10, "age_days": 0.0,
+         "goal_id": "g1", "volatility": "stable"},
+    ])
+    memory = SemanticMemory(store, top_k=5, half_life_semi=90.0,
+                            half_life_volatile=14.0)
+
+    assert memory.min_similarity == 0.0
+    assert len(memory.retrieve("q")) == 1
+
+
+def test_the_server_side_path_also_applies_the_floor():
+    """Stricter there, and the docstring says so: Qdrant's "similarity" on
+    that path is already similarity x decay, so there is no raw value to
+    test. Applying the floor to the only number available is the honest
+    reading -- but it means the two paths are NOT identical here, which is
+    why the Python path stays the default."""
+    store = _FakeDecayStore(decay_hits=[
+        {"content": "low", "similarity": 0.30, "goal_id": "g1",
+         "volatility": "semi_stable"},
+        {"content": "high", "similarity": 0.82, "goal_id": "g1",
+         "volatility": "semi_stable"},
+    ])
+    memory = SemanticMemory(store, top_k=5, half_life_semi=90.0,
+                            half_life_volatile=14.0, server_side_decay=True,
+                            min_similarity=0.60)
+
+    out = memory.retrieve("q")
+
+    assert store.search_with_decay_calls == 1
+    assert [e.content for e in out] == ["high"]
+

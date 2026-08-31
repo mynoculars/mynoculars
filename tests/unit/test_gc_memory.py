@@ -34,7 +34,7 @@ def _mock_store(collection="test_collection"):
     test here asserts anything about it: scroll_all() calls
     ensure_collection() first, which probes the embedder for vector
     dimensions when the (mocked) client reports no existing collection."""
-    store = QdrantStore("http://127.0.0.1:1", collection)
+    store = QdrantStore("http://127.0.0.1:1", collection, probe=False)
     assert store.available is False
     store.available = True
     store._client = MagicMock()

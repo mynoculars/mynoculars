@@ -951,6 +951,95 @@ Two things about that number are worth internalising rather than copying:
   Leave the wider margin below the signal floor, not above the noise
   ceiling.
 
+### The SECOND floor, and why it needs the same number (D-142)
+
+`MIN_SIMILARITY` gates the **corpus** dense leg. Until D-142 there was no
+equivalent gate on **memory**, and that asymmetry was doing real damage:
+
+```ini
+MEMORY_MIN_SIMILARITY=0.60
+```
+
+`memory_write_min_score` (0.4) decides what a passed run WRITES to memory.
+Nothing decided what a later run READ BACK. `SemanticMemory.retrieve` took
+its top 5 unconditionally, so every run inherited five remembered items
+however unrelated they were to the question asked.
+
+What that looked like in practice (run `p205.280-check`, *"Compare the
+Armies of China and India"*):
+
+```text
+  the corpus floor at 0.55   dropped  72 of 72  dense candidates
+  the prompt budget          dropped  47        real evidence items
+  the memory tier            admitted  5        Redis-vs-Memcached items
+                                               at similarity 0.45-0.47
+                                               ...at the TOP of the prompt
+```
+
+The lowest bar in the system was applied to its least trustworthy source.
+
+**Set it to the same value you derived above.** It is the same question
+asked of the same embedding model and the same vector space, so the noise
+floor you just measured applies unchanged. Two properties worth knowing:
+
+- **It tests RAW similarity, before decay.** Relevance and freshness are
+  different questions. A stale-but-relevant fact should be de-ranked by
+  decay, not deleted by a relevance gate; a fresh-but-irrelevant one must
+  go however new it is.
+- **`MEMORY_SERVER_SIDE_DECAY=true` makes it stricter.** On that path
+  Qdrant returns similarity x decay and there is no raw value to test, so
+  the floor is applied to the decayed number. That is the honest reading
+  of the only figure available, and it is one more reason the Python path
+  stays the default.
+
+`MEMORY_MIN_SIMILARITY=0.0` disables it and reproduces the pre-D-142
+behaviour exactly, the same escape hatch `MIN_SIMILARITY=0.0` provides.
+
+### And the floor now binds the keyword leg too (D-150)
+
+`MIN_SIMILARITY` used to gate only the DENSE leg. OpenSearch hits went
+straight into fusion, so an off-topic document could still become evidence
+for a query the corpus does not cover — the thing the floor exists to
+prevent, reached through the other door:
+
+```text
+OPENSEARCH (BM25)
+query: "organizational structures command hierarchies Chinese People's"
+[hit 1]  bm25=0.92  topic=redis
+```
+
+That put **42 corpus + 36 mcp** items into a China-vs-India run against a
+Redis corpus. BM25 matched on `command` and `structures`.
+
+There is no BM25 number to calibrate — the scores are unbounded and
+corpus-relative — so the rule reuses the floor you already derived above:
+**if every dense candidate for a query fell below `MIN_SIMILARITY`, the
+corpus does not cover that query, and the keyword hits are dropped with
+them.** It fires only when Qdrant was reachable and actually returned
+candidates, so a degraded dense leg still leaves single-leg BM25 working
+exactly as documented.
+
+Watch for it in telemetry as `retrieval_keyword_dropped_off_topic`, and in
+the logs as:
+
+```text
+retrieval.keyword_off_topic   dropped=2  floor=0.55
+```
+
+**Nonzero here alongside `retrieval_dropped_by_floor` is normal on an
+off-corpus question.** Nonzero on a question your corpus SHOULD answer
+means the floor is too high — go back and re-derive it.
+
+**Verify it fired.** A run whose recall was previously polluted now logs:
+
+```text
+memory.below_floor   dropped=5  floor=0.6  kept=0
+```
+
+and the compile prompt's evidence block opens with corpus and web items
+rather than remembered ones — D-142 also orders that block by provenance,
+then score, instead of by the order retrieval happened to produce.
+
 **If the two populations OVERLAP**, stop tuning. That is a real finding, not
 a threshold problem: your embedding model cannot separate on-topic from
 off-topic for this corpus, and no floor will fix it. The answer is a bigger
@@ -2026,13 +2115,89 @@ the telemetry change, move on.
 
 ## Running and Interpreting the Test Suite
 
-The suite is fully offline — no services, no API keys, no
-network. It's organized into `tests/unit/` and `tests/integration/`:
+The suite is fully offline — no services, no API keys, and **as of D-140,
+no sockets either**. Those are not the same claim, and the difference used
+to be the suite's single largest cost: "offline" meant no test talked to a
+service that *answered*, while `conftest`'s `off_memory` fixture still
+built a real `QdrantStore` per test against `127.0.0.1:1` and waited for
+the connection to fail.
 
 ```powershell
 $env:PYTHONPATH = "src"
 python -m pytest tests/ -q
 ```
+
+`pytest.ini` sets `addopts = -n auto --dist loadfile`, so that command
+runs in parallel across your cores. Three variants worth knowing:
+
+```powershell
+python -m pytest tests/ -q -n0            # serial — use when debugging a failure
+python -m pytest tests/ -q -m "not slow"  # skip the one test that waits on a real timeout
+python -m pytest tests/ -q --durations=25 # what actually costs time on YOUR machine
+```
+
+**If the suite takes minutes rather than seconds on your machine, run that
+last one first.** It has now answered this question twice, and both
+answers were the same shape: a small number of tests waiting out a TCP
+connect that Linux refuses instantly and Windows does not.
+
+| Run | Wall | What `--durations` showed |
+|---|---|---|
+| before D-140 | 925 s | 28 `QdrantStore` constructions probing `127.0.0.1:1` |
+| after D-140 | 662 s | **650.61 s in four tests** — five `POST /research` calls reaching `record_run` against `127.0.0.1:1`, ~130 s each |
+| after D-149 | seconds | — |
+
+Both were invisible on Linux, where a refused connect to a closed
+localhost port returns instantly. On Windows it does not necessarily:
+Docker Desktop's WinNAT holds reserved port-exclusion ranges, and a
+connect into one waits out the OS timeout. Every store in this codebase
+now bounds its own connect (`QdrantStore` and `OpenSearchStore` at
+`timeout=5`, Postgres at `CONNECT_TIMEOUT_SECONDS`), so the worst case is
+seconds rather than minutes — but **the right answer for a unit test is
+still not to open the socket at all**.
+
+**On `-n auto`.** It is a win on 8+ cores and on Windows, where per-test
+latency dominates. On a low-core machine it can be *slower* than serial,
+because each worker pays the ~2.2 s `research_agent`/langgraph/fastapi
+import: measured on a 2-core container, 17.1 s serial against 23.6 s at
+`-n4`. Use `-n0` there. `--dist loadfile` keeps a module's tests on one
+worker, which matters for the two files that spawn subprocess MCP servers.
+
+**One caveat on the warnings block.** Under xdist the per-occurrence
+warning total is assembled from N processes, so a warning that fires once
+per process contributes a count that depends on worker count — measured
+57/55/52 for the same commit at `-n0`/`-n4`/`-n8`. `conftest`'s summary
+hook therefore prints the DISTINCT set under xdist, sorted, with a
+per-line count. The distinct set is reproducible; the occurrence totals
+are not, and the block says so.
+
+**The suite reads none of your configuration (D-147).** An autouse,
+session-scoped fixture in `tests/conftest.py` removes the `.env` file and
+every OS environment variable that maps to a `Settings` field, for the
+whole run. This is not decoration: before it existed, `LLM_PRIMARY_CONTEXT_TOKENS=8,876`
+in one developer's `.env` produced **26 failed, 1087 passed, 17 errors**,
+because 43 tests build `Settings` through `get_settings()` -- several of
+them merely by importing `scripts/mcp_corpus_server.py` or
+`scripts/mcp_web_search_server.py`, which call it at module import.
+
+So: **if the suite fails on your machine and it passes on someone else's,
+your `.env` is not the reason.** It has not been read. Look at the
+failure itself.
+
+A test that WANTS a setting still sets it with `monkeypatch.setenv`, which
+runs after the fixture and is undone at its own teardown.
+
+**Writing a test that touches a store.** Construct it with `probe=False`:
+
+```python
+store = QdrantStore(settings.qdrant_url, "test", probe=False)
+```
+
+That reaches the same degraded state a failed probe reaches — every method
+short-circuits on `self.available` — without any network I/O. If your test
+genuinely needs a *failed connection*, use `tests/conftest.py`'s
+`UNROUTABLE_URL` (RFC 5737 TEST-NET-1) rather than a localhost port, and
+mark it `@pytest.mark.slow`.
 
 ```text
 tests/unit/                   one file per src/research_agent/ module
@@ -2789,6 +2954,83 @@ the underlying reducer-accumulation mechanism, and it is still LIVE for
 anyone driving the graph directly — the guard lives in `cli.py`'s `main()`
 only, not in `assembly.py` or the graph itself, so the API's `/research`
 endpoint has no equivalent check today.
+
+## Reading the Confidence Verdict (D-145)
+
+Every run's RESULT block now opens with a single composed verdict:
+
+```text
+=== RESULT ===
+Confidence   : UNRELIABLE (15%)  — the report cites no evidence despite 100 item(s) retrieved; the critic never accepted the report (+3 more)
+Citations    : 0 goal(s) cited in the prose   [100 evidence item(s) available]
+Sources      : 0 listed / 58 web item(s) across 33 domain(s)
+Critique     : FAILED after 2 revision cycle(s)
+```
+
+That is `p205.280-check`, the run this was built for. Before D-145 the
+same run printed six of those signals as separate raw numbers — `recall
+1.0`, `grounding_ratio 1.0`, `corpus_recall 0.0`, `grounded 0.0`, a 0.067
+judge mean, a failed critique — and left you to integrate them. Every
+signal was bad, and a confident, well-formatted report shipped because a
+human approved the escalation and the prose read fine.
+
+**Four bands, and what each should make you do:**
+
+| Band | Read it as | What to do |
+|---|---|---|
+| `HIGH` | grounded in the corpus, cited by the model, critic passed | use it |
+| `MODERATE` | usable, with a named limitation | read the reasons line before quoting anything |
+| `LOW` | something structural went wrong in retrieval or review, OR the corpus simply does not cover the question | read the reason — D-152 distinguishes the two, because the remedies are opposite |
+| `UNRELIABLE` | the report rests on nothing you can check | do not quote figures from it |
+
+**It is capped, not averaged, and that is the whole design.** A weighted
+mean over `p205.280-check`'s numbers lands near 50%, because `recall` and
+`grounding_ratio` were both 1.0 and would have carried it. "The report
+cites nothing despite 100 evidence items" is not a quantity to be averaged
+against other quantities — it is a fact that invalidates them. So certain
+conditions impose a ceiling no amount of good news elsewhere can raise,
+and the lowest ceiling wins. The `caps` list in telemetry names every one
+that fired.
+
+**What the percentage is and is not.** It is an ordering aid inside the
+band, not a probability. There is no labelled corpus of good and bad
+reports to calibrate one against; what exists is
+`sample_data/golden_queries.jsonl`, and the bands are set so its in-corpus
+cases land HIGH/MODERATE and its off-corpus cases do not. If you change
+the thresholds, re-run the golden sweep — `python scripts/eval_suite.py`
+— rather than trusting the new numbers.
+
+**It is NOT the quality judge.** `llm_quality_score_mean` scores a raw
+answer to decide fallback routing, is fail-open by design, and is one
+weighted input here among eight.
+
+**Across runs**, `python scripts/analyze_runs.py` now prints the band
+distribution and a tally of which caps fired most often:
+
+```text
+Confidence (D-145)
+--------------------------------------------------------------
+  runs scored                      : 12 / 12
+  mean score                       : 41.5%
+    LOW                            : 6  (50%)
+    UNRELIABLE                     : 4  (33%)
+    MODERATE                       : 2  (17%)
+  what capped them (most common first):
+      7 x the relevance floor dropped at least 80% of dense candidates; retrieval was starved
+      4 x the report cites no evidence despite N item(s) retrieved
+```
+
+One run's band tells you whether that report is trustworthy. The
+distribution tells you whether the system is improving, and the cap tally
+tells you at what — which is the question a threshold change should be
+answering.
+
+**One line to look for on the Citations row.** `N attached
+deterministically` means D-144's attachment pass fired: the model wrote no
+`[gN]` markers and this codebase attached them by term overlap. That is a
+rescue and it beats shipping uncited, but it is a machine's judgement
+standing in for the writer's own, so such a run is capped at MODERATE and
+can never read HIGH.
 
 ## Reading a Failed Run
 

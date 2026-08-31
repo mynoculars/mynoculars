@@ -300,3 +300,82 @@ def test_a_failed_run_contributes_no_judgements():
 
     assert facts["quality_judgements"] == 1
     assert facts["quality_bands"] == {"low": 1}
+
+
+# ---------------------------------------------------------------------------
+# D-145 / D-144 -- the verdict and the rescue, aggregated across runs
+#
+# One run's band says whether THAT report is trustworthy. The distribution
+# says whether the system is improving, and the cap tally says at what.
+# ---------------------------------------------------------------------------
+
+
+def _run(**telemetry):
+    return {"id": 1, "thread_id": "t", "query": "q",
+            "recall": telemetry.get("recall"), "telemetry": telemetry,
+            "created_at": None}
+
+
+def test_confidence_bands_and_caps_are_tallied():
+    runs = [
+        _run(confidence={"band": "UNRELIABLE", "score": 15,
+                         "caps": ["the report cites no evidence despite 100 item(s) retrieved",
+                                  "the critic never accepted the report"]}),
+        _run(confidence={"band": "UNRELIABLE", "score": 12,
+                         "caps": ["the critic never accepted the report"]}),
+        _run(confidence={"band": "HIGH", "score": 92, "caps": []}),
+    ]
+
+    facts = _load().summarize(runs)
+
+    assert facts["confidence_runs"] == 3
+    assert facts["confidence_bands"] == {"UNRELIABLE": 2, "HIGH": 1}
+    assert facts["mean_confidence"] == round((15 + 12 + 92) / 3, 1)
+    assert facts["confidence_caps"]["the critic never accepted the report"] == 2
+
+
+def test_rows_written_before_the_field_existed_are_not_counted():
+    """Telemetry rows predating D-145 simply lack the key, and a cross-run
+    report that crashed on the first old row would be useless exactly when
+    you most want history."""
+    facts = _load().summarize([_run(recall=1.0), _run(confidence={"band": "HIGH",
+                                                          "score": 90,
+                                                          "caps": []})])
+
+    assert facts["confidence_runs"] == 1
+    assert facts["mean_confidence"] == 90.0
+
+
+def test_no_scored_runs_reports_none_rather_than_dividing_by_zero():
+    facts = _load().summarize([_run(recall=1.0)])
+
+    assert facts["confidence_runs"] == 0
+    assert facts["mean_confidence"] is None
+    assert facts["confidence_bands"] == {}
+
+
+def test_deterministic_attachments_are_counted_across_runs():
+    facts = _load().summarize([_run(citations_attached=5), _run(citations_attached=3),
+                       _run(citations_attached=0), _run(recall=1.0)])
+
+    assert facts["runs_with_attached_citations"] == 2
+    assert facts["citations_attached"] == 8
+
+
+def test_every_field_the_confidence_block_prints_is_actually_produced():
+    """main() renders these by key. Asserting the KEYS here rather than the
+    printed text follows this file's existing shape -- every other test in
+    it reads summarize()'s dict -- and still fails loudly if a field the
+    renderer needs stops being produced."""
+    facts = _load().summarize([
+        _run(confidence={"band": "LOW", "score": 40,
+                         "caps": ["retrieval was starved"]},
+             citations_attached=4)])
+
+    for key in ("confidence_runs", "mean_confidence", "confidence_bands",
+                "confidence_caps", "runs_with_attached_citations",
+                "citations_attached"):
+        assert key in facts, key
+    assert facts["confidence_bands"] == {"LOW": 1}
+    assert facts["confidence_caps"] == {"retrieval was starved": 1}
+

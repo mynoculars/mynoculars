@@ -60,6 +60,13 @@ langfuse>=4.0
 
 # Tests
 pytest>=8.0
+# P8-2 (D-141): pytest.ini sets `addopts = -n auto --dist loadfile`, so the
+# suite does not run without this. Adopted only after verifying the suite
+# is actually parallel-safe -- 1019/1019 at -n0, -n4 and -n8, no flakes --
+# which is not free for a suite with subprocess MCP fixtures and a
+# threading.local retrieval counter. Remove the addopts line, not this
+# package, if you want serial runs back.
+pytest-xdist>=3.5
 
 # Windows API bindings for Python
 pywin32>=311; platform_system == "Windows"

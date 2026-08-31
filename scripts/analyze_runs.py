@@ -154,6 +154,18 @@ def summarize(runs) -> dict:
     # p205.253-check carried 0 / 78 in its telemetry the whole time and
     # nobody read it. Counted here so nobody has to.
     silent_source_runs = 0
+    # D-145. The composed verdict is stored per run inside the telemetry
+    # JSONB, so a history of it costs nothing to read. What it answers that
+    # no single run can: is the band distribution moving, and do the caps
+    # that fire most often match the defects being worked on.
+    confidence_bands = Counter()
+    confidence_caps = Counter()
+    confidence_total = 0
+    confidence_runs = 0
+    # D-144. A rescued report and a self-cited one must never look the same
+    # in a history either.
+    attached_runs = 0
+    citations_attached = 0
 
     for run in runs:
         t = run["telemetry"]
@@ -184,6 +196,17 @@ def summarize(runs) -> dict:
                 quality_score_total += float(mean_score) * judged
             for name, count in (t.get("llm_quality_bands") or {}).items():
                 quality_bands[str(name)] += int(count)
+        confidence = t.get("confidence") or {}
+        if confidence.get("band"):
+            confidence_runs += 1
+            confidence_bands[str(confidence["band"])] += 1
+            confidence_total += int(confidence.get("score") or 0)
+            for cap in confidence.get("caps") or []:
+                confidence_caps[str(cap)] += 1
+        attached = int(t.get("citations_attached") or 0)
+        if attached:
+            attached_runs += 1
+            citations_attached += attached
         listed = int(t.get("web_sources_listed") or 0)
         suppressed = int(t.get("web_sources_suppressed") or 0)
         if listed == 0 and suppressed > 0:
@@ -232,6 +255,15 @@ def summarize(runs) -> dict:
         "quality_bands": {name: quality_bands[name]
                           for _upper, name in _BAND_ORDER
                           if quality_bands[name]},
+        # D-145
+        "confidence_runs": confidence_runs,
+        "mean_confidence": (round(confidence_total / confidence_runs, 1)
+                            if confidence_runs else None),
+        "confidence_bands": dict(confidence_bands.most_common()),
+        "confidence_caps": dict(confidence_caps.most_common()),
+        # D-144
+        "runs_with_attached_citations": attached_runs,
+        "citations_attached": citations_attached,
         "runs_listing_no_cited_web_sources": silent_source_runs,   # D-105
         "intents": dict(intents.most_common()),
         "tier_answers": dict(tiers.most_common()),
@@ -367,6 +399,33 @@ def main(argv=None) -> int:
               f"{facts['runs_listing_no_cited_web_sources']} / {done}")
         print("     (web_sources_listed 0 with web_sources_suppressed > 0 --"
               " the D-99 shape: a report whose citations nothing could read)")
+    # D-144: a rescue must be visible in a history, not just in one run.
+    if facts["runs_with_attached_citations"]:
+        print(f"  citations attached deterministically: "
+              f"{facts['runs_with_attached_citations']} / {done} run(s), "
+              f"{facts['citations_attached']} marker(s)")
+        print("     (D-144 fired -- those reports cited nothing until it did)")
+    print()
+    # D-145: the composed verdict, aggregated. One run's band says whether
+    # THAT report is trustworthy; the distribution says whether the system
+    # is getting better, and the cap tally says at what.
+    print("Confidence (D-145)")
+    print("-" * 62)
+    if facts["confidence_runs"]:
+        print(f"  runs scored                      : "
+              f"{facts['confidence_runs']} / {done}")
+        print(f"  mean score                       : "
+              f"{facts['mean_confidence']}%")
+        for band, count in facts["confidence_bands"].items():
+            print(f"    {band:<12}                   : {count}"
+                  f"  ({_pct(count, facts['confidence_runs'])})")
+        if facts["confidence_caps"]:
+            print("  what capped them (most common first):")
+            for cap, count in facts["confidence_caps"].items():
+                print(f"    {count:>3} x {cap}")
+    else:
+        print("  no run in this window carries a confidence verdict")
+        print("  (rows written before D-145 simply lack the field)")
     print()
     print("Quality judge")
     print("-" * 62)

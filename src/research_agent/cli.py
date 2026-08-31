@@ -60,6 +60,7 @@ from research_agent.assembly import (AppBundle, build_app_and_settings,
 from research_agent.config import get_settings
 from research_agent.llm.router import ProviderChainExhausted
 from research_agent.logging_setup import drain_problems, run_id_var
+from research_agent.reporting.confidence import format_line as format_confidence
 from research_agent.reporting.metrics import count_sections
 from research_agent.state import ResearchState
 from research_agent.tracing import NullTracer, Tracer
@@ -248,9 +249,34 @@ def _fmt_result_summary(telemetry: dict, report: str) -> str:
     # different counts for the same report.
     sections = count_sections(report)
 
+    # D-145: the composed verdict FIRST, because it is the one line that
+    # answers the question every other line contributes to. p205.280-check
+    # printed six raw signals -- recall 1.0, grounding_ratio 1.0,
+    # corpus_recall 0.0, grounded 0.0, a 0.067 judge mean and a failed
+    # critique -- and left the reader to integrate them; the report shipped
+    # because a human approved an E4 and the prose read fine.
+    confidence = telemetry.get("confidence") or {}
+    # D-144: two attribution facts that WERE computed and never printed.
+    # "0 listed / 58 retrieved" is the single most useful line in the block
+    # on a run like p205.280-check, and finding it previously meant reading
+    # 45 lines of JSON.
+    listed = telemetry.get("web_sources_listed")
+    web_items = telemetry.get("web_sourced_items")
+    domains = telemetry.get("web_source_domains")
+    cited_goals = telemetry.get("evidence_cited")
+    attached = int(telemetry.get("citations_attached") or 0)
+
     lines = [
         "",
         "=== RESULT ===",
+        f"Confidence   : {format_confidence(confidence)}"
+        if confidence else "Confidence   : n/a",
+        f"Citations    : {num('evidence_cited')} goal(s) cited in the prose"
+        + (f", {attached} attached deterministically" if attached else "")
+        + f"   [{num('evidence_items')} evidence item(s) available]",
+        f"Sources      : {num('web_sources_listed')} listed"
+        + (f" / {int(web_items)} web item(s) across {num('web_source_domains')} domain(s)"
+           if web_items else " (no web evidence retrieved)"),
         f"Critique     : {verdict}",
         f"Escalations  : {esc_line}",
         f"Report       : {sections} section(s), {len(report):,} chars",

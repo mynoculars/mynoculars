@@ -32,7 +32,7 @@ def _p214_settings(mcp_enabled: bool):
 
 
 def _p214_memory(settings):
-    return SemanticMemory(QdrantStore(settings.qdrant_url, "test"),
+    return SemanticMemory(QdrantStore(settings.qdrant_url, "test", probe=False),
                           settings.memory_top_k, 90.0, 14.0)
 
 

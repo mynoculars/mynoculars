@@ -109,10 +109,38 @@ def _import_server(bundle, monkeypatch):
     regardless. Tests that DO go on to use TestClient trigger a SECOND,
     independent lifespan pass of their own -- harmless, since it re-reads
     the same monkeypatched bundle and simply re-sets the same globals.
+    D-149: record_run is stubbed HERE, for every test, rather than left
+    to each test to remember. Five tests below already patched it by hand
+    and four did not -- and those four were, exactly, the four slowest
+    tests in the entire suite.
+
+    `_respond`'s "done" branch calls record_run against
+    _FakeSettings.postgres_dsn, which points at 127.0.0.1:1. On Linux that
+    connect refuses instantly. On Windows it does not: measured on a real
+    run, each of the five POST /research calls that reached that branch
+    cost 130 SECONDS, for 650.61s of a 662.25s suite -- 98% of the total,
+    against ~12s for everything else combined.
+
+    storage/postgres.py now bounds the connect at 5 seconds (D-149), so
+    the worst case is 25s rather than 650s. This makes it zero, and makes
+    it impossible for the next test to reintroduce it by forgetting. A
+    test that wants to ASSERT what was recorded reads
+    `server.recorded_runs`; a test that wants different behaviour patches
+    record_run again, which still works.
     """
     sys.modules.pop("research_agent.api.server", None)
     server = importlib.import_module("research_agent.api.server")
     monkeypatch.setattr(server, "build_app_and_settings", lambda: bundle)
+
+    server.recorded_runs = []
+
+    def _record(dsn, thread_id, query, recall, telemetry):
+        server.recorded_runs.append(
+            {"dsn": dsn, "thread_id": thread_id, "query": query,
+             "recall": recall, "telemetry": telemetry})
+        return None
+
+    monkeypatch.setattr(server, "record_run", _record)
 
     async def _advance():
         cm = server._lifespan(server.app)

@@ -119,7 +119,7 @@ class QdrantStore:
     """Thin, failure-tolerant wrapper over qdrant-client."""
 
     def __init__(self, url: str, collection: str, tracer: Any = None,
-                 trace_label: str = "QDRANT (dense)"):
+                 trace_label: str = "QDRANT (dense)", probe: bool = True):
         """Connect lazily; mark unavailable instead of raising.
 
         CALLED BY   cli.py::build_app_and_settings, twice per run — once
@@ -130,6 +130,19 @@ class QdrantStore:
                     checks this flag FIRST and no-ops (returns [] or 0)
                     if it's False, rather than attempting a network call
                     that would just fail again.
+
+        probe=False constructs the store already-degraded WITHOUT opening
+        a socket (D-140). Behaviourally identical to a failed probe --
+        `available` is False either way and every method short-circuits on
+        it -- but it costs no network I/O at all. Measured cost of the
+        probe against a port that refuses INSTANTLY: 235 ms, all of it
+        qdrant-client's own version-check retry loop. The test suite built
+        28 of these per run and paid 6.6 s of 24.4 s for connections it
+        never wanted; on Windows, where Docker Desktop's WinNAT port
+        exclusions stop a refused connect from returning a fast RST, the
+        same 28 constructions dominated a 925 s run. Production always
+        probes -- this flag exists for tests and for `--dry-run`-shaped
+        callers that want the object without the network.
         """
         self.collection = collection
         self.available = False
@@ -144,6 +157,12 @@ class QdrantStore:
         # scripts/mcp_corpus_server.py::_get_corpus_tool already documents
         # fixing one layer up, with the same remedy.
         self._embedder_lock = threading.Lock()
+        if not probe:
+            # No socket, no log line: this is a deliberate construction,
+            # not a degraded one, and a WARNING here would be noise.
+            self._tracer = tracer
+            self._label = trace_label
+            return
         try:
             # Import happens here, not at module load time — see the
             # module docstring's explanation of why.

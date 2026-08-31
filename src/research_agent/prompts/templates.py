@@ -80,7 +80,11 @@ PROMPT_VERSIONS = {
     "goal_manager":     ("compose_goals", "v1"),
     "task_expander":    ("expand_tasks", "v1"),
     "gap_generator":    ("generate_gaps", "v1"),
-    "compiler":         ("compile_report", "v1"),
+    # D-142 reordered compile_report's evidence block (provenance, then
+    # score, instead of retrieval order). No instruction text changed, but
+    # what the model reads first did -- and that is exactly the kind of
+    # structural change this table exists to mark.
+    "compiler":         ("compile_report", "v2"),
     "critic":           ("critique", "v1"),
     # detect_contradictions runs inside the "merger" node but is called
     # conditionally, not on every merger execution -- so merger's
@@ -89,6 +93,21 @@ PROMPT_VERSIONS = {
     # detect_contradictions; see llm/client.py's lookup for how an absent
     # node name is handled (no prompt metadata, not a crash).
 }
+
+
+# D-142: provenance ranking for the compile prompt's evidence block. The
+# same ordering prompts/budget.py::_SOURCE_RANK uses to break ties, defined
+# here so templates.py does not import a private name out of budget.py --
+# the two are deliberately the same numbers, and a test asserts they stay
+# that way rather than a comment asking politely.
+#
+# corpus and mcp tie at 0: both resolve to documents in the operator's own
+# ingested corpus (tiers 1-3 of the D-38 ladder reach the same material by
+# different routes). web is retrieved-but-uncurated. model is the model's
+# own recollection, which D-49/D-51 already hedge. memory is last: it is
+# the only tier whose content was admitted by a PREVIOUS run's judgement
+# rather than this one's.
+EVIDENCE_ORDER = {"corpus": 0, "mcp": 0, "web": 1, "model": 2, "memory": 3}
 
 
 # A single, shared system message reused by EVERY prompt builder below (see
@@ -346,10 +365,28 @@ def compile_report(query: str, goals: List[Goal], evidence: List[Evidence],
     # tools/model_knowledge.py::_looks_overspecific) -- the deterministic
     # half of this guardrail; the ATTRIBUTION RULE instruction below is
     # the half that tells the compiler what to DO about the tag.
+    # D-142: ordered by provenance, then by score, instead of by the order
+    # retrieval happened to produce.
+    #
+    # The old order was retrieval order, and memory_retrieve is the second
+    # node of every run -- so the least trustworthy evidence in the whole
+    # prompt was reliably the first thing the model read. Live shape (run
+    # p205.280-check): a China-vs-India compile prompt opened with three
+    # Redis-vs-Memcached memory items at similarity 0.45-0.47, above every
+    # web and corpus item that actually answered the question.
+    #
+    # EVIDENCE_ORDER is the same provenance ranking prompts/budget.py
+    # already uses to break ties (_SOURCE_RANK), reused rather than
+    # reinvented so "which source do we trust more" cannot come to mean two
+    # different things in two files. Ordering only -- nothing is added or
+    # removed here, and the per-item goal/source/score tags are unchanged,
+    # so what the model can attribute is exactly what it could before.
+    ordered_evidence = sorted(
+        evidence, key=lambda e: (EVIDENCE_ORDER.get(e.source, 9), -e.score))
     ev = "\n".join(f"- [{e.goal_id} | {e.source} | score={e.score:.2f}"
                    f"{' | UNVERIFIED-SPECIFIC' if e.hedge_specific else ''}] "
                    f"{fence_untrusted(e.content)}"
-                   for e in evidence) or "(no evidence gathered)"
+                   for e in ordered_evidence) or "(no evidence gathered)"
     # A generator expression with an inline conditional inside the f-string
     # itself: for each goal, append the extra "[CONTESTED ...]" marker text
     # only if g.contested is True, otherwise append an empty string.

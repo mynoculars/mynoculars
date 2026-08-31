@@ -372,6 +372,36 @@ def report_body(report: str) -> str:
     return body
 
 
+def cited_goal_ids_in_prose(report: str) -> set:
+    """Which goals the report's OWN PROSE cites (D-144).
+
+    CALLED BY   agents/compilation.py -- the evidence_cited count, the D-66
+                zero-citation gate and telemetry's shipped-with-no-citations
+                backstop -- and guardrails/attribution.py's all-or-nothing
+                gate.
+
+    WHY THIS IS NOT sources.py::cited_goal_ids. That function matches
+    `[gN]` anywhere in the string it is given, which is correct for the
+    single line or single sentence claims.py hands it. Given a WHOLE
+    report it also matches the Sources block, whose every entry begins
+    "1. [g1] " by construction (D-57) -- so a report whose prose cites
+    nothing at all, but which carries a Sources block, reads back as
+    fully cited.
+
+    That is a real defect and it predates D-144: evidence_cited would
+    report 4 for a report with no markers in its prose, the D-66 gate
+    would skip a report it exists to catch, and telemetry's backstop
+    would agree with both. It was unreachable only because the block was
+    itself gated on prose citations -- the exact coupling D-144 removes.
+    Fixing the readers is what makes removing that coupling safe.
+
+    report_body already strips both deterministically-appended blocks (the
+    Sources section and D-85's provenance notice) for the same reason, so
+    this is that boundary reused, not a second one.
+    """
+    return cited_goal_ids(report_body(report))
+
+
 def iter_cited_sentences(body: str):
     """Yield (sentence, cited_goal_ids) over a report body's PROSE.
 

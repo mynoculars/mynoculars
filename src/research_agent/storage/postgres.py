@@ -62,6 +62,30 @@ from research_agent.state import Evidence, Goal, SearchTask, Volatility
 
 logger = logging.getLogger(__name__)
 
+# How long any connection attempt to Postgres may take before this module
+# gives up and degrades (D-149).
+#
+# WHY THIS NUMBER HAD TO EXIST AT ALL. psycopg's default is no timeout: it
+# waits for whatever the operating system's TCP stack decides, which on an
+# unreachable host is minutes, not seconds. Every other store in this
+# codebase already bounds itself -- QdrantStore and OpenSearchStore both
+# pass timeout=5, and scripts/check_services.py has always used
+# connect_timeout=5 -- and Postgres was the one that did not.
+#
+# Measured, from a real run of this suite on Windows: five POST /research
+# calls in tests/unit/test_api_server.py reached record_run against an
+# unreachable DSN and cost 130 SECONDS EACH -- 650.61s of a 662.25s run,
+# 98% of the total, against ~12s for everything else combined. On Linux
+# the same connect refuses instantly, which is why it was invisible here
+# and enormous there.
+#
+# It is not only a test problem. record_run runs at the END of every CLI
+# run, after the report has printed: an operator whose Postgres went away
+# gets a two-minute hang with the answer already on screen and no
+# explanation. 5 seconds matches the rest of the codebase and is far more
+# than a local or same-VPC Postgres needs.
+CONNECT_TIMEOUT_SECONDS = 5
+
 # Every custom type that can appear ANYWHERE inside ResearchState and
 # therefore ever needs to be checkpointed to Postgres (or held by the
 # in-memory fallback). Passing the classes themselves here — rather than
@@ -191,15 +215,24 @@ def get_checkpointer(dsn: str) -> Tuple[Any, bool]:
         conn = None
         try:
             from psycopg_pool import ConnectionPool
-            conn = ConnectionPool(dsn, min_size=1, max_size=10, open=True,
-                                  kwargs={"autocommit": True})
+            conn = ConnectionPool(
+                dsn, min_size=1, max_size=10, open=True,
+                # D-149: bound the wait. Without `timeout`, a pool against
+                # an unreachable Postgres blocks a caller indefinitely; with
+                # it, the pool reports failure and get_checkpointer falls
+                # through to the in-memory saver, which is the whole point
+                # of this function's degrade-don't-die contract.
+                timeout=CONNECT_TIMEOUT_SECONDS,
+                kwargs={"autocommit": True,
+                        "connect_timeout": CONNECT_TIMEOUT_SECONDS})
             log_event(logger, "checkpointer.pool_active", max_size=10)
         except ImportError:
             # autocommit=True means each SQL statement takes effect
             # immediately rather than needing an explicit conn.commit()
             # call — appropriate here since PostgresSaver manages its own
             # transactions internally once it has a connection to use.
-            conn = psycopg.connect(dsn, autocommit=True)
+            conn = psycopg.connect(dsn, autocommit=True,
+                                   connect_timeout=CONNECT_TIMEOUT_SECONDS)
             log_event(logger, "checkpointer.single_connection",
                       level=logging.WARNING,
                       reason="psycopg_pool not installed; install psycopg[pool]")
@@ -313,7 +346,8 @@ def _insert_run(dsn: str, thread_id: str, query: str,
     """
     try:
         import psycopg
-        with psycopg.connect(dsn, autocommit=True) as conn:
+        with psycopg.connect(dsn, autocommit=True,
+                             connect_timeout=CONNECT_TIMEOUT_SECONDS) as conn:
             # Run the CREATE TABLE IF NOT EXISTS on every single call —
             # cheap and idempotent, and means this function never depends
             # on some separate migration step having been run beforehand.

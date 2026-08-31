@@ -238,3 +238,119 @@ def test_empty_and_blank_notes_are_handled():
 
     assert budget_notes([]) == ([], {})
     assert budget_notes(["", None, "real note"]) == (["real note"], {})
+
+
+# ---------------------------------------------------------------------------
+# D-142 — memory shares ONE round-robin bucket
+#
+# P2-02 namespaces recalled evidence as "memory::gN", which must stay. But
+# the round-robin allocates a slot per BUCKET per lap, so those namespaced
+# ids were read as several independent goals, each guaranteed a slot in lap
+# 1 ahead of the second item for any real goal. _SOURCE_RANK ranks memory
+# last precisely to stop this, and never got to apply because it only
+# breaks ties WITHIN a bucket.
+# ---------------------------------------------------------------------------
+
+
+def _bev(goal_id, source, score, size=100):
+    """D-142's own fixture. Deliberately NOT the module's `_ev` above --
+    that one defaults source="web" and takes a task_key, and these tests
+    are specifically about provenance, so they name it explicitly."""
+    from research_agent.state import Evidence, Volatility
+
+    return Evidence(task_key=f"{goal_id}-{source}-{score}", goal_id=goal_id,
+                    source=source, content="x" * size, score=score,
+                    volatility=Volatility.SEMI_STABLE)
+
+
+def test_memory_pseudo_goals_collapse_to_one_bucket():
+    from research_agent.prompts.budget import MEMORY_BUCKET, _bucket
+
+    assert _bucket("memory::g1") == MEMORY_BUCKET
+    assert _bucket("memory::g4") == MEMORY_BUCKET
+    assert _bucket("g1") == "g1"
+
+
+def test_recall_no_longer_claims_a_slot_per_remembered_goal():
+    """The p205.280-check shape, reconstructed: four memory items filed
+    under four DIFFERENT remembered goals, against one real goal, in a
+    budget that fits four items.
+
+    Before D-142 those four namespaced ids were four buckets, so lap 1
+    handed a slot to each and the real goal got exactly one -- three of the
+    four slots went to recall. With one shared bucket the two compete
+    fairly, so recall can take at most half.
+    """
+    from research_agent.prompts.budget import _cost, budget_evidence
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="China vs India force size")]
+    evidence = (
+        [_bev(f"memory::g{i}", "memory", 0.46) for i in range(1, 5)]
+        + [_bev("g1", "web", 0.75) for _ in range(4)]
+    )
+
+    kept, counters = budget_evidence(evidence, goals,
+                                     max_chars=4 * _cost(evidence[0]))
+
+    by_source = {}
+    for e in kept:
+        by_source[e.source] = by_source.get(e.source, 0) + 1
+    assert len(kept) == 4
+    assert by_source.get("memory", 0) == 2, by_source
+    assert by_source.get("web", 0) == 2, by_source
+    assert counters["evidence_prompt_dropped"] == 4
+
+
+def test_more_real_goals_shrink_recalls_share_not_grow_it():
+    """The property that actually matters. Recall holds ONE bucket, so its
+    share falls as the run has more real goals to cover -- the opposite of
+    the pre-D-142 behaviour, where more remembered goals meant more slots
+    for recall regardless of what the run was researching."""
+    from research_agent.prompts.budget import _cost, budget_evidence
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id=f"g{i}", description=f"goal {i}") for i in range(1, 5)]
+    evidence = (
+        [_bev(f"memory::g{i}", "memory", 0.46) for i in range(1, 5)]
+        + [_bev(f"g{i}", "web", 0.75) for i in range(1, 5)]
+    )
+
+    kept, _ = budget_evidence(evidence, goals,
+                              max_chars=5 * _cost(evidence[0]))
+
+    memory_kept = [e for e in kept if e.source == "memory"]
+    assert len(memory_kept) == 1, [e.goal_id for e in kept]
+
+
+def test_within_the_shared_bucket_the_best_recall_wins():
+    """_SOURCE_RANK already ranked memory last; it only ever broke ties
+    INSIDE a bucket, which is why one bucket per pseudo-goal meant it never
+    applied. With one bucket, score ordering inside it finally does."""
+    from research_agent.prompts.budget import _cost, budget_evidence
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="d")]
+    weak = _bev("memory::g1", "memory", 0.41)
+    strong = _bev("memory::g9", "memory", 0.79)
+    evidence = [weak, strong, _bev("g1", "web", 0.75)]
+
+    kept, _ = budget_evidence(evidence, goals, max_chars=2 * _cost(weak))
+
+    assert strong in kept and weak not in kept
+
+
+def test_real_goals_still_get_one_slot_each_before_anyone_gets_two():
+    """The round-robin's actual guarantee, unchanged by D-142."""
+    from research_agent.prompts.budget import _cost, budget_evidence
+    from research_agent.state import Goal
+
+    goals = [Goal(goal_id="g1", description="a"), Goal(goal_id="g2", description="b")]
+    evidence = [_bev("g1", "web", 0.9), _bev("g1", "web", 0.8),
+                _bev("g2", "web", 0.7)]
+    two_items = 2 * _cost(evidence[0])
+
+    kept, _ = budget_evidence(evidence, goals, max_chars=two_items)
+
+    assert {e.goal_id for e in kept} == {"g1", "g2"}
+

@@ -16,11 +16,17 @@ to build agentic systems that degrade gracefully and improve with oversight.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
-> human-in-the-loop escalation. All six phases of a comprehensive review
-> (`DECISIONS.md` D-1…D-79) are closed as of this revision -- correctness
-> fixes, structural simplification, and operational hardening. Release
-> history, prior test counts, and superseded claims from earlier revisions
-> live in [CHANGELOG.md](CHANGELOG.md), not here.
+> human-in-the-loop escalation. Eight phases of review are closed as of
+> this revision (`DECISIONS.md` D-1…D-146) -- correctness fixes,
+> structural simplification, and operational hardening. Release history,
+> prior test counts, and superseded claims from earlier revisions live in
+> [CHANGELOG.md](CHANGELOG.md), not here.
+>
+> **Test counts are deliberately not written down in this file.** Every
+> literal one went stale (three different numbers appeared in three
+> sections, against an actual 1,130), so the rule OPERATIONS.md already
+> adopted now applies here too: run the suite and read its own summary
+> line. `python -m pytest tests/ -q`.
 
 
 ## Overview
@@ -51,6 +57,7 @@ deliberately does not duplicate them:
 |---|---|
 | `OPERATIONS.md` | Install, the L1/L2/L3 run ladder, service startup, ingest, manual test recipes |
 | `internal/LEARNING_GUIDE.md` | Pedagogy — follow-one-query walkthrough, concept teaching, technical-evaluation framing (note: `internal/` is gitignored, so it ships only in archives) |
+| `internal/PHASE8-FEEDBACK-LOOP.md` | The most recent phase record (D-140…D-146): why a 15-minute test suite, an uncited report, a missing trust signal and unreadable code are one problem |
 | `design/Research_Agent_Design.md` | The full target architecture and D-1…D-30 rationale — a strict superset of this build |
 | **`README.md`** (this file) | What exists, how it is wired, what each store actually holds, and what is broken |
 
@@ -171,7 +178,8 @@ below for continuity); Tier 2's table follows it.
 | **Incidental — opensearch-py 3.x compatibility** | `storage/opensearch_store.py`'s `indices.exists`/`.create`/`.index`/`indices.refresh` calls passed the index/document name **positionally**; the installed `opensearch-py` 3.x client makes this a hard `TypeError` (`index=` must be a keyword). Fixed at all four call sites — `search()` already used the keyword form and was unaffected | Live: `python scripts/ingest_sample_data.py` failed with exactly this `TypeError` before the fix and completed cleanly (`OpenSearch: indexed 10`) after it |
 | **P2-03 follow-up — ingest script now actually idempotent** | `scripts/ingest_sample_data.py` was still calling `QdrantStore.upsert_texts(docs)` with no `id_fn` — the mechanism P2-03 added existed but nothing used it, so every re-ingest still duplicated the dense leg. New `content_id()` helper (`uuid.uuid5` of each document's content — deterministic, and a valid Qdrant point-id shape, unlike a raw hash digest) is now passed as `id_fn` | Three new unit tests (determinism, distinctness, valid-UUID shape); **your own Qdrant collection still has the ~20 duplicate points from ingest runs before this fix landed** — this only stops future re-ingests from adding more, it doesn't retroactively clean up what's already there (a `reset_stores.py --yes` + re-ingest gets you back to a clean 10) |
 
-**Full test suite: 157/157 passing.**
+*(An earlier revision stated a literal test count here. See the Status
+note above for why this file no longer carries one.)*
 
 **A calibration caveat, stated plainly rather than buried:** `min_similarity`
 ships with a code default of `0.35`, which predates any real measurement and
@@ -212,8 +220,8 @@ expected output at each step.
 
 ## Guardrails
 
-*New since D-46. `Full test suite: 341/341 passing` (up from 294 — the 47
-new tests are entirely regression coverage for the items below).*
+*New since D-46. The tests added for these items are entirely regression
+coverage; run the suite for the current count.*
 
 A dedicated `research_agent/guardrails/` package holds deterministic
 post-processing checks — `citations.py` and `fencing.py` predate this work
@@ -271,6 +279,23 @@ change the graph's topology.
 |---|---|---|
 | **Claim-level figure check** | New `guardrails/claims.py::audit_cited_figures`, run from `telemetry_node` against the SHIPPED report. For every sentence stating a figure AND citing a goal, it checks whether any evidence under that goal contains that figure, and reports the ones that do not (`cited_figures_checked` / `cited_figures_unsupported` / `unsupported_figures`, plus a `report.unsupported_cited_figures` WARNING). **This is the first claim-level honesty signal in the harness** — every earlier one judges the whole report or the whole evidence set. Scope is deliberately narrow: figures only, since a number is decidable without meaning; it does NOT check semantic support, which stays the critic's job (D-43/D-46). WARN-only, matching G1/G4/G7 and D-54 — the false-positive surface is real and unmeasured, and failing a critique would burn revision budget on a finding a rewrite often cannot fix (D-85's objection verbatim) | 20 tests covering both halves — that a fabricated figure IS caught, and that list numbering, heading numbers, the `## Sources` block and the D-85 provenance notice are NOT flagged. Demonstrated end-to-end on a p205.246-shaped report: `14.7%` and `2015` flagged, while `2,000,000` and `231` (both genuinely in the evidence) passed |
 
+### Phase 8 — attribution repair, the memory floor, and a composed verdict (D-140…D-146)
+
+| Item | What changed | Verified how |
+|---|---|---|
+| **Deterministic citation attachment (D-144)** | New `guardrails/attribution.py::attach_missing_citations`, run between `normalise_citation_form` and `clean_citations`. When the report's PROSE cites nothing at all, it attaches `[gN]` markers by distinctive-term overlap between each sentence and each goal's own evidence. Four runs had shipped zero-citation reports (`p205.276`, `p205.277`, `p205.280`) against 35–100 evidence items, and every prior fix was a prompt instruction (D-40, D-73) or a form-normaliser (D-99) — none of which help when the model emits no goal id in any form. Deliberately narrow: all-or-nothing, unambiguous only (a tie attributes nothing), a two-term floor, and **add-only**, so every marker it writes then passes through `clean_citations` like the model's own. Counted as `citations_attached` so a rescue is never invisible | 18 tests, including a replay of `p205.280-check`'s shipped report (0 markers → 5), idempotence across revision passes, and that a partially-cited report comes back **byte-identical** |
+| **Sources decoupled from citations (D-144)** | `append_web_sources` gains `list_when_uncited`. The old `listed` was a strict subset of what the prose cited, so a report with no markers got no Sources section either — one formatting failure took out attribution twice. Live: `web_sources_listed: 0` against 58 web items across **33 distinct domains**, under a provenance notice telling the reader to trust figures *"unless a listed source confirms them"*. The pages are now listed under a note saying they were retrieved rather than cited. D-59's rule is kept BY the note, and its topical gate still applies in full | 7 tests, including that D-59's nine-Redis-URL failure is still dropped on the fallback path, that the fallback is off by default, and that `count_listed_sources` still parses the block |
+| **`cited_goal_ids_in_prose` (D-144)** | `cited_goal_ids` matches `[gN]` anywhere, and every Sources entry begins `1. [g1] ` by construction — so a report whose prose cited nothing but which carried a Sources block read back as fully cited. That would have made `evidence_cited` wrong, the D-66 gate silent, and telemetry's backstop agree with both. **The defect predates Phase 8** and was unreachable only because the block was itself gated on prose citations — the exact coupling above removes | 3 tests pinning the old whole-report read against the new prose-scoped one |
+| **Memory relevance floor (D-142)** | New `MEMORY_MIN_SIMILARITY` (default `0.60`). `SemanticMemory.retrieve` had **no floor at all** — `memory_write_min_score` gates what goes IN, nothing gated what came OUT. Live: five Redis-vs-Memcached items recalled at similarity 0.45–0.47 into a China-vs-India query, **leading** the compile prompt, while the corpus floor at 0.55 dropped 72 of 72 dense candidates. Tested against RAW similarity before decay: relevance and freshness are different questions. Memory pseudo-goals also collapse to one prompt-budget bucket, and the evidence block is now ordered by provenance then score | 7 memory tests + 4 budget tests + 4 prompt-ordering tests, including that a stale-but-relevant item is de-ranked rather than deleted, and that `EVIDENCE_ORDER == _SOURCE_RANK` |
+| **Composed confidence verdict (D-145)** | New `reporting/confidence.py`. Caps, not a weighted mean — a mean scores `p205.280-check` near 0.5 because `recall` and `grounding_ratio` were both 1.0. Surfaced in the RESULT block, the run narrative, telemetry (and so the `agent_runs` row) and `analyze_runs.py` | 27 tests, including that a naive average really is that generous, each cap individually, and a parametrised calibration against `golden_queries.jsonl` |
+| **Config self-contradiction check (D-143)** | `warn_on_primary_context_below_prompt_budget`. `PROMPT_EVIDENCE_MAX_CHARS=12000` (~3,000 tokens) and `LLM_PRIMARY_CONTEXT_TOKENS=1536` are arithmetically incompatible, so D-93 skipped the primary on **every** compile and critique and the chain became cloud-only for the two nodes that write the report | 5 tests, including that both named remedies actually silence it |
+| **The report pipeline is a list (D-146)** | `reporting/pipeline.py::REPORT_PASSES`. Twelve straight-line steps with a paragraph between each became a named ordered tuple whose ordering constraints are **data** (`ReportPass.after`) and are asserted by a test. `reporting/telemetry.py` extracts the counter-only half of the 531-line `telemetry_node`. `compiler_node` 231 → 171 lines; `agents/compilation.py` 1,149 → 1,049 | 23 tests, and — the claim that matters — **not one existing test changed**, plus a direct key-set comparison proving the telemetry contract lost nothing |
+| **The test suite stopped opening sockets (D-140/D-141)** | `probe=False` on both stores, session-scoped `settings`/`off_memory`, and `-n auto --dist loadfile` in a `pytest.ini` that now has more than one setting in it. See OPERATIONS.md's "Running and Interpreting the Test Suite" | Measured, not assumed: **24.39 s → 17.14 s** serial and **57 → 1** warnings on Linux; 1019/1019 verified at `-n0`, `-n4` and `-n8` before xdist was adopted |
+| **Postgres was the one store that bounded nothing (D-149)** | `storage/postgres.py` set `connect_timeout` at no call site, so `record_run` against an unreachable DSN waited out the OS TCP timeout. Five `POST /research` calls in one test file cost **650.61s of a 662.25s suite** — 98% of it, against ~12s for everything else. Not only a test problem: `record_run` runs at the END of every CLI run, so an unreachable Postgres hangs the process with the answer already on screen. `CONNECT_TIMEOUT_SECONDS = 5` now applies to `record_run`, the single connection and the pool, matching `QdrantStore`, `OpenSearchStore` and `check_services.py` | Measured from a real `--durations=25`. D-140 fixed the two store CONSTRUCTORS and missed this one; five tests in that file already stubbed `record_run` by hand and four did not, and **those four were exactly the four slowest tests in the suite** — now stubbed in the shared harness so it cannot recur |
+| **The relevance floor had a second door (D-150)** | `MIN_SIMILARITY` gated only the dense leg; OpenSearch hits went straight into fusion. Live: BM25 matched a Redis document at `0.92` for *"organizational structures command hierarchies Chinese People's"* — on `command` and `structures` — putting **42 corpus + 36 mcp** items into a China-vs-India run. The floor's verdict now binds both legs: if every dense candidate fell below it, the corpus does not cover that query and the keyword hits go too | The obvious fix was **measured and rejected**: a `>=2` term-overlap gate drops the Redis hits correctly but also drops `in-corpus-operational` from this repo's own golden set, a query two documents genuinely answer in different words. 5 tests, including a replay of the live shape and one pinning single-leg degradation |
+| **The context setting no longer has to be right (D-151)** | `LLM_PRIMARY_CONTEXT_TOKENS` describes the SERVER and had drifted from it — `.env` said 8876, llama-server reported `n_ctx` 1536 — so D-93 stopped skipping and spent two guaranteed-failed calls where it used to spend two free skips. The real window is now read out of the provider's own 400 and used for the rest of the process. **D-143's note in `.env.example` caused this** by saying "the model's real window"; it is corrected to the `-c` the server was started with | 11 tests keyed off the exact body the server returned. A third defect surfaced while fixing it: `looks_like_context_overflow` never matched llama.cpp's phrasing at all — `"exceeds context"` does not occur in `"exceeds the available context size"` — so a textbook context rejection read as a generic bad request |
+| **One ratio, two meanings (D-152)** | `retrieval_floor_drop_ratio >= 0.8` capped confidence with *"retrieval was starved"*. For a query the corpus covers that names a real defect; for one it does not, the identical ratio is the floor working and the message sends someone to fix a correct threshold. `tier_answers` separates them | The **cap is unchanged** either way — an answer with no corpus behind it is LOW whichever the cause. Only the remedy differs, so only the wording does |
+
 **Guardrails config summary** (all in `config.py`, all `Field`-validated):
 
 | Setting | Default | Guards |
@@ -281,6 +306,7 @@ change the graph's topology.
 | `web_search_max_per_domain` | `2` | hits allowed from any one registrable domain before the rest are dropped |
 | `quality_judge_warn_ratio` | `0.5` | quality-judge failure ratio above which `quality.judge_unreliable` WARNs |
 | `run_call_budget_warn` | `40` | `llm_provider_calls` count above which `run.call_budget_high` WARNs |
+| `memory_min_similarity` | `0.60` | D-142: raw similarity a recalled memory item must reach before it enters evidence at all. `0.0` disables it and restores the pre-D-142 behaviour exactly. Re-derive it for your own corpus alongside `min_similarity` — OPERATIONS.md's calibration section now covers both |
 | `llm_max_tokens` | `4096` | generation budget sent to every LLM provider on every call (`llm/client.py::OpenAICompatibleClient`) — bounds a runaway generation at the request level, complementing (not replacing) the existing `_truncate_at_sentinel` cleanup on whatever comes back |
 | `prompt_evidence_max_chars` *(D-131)* | `12000` | how much EVIDENCE may enter one compile or critique prompt — the input-side counterpart to `llm_max_tokens` above, which bounds only what a provider may GENERATE. Selection is round-robin across goals, best-first within each goal (`prompts/budget.py`), so a goal with one hit is never crowded out by a goal with forty. `0` disables it and restores the pre-D-131 prompt; startup WARNs (`config.prompt_budget_unbounded`) when it does |
 | `run_deadline_seconds` *(D-132)* | `0` (off) | wall-clock seconds of RESEARCH time before the run soft-stops into the compiler — time paused for a human review is subtracted. The first setting here that can END a run early, hence opt-in like `HITL_ENABLED`; with it and the token budget at 0 the graph is byte-identical to before D-132 |
@@ -1637,10 +1663,24 @@ research-agent-dmp/
 │   │                        the codebase uncoupled from the chosen engine
 │   ├── guardrails/           # grounded convergence, hedging, citation repair,
 │   │                        fencing, sources.py (D-57: the deterministic
-│   │                        `## Sources` pass for cited web evidence) and
+│   │                        `## Sources` pass for cited web evidence),
 │   │                        annotations.py (D-139: separates what the MODEL
 │   │                        wrote from what this system inserted, so the
-│   │                        critic is never asked to fix machine text)
+│   │                        critic is never asked to fix machine text) and
+│   │                        attribution.py (D-144: attaches [gN] markers
+│   │                        deterministically when the model wrote none —
+│   │                        the pass that stops one formatting failure
+│   │                        taking out citations, Sources and the D-91
+│   │                        figure audit all at once)
+│   ├── reporting/           # narrative.py (the human-readable execution
+│   │                        trace), metrics.py, and three D-145/D-146
+│   │                        additions: pipeline.py (REPORT_PASSES — the
+│   │                        report post-processing steps as a named
+│   │                        ordered list whose ordering constraints are
+│   │                        DATA, checked by a test, rather than twelve
+│   │                        comments), telemetry.py (the counter-only
+│   │                        half of the telemetry record) and
+│   │                        confidence.py (the composed per-run verdict)
 │   ├── evaluation/          # answer quality, judged cross-provider
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop

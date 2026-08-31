@@ -34,7 +34,7 @@ def _mock_store(points):
     rather than driving the underlying client's pagination -- which
     test_storage_qdrant_store.py already covers on its own.
     """
-    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    store = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert store.available is False
     store.available = True
     store._client = MagicMock()
@@ -117,7 +117,7 @@ def test_main_reports_an_unreachable_qdrant_as_exit_1_not_a_crash():
     """Same posture as gc_memory.py and reset_stores.py: an unreachable
     store is reported and exits non-zero, never a traceback."""
     inspect_memory = _load()
-    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    store = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert store.available is False
     inspect_memory.QdrantStore = lambda *a, **kw: store
 

@@ -227,6 +227,7 @@ def build_app_and_settings(tracer=None):
         settings.decay_half_life_days_semi_stable,
         settings.decay_half_life_days_volatile,
         server_side_decay=settings.memory_server_side_decay,  # P2-10
+        min_similarity=settings.memory_min_similarity,         # D-142
     )
     checkpointer, durable = get_checkpointer(settings.postgres_dsn)
     if not durable:

@@ -342,3 +342,76 @@ def test_compile_report_revision_reminder_follows_the_critique_notes():
     reminder_idx = body.index("STILL cite every")
     citation_format_idx = body.index("CITATION FORMAT")
     assert notes_idx < reminder_idx < citation_format_idx
+
+
+# ---------------------------------------------------------------------------
+# D-142 — the compile prompt's evidence block is ordered by provenance
+#
+# It used to be in retrieval order, and memory_retrieve is the second node
+# of every run -- so the least trustworthy evidence was reliably the first
+# thing the model read.
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_order_matches_the_budget_module_source_rank():
+    """Two files, one ranking. A comment asking politely that they stay in
+    step is what let _SOURCE_RANK and the prompt disagree in the first
+    place."""
+    from research_agent.prompts.budget import _SOURCE_RANK
+    from research_agent.prompts.templates import EVIDENCE_ORDER
+
+    assert EVIDENCE_ORDER == _SOURCE_RANK
+
+
+def test_compile_prompt_puts_corpus_above_web_above_memory():
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Evidence, Goal, Volatility
+
+    def ev(source, score, marker):
+        return Evidence(task_key=marker, goal_id="g1", source=source,
+                        content=marker, score=score,
+                        volatility=Volatility.SEMI_STABLE)
+
+    # Deliberately supplied worst-first, the order retrieval actually
+    # produced in p205.280-check.
+    evidence = [ev("memory", 0.47, "REMEMBERED"), ev("web", 0.71, "WEBPAGE"),
+                ev("corpus", 0.62, "DOCUMENT")]
+    goals = [Goal(goal_id="g1", description="compare the armies")]
+
+    body = compile_report("q", goals, evidence, [])[-1]["content"]
+
+    assert (body.index("DOCUMENT") < body.index("WEBPAGE")
+            < body.index("REMEMBERED"))
+
+
+def test_ordering_adds_and_removes_nothing():
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Evidence, Goal, Volatility
+
+    evidence = [Evidence(task_key=f"t{i}", goal_id="g1", source=s, content=f"item{i}",
+                         score=0.5, volatility=Volatility.SEMI_STABLE)
+                for i, s in enumerate(["memory", "web", "corpus", "model", "mcp"])]
+    goals = [Goal(goal_id="g1", description="d")]
+
+    body = compile_report("q", goals, evidence, [])[-1]["content"]
+
+    for i in range(5):
+        assert f"item{i}" in body
+
+
+def test_within_one_source_the_higher_score_comes_first():
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Evidence, Goal, Volatility
+
+    evidence = [
+        Evidence(task_key="lo", goal_id="g1", source="web", content="LOWSCORE",
+                 score=0.61, volatility=Volatility.SEMI_STABLE),
+        Evidence(task_key="hi", goal_id="g1", source="web", content="HIGHSCORE",
+                 score=0.93, volatility=Volatility.SEMI_STABLE),
+    ]
+    goals = [Goal(goal_id="g1", description="d")]
+
+    body = compile_report("q", goals, evidence, [])[-1]["content"]
+
+    assert body.index("HIGHSCORE") < body.index("LOWSCORE")
+

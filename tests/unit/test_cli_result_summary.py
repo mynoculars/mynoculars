@@ -209,3 +209,90 @@ def test_the_result_summary_carries_the_judge_line():
 def test_a_telemetry_dict_with_no_quality_keys_at_all_still_formats():
     """Every pre-D-106 row, and every stub run."""
     assert "Quality judge:" in _fmt_result_summary({}, "")
+
+
+# ---------------------------------------------------------------------------
+# D-145 / D-144 -- the three lines the RESULT block never had
+#
+# p205.280-check printed six raw signals and left the reader to integrate
+# them. Finding "0 sources listed against 58 web items" meant reading 45
+# lines of JSON.
+# ---------------------------------------------------------------------------
+
+
+def _p205_280_telemetry():
+    from research_agent.reporting.confidence import score_report
+
+    t = {
+        "goals": 4, "evidence_items": 100, "evidence_cited": 0,
+        "citations_attached": 0, "grounding_ratio": 1.0, "recall": 1.0,
+        "corpus_recall": 0.0, "grounded_score": 0.0,
+        "retrieval_floor_drop_ratio": 1.0, "llm_quality_score_mean": 0.067,
+        "llm_quality_scores_judged": 3, "llm_quality_calls": 3,
+        "llm_quality_calls_failed": 0, "llm_quality_rejections": 3,
+        "llm_quality_bands": {"very_low": 2, "low": 1},
+        "critique_passed": False, "revision_cycles": 2,
+        "cited_figures_unsupported": 0, "goals_without_evidence": [],
+        "escalations": [{"trigger": "E4", "action": "approve"}],
+        "evidence_by_source": {"memory": 5, "web": 58, "corpus": 19, "mcp": 18},
+        "web_sources_listed": 0, "web_sourced_items": 58,
+        "web_source_domains": 33, "llm_provider_calls": 8,
+        "llm_fallback_hops": 2, "search_calls": 12, "search_failures": 0,
+    }
+    t["confidence"] = score_report(t)
+    return t
+
+
+def test_the_verdict_is_the_first_line_after_the_banner():
+    out = _fmt_result_summary(_p205_280_telemetry(), "x" * 4341)
+
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0] == "=== RESULT ==="
+    assert lines[1].startswith("Confidence   : UNRELIABLE")
+
+
+def test_the_attribution_failure_is_visible_without_reading_json():
+    out = _fmt_result_summary(_p205_280_telemetry(), "x" * 4341)
+
+    assert "Citations    : 0 goal(s) cited in the prose" in out
+    assert "100 evidence item(s) available" in out
+    assert "Sources      : 0 listed / 58 web item(s) across 33 domain(s)" in out
+
+
+def test_a_deterministic_rescue_says_so_on_the_citations_line():
+    """A reader must never be unable to tell a report the model cited from
+    one this codebase repaired."""
+    from research_agent.reporting.confidence import score_report
+
+    t = _p205_280_telemetry()
+    t.update({"evidence_cited": 4, "citations_attached": 5,
+              "web_sources_listed": 12})
+    t["confidence"] = score_report(t)
+
+    out = _fmt_result_summary(t, "x" * 4341)
+
+    assert "5 attached deterministically" in out
+
+
+def test_a_run_with_no_web_evidence_says_so_rather_than_printing_zeroes():
+    """WEB_SEARCH_ENABLED defaults false, so this is the common shape."""
+    from research_agent.reporting.confidence import score_report
+
+    t = _p205_280_telemetry()
+    t.update({"web_sourced_items": 0, "web_source_domains": 0,
+              "web_sources_listed": 0})
+    t["confidence"] = score_report(t)
+
+    out = _fmt_result_summary(t, "x" * 100)
+
+    assert "Sources      : 0 listed (no web evidence retrieved)" in out
+
+
+def test_an_empty_telemetry_dict_still_renders():
+    """A degraded or interrupted run reaches this line, and the whole point
+    of the summary is to stay readable exactly then."""
+    out = _fmt_result_summary({}, "")
+
+    assert "=== RESULT ===" in out
+    assert "Confidence   : n/a" in out
+

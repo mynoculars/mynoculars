@@ -161,6 +161,25 @@ class NarrativeFormatter(logging.Formatter):
 
     def _render_telemetry(self, f: dict) -> str:
         lines = [self._BANNER, "TELEMETRY", self._BANNER]
+        # D-145: the composed verdict opens the block, with EVERY reason --
+        # this is the artifact someone reads after the fact, so unlike
+        # cli.py's one-line summary there is no need to truncate the list.
+        confidence = f.get("confidence")
+        if confidence:
+            lines.append("\nConfidence")
+            lines.append(self._THIN)
+            lines.append(f"Verdict          : {confidence.get('band')} "
+                         f"({confidence.get('score')}%)")
+            for reason in confidence.get("reasons") or []:
+                lines.append(f"  - {reason}")
+        lines.append("\nAttribution")
+        lines.append(self._THIN)
+        lines.append(f"Goals cited      : {f.get('evidence_cited')}")
+        if f.get("citations_attached"):
+            lines.append(f"  attached deterministically (D-144): "
+                         f"{f.get('citations_attached')}")
+        lines.append(f"Sources listed   : {f.get('web_sources_listed')} "
+                     f"({f.get('web_sources_suppressed')} suppressed)")
         lines.append("\nResearch")
         lines.append(self._THIN)
         lines.append(f"Intent           : {f.get('intent')}")

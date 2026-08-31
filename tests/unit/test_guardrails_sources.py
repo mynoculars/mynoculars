@@ -250,3 +250,146 @@ def test_count_listed_sources_is_zero_without_a_sources_section():
     assert count_listed_sources("# Report\n\nJust prose [g1].\n") == 0
     # A report that merely mentions the words must not be miscounted.
     assert count_listed_sources("We list 1. [g1] nothing here\n") == 0
+
+
+# ---------------------------------------------------------------------------
+# D-144 -- the Sources block no longer dies with the citations
+#
+# `listed` was a strict subset of what the prose cited, so a report with no
+# [gN] markers got no Sources section either: one LLM formatting failure
+# took out attribution twice. Live (p205.280-check): 58 web items across 33
+# distinct domains retrieved, 0 listed, and the shipped report still
+# carried D-85's notice telling the reader to trust figures "unless a
+# listed source confirms them".
+# ---------------------------------------------------------------------------
+
+
+def _d144_web(goal_id, content, url, domain, score=0.72):
+    from research_agent.state import Evidence, Volatility
+
+    return Evidence(task_key=url, goal_id=goal_id, source="web",
+                    content=content, score=score,
+                    volatility=Volatility.SEMI_STABLE, url=url, domain=domain)
+
+
+def _army_goals():
+    from research_agent.state import Goal
+
+    return [Goal(goal_id="g1", description="active-duty military personnel "
+                                           "strength of China and India")]
+
+
+UNCITED = "China's active-duty military is substantially larger than India's.\n"
+
+
+def test_an_uncited_report_still_gets_its_sources_when_asked():
+    from research_agent.guardrails.sources import append_web_sources
+
+    evidence = [_d144_web("g1", "India Military Strength — 1.45 million active "
+                           "military personnel", "https://a.com/1", "a.com")]
+
+    out, counters = append_web_sources(UNCITED, evidence, _army_goals(), "",
+                                       list_when_uncited=True)
+
+    assert "## Sources" in out
+    assert "https://a.com/1" in out
+    assert counters["web_sources_listed"] == 1
+    assert counters["web_sources_listed_uncited"] == 1
+
+
+def test_the_fallback_block_says_what_it_is():
+    """The note is the whole reason this is honest rather than a D-59
+    violation: it asserts "retrieved", not "supports"."""
+    from research_agent.guardrails.sources import UNCITED_NOTE, append_web_sources
+
+    evidence = [_d144_web("g1", "India Military Strength — 1.45 million active "
+                           "military personnel", "https://a.com/1", "a.com")]
+
+    out, _ = append_web_sources(UNCITED, evidence, _army_goals(), "",
+                                list_when_uncited=True)
+
+    assert UNCITED_NOTE in out
+    assert "not as support for any specific claim" in out
+
+
+def test_the_fallback_is_off_by_default():
+    """Every existing caller and test must see byte-identical behaviour."""
+    from research_agent.guardrails.sources import append_web_sources
+
+    evidence = [_d144_web("g1", "India Military Strength — 1.45 million active "
+                           "military personnel", "https://a.com/1", "a.com")]
+
+    out, counters = append_web_sources(UNCITED, evidence, _army_goals(), "")
+
+    assert out == UNCITED
+    assert counters["web_sources_listed"] == 0
+    assert "web_sources_listed_uncited" not in counters
+
+
+def test_the_fallback_never_fires_when_the_prose_cites_something():
+    """A cited report takes the normal per-goal path, and the note must not
+    appear on it."""
+    from research_agent.guardrails.sources import UNCITED_NOTE, append_web_sources
+
+    cited = "China's active-duty military is substantially larger. [g1]\n"
+    evidence = [_d144_web("g1", "India Military Strength — 1.45 million active "
+                           "military personnel", "https://a.com/1", "a.com")]
+
+    out, counters = append_web_sources(cited, evidence, _army_goals(), "",
+                                       list_when_uncited=True)
+
+    assert "https://a.com/1" in out
+    assert UNCITED_NOTE not in out
+    assert "web_sources_listed_uncited" not in counters
+
+
+def test_the_d59_topical_gate_still_applies_on_the_fallback_path():
+    """D-59's motivating failure was nine Redis-monitoring URLs listed under
+    [g1] in an India-vs-US report. Widening the gate to "any goal this run
+    pursued" must not readmit them."""
+    from research_agent.guardrails.sources import append_web_sources
+
+    evidence = [
+        _d144_web("g1", "India Military Strength — 1.45 million active military "
+                   "personnel", "https://a.com/1", "a.com"),
+        _d144_web("g1", "Monitoring Redis with Prometheus exporters and Grafana "
+                   "dashboards", "https://redis.example/9", "redis.example"),
+    ]
+
+    out, counters = append_web_sources(UNCITED, evidence, _army_goals(), "",
+                                       list_when_uncited=True)
+
+    assert "https://a.com/1" in out
+    assert "redis.example" not in out
+    assert counters["web_sources_suppressed"] == 1
+
+
+def test_no_web_evidence_is_still_a_byte_identical_no_op():
+    """Every run with WEB_SEARCH_ENABLED false, which is the default."""
+    from research_agent.guardrails.sources import append_web_sources
+
+    out, counters = append_web_sources(UNCITED, [], _army_goals(), "",
+                                       list_when_uncited=True)
+
+    assert out == UNCITED
+    assert counters == {"web_sources_listed": 0.0, "web_sources_suppressed": 0.0}
+
+
+def test_count_listed_sources_reads_the_fallback_block_too():
+    """D-59 counts the SHIPPED artifact. The note line must not be counted
+    as an entry, and the numbered entries must still be."""
+    from research_agent.guardrails.sources import (append_web_sources,
+                                                   count_listed_sources)
+
+    evidence = [
+        _d144_web("g1", "India Military Strength — 1.45 million active military "
+                   "personnel", "https://a.com/1", "a.com"),
+        _d144_web("g1", "China military personnel by type — 2,035,000 active "
+                   "military", "https://b.com/2", "b.com"),
+    ]
+
+    out, _ = append_web_sources(UNCITED, evidence, _army_goals(), "",
+                                list_when_uncited=True)
+
+    assert count_listed_sources(out) == 2
+

@@ -143,3 +143,119 @@ def test_rrf_never_credits_the_same_doc_twice_within_one_ranking():
     # Cross-leg agreement is still rewarded -- that is the point of fusion.
     both = rrf_fuse([["docA"], ["docA"]])
     assert both["docA"] > dup["docA"]
+
+
+# ---------------------------------------------------------------------------
+# D-150 -- the floor's verdict binds BOTH legs
+#
+# min_similarity only ever gated the dense leg. OpenSearch hits went
+# straight into fusion, so an off-topic corpus document could still become
+# Evidence for a query the corpus does not cover. Live (p205.282-check,
+# "Compare the Armies of China and India" against a Redis/Memcached
+# corpus):
+#
+#     OPENSEARCH (BM25)
+#     query: "organizational structures command hierarchies Chinese People's"
+#     [hit 1]  bm25=0.92  topic=redis
+#
+# 42 corpus + 36 mcp items entered a military run through that door.
+# ---------------------------------------------------------------------------
+
+
+class _Leg:
+    """One retrieval leg, with the `available` flag the real stores carry."""
+
+    def __init__(self, hits, available=True):
+        self._hits = hits
+        self.available = available
+        self.calls = 0
+
+    def search(self, query, top_k=5):
+        self.calls += 1
+        return list(self._hits)
+
+
+def _dense(sim, content="doc"):
+    return {"content": content, "title": content, "similarity": sim}
+
+
+def _kw(content="doc", bm25=0.92):
+    return {"content": content, "title": content, "bm25": bm25}
+
+
+def test_the_p205_282_shape_no_longer_reaches_fusion():
+    """Every dense candidate below the floor means the corpus does not
+    cover this query. The keyword leg must not overrule that."""
+    from research_agent.retrieval.hybrid import HybridRetriever
+
+    dense = _Leg([_dense(0.41, "Redis data structures"),
+                  _dense(0.38, "Throughput characteristics")])
+    keyword = _Leg([_kw("Redis data structures")])
+    retriever = HybridRetriever(dense, keyword, min_similarity=0.55)
+
+    results = retriever.search("organizational structures command hierarchies")
+
+    assert results == []
+    assert retriever.drain_counts()["retrieval_keyword_dropped_off_topic"] == 1
+
+
+def test_a_query_the_corpus_does_cover_keeps_its_keyword_hits():
+    """The half that matters more. Embeddings are what handle the
+    vocabulary mismatch BM25 cannot, so a query whose dense leg clears the
+    floor keeps everything -- this is what a >=2 term-overlap gate would
+    have broken (measured: it drops `in-corpus-operational`, a query two
+    documents genuinely answer using different words)."""
+    from research_agent.retrieval.hybrid import HybridRetriever
+
+    dense = _Leg([_dense(0.81, "Redis persistence"), _dense(0.40, "noise")])
+    keyword = _Leg([_kw("Redis failure modes")])
+    retriever = HybridRetriever(dense, keyword, min_similarity=0.55)
+
+    results = retriever.search("failure modes and operational tooling")
+
+    assert len(results) == 2
+    assert "retrieval_keyword_dropped_off_topic" not in retriever.drain_counts()
+
+
+def test_a_degraded_dense_leg_never_silences_the_keyword_leg():
+    """Single-leg degradation must keep working exactly as documented. An
+    unavailable Qdrant returns no hits, which must not be read as the
+    corpus rejecting the query."""
+    from research_agent.retrieval.hybrid import HybridRetriever
+
+    dense = _Leg([], available=False)
+    keyword = _Leg([_kw("Redis persistence")])
+    retriever = HybridRetriever(dense, keyword, min_similarity=0.55)
+
+    results = retriever.search("redis persistence")
+
+    assert len(results) == 1
+    assert "retrieval_keyword_dropped_off_topic" not in retriever.drain_counts()
+
+
+def test_a_dense_leg_that_returned_nothing_at_all_is_not_a_verdict():
+    """No candidates is not the same as candidates that all failed. Only
+    the latter says the corpus does not cover the query."""
+    from research_agent.retrieval.hybrid import HybridRetriever
+
+    dense = _Leg([])
+    keyword = _Leg([_kw("Redis persistence")])
+    retriever = HybridRetriever(dense, keyword, min_similarity=0.55)
+
+    results = retriever.search("redis persistence")
+
+    assert len(results) == 1
+    assert "retrieval_keyword_dropped_off_topic" not in retriever.drain_counts()
+
+
+def test_the_floor_switched_off_leaves_both_legs_exactly_as_before():
+    """MIN_SIMILARITY=0.0 is the documented escape hatch and must restore
+    pre-D-150 behaviour too, not just pre-P2-01."""
+    from research_agent.retrieval.hybrid import HybridRetriever
+
+    dense = _Leg([_dense(0.01, "irrelevant")])
+    keyword = _Leg([_kw("also irrelevant")])
+    retriever = HybridRetriever(dense, keyword, min_similarity=0.0)
+
+    assert len(retriever.search("anything")) == 2
+

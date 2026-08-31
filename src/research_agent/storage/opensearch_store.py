@@ -45,7 +45,7 @@ class OpenSearchStore:
     def __init__(self, url: str, index: str, username: str = "",
                  password: str = "", use_ssl: bool = False,
                  verify_certs: bool = False, tracer: Any = None,
-                 trace_label: str = "OPENSEARCH (BM25)"):
+                 trace_label: str = "OPENSEARCH (BM25)", probe: bool = True):
         """Connect lazily; mark unavailable instead of raising.
 
         CALLED BY   cli.py::build_app_and_settings, once, for the corpus
@@ -58,6 +58,13 @@ class OpenSearchStore:
         self.index = index
         self.available = False
         self._client = None
+        if not probe:
+            # D-140, same contract as QdrantStore: construct already-
+            # degraded without opening a socket. See that class for the
+            # measurement that motivated it.
+            self._tracer = tracer
+            self._label = trace_label
+            return
         try:
             from opensearchpy import OpenSearch
             # Build up the connection arguments as a plain dict FIRST,

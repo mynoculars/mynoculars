@@ -51,8 +51,8 @@ def _mock_store(collection="test_collection"):
     no existing test in this suite does; every prior QdrantStore test only
     ever exercised the degraded no-op path or a standalone helper function)
     without a real server."""
-    store = QdrantStore("http://127.0.0.1:1", collection)
-    assert store.available is False  # sanity: really did fail to connect
+    store = QdrantStore("http://127.0.0.1:1", collection, probe=False)
+    assert store.available is False  # sanity: constructed degraded
     store.available = True
     store._client = MagicMock()
     store._embedder = MagicMock()
@@ -86,7 +86,7 @@ def test_ensure_payload_indexes_creates_the_two_required_indexes():
 
 
 def test_ensure_payload_indexes_is_a_noop_when_degraded():
-    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    store = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert store.available is False
     store.ensure_payload_indexes()  # must not raise
 
@@ -138,7 +138,7 @@ def test_upsert_texts_writes_both_created_at_and_created_at_iso():
 
 
 def test_search_with_decay_returns_empty_list_when_degraded():
-    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    store = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert store.available is False
     out = store.search_with_decay("q", top_k=3, decay_field="volatility",
                                   half_lives={"stable": None, "semi_stable": 90.0})
@@ -250,7 +250,7 @@ def test_existing_point_ids_returns_only_the_ids_qdrant_actually_has():
 
 
 def test_existing_point_ids_returns_empty_set_when_degraded():
-    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    store = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert store.available is False
     assert store.existing_point_ids(["id1"]) == set()
 
@@ -291,7 +291,7 @@ def test_scroll_all_follows_pagination_until_offset_is_none():
 
 
 def test_scroll_all_returns_empty_list_when_degraded():
-    store = QdrantStore("http://127.0.0.1:1", "test_collection")
+    store = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert store.available is False
     assert store.scroll_all() == []
 
@@ -307,7 +307,7 @@ def test_delete_points_calls_client_delete_with_the_given_ids():
 
 
 def test_delete_points_is_a_noop_on_empty_list_or_when_degraded():
-    degraded = QdrantStore("http://127.0.0.1:1", "test_collection")
+    degraded = QdrantStore("http://127.0.0.1:1", "test_collection", probe=False)
     assert degraded.delete_points(["id1"]) == 0  # degraded -> no client call possible
 
     store = _mock_store()

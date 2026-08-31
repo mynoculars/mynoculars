@@ -424,3 +424,257 @@ def test_a_mistyped_deadline_is_flagged_like_every_other_known_typo(
     hits = [r for r in caplog.records if "config.likely_typo" in r.message]
     assert any(r.event_fields["probably_meant"] == "RUN_DEADLINE_SECONDS"
                for r in hits)
+
+
+# ---------------------------------------------------------------------------
+# D-143 -- the primary's context window vs the evidence budget
+#
+# Two settings decided whether the local model could ever serve a compile
+# or a critique, and nothing compared them. Live (p205.280-check):
+# LLM_PRIMARY_CONTEXT_TOKENS=1536 against PROMPT_EVIDENCE_MAX_CHARS=12000,
+# llm_context_skips 2, and the shipped report came from a fallback hop the
+# primary was never allowed to attempt.
+# ---------------------------------------------------------------------------
+
+
+def test_the_p205_280_configuration_warns(caplog):
+    from research_agent.config import warn_on_primary_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_primary_context_tokens=1536,
+                 prompt_evidence_max_chars=12000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_primary_context_below_prompt_budget(s)
+
+    matches = [r for r in caplog.records
+               if "config.primary_context_below_prompt_budget" in r.message]
+    assert matches
+    fields = matches[0].event_fields
+    assert fields["setting"] == "LLM_PRIMARY_CONTEXT_TOKENS"
+    assert fields["value"] == 1536
+    assert fields["evidence_tokens_estimate"] == 3000
+    assert "compile" in fields["effect"] and "critique" in fields["effect"]
+
+
+def test_an_unconfigured_window_is_silent(caplog):
+    """0 means "not configured" and makes D-93 inert -- there is nothing to
+    compare, and warning would fire for every default install."""
+    from research_agent.config import warn_on_primary_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_primary_context_tokens=0)
+    with caplog.at_level(logging.WARNING):
+        warn_on_primary_context_below_prompt_budget(s)
+
+    assert not [r for r in caplog.records
+                if "config.primary_context" in r.message]
+
+
+def test_a_window_that_actually_fits_the_budget_is_silent(caplog):
+    from research_agent.config import warn_on_primary_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_primary_context_tokens=8192,
+                 prompt_evidence_max_chars=12000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_primary_context_below_prompt_budget(s)
+
+    assert not [r for r in caplog.records
+                if "config.primary_context" in r.message]
+
+
+def test_lowering_the_evidence_budget_is_the_other_way_to_satisfy_it(caplog):
+    """The warning names two remedies and both must actually silence it,
+    or it is telling people to do something that does not work."""
+    from research_agent.config import warn_on_primary_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_primary_context_tokens=1536,
+                 prompt_evidence_max_chars=4000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_primary_context_below_prompt_budget(s)
+
+    assert not [r for r in caplog.records
+                if "config.primary_context" in r.message]
+
+
+def test_the_default_install_does_not_warn(caplog):
+    """.env.example ships LLM_PRIMARY_CONTEXT_TOKENS=0, so a clean clone
+    must be quiet here."""
+    from research_agent.config import warn_on_primary_context_below_prompt_budget
+
+    with caplog.at_level(logging.WARNING):
+        warn_on_primary_context_below_prompt_budget(Settings(_env_file=None))
+
+    assert not [r for r in caplog.records
+                if "config.primary_context" in r.message]
+
+
+
+# ---------------------------------------------------------------------------
+# D-148 -- a numeric setting may carry a thousands separator
+#
+# LLM_PRIMARY_CONTEXT_TOKENS=8,876 -- a model's real context window, written
+# the way a person writes a number -- made Settings() raise. Because 43
+# tests reach Settings() through get_settings(), that ONE line reported as
+# "26 failed, 1087 passed, 17 errors", none of it near the field in
+# question. Reproduced exactly from the developer's own .env.
+# ---------------------------------------------------------------------------
+
+
+def test_the_exact_value_that_broke_the_suite_now_parses():
+    from research_agent.config import Settings
+
+    s = Settings(_env_file=None, llm_primary_context_tokens="8,876")
+
+    assert s.llm_primary_context_tokens == 8876
+    assert isinstance(s.llm_primary_context_tokens, int)
+
+
+def test_a_grouped_float_parses_too():
+    from research_agent.config import Settings
+
+    s = Settings(_env_file=None, decay_half_life_days_semi_stable="1,095")
+
+    assert s.decay_half_life_days_semi_stable == 1095.0
+
+
+def test_quotes_and_spaces_are_stripped_from_a_number():
+    """A .env value copied out of documentation picks these up."""
+    from research_agent.config import Settings
+
+    assert Settings(_env_file=None,
+                    llm_primary_context_tokens=' "8 192" ').llm_primary_context_tokens == 8192
+
+
+def test_a_clean_value_is_untouched():
+    from research_agent.config import _normalise_numeric
+
+    for raw in ("8192", "0.6", "-1", "1e3", ""):
+        assert _normalise_numeric(raw) == raw
+
+
+def test_something_that_is_not_a_number_is_left_for_pydantic_to_reject():
+    """This widens what is accepted; it must never guess. "1,2,3" is not a
+    number anyone meant, and neither is "abc"."""
+    from research_agent.config import Settings, _normalise_numeric
+
+    assert _normalise_numeric("1,2,3") == "1,2,3", "invalid grouping is not a number"
+    assert _normalise_numeric("abc") == "abc"
+    assert _normalise_numeric("1,23") == "1,23"
+    assert _normalise_numeric("8,8765") == "8,8765"
+    with pytest.raises(Exception):
+        Settings(_env_file=None, llm_primary_context_tokens="abc")
+
+
+def test_non_numeric_fields_are_never_touched():
+    """A comma in a string setting is content, not grouping."""
+    from research_agent.config import Settings
+
+    s = Settings(_env_file=None, llm_primary_model="qwen,cogito")
+
+    assert s.llm_primary_model == "qwen,cogito"
+
+
+def test_the_normalisation_is_reported_not_silent(caplog):
+    """Accepting the value is right; rewriting a person's configuration
+    without saying so is not."""
+    from research_agent.config import (Settings, _NUMERIC_NORMALISATIONS,
+                                       warn_on_normalised_numerics)
+
+    _NUMERIC_NORMALISATIONS.clear()
+    Settings(_env_file=None, llm_primary_context_tokens="8,876")
+    with caplog.at_level(logging.WARNING):
+        warn_on_normalised_numerics()
+
+    matches = [r for r in caplog.records
+               if "config.numeric_normalised" in r.message]
+    assert matches
+    fields = matches[0].event_fields
+    assert fields["setting"] == "LLM_PRIMARY_CONTEXT_TOKENS"
+    assert fields["raw"] == "8,876"
+    assert fields["parsed"] == "8876"
+
+
+def test_the_report_drains_so_it_cannot_repeat(caplog):
+    from research_agent.config import (Settings, _NUMERIC_NORMALISATIONS,
+                                       warn_on_normalised_numerics)
+
+    _NUMERIC_NORMALISATIONS.clear()
+    Settings(_env_file=None, llm_primary_context_tokens="8,876")
+    warn_on_normalised_numerics()
+    # caplog.records accumulates for the WHOLE test, so the first call's
+    # record is still there and would look like a repeat.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        warn_on_normalised_numerics()
+
+    assert not [r for r in caplog.records
+                if "config.numeric_normalised" in r.message]
+
+
+def test_a_clean_configuration_reports_nothing(caplog):
+    from research_agent.config import (Settings, _NUMERIC_NORMALISATIONS,
+                                       warn_on_normalised_numerics)
+
+    _NUMERIC_NORMALISATIONS.clear()
+    Settings(_env_file=None, llm_primary_context_tokens=8192)
+    with caplog.at_level(logging.WARNING):
+        warn_on_normalised_numerics()
+
+    assert not [r for r in caplog.records
+                if "config.numeric_normalised" in r.message]
+
+
+def test_a_real_dotenv_carrying_the_bad_value_still_loads(tmp_path, monkeypatch):
+    """The REAL-RUN path, not the test path: a .env file on disk with the
+    grouped value must produce a working Settings. conftest's isolation
+    stops the suite reading .env at all, so this test supplies its own."""
+    from research_agent.config import Settings
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("LLM_PRIMARY_CONTEXT_TOKENS=8,876\n",
+                                   encoding="utf-8")
+
+    s = Settings(_env_file=str(tmp_path / ".env"))
+
+    assert s.llm_primary_context_tokens == 8876
+
+
+# ---------------------------------------------------------------------------
+# D-147 -- the suite reads no ambient configuration at all
+#
+# These assert the contract of tests/conftest.py::_no_ambient_config, which
+# is autouse and session-scoped. Without it, one malformed line in a
+# developer's .env fails 43 tests that do not test configuration.
+# ---------------------------------------------------------------------------
+
+
+def test_no_dotenv_file_is_read_during_the_suite():
+    from research_agent.config import Settings
+
+    assert Settings.model_config["env_file"] is None
+
+
+def test_no_settings_field_is_visible_as_an_os_environment_variable():
+    """Settings(_env_file=None) does NOT insulate against these --
+    pydantic-settings always checks os.environ first. A developer who ran
+    `$env:HITL_ENABLED = "true"` earlier in the same shell would otherwise
+    change what this suite asserts."""
+    import os
+
+    from research_agent.config import Settings
+
+    leaked = {name.upper() for name in Settings.model_fields} & set(os.environ)
+
+    assert not leaked, f"ambient configuration reached the suite: {sorted(leaked)}"
+
+
+def test_a_test_can_still_set_a_value_deliberately(monkeypatch):
+    """The fixture removes AMBIENT configuration. It must not stop a test
+    from asking for a value."""
+    import os
+
+    from research_agent.config import Settings
+
+    monkeypatch.setenv("HITL_ENABLED", "true")
+
+    assert Settings().hitl_enabled is True
+    assert os.environ["HITL_ENABLED"] == "true"
+
