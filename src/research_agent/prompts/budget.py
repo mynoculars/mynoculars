@@ -158,3 +158,66 @@ def budget_evidence(evidence: Iterable[Evidence], goals: Sequence[Goal],
               kept=len(kept), chars=spent, limit=max_chars,
               goals_represented=len({e.goal_id for e in kept}))
     return kept, {"evidence_prompt_dropped": float(dropped)}
+# ---------------------------------------------------------------------------
+# D-138: the same rule, applied to the OTHER thing that grows in a prompt.
+# ---------------------------------------------------------------------------
+
+# What one critique's verdict actually costs, measured rather than guessed.
+# Live: p205.276-check's critique produced 6 notes / 1,832 chars;
+# p205.277-check's first produced 10 notes / 2,722 chars and its second 6
+# more. Because state.critique_notes accumulates (state.py, operator.add)
+# and compile_report inlined all of it, the THIRD compile of p205.277-check
+# opened with 16 notes / 4,947 chars -- 41% of the whole evidence budget
+# (PROMPT_EVIDENCE_MAX_CHARS, 12,000) spent on instructions about drafts
+# that no longer exist.
+#
+# Both bounds sit ABOVE the largest single verdict yet observed, which is
+# the property that matters: the notes the CURRENT draft actually failed on
+# are never truncated, and only superseded ones are dropped.
+_MAX_PROMPT_NOTES = 12
+_MAX_NOTE_CHARS = 3500
+
+
+def budget_notes(notes, max_notes=_MAX_PROMPT_NOTES,
+                 max_chars=_MAX_NOTE_CHARS):
+    """Bound the critique notes entering ONE compile prompt.
+
+    Returns (kept, counters) with the survivors in their original order.
+
+    KEEPS THE NEWEST. `critique_notes` accumulates via a reducer, so the
+    notes appended LAST are the ones the current draft failed on; the
+    earlier ones describe a draft that has already been rewritten and
+    cannot be acted on. "Address every note" over sixteen notes about three
+    different drafts is not an instruction a compiler can follow, and live
+    (p205.277-check) the compile that received exactly that dropped its
+    citations entirely.
+
+    NO SETTING, deliberately. D-98's rule -- a knob nobody has evidence to
+    tune is a knob that ships mis-set -- and unlike the evidence budget
+    there is no live measurement here saying an operator would ever want a
+    different number. Both bounds are stated above the largest verdict yet
+    observed, so nothing an operator would recognise is being cut.
+
+    Prompt-only, exactly as budget_evidence and dedupe_evidence are:
+    state.critique_notes is untouched, so the escalation payload, the
+    review a human reads and every telemetry figure still carry the whole
+    history.
+    """
+    notes = [n for n in notes if n]
+    if not notes:
+        return [], {}
+    kept, spent = [], 0
+    # Walk backwards -- newest first -- then restore the original order,
+    # so the prompt still reads oldest to newest and only the head is lost.
+    for note in reversed(notes):
+        if len(kept) >= max_notes or spent + len(note) > max_chars:
+            break
+        kept.append(note)
+        spent += len(note)
+    kept.reverse()
+    dropped = len(notes) - len(kept)
+    if not dropped:
+        return kept, {}
+    log_event(logger, "guardrail.notes_budgeted", dropped=dropped,
+              kept=len(kept), chars=spent, limit=max_chars)
+    return kept, {"critique_notes_dropped": float(dropped)}

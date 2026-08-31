@@ -2596,6 +2596,46 @@ drifted off-topic and the drift got as far as the report's attribution
 block; it does not mean the prose is wrong. Read it alongside
 `corpus_recall` and `grounded_score`.
 
+**D-137 adds one, and it is the one to read on a report that looks wrong.**
+
+**`report.residual_glued_sentences`** — `agents/compilation.py::
+telemetry_node`, once per run, only when the repair left something behind:
+
+```json
+{"msg": "report.residual_glued_sentences", "sites": 3, "repaired": 9}
+```
+
+**What the defect looks like in a report.** The compiler is asked to close
+a claim with a `[gN]` marker. Sometimes it writes its own restatement of
+the source instead and runs it into the sentence with no space:
+
+> ...along the disputed Himalayan border**India raised a new mountain
+> strike corps to strengthen its defence along its disputed border with
+> China.**
+
+Live (runs `p205.276-check` and `p205.277-check`) that happened **9 and 22
+times** in the two reports that shipped. `repair_glued_sentences` now
+restores the boundary — you will see `citations_glued_sentences_repaired`
+in the `last_compile_guardrails` block — and this WARNING fires only if any
+site survived it.
+
+**Read it with `citations_residual_paste_sites`, not instead of it.** They
+are two different defects and only one of them is fixable by deletion:
+
+| Counter | What it means | What was done |
+| --- | --- | --- |
+| `citations_pasted_evidence_removed` | The model pasted VERBATIM source text onto a claim | The paste was deleted (D-96) |
+| `citations_residual_paste_sites` | A verbatim paste is still in the shipped report | Nothing — investigate |
+| `citations_glued_sentences_repaired` | The model wrote its OWN restatement and welded it on | A sentence boundary was inserted (D-137) |
+| `citations_residual_glue_sites` | A welded join is still in the shipped report | Nothing — investigate |
+
+**What this does NOT fix.** The restatement itself stays, and it is still
+uncited — the repair makes the report readable, it does not make it
+attributed. If you are seeing high `citations_glued_sentences_repaired`
+counts, the run is telling you the compiler is substituting restatements
+for citations, and the thing to look at is `evidence_cited` in the compile
+decision line and whether the zero-citation gate (D-66) fired.
+
 **Phase 4 (D-57) adds two more, both `chain`/`web_search` scoped.** Neither
 changes routing either.
 

@@ -1534,3 +1534,268 @@ def test_telemetry_on_an_ordinary_run_reports_no_budget_stop():
     assert telemetry["run_budget_exhausted"] is None
     assert telemetry["run_elapsed_seconds"] == 0.0
     assert telemetry["truncation_notice_shipped"] is False
+
+
+# ---------------------------------------------------------------------------
+# D-137 — the glue signature without the verbatim confirmation
+# ---------------------------------------------------------------------------
+
+def test_a_paraphrased_restatement_glued_to_a_claim_is_separated():
+    """The live shape, from run p205.277-check's shipped report. This
+    sentence appears NOWHERE in the evidence block -- the model wrote its
+    own restatement and welded it on where a [gN] marker belongs -- so the
+    verbatim paste guard cannot see it."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    report = ("The establishment of a new mountain strike corps is reported "
+              "as part of efforts along the disputed Himalayan borderIndia "
+              "raised a new mountain strike corps to strengthen its defence "
+              "along its disputed border with China.")
+
+    repaired, counters = repair_glued_sentences(report)
+
+    assert "Himalayan border. India raised" in repaired
+    assert counters["citations_glued_sentences_repaired"] == 1.0
+
+
+def test_every_glued_site_in_one_paragraph_is_separated():
+    from research_agent.guardrails.citations import (repair_glued_sentences,
+                                                     residual_glue_sites)
+
+    report = ("China leads on personnel and equipment across the boardIndia "
+              "fields the second largest ground force in the world today. "
+              "Both navies are expanding their carrier fleets quicklyIndia "
+              "operates fewer hulls than China does at present.")
+
+    repaired, counters = repair_glued_sentences(report)
+
+    assert counters["citations_glued_sentences_repaired"] == 2.0
+    assert residual_glue_sites(repaired) == 0
+
+
+def test_a_correctly_formatted_report_is_returned_byte_identical():
+    """The common path. Not "similar" -- identical, and with no counter,
+    so a clean run's guardrail block is unchanged."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    report = ("# Report\n\nChina fields more personnel [g1]. India fields "
+              "fewer but is modernising quickly [g2].\n")
+
+    assert repair_glued_sentences(report) == (report, {})
+
+
+def test_camel_case_names_are_never_split():
+    """The signature has to survive ordinary prose. Each of these carries
+    the lowercase-then-capital shape the weak signal matches on, and none
+    of them is a missing sentence boundary."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    for text in (
+            "eBay is a large online marketplace with many active sellers.",
+            "We use LinkedIn to recruit engineers across several regions.",
+            "The McKinsey report was published last year for its clients.",
+            "PayPal processes payments for merchants in many countries.",
+            "The iPhone remains the best selling handset in some markets.",
+            "Run PostgreSQL migrations before deploying the service today.",
+    ):
+        assert repair_glued_sentences(text) == (text, {}), text
+
+
+def test_a_digit_before_the_capital_is_never_split():
+    """Live near-miss: "Type 054B frigate" carries the shape and is a
+    model number. The left side must be LETTERS."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    text = "A new Type 054B frigate launched with a vertical launch system."
+
+    assert repair_glued_sentences(text) == (text, {})
+
+
+def test_two_words_that_merely_lost_a_space_are_left_alone():
+    """The run must be a whole SENTENCE. Six words is the floor, so a
+    missing space inside a phrase is not turned into a full stop."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    text = "The forces deployed acrossChina and India."
+
+    assert repair_glued_sentences(text) == (text, {})
+
+
+def test_a_url_is_never_punctuated():
+    """A link's path carries the same shape, and a full stop inserted into
+    one breaks it."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    text = ("See https://www.orfonline.org/researchIndia and China have "
+            "both expanded their naval forces considerably.")
+
+    assert repair_glued_sentences(text) == (text, {})
+
+
+def test_a_verbatim_paste_is_removed_rather_than_punctuated():
+    """Ordering check. clean_citations runs the verbatim strip first, so
+    the stronger verdict gets first refusal at a site both could claim."""
+    from research_agent.guardrails.citations import (clean_citations,
+                                                     repair_glued_sentences)
+
+    source = ("India fields roughly 1.45 million active personnel across "
+              "three services today.")
+    report = "China leads on raw numbers" + source
+    evidence = [_e("g1", source)]
+
+    cleaned, counters = clean_citations(report, [_g("g1")], evidence)
+    repaired, glue_counters = repair_glued_sentences(cleaned)
+
+    assert counters["citations_pasted_evidence_removed"] == 1.0
+    assert source not in repaired
+    assert glue_counters == {}
+
+
+def test_residual_glue_sites_reads_the_shipped_artifact():
+    """The counter that closes the honesty gap: two live reports shipped
+    with 9 and 22 welded joins while citations_residual_paste_sites read
+    0, because a paste was the only thing it could see."""
+    from research_agent.guardrails.citations import residual_glue_sites
+
+    report = ("China leads on personnel and equipment across the boardIndia "
+              "fields the second largest ground force in the world today.")
+
+    assert residual_glue_sites(report) == 1
+    assert residual_glue_sites("") == 0
+
+
+def test_compiler_node_separates_glued_sentences_before_shipping():
+    """Wiring: the repair has to run inside the node, not only as a pure
+    function nobody calls."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _FakeRouter(
+        "# Report\n\nChina leads on personnel and equipment across the "
+        "boardIndia fields the second largest ground force today [g1].\n")
+    node = build_compiler_node(router, Settings(_env_file=None,
+                                                llm_mode="live"))
+
+    out = node(ResearchState(raw_query="q",
+                             goals=[Goal(goal_id="g1", description="d1")],
+                             evidence=[_e("g1", "unrelated evidence text")]))
+
+    assert "board. India fields" in out["final_report"]
+    assert out["counters"]["citations_glued_sentences_repaired"] == 1.0
+    assert out["last_compile_guardrails"][
+        "citations_glued_sentences_repaired"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# D-138 — the critique notes entering a compile prompt
+# ---------------------------------------------------------------------------
+
+def test_compiler_node_bounds_the_critique_notes_it_sends():
+    """Live (p205.277-check) the third compile opened with 16 notes /
+    4,947 chars about three different drafts, and dropped its citations
+    entirely."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None,
+                                                llm_mode="live"))
+    notes = [f"note {i} " + "x" * 400 for i in range(20)]
+
+    out = node(ResearchState(raw_query="q",
+                             goals=[Goal(goal_id="g1", description="d1")],
+                             evidence=[_e("g1", "text")],
+                             critique_notes=notes))
+
+    body = router.prompts["compile"][-1]["content"]
+    assert "note 19" in body          # newest kept
+    assert "note 0 " not in body      # oldest, about a superseded draft
+    assert out["counters"]["critique_notes_dropped"] > 0
+
+
+def test_an_ordinary_revision_carries_every_note():
+    """The bound sits above the largest verdict yet observed (10 notes /
+    2,722 chars), so a real critique is never truncated."""
+    from research_agent.agents.compilation import build_compiler_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_compiler_node(router, Settings(_env_file=None,
+                                                llm_mode="live"))
+    notes = [f"Goal g{i}: the report claims something unsupported. FAIL."
+             for i in range(10)]
+
+    out = node(ResearchState(raw_query="q",
+                             goals=[Goal(goal_id="g1", description="d1")],
+                             evidence=[_e("g1", "text")],
+                             critique_notes=notes))
+
+    body = router.prompts["compile"][-1]["content"]
+    for note in notes:
+        assert note in body
+    assert "critique_notes_dropped" not in out["counters"]
+
+
+# ---------------------------------------------------------------------------
+# D-139 — the critic judges what the MODEL wrote
+# ---------------------------------------------------------------------------
+
+def test_the_critic_is_not_shown_the_provenance_notice():
+    """Live (p205.276-check) three of six notes demanded the removal of a
+    notice the compiler never wrote and cannot remove."""
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_critic_node(router, Settings(_env_file=None,
+                                              llm_mode="live"))
+    report = ("> **Provenance notice — inserted automatically, not written "
+              "by the model.**\n> None of this report's goals are supported "
+              "by a document.\n\n# Report\n\nChina leads [g1].\n")
+
+    node(ResearchState(raw_query="q", final_report=report,
+                       goals=[Goal(goal_id="g1", description="d1")],
+                       evidence=[_e("g1", "text")]))
+
+    body = router.prompts["critique"][-1]["content"]
+    assert "Provenance notice" not in body
+    assert "China leads [g1]." in body
+
+
+def test_the_critic_is_not_shown_the_sources_block():
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_critic_node(router, Settings(_env_file=None,
+                                              llm_mode="live"))
+    report = ("# Report\n\nChina leads [g1].\n\n## Sources\n\n"
+              "1. [g1] A Title (example.com) — https://example.com/a\n")
+
+    node(ResearchState(raw_query="q", final_report=report,
+                       goals=[Goal(goal_id="g1", description="d1")],
+                       evidence=[_e("g1", "text")]))
+
+    body = router.prompts["critique"][-1]["content"]
+    assert "example.com" not in body
+    assert "China leads [g1]." in body
+
+
+def test_the_zero_citation_gate_still_reads_the_shipped_report():
+    """Deliberately unchanged (D-139). append_web_sources only lists goals
+    the PROSE cites, so a report citing nothing has no Sources block for
+    the gate to miscount -- and the gate must keep failing that report."""
+    from research_agent.agents.compilation import build_critic_node
+    from research_agent.config import Settings
+
+    router = _PromptCapturingRouter()
+    node = build_critic_node(router, Settings(_env_file=None,
+                                              llm_mode="live"))
+
+    out = node(ResearchState(raw_query="q",
+                             final_report="# Report\n\nChina leads.\n",
+                             goals=[Goal(goal_id="g1", description="d1")],
+                             evidence=[_e("g1", "text")]))
+
+    assert out["critique_passed"] is False
+    assert "cites no evidence" in out["critique_notes"][0]

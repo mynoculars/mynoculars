@@ -169,3 +169,72 @@ def test_the_trim_is_logged_with_what_it_kept(caplog):
 
 def test_an_empty_evidence_list_is_not_a_special_case():
     assert budget_evidence([], _goals(2), 12000) == ([], {})
+
+
+# ---------------------------------------------------------------------------
+# D-138 — budget_notes
+# ---------------------------------------------------------------------------
+
+def test_a_short_note_list_is_returned_unchanged():
+    """The common path: one critique's verdict, entire, with no counter."""
+    from research_agent.prompts.budget import budget_notes
+
+    notes = ["Goal g1: unsupported figure. FAIL.",
+             "Goal g2: the comparison is not evidenced. FAIL."]
+
+    assert budget_notes(notes) == (notes, {})
+
+
+def test_the_newest_notes_survive():
+    """Notes accumulate across revisions, so the ones appended LAST are
+    the ones the CURRENT draft failed on. The earlier ones describe a
+    draft that has already been rewritten."""
+    from research_agent.prompts.budget import budget_notes
+
+    notes = [f"note {i}" for i in range(30)]
+
+    kept, counters = budget_notes(notes)
+
+    assert kept[-1] == "note 29"
+    assert "note 0" not in kept
+    assert counters["critique_notes_dropped"] == 30 - len(kept)
+
+
+def test_the_kept_notes_stay_in_their_original_order():
+    """The prompt still reads oldest to newest; only the head is lost."""
+    from research_agent.prompts.budget import budget_notes
+
+    kept, _ = budget_notes([f"note {i}" for i in range(30)])
+
+    assert kept == sorted(kept, key=lambda n: int(n.split()[1]))
+
+
+def test_the_character_bound_stops_a_few_very_long_notes():
+    """Live, one note ran to 874 characters. A count-only bound would let
+    twelve of those into a prompt the evidence budget then has to share."""
+    from research_agent.prompts.budget import budget_notes
+
+    notes = ["x" * 900 for _ in range(12)]
+
+    kept, counters = budget_notes(notes)
+
+    assert sum(len(n) for n in kept) <= 3500
+    assert counters["critique_notes_dropped"] > 0
+
+
+def test_the_largest_verdict_yet_observed_passes_through_whole():
+    """p205.277-check's first critique: 10 notes, 2,722 characters. The
+    bounds are set above it deliberately, so a real critique is never
+    truncated -- only superseded ones are dropped."""
+    from research_agent.prompts.budget import budget_notes
+
+    notes = ["n" * 272 for _ in range(10)]
+
+    assert budget_notes(notes) == (notes, {})
+
+
+def test_empty_and_blank_notes_are_handled():
+    from research_agent.prompts.budget import budget_notes
+
+    assert budget_notes([]) == ([], {})
+    assert budget_notes(["", None, "real note"]) == (["real note"], {})

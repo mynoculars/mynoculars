@@ -213,6 +213,131 @@ def _strip_pasted_evidence(report: str, evidence) -> tuple:
     return "".join(out), removed
 
 
+# ---------------------------------------------------------------------------
+# D-137: the glue signature, WITHOUT the verbatim confirmation.
+# ---------------------------------------------------------------------------
+#
+# _strip_pasted_evidence above acts only where the text following a glue
+# site is VERBATIM evidence. Live (runs p205.276-check and p205.277-check,
+# "Compare the Armies of China and India") the compiler stopped pasting and
+# started PARAPHRASING: it wrote its own condensed restatement and welded
+# it to the claim exactly where a [gN] marker belongs --
+#
+#   "...along the disputed Himalayan borderIndia raised a new mountain
+#    strike corps to strengthen its defence along its disputed border with
+#    China in the high reaches of the Himalayas."
+#
+# -- and that sentence appears NOWHERE in the evidence block. The verbatim
+# test cannot see it, so `citations_pasted_evidence_removed` read 1,
+# `citations_residual_paste_sites` read 0, and the two reports shipped with
+# 9 and 22 welded sentence joins respectively. Both counters were telling
+# the truth about PASTES and leaving a false impression about the REPORT.
+#
+# WHY A SECOND, NARROWER SIGNATURE RATHER THAN A LOOSER VERBATIM TEST.
+# Overlap between the glued run and its supposed source was measured across
+# every site in both shipped reports: 0.17 to 0.64 against the best-matching
+# evidence item, and 0.00 to 1.00 against the claim it was welded to. No
+# ratio separates these from ordinary prose, and a guard that DELETES text
+# on a ratio is how D-45's p205.107-check failure happened (legitimate
+# restatements removed, six whole sections emptied). So this pass tightens
+# the SIGNATURE instead of loosening the confirmation:
+#
+#   left  -- at least four lowercase letters, so "eBay", "iPhone" and
+#            "McKinsey" (two letters or fewer before the capital) and
+#            "Type 054B" (digits, not letters) cannot match;
+#   right -- a capital followed by at least two lowercase letters, so
+#            "LinkedIn" ("In") and "...systemsA new..." ("A") cannot match;
+#   run   -- at least six words, ending at sentence punctuation, so what is
+#            being separated is a whole SENTENCE and never two words that
+#            merely lost a space.
+#
+# Measured on those two shipped reports: 9 and 22 sites confirmed, and zero
+# on a control set of eBay / LinkedIn / McKinsey / PayPal / iPhone /
+# PostgreSQL / "Type 054B" sentences.
+#
+# AND IT INSERTS RATHER THAN DELETES. The verbatim test proves the words
+# belong to the SOURCE, so removing them loses nothing the report wrote.
+# This signature proves only that a sentence boundary is missing, which is
+# a formatting fact and not a claim about authorship -- so the repair is
+# the boundary itself. A false positive costs a spurious full stop; it can
+# never cost a sentence.
+_GLUED_SENTENCE_RE = re.compile(r"(?<=[a-z]{4})(?=[A-Z][a-z]{2,})")
+
+# Sentence end: terminal punctuation followed by whitespace or the end of
+# the report. Deliberately not a general sentence splitter -- it only has
+# to answer "does a whole sentence follow this glue site?".
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
+
+# A glued run must be a whole sentence, not a lost space between two words.
+_MIN_GLUED_WORDS = 6
+
+# How far back to look for a URL before acting. A link's path can carry the
+# same lowercase-then-capital shape ("/researchIndia..."), and a full stop
+# inserted into a URL breaks it. Prose that carries a bare URL is already
+# outside what compile_report asks for; this is belt and braces.
+_URL_GUARD_CHARS = 60
+
+
+def _confirmed_glue_sites(report: str):
+    """Yield the offset of every confirmed glue site, left to right.
+
+    One definition, read by both the repair and the residual counter, so
+    the two can never disagree about what a glue site is -- the same rule
+    residual_paste_sites states for itself.
+    """
+    for match in _GLUED_SENTENCE_RE.finditer(report):
+        start = match.start()
+        if "http" in report[max(0, start - _URL_GUARD_CHARS):start]:
+            continue
+        end_match = _SENTENCE_END_RE.search(report, start)
+        if end_match is None:
+            continue
+        if len(report[start:end_match.end()].split()) >= _MIN_GLUED_WORDS:
+            yield start
+
+
+def repair_glued_sentences(report: str) -> tuple:
+    """Restore the missing sentence boundary at each confirmed glue site.
+
+    Returns (report, counters). Byte-identical, with empty counters, when
+    nothing matches -- which is every report the compiler formats
+    correctly, so that path must be exactly unchanged rather than merely
+    similar.
+
+    Runs AFTER _strip_pasted_evidence (see clean_citations) so a verbatim
+    paste is REMOVED rather than merely punctuated: the stronger verdict
+    gets first refusal at every site, the same ordering D-66's gate has
+    ahead of D-91's figure audit.
+    """
+    if not report:
+        return report, {}
+    out, pos, repaired = [], 0, 0
+    for start in _confirmed_glue_sites(report):
+        if start < pos:
+            continue
+        out.append(report[pos:start])
+        out.append(". ")
+        pos = start
+        repaired += 1
+    if not repaired:
+        return report, {}
+    out.append(report[pos:])
+    return "".join(out), {"citations_glued_sentences_repaired": float(repaired)}
+
+
+def residual_glue_sites(report: str) -> int:
+    """How many confirmed glue sites are STILL in a finished report.
+
+    The companion to residual_paste_sites, here for that counter's own
+    reason stated the other way round: it read 0 on two reports carrying 9
+    and 22 welded joins, because a paste was the only thing it could see.
+    This one reads the shipped artifact with the signature that actually
+    matched them, so a repair that silently stops working cannot present
+    as a clean report.
+    """
+    return sum(1 for _ in _confirmed_glue_sites(report)) if report else 0
+
+
 # One citation block, in any delimiter the compiler has actually been
 # observed using (D-99). Matches a bracket or paren containing ONLY goal
 # ids, their separators, and an optional pipe-suffix -- nothing else. A

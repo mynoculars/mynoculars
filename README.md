@@ -1636,8 +1636,11 @@ research-agent-dmp/
 │   │                        search client, which is what keeps the rest of
 │   │                        the codebase uncoupled from the chosen engine
 │   ├── guardrails/           # grounded convergence, hedging, citation repair,
-│   │                        fencing, and sources.py (D-57: the deterministic
-│   │                        `## Sources` pass for cited web evidence)
+│   │                        fencing, sources.py (D-57: the deterministic
+│   │                        `## Sources` pass for cited web evidence) and
+│   │                        annotations.py (D-139: separates what the MODEL
+│   │                        wrote from what this system inserted, so the
+│   │                        critic is never asked to fix machine text)
 │   ├── evaluation/          # answer quality, judged cross-provider
 │   ├── api/server.py        # FastAPI: /health, /research, /resume
 │   └── cli.py               # CLI entry + dependency assembly + HITL loop
@@ -2225,6 +2228,19 @@ visible rather than deleted, so the history stays auditable.
    "the corpus answered this", "the provenance notice shipped", "no cited
    figure was unsupported", "this did not cost more than N tokens". It cannot
    assert that the prose is correct, and nothing in this repo can.
+10. **A report can still be welded together, and the guard that says so is
+    narrow by design (D-137).** The compiler is asked to end a claim with a
+    `[gN]` marker. When it instead writes its own restatement of the source
+    and runs it straight into the sentence — live, 9 and 22 times in two
+    shipped reports — `repair_glued_sentences` restores the missing sentence
+    boundary and `citations_residual_glue_sites` reports anything it left.
+    **It repairs punctuation, not attribution**: the restatement stays, still
+    uncited, and only the D-66 zero-citation gate speaks to that. The
+    signature is deliberately conservative (four lowercase letters left, a
+    capital plus two lowercase right, six words to a sentence end), so
+    `eBay`, `LinkedIn` and `Type 054B` are safe and a glue site behind a
+    closing parenthesis is missed. A false positive costs a spurious full
+    stop; it can never cost a sentence.
 
 ## Documentation Corrections and Roadmap History
 

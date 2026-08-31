@@ -27,8 +27,11 @@ from typing import Any, Dict
 from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
 from research_agent.config import Settings
+from research_agent.guardrails.annotations import strip_machine_annotations
 from research_agent.guardrails.citations import (clean_citations,
                                                  normalise_citation_form,
+                                                 repair_glued_sentences,
+                                                 residual_glue_sites,
                                                  residual_paste_sites)
 from research_agent.guardrails.claims import audit_cited_figures
 from research_agent.guardrails.dedup import dedupe_evidence
@@ -48,7 +51,7 @@ from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event, run_id_var
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
-from research_agent.prompts.budget import budget_evidence
+from research_agent.prompts.budget import budget_evidence, budget_notes
 from research_agent.reporting.metrics import count_sections
 from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import ResearchState
@@ -146,8 +149,15 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # still counts what was actually retrieved.
         prompt_evidence, budget_counters = budget_evidence(
             prompt_evidence, state.goals, settings.prompt_evidence_max_chars)
+        # D-138: and the OTHER thing that grows in this prompt. D-131
+        # bounded the evidence; nothing bounded the critique notes, which
+        # accumulate across revisions (state.py, operator.add) and were
+        # inlined in full. Same prompt-only rule as dedup and the evidence
+        # budget: state.critique_notes is untouched, so the escalation
+        # payload and the review a human reads still carry every note.
+        prompt_notes, note_counters = budget_notes(state.critique_notes)
         report = router.complete(templates.compile_report(
-            state.raw_query, state.goals, prompt_evidence, state.critique_notes))
+            state.raw_query, state.goals, prompt_evidence, prompt_notes))
         # A model under fallback can still wrap its answer in a code fence
         # despite compile_report's explicit "write Markdown, not JSON, no
         # fence" instruction -- observed live from Mistral after a
@@ -171,7 +181,17 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # enforced without reading meaning.
         report, citation_counters = clean_citations(
             report, state.goals, state.evidence)
-        citation_counters = {**form_counters, **citation_counters}
+        # D-137: the same wound, without the verbatim confirmation.
+        # clean_citations above removes a run of PASTED source text; this
+        # restores the missing sentence boundary where the compiler wrote
+        # its own restatement and welded it to the claim instead. Ordered
+        # AFTER, so a verbatim paste is deleted rather than merely
+        # punctuated -- the stronger verdict gets first refusal at every
+        # site. Before append_web_sources, deliberately: the Sources block
+        # is a list of URLs, and a full stop inserted into one breaks it.
+        report, glue_counters = repair_glued_sentences(report)
+        citation_counters = {**form_counters, **citation_counters,
+                             **glue_counters}
         # Guardrail G3 enforcement half (P205.135 follow-up): same call
         # site, same shape of check as clean_citations above -- see
         # guardrails/hedging.py for why this exists (the compiler
@@ -247,8 +267,8 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # is cross-provider, not self-scoring -- P2-11).
         counters = {"llm_node_calls": 1, **router.drain_counters(),
                     **citation_counters, **hedge_counters, **source_counters,
-                    **dedup_counters, **budget_counters, **grounding_counters,
-                    **truncation_counters}
+                    **dedup_counters, **budget_counters, **note_counters,
+                    **grounding_counters, **truncation_counters}
         # D-88: the SAME guardrail numbers, carried a second way -- scoped
         # to THIS compile pass instead of summed across every revision.
         # See ResearchState.last_compile_guardrails for why both views
@@ -261,8 +281,8 @@ def build_compiler_node(router: FallbackRouter, settings: Settings,
         # and have no per-report meaning.
         last_compile = {**citation_counters, **hedge_counters,
                         **source_counters, **dedup_counters,
-                        **budget_counters, **grounding_counters,
-                        **truncation_counters}
+                        **budget_counters, **note_counters,
+                        **grounding_counters, **truncation_counters}
         update: Dict[str, Any] = {"final_report": report, "counters": counters,
                                   "last_compile_guardrails": last_compile}
         # D-132: the SECOND of the two check sites (progress_checker is
@@ -384,6 +404,17 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             log_event(logger, "node.enter", node="critic")
         if state.planning_error or state.abort_reason:
             return {"critique_passed": True}
+        # D-139: what the MODEL wrote, with this system's own
+        # insertions taken back out -- D-85's provenance notice,
+        # D-132's stopped-early notice, D-57's Sources block. Live
+        # (p205.276-check) three of six critique notes demanded the
+        # removal of the provenance notice, which the compiler never
+        # wrote and cannot remove: annotate_ungrounded_report re-adds it
+        # after every compile. A revision was spent on an instruction no
+        # rewrite can satisfy, and the compile that followed it dropped
+        # its citations entirely. The model is held to its own text; the
+        # reader still receives all of it (see guardrails/annotations.py).
+        authored = strip_machine_annotations(state.final_report)
         if (settings.llm_mode != "stub" and state.evidence
                 and not cited_goal_ids(state.final_report)):
             # D-66: a report can reach here having cited NOTHING despite
@@ -438,8 +469,11 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         # Ordered AFTER D-66 deliberately: a report citing nothing has no
         # cited figures to audit, so that gate must get first refusal.
         if settings.claim_verification_enabled and state.evidence:
+            # D-139: the audit reads the authored body too. A figure in
+            # the Sources block belongs to a URL this system printed, and
+            # asking the model to defend it is the same unanswerable note.
             flagged, _ = audit_cited_figures(
-                state.final_report, state.goals, state.evidence)
+                authored, state.goals, state.evidence)
             confirmed = _confirm_unsupported_figures(router, flagged,
                                                      state.evidence)
             if confirmed:
@@ -493,7 +527,7 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         prompt_evidence, _ = budget_evidence(
             prompt_evidence, state.goals, settings.prompt_evidence_max_chars)
         result = router.complete_json(templates.critique(
-            state.raw_query, state.final_report, state.goals,
+            state.raw_query, authored, state.goals,
             prompt_evidence))
         passed = bool(result.get("passed", False))
         notes = [str(n) for n in result.get("notes", [])]
@@ -810,6 +844,20 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                       level=logging.WARNING, sites=residual_pastes,
                       removed=int(state.last_compile_guardrails.get(
                           "citations_pasted_evidence_removed", 0)))
+        # D-137: the same question asked of the OTHER signature. The
+        # counter above read 0 on two shipped reports carrying 9 and 22
+        # welded sentence joins, because a paste was the only thing it
+        # could see. This one reads the artifact with the signature that
+        # matched them, so a repair that stops working cannot present as
+        # a clean report.
+        residual_glue = 0
+        if settings.llm_mode != "stub":
+            residual_glue = residual_glue_sites(state.final_report)
+        if residual_glue:
+            log_event(logger, "report.residual_glued_sentences",
+                      level=logging.WARNING, sites=residual_glue,
+                      repaired=int(state.last_compile_guardrails.get(
+                          "citations_glued_sentences_repaired", 0)))
         if (settings.llm_mode != "stub" and state.evidence and state.goals
                 and corpus_recall < settings.grounded_recall_target):
             log_event(logger, "report.shipped_ungrounded",
@@ -983,6 +1031,7 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
             # claim-level (rather than report-level or evidence-set-level)
             # honesty signal this harness has had.
             "citations_residual_paste_sites": residual_pastes,
+            "citations_residual_glue_sites": residual_glue,
             "cited_figures_checked": int(
                 figure_counters.get("cited_figures_checked", 0)),
             "cited_figures_unsupported": int(
