@@ -85,7 +85,7 @@ PROMPT_VERSIONS = {
     # what the model reads first did -- and that is exactly the kind of
     # structural change this table exists to mark.
     "compiler":         ("compile_report", "v2"),
-    "critic":           ("critique", "v1"),
+    "critic":           ("critique", "v2"),
     # detect_contradictions runs inside the "merger" node but is called
     # conditionally, not on every merger execution -- so merger's
     # generations are a MIX of that prompt and none at all. Deliberately
@@ -598,6 +598,25 @@ def critique(query: str, report: str, goals: List[Goal],
             f"marker. Specifics that no evidence supplied are the single "
             f"most damaging thing a report can contain, because they read "
             f"as researched findings. "
+            # p205.287: the critic failed a correct report on four notes,
+            # every one of them objecting to FAITHFUL RESTATEMENT rather
+            # than to an invented specific -- "approximately 2 million"
+            # against evidence reading "approximately 2 million to 2.1
+            # million", and three more of the same shape. All four
+            # figures appeared verbatim in the evidence block; D-91's
+            # deterministic audit reported cited_figures_unsupported: 0
+            # on the same report. The bar below now says out loud what
+            # "appears in no evidence item" was always meant to mean.
+            f"Restating an evidence figure in different words is NOT "
+            f"unfaithful. Rounding it, narrowing a range to one of its "
+            f"endpoints, giving an approximation, converting a unit, or "
+            f"summarising several evidence items into one sentence are "
+            f"all faithful so long as the underlying figure is in the "
+            f"evidence. The violation is a specific the evidence never "
+            f"supplied at all — not a specific the evidence supplied and "
+            f"the report phrased its own way. Before writing a note that "
+            f"names a figure, find that figure in the EVIDENCE block; if "
+            f"it is there in any wording, do not raise it. "
             'JSON schema: {"passed": <bool>, "score": <0..1>, "notes": ["..."]}'}]
 
 

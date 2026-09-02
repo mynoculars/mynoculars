@@ -331,6 +331,7 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "memory_hits": 0,
   "memory_writes": 0,
   "revision_cycles": 1,
+  "critique_notes_dismissed": 0,  <-- D-155; a nonzero value is explained below
   "critique_passed": true, 
   "planning_error": null,
   "escalations": []
@@ -2170,6 +2171,87 @@ per process contributes a count that depends on worker count — measured
 hook therefore prints the DISTINCT set under xdist, sorted, with a
 per-line count. The distinct set is reproducible; the occurrence totals
 are not, and the block says so.
+
+### Per-provider context windows (D-153)
+
+Each provider slot now has its own window setting, all defaulting to `0`:
+
+```ini
+LLM_PRIMARY_CONTEXT_TOKENS=0      # the local server's -c
+LLM_MISTRAL_CONTEXT_TOKENS=0      # mistral-small-latest is 32768
+LLM_FALLBACK_CONTEXT_TOKENS=0     # gemini-2.0-flash is far larger
+```
+
+**`0` means "not configured", and a provider with `0` is never skipped** —
+so an existing `.env` behaves exactly as it did before these existed.
+
+Each is **the window the SERVER was started with**, not the model's
+theoretical maximum. That distinction is what made D-151 necessary; read
+the note beside `LLM_PRIMARY_CONTEXT_TOKENS` in `.env.example` before
+setting any of them.
+
+**You probably do not need the two new ones.** For the shipped defaults
+they sit so far above a compile prompt that setting them changes nothing.
+They earn their keep when a slot points at something small — most
+obviously a **second local `llama-server` in the fallback slot**, which
+D-114 makes a configuration change rather than a code change.
+
+**And they are optional even then.** D-151 reads a provider's real window
+out of its own 400 and uses it for the rest of the process, so leaving
+them at 0 costs one wasted call per provider that ever refuses on size.
+Setting them costs zero. That is the whole trade.
+
+Two places to watch the effect:
+
+```text
+llm.skipped_for_context   provider=mistral  context_tokens=2048
+```
+
+and, in telemetry, `context_skips_by_provider` — `llm_context_skips` alone
+cannot tell you whether the chain lost its local hop or its cloud one.
+
+If a slot's window cannot hold the evidence budget at all, startup says so
+for **every** failing slot, not just the first:
+
+```text
+config.context_below_prompt_budget   setting=LLM_MISTRAL_CONTEXT_TOKENS  value=1536
+```
+
+### When the critic's verdict is resolved deterministically (D-155)
+
+`critique_notes_dismissed` in a run's metrics is **not** an error. It says
+the critic failed the report, every note it gave disputed a figure that IS
+present in the evidence the critic was shown, and D-91's deterministic
+figure audit found nothing on the same report — so the failure had no
+corroboration and the report passed.
+
+The WARNING line names every note, so you can always read what was
+dismissed:
+
+```text
+critic.failure_not_corroborated   dismissed=4  notes=[...]
+```
+
+**What to do about it depends entirely on the count over time.**
+
+| What you see | Read it as | What to do |
+|---|---|---|
+| `0` on most runs, occasional `1` | the counterweight doing its job on an outlier | nothing |
+| a persistent nonzero count | the CRITIC is systematically wrong about faithfulness, and this is masking it | read the dismissed notes and revisit `templates.critique` — **do not widen the check** |
+| `0` but E4 escalations on figure notes | notes this cannot adjudicate, or a figure genuinely absent | read them; the critic may well be right |
+
+The counterweight is deliberately narrow and will not fire on:
+
+- a note naming **no** figure (*"the report never addresses goal g3"*) —
+  a coverage or semantic finding, which is what the LLM critic is for;
+- a note naming a figure genuinely **absent** from the evidence;
+- a note quoting **both** figures (*"the report says 1.4 where the
+  evidence says 1.23"*) — 1.4 is absent precisely because the report
+  rounded it, and nothing can tell which of the two is disputed;
+- **any** report where `audit_cited_figures` flagged something.
+
+One surviving note leaves the verdict exactly as the critic set it. This
+is not per-note arithmetic.
 
 **The suite reads none of your configuration (D-147).** An autouse,
 session-scoped fixture in `tests/conftest.py` removes the `.env` file and

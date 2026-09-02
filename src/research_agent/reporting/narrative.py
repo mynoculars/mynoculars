@@ -29,7 +29,6 @@ CALLED BY   tracing.py::Tracer, via enable_narrative_logging() (turns the
 import logging
 import pathlib
 import time
-from typing import Any
 
 from research_agent.logging_setup import run_id_var
 

@@ -178,8 +178,8 @@ class _RecordingObserver:
 
 
 def _bundle(**overrides):
-    base = dict(app=_FakeGraph(), settings=_FakeSettings(), durable=True,
-                checkpointer=object(), mcp_bridge=None, router=None)
+    base = {"app": _FakeGraph(), "settings": _FakeSettings(), "durable": True,
+            "checkpointer": object(), "mcp_bridge": None, "router": None}
     base.update(overrides)
     return AppBundle(**base)
 

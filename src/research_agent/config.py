@@ -58,7 +58,6 @@ import logging
 import os
 import pathlib
 import re
-import sys
 from functools import lru_cache
 from typing import Literal
 
@@ -272,14 +271,35 @@ class Settings(BaseSettings):
     # OPERATIONS.md's own recommended invocation for that machine is
     # `-c 1536`. So on that deployment the primary can NEVER serve
     # compiler or critic, and every run burns two guaranteed-failed
-    # provider calls before falling back. Cloud fallbacks have
-    # context windows orders of magnitude larger and have never been
-    # observed to refuse on size, so giving them a knob would be
-    # configuration nobody needs.
+    # provider calls before falling back.
     #
     # Note this ALSO makes llm_max_tokens (4096) legible: a
     # generation cap larger than the whole context window is inert.
     llm_primary_context_tokens: int = Field(0, ge=0)
+    # D-153: the same knob for the other two slots.
+    #
+    # D-93 shipped primary-only, and said so: "cloud fallbacks have
+    # context windows orders of magnitude larger and have never been
+    # observed to refuse on size, so giving them a knob would be
+    # configuration nobody needs." That was true of the providers it was
+    # written for and is no longer true of the SLOT. D-114 made the third
+    # slot point at any OpenAI-compatible endpoint by configuration --
+    # including a second local llama-server, which is exactly the case
+    # D-93 exists for. Nothing in the chain is "the cloud one" any more;
+    # that was an assumption about deployment, encoded as a missing field.
+    #
+    # Read the same way as the primary's: THE SERVER'S WINDOW, not the
+    # model's theoretical maximum -- see D-151 and the note in
+    # .env.example. 0 means "not configured" and is the default for both,
+    # so an existing .env behaves identically to before this existed.
+    #
+    # These are a PRE-SEED, not a requirement. D-151 learns a provider's
+    # real window from its own 400 and uses it for the rest of the
+    # process, so leaving these at 0 costs one wasted call per provider
+    # that ever refuses on size, and nothing at all for one that does not.
+    # Setting them correctly costs zero.
+    llm_mistral_context_tokens: int = Field(0, ge=0)
+    llm_fallback_context_tokens: int = Field(0, ge=0)
 
 
     # --- Storage endpoints -------------------------------------------------
@@ -927,8 +947,8 @@ def warn_on_web_search_band(s: "Settings") -> None:
                          "band, but the configured values are not what was meant")
 
 
-def warn_on_primary_context_below_prompt_budget(s: "Settings") -> None:
-    """WARN when the primary can never serve a compile or critique (D-143).
+def warn_on_context_below_prompt_budget(s: "Settings") -> None:
+    """WARN when a provider can never serve a compile or critique (D-143).
 
     CALLED BY   get_settings(), below, alongside the other warn_on_* checks
                 it deliberately mirrors in shape and posture.
@@ -961,27 +981,51 @@ def warn_on_primary_context_below_prompt_budget(s: "Settings") -> None:
     must not be is invisible. The remedy is one of two things and the
     message says both: raise the server's -c to the model's real window, or
     lower PROMPT_EVIDENCE_MAX_CHARS to something that fits it.
+
+    D-153 GENERALISED THIS TO EVERY SLOT, and that is not cosmetic. The
+    check shipped primary-only because only the primary had a window to
+    configure; with three, a `LLM_MISTRAL_CONTEXT_TOKENS=4096` against a
+    12,000-character budget would have been exactly the defect this
+    function exists to catch, and it would have been silent. A check that
+    covers one of three configurable things is worse than none, because it
+    reads as coverage.
+
+    Reports EVERY slot that fails, not the first: two misconfigured
+    providers are two separate things to fix, and stopping at the first
+    hides the second until the first is fixed.
     """
-    if s.llm_primary_context_tokens <= 0:
-        return  # unconfigured; D-93 is inert and there is nothing to compare
     # The same ~4 chars/token estimate llm/client.py::estimate_prompt_tokens
     # uses, reused rather than reinvented -- a second, subtly different
     # notion of "how big is this prompt" is exactly the drift D-99 records.
     evidence_tokens = s.prompt_evidence_max_chars / 4.0
-    if evidence_tokens < s.llm_primary_context_tokens:
-        return
-    log_event(logger, "config.primary_context_below_prompt_budget",
-              level=logging.WARNING,
-              setting="LLM_PRIMARY_CONTEXT_TOKENS",
-              value=s.llm_primary_context_tokens,
-              prompt_evidence_max_chars=s.prompt_evidence_max_chars,
-              evidence_tokens_estimate=int(evidence_tokens),
-              effect="the evidence block alone cannot fit the primary's "
-                     "window, so D-93 will skip it on EVERY compile and "
-                     "critique and the chain is cloud-only for the two "
-                     "nodes that write the report; raise the local "
-                     "server's -c to the model's real window, or lower "
-                     "PROMPT_EVIDENCE_MAX_CHARS to fit it")
+    for setting, configured, remedy in (
+        ("LLM_PRIMARY_CONTEXT_TOKENS", s.llm_primary_context_tokens,
+         "raise the local server's -c"),
+        ("LLM_MISTRAL_CONTEXT_TOKENS", s.llm_mistral_context_tokens,
+         "raise that endpoint's window"),
+        ("LLM_FALLBACK_CONTEXT_TOKENS", s.llm_fallback_context_tokens,
+         "raise that endpoint's window"),
+    ):
+        # 0 means "not configured": D-93 is inert for that slot and there
+        # is nothing to compare. This is why a default install is silent.
+        if configured <= 0 or evidence_tokens < configured:
+            continue
+        # D-153: renamed from "config.primary_context_below_prompt_budget".
+        # An honest rename, in D-107's sense -- the event now fires for any
+        # of three slots and the `setting` field says which, so keeping
+        # "primary" in the name would make the log line disagree with its
+        # own payload. No alias: a name that is wrong is not worth
+        # preserving for compatibility with nothing.
+        log_event(logger, "config.context_below_prompt_budget",
+                  level=logging.WARNING,
+                  setting=setting,
+                  value=configured,
+                  prompt_evidence_max_chars=s.prompt_evidence_max_chars,
+                  evidence_tokens_estimate=int(evidence_tokens),
+                  effect="the evidence block alone cannot fit this "
+                         "provider's window, so D-93 will skip it on EVERY "
+                         "compile and critique; " + remedy + ", or lower "
+                         "PROMPT_EVIDENCE_MAX_CHARS to fit it")
 
 
 def warn_on_normalised_numerics() -> None:
@@ -1041,5 +1085,5 @@ def get_settings() -> Settings:
     warn_on_web_search_band(settings)
     warn_on_unbounded_prompt_budget(settings)  # D-131
     warn_on_unpriced_fallback(settings)  # D-114
-    warn_on_primary_context_below_prompt_budget(settings)  # D-143
+    warn_on_context_below_prompt_budget(settings)  # D-143, D-153
     return settings

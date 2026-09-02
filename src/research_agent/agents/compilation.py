@@ -20,7 +20,6 @@ Responsibilities:
 """
 
 import logging
-import re
 from collections import Counter
 from typing import Any, Dict
 
@@ -32,6 +31,7 @@ from research_agent.guardrails.citations import (residual_glue_sites,
                                                  residual_paste_sites)
 from research_agent.guardrails.claims import (audit_cited_figures,
                                               cited_goal_ids_in_prose)
+from research_agent.guardrails.critique import resolve_verdict
 from research_agent.guardrails.dedup import dedupe_evidence
 from research_agent.guardrails.grounding import report_carries_grounding_notice
 from research_agent.guardrails.retrieval import has_grounded_evidence
@@ -404,12 +404,19 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         #
         # Ordered AFTER D-66 deliberately: a report citing nothing has no
         # cited figures to audit, so that gate must get first refusal.
+        # D-155 reads this: the deterministic figure audit's own verdict
+        # on THIS report. It stays 0 when the audit is disabled or has no
+        # evidence to audit against, which is the conservative value --
+        # "no deterministic corroboration either way", and the D-155
+        # counterweight declines to act on it.
+        audit_flagged = 0
         if settings.claim_verification_enabled and state.evidence:
             # D-139: the audit reads the authored body too. A figure in
             # the Sources block belongs to a URL this system printed, and
             # asking the model to defend it is the same unanswerable note.
             flagged, _ = audit_cited_figures(
                 authored, state.goals, state.evidence)
+            audit_flagged = len(flagged)
             confirmed = _confirm_unsupported_figures(router, flagged,
                                                      state.evidence)
             if confirmed:
@@ -467,11 +474,21 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             prompt_evidence))
         passed = bool(result.get("passed", False))
         notes = [str(n) for n in result.get("notes", [])]
+        # D-155: the one LLM judgement in this codebase that had no
+        # deterministic counterweight now gets one. resolve_verdict only
+        # ever acts when EVERY note disputes a figure the evidence itself
+        # contains -- falsifying the critique prompt's own stated bar --
+        # and when the D-91 audit flagged nothing on the same report. A
+        # note it cannot adjudicate (coverage, semantics) survives, and a
+        # single survivor leaves the verdict exactly as the critic set it.
+        passed, notes, verdict_counters = resolve_verdict(
+            passed, notes, prompt_evidence, audit_flagged)
         revision = state.revision_count + 1
         update: Dict[str, Any] = {
             "critique_passed": passed,
             "revision_count": revision,
             "counters": {"llm_node_calls": 1, "revision_cycles": 1,
+                        **verdict_counters,
                         **router.drain_counters()},
         }
         if not passed:

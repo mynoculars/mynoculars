@@ -215,7 +215,12 @@ def test_mcp_bridge_surfaces_a_clear_error_for_an_unreachable_server():
     bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
                        startup_timeout_seconds=5.0)
     try:
-        with pytest.raises(BaseException):
+        # B017 is deliberate here, unlike the four others this ruleset
+        # found: what an unreachable server raises comes from the MCP SDK's
+        # own transport, and pinning a type would make this a test about
+        # the SDK's internals rather than about the bridge failing loudly
+        # instead of hanging.
+        with pytest.raises(BaseException):  # noqa: B017
             bridge.call_tool("search", {"query": "x"}, timeout_seconds=5.0)
     finally:
         bridge.close()  # must not itself raise, even after a failed start
@@ -337,7 +342,7 @@ def test_mcp_bridge_timeout_error_is_actually_informative():
         try:
             try:
                 bridge.call_tool("search", {"query": "redis vs cassandra"}, timeout_seconds=1.0)
-                assert False, "expected a TimeoutError"
+                raise AssertionError("expected a TimeoutError")
             except TimeoutError as exc:
                 message = str(exc)
                 assert message, "the whole point of this fix: the message must NOT be empty"

@@ -55,7 +55,7 @@ from research_agent.llm.router import FallbackRouter
 from research_agent.logging_setup import log_event
 from research_agent.memory.semantic_memory import SemanticMemory
 from research_agent.prompts import templates
-from research_agent.state import Goal, ResearchState, SearchTask
+from research_agent.state import Goal, ResearchState
 
 
 class RawGoal(BaseModel):

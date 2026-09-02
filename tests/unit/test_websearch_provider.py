@@ -13,6 +13,7 @@ import sys
 import types
 
 import pytest
+from pydantic import ValidationError
 
 from research_agent.websearch import (
     WebResult,
@@ -30,7 +31,7 @@ from research_agent.websearch import (
 def test_web_result_forbids_extra_fields():
     """D-29's extra="forbid" posture applies here too: a typo'd field name
     must fail at construction, not create a silently-wrong object."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         WebResult(title="t", url="https://a.com/x", snippet="s", rank=1,
                   engine="ddg_text", scoer=0.7)  # noqa - deliberate typo
 
@@ -39,7 +40,7 @@ def test_web_result_rank_must_be_one_based():
     """rank=0 is rejected. The whole scoring formula reads rank as a 1-based
     ordinal (scoring.rank_to_score); admitting 0 would let an off-by-one
     reach the interpolation silently."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         WebResult(title="t", url="https://a.com/x", snippet="s", rank=0,
                   engine="ddg_text")
 

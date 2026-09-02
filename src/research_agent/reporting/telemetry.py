@@ -52,6 +52,14 @@ def llm_metrics(c: Dict[str, float]) -> Dict[str, Any]:
         "llm_completion_tokens": completion,
         "llm_total_tokens": prompt + completion,
         "llm_context_skips": int(c.get("llm_context_skips", 0)),
+        # D-153: llm_context_skips, broken down by which provider was
+        # skipped. Empty on every run where nothing was skipped, and on
+        # every run before this existed.
+        "context_skips_by_provider": {
+            key[len("llm_context_skipped_"):]: int(value)
+            for key, value in sorted(c.items())
+            if key.startswith("llm_context_skipped_") and value
+        },
         "llm_disabled_skips": int(c.get("llm_disabled_skips", 0)),
     }
 
@@ -95,6 +103,13 @@ def run_metrics(c: Dict[str, float]) -> Dict[str, Any]:
 
     producer_rejects (P2-06) counts malformed goal/task items the LLM
     returned that were dropped rather than crashing the run.
+
+    critique_notes_dismissed (D-155) counts critic notes the evidence
+    itself refuted -- every figure the note disputed was present in the
+    evidence the critic was shown. It is reported so that a run whose
+    verdict was resolved deterministically is never indistinguishable
+    from one the critic passed on its own; a persistently nonzero value
+    is a signal to revisit templates.critique, not to widen this check.
     """
     return {
         "search_calls": int(c.get("search_calls", 0)),
@@ -103,4 +118,5 @@ def run_metrics(c: Dict[str, float]) -> Dict[str, Any]:
         "memory_writes": int(c.get("memory_writes", 0)),
         "revision_cycles": int(c.get("revision_cycles", 0)),
         "producer_rejects": int(c.get("producer_rejects", 0)),
+        "critique_notes_dismissed": int(c.get("critique_notes_dismissed", 0)),
     }

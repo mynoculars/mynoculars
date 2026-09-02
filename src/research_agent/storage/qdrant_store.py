@@ -344,7 +344,11 @@ class QdrantStore:
         # the module docstring for exactly what zip() does here.
         vectors = self._embed([i["content"] for i in items])
         points = []
-        for item, vec in zip(items, vectors):
+        # strict=True (B905): _embed returns exactly one vector per item, so
+        # a length mismatch is a bug in _embed, not a case to absorb. Without
+        # it zip() silently truncates and the upsert quietly writes fewer
+        # points than it was given.
+        for item, vec in zip(items, vectors, strict=True):
             # P2-10: write BOTH the original float "created_at" (unchanged
             # — the Python-side decay_factor path in
             # memory/semantic_memory.py still reads this) AND a new

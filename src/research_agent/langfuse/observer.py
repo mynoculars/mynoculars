@@ -101,7 +101,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
-import time
 from typing import Any, Dict, Generator, Optional
 
 from research_agent.langfuse.pricing import (

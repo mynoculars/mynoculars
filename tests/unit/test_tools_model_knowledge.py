@@ -12,7 +12,6 @@ catch it; this deterministic heuristic is the guardrail that flags it
 for the compiler instead.
 """
 
-import json
 
 from research_agent.tools.model_knowledge import (_looks_overspecific,
                                                     make_model_knowledge_tool)

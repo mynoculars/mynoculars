@@ -257,7 +257,7 @@ def test_no_prompt_carries_a_concrete_worked_example():
                    "Compare India and US", "Cassandra clusters"):
         assert leaked not in rendered, (
             f"{leaked!r} is a worked example and can surface in output")
-        
+
 def test_critique_is_shown_the_evidence_it_must_verify_against():
     """P205 regression (runs p205.111/.112-check). The critic is instructed
     to fail any named entity, figure or date that appears in no evidence
@@ -275,8 +275,8 @@ def test_critique_is_shown_the_evidence_it_must_verify_against():
     assert "<evidence>" in body
     assert "median age is about 28" in body
     assert "| model]" in body, "the source tag must be visible to the critic"
-    assert "items tagged `model` are evidence too" in body  
-    
+    assert "items tagged `model` are evidence too" in body
+
 def test_critique_forbids_the_query_vs_report_standard_for_named_entities():
     """P205 regression (run p205.117-check). With the critic finally shown
     the evidence (D-46), a live run flagged SLOWLOG, AOF, Sentinel,
@@ -291,7 +291,7 @@ def test_critique_forbids_the_query_vs_report_standard_for_named_entities():
     body = critique("q", "r", [Goal(goal_id="g1", description="d")], [])[-1]["content"]
     assert "never QUERY vs REPORT" in body
     assert 'not part of the question' in body
-    assert "evidence legitimately introduces vocabulary the query itself never used" in body      
+    assert "evidence legitimately introduces vocabulary the query itself never used" in body
 
 
 # ---------------------------------------------------------------------------

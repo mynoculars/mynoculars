@@ -51,7 +51,7 @@ Quality floor:
 
 import logging
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from research_agent.logging_setup import log_event
 from research_agent.retrieval.terms import FILLER, distinctive_terms

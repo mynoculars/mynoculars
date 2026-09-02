@@ -3,7 +3,6 @@ tests/unit/test_tools_retrieval_chain.py — the retrieval escalation ladder
 (D-38), fully offline.
 """
 
-import pytest
 
 from research_agent.state import Evidence, SearchTask, Volatility
 from research_agent.tools.model_knowledge import make_model_knowledge_tool

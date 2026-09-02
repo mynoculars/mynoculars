@@ -1150,8 +1150,8 @@ def _figure_critic_state():
 
 
 def _settings(**kw):
-    base = dict(_env_file=None, llm_mode="live", max_revisions=2,
-                claim_verification_enabled=True)
+    base = {"_env_file": None, "llm_mode": "live", "max_revisions": 2,
+            "claim_verification_enabled": True}
     base.update(kw)
     return Settings(**base)
 
@@ -1941,7 +1941,7 @@ def test_evidence_cited_counts_prose_not_the_sources_block():
 # ---------------------------------------------------------------------------
 
 
-def testllm_metrics_reads_only_counters_and_defaults_everything():
+def test_llm_metrics_reads_only_counters_and_defaults_everything():
     from research_agent.reporting.telemetry import llm_metrics
 
     empty = llm_metrics({})
@@ -1953,6 +1953,8 @@ def testllm_metrics_reads_only_counters_and_defaults_everything():
         "llm_quality_calls", "llm_quality_calls_failed",
         "llm_quality_rejections", "llm_prompt_tokens",
         "llm_completion_tokens", "llm_total_tokens", "llm_context_skips",
+        # D-153: which provider was skipped, not just how many times.
+        "context_skips_by_provider",
         "llm_disabled_skips"}
 
 
@@ -1965,7 +1967,7 @@ def test_llm_total_tokens_is_the_sum_of_the_two_halves():
     assert out["llm_total_tokens"] == 24601, "p205.280-check's own figures"
 
 
-def testretrieval_metrics_derives_tier_answers_from_the_chain_counters():
+def test_retrieval_metrics_derives_tier_answers_from_the_chain_counters():
     from research_agent.reporting.telemetry import retrieval_metrics
 
     out = retrieval_metrics({"chain_answered_web": 12,
@@ -1976,7 +1978,7 @@ def testretrieval_metrics_derives_tier_answers_from_the_chain_counters():
     assert out["retrieval_dense_calls"] == 24
 
 
-def testrun_metrics_is_the_whole_run_tally():
+def test_run_metrics_is_the_whole_run_tally():
     from research_agent.reporting.telemetry import run_metrics
 
     out = run_metrics({"search_calls": 12, "memory_hits": 5,
@@ -2016,3 +2018,118 @@ def test_they_are_pure_and_do_not_mutate_the_counters_they_read():
 
     assert counters == before
 
+
+
+class _VerdictRouter(_FakeRouter):
+    """A router whose critique call fails the report on the notes given."""
+
+    def __init__(self, notes, passed=False):
+        super().__init__("unused")
+        self._notes = notes
+        self._passed = passed
+        self.json_calls = 0
+
+    def complete_json(self, messages, temperature=0.0):
+        self.json_calls += 1
+        return {"passed": self._passed, "notes": self._notes}
+
+
+def _corroboration_state(report, evidence):
+    return ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1")],
+        evidence=evidence,
+        final_report=report)
+
+
+# The p205.287 shape: the report rounds, the evidence carries the figure,
+# and the critic calls the rounding unfaithful.
+_ROUNDING_EVIDENCE = [
+    _e("g1", "The PLA is estimated at approximately 2 million to 2.1 "
+             "million active personnel."),
+    _e("g1", "The force was formally established in 1948."),
+]
+_ROUNDING_REPORT = ("# R\n\nThe PLA fields approximately 2 million "
+                    "personnel [g1], and was founded in 1948 [g1].\n")
+_ROUNDING_NOTES = [
+    "Unfaithful: the report claims 'approximately 2 million personnel'. "
+    "The evidence states 'approximately 2 million to 2.1 million', so the "
+    "report's figure omits the upper bound.",
+    "Unfaithful: the report dates the founding to 1948; no evidence item "
+    "supports 1948.",
+]
+
+
+def test_critic_node_resolves_a_verdict_the_evidence_refutes():
+    """D-155, end to end. Both notes dispute a figure the evidence the
+    critic was SHOWN actually contains, and D-91 flagged nothing on the
+    same report. Before this, the run took the LLM's word and spent a
+    revision -- or, twice in three live runs, an E4 escalation."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _VerdictRouter(_ROUNDING_NOTES)
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(_ROUNDING_REPORT, _ROUNDING_EVIDENCE))
+
+    assert result["critique_passed"] is True
+    assert result["counters"]["critique_notes_dismissed"] == 2.0
+    assert "critique_notes" not in result, \
+        "a passing verdict must not accumulate notes into the next cycle"
+
+
+def test_critic_node_leaves_an_unadjudicatable_note_alone():
+    """A coverage finding is what the LLM critic is FOR, and one of them
+    stops the whole resolution."""
+    from research_agent.agents.compilation import build_critic_node
+
+    notes = _ROUNDING_NOTES + ["The report never addresses goal g1's "
+                               "second half."]
+    router = _VerdictRouter(notes)
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(_ROUNDING_REPORT, _ROUNDING_EVIDENCE))
+
+    assert result["critique_passed"] is False
+    assert result["critique_notes"] == notes
+    assert "critique_notes_dismissed" not in result["counters"]
+
+
+def test_a_clean_pass_is_untouched():
+    """The common path. No counter, no log line, nothing added."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _VerdictRouter([], passed=True)
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(_ROUNDING_REPORT, _ROUNDING_EVIDENCE))
+
+    assert result["critique_passed"] is True
+    assert "critique_notes_dismissed" not in result["counters"]
+
+
+def test_the_verdict_is_checked_against_the_evidence_the_critic_saw():
+    """Not state.evidence: the critic is budgeted (D-131), so an item
+    dropped from its prompt is an item it could not have read. Falsifying
+    a note against evidence the critic never saw would be a different and
+    much weaker claim."""
+    import research_agent.agents.compilation as comp
+
+    seen = {}
+    original = comp.resolve_verdict
+
+    def spy(passed, notes, evidence, audit_flagged):
+        seen["evidence"] = list(evidence)
+        return original(passed, notes, evidence, audit_flagged)
+
+    comp.resolve_verdict = spy
+    try:
+        router = _VerdictRouter(_ROUNDING_NOTES)
+        comp.build_critic_node(router, _settings(
+            claim_verification_enabled=False, prompt_evidence_max_chars=80))(
+                _corroboration_state(_ROUNDING_REPORT, _ROUNDING_EVIDENCE))
+    finally:
+        comp.resolve_verdict = original
+
+    assert len(seen["evidence"]) < len(_ROUNDING_EVIDENCE), \
+        "the budget must have dropped an item for this test to mean anything"

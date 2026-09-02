@@ -115,7 +115,8 @@ def load_cases(path):
         try:
             case = json.loads(line)
         except ValueError as exc:
-            raise ValueError(f"{path}:{number}: not valid JSON -- {exc}")
+            raise ValueError(
+                f"{path}:{number}: not valid JSON -- {exc}") from exc
         if not case.get("id") or not case.get("query"):
             raise ValueError(f"{path}:{number}: every case needs an 'id' and "
                              f"a 'query'")

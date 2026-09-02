@@ -11,7 +11,6 @@ full-graph integration runs (tests/integration/test_*_end_to_end.py) --
 this file tests each node's own logic directly, with fakes.
 """
 
-import logging
 
 from research_agent.agents.planning import (build_classify_node,
                                              build_goal_manager_node,

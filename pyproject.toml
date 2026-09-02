@@ -128,3 +128,71 @@ include = ["research_agent*"]
 # so duplicating it here would create a second copy that silently does
 # nothing -- and pytest.ini's filterwarnings=always is load-bearing (see
 # its own comment for the warnings it stopped hiding).
+
+
+# ---------------------------------------------------------------------------
+# Ruff (D-154)
+#
+# WHAT IS SELECTED, AND WHY IT IS A SHORT LIST. The rules below are the ones
+# that find BUGS or dead code -- things that are wrong regardless of taste:
+#
+#   E4/E7/E9  import, statement and syntax errors (ruff's own default E subset)
+#   F         pyflakes: unused imports, unused locals, undefined names
+#   W         trailing whitespace, missing newline at EOF, invalid escapes
+#   B         flake8-bugbear: mutable defaults, `assert False`, bare `zip()`,
+#             `raise` inside `except` without `from`
+#   C4        comprehension and collection-call correctness
+#
+# The repository passes all of them with ZERO violations, which is the only
+# state in which a linter is worth having in a project someone else reads.
+# Getting there found real cruft, not style: 11 unused imports, 3 dead
+# locals, a `zip()` that would truncate silently, an `assert False` that
+# `python -O` deletes, and 4 tests asserting a blind `Exception` that would
+# pass for a typo in the test itself.
+#
+# WHAT IS DELIBERATELY NOT SELECTED, with the count each would produce:
+#
+#   E501 (line-too-long)  192 at ruff's default 88. This codebase wraps at
+#         79 by hand: p50 is 57 characters, p99 is 84, and only 34 lines in
+#         43,000 exceed 100. A cap would be re-litigating a convention the
+#         code already follows more tightly than the tool would ask.
+#   UP    ~500. Modernising `List[str]` to `list[str]` is a real improvement
+#         and a 500-line diff across 70 files. It is a change to make on
+#         purpose, in its own commit, not as a side effect of adding a
+#         linter. Run `ruff check --select UP --fix` when you want it.
+#   I     77 files. Same reasoning: `ruff check --select I --fix` sorts every
+#         import block in one pass, and that pass should be its own commit.
+#   ARG   275. WRONG for this codebase, not merely noisy. It flags unused
+#         function arguments, and this design is built on closures and
+#         Protocol implementations where an unused parameter IS the
+#         contract -- every node factory in agents/, every ToolFn, every
+#         ReportPass.fn. Selecting it would mean 275 noqa comments
+#         documenting that the architecture is intentional.
+#   SIM/RET  26. Style opinions that argue with deliberate explicitness --
+#         `contextlib.suppress` in place of a try/except that carries a
+#         comment explaining what is being swallowed, for instance.
+#
+# HOW TO RUN IT:
+#     pip install ruff
+#     ruff check .            # expect: All checks passed!
+#     ruff check . --fix      # only touches what is safely auto-fixable
+#
+# NOT wired into CI yet, on purpose: .github/workflows/tests.yml runs the
+# test suite and nothing else, so a green badge means the tests pass and
+# says so honestly. Add ruff to that workflow when you want the badge to
+# mean both.
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["internal", "logs", "tmp"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "B", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+# scripts/ and tests/fixtures/ import after a deliberate sys.path or
+# environment set-up step, which E402 (module-level import not at top of
+# file) cannot know about. Those sites already carry `# noqa: E402`; this
+# keeps the exemption in one visible place rather than scattered.
+"scripts/*.py" = ["E402"]
+"tests/fixtures/*.py" = ["E402"]
+

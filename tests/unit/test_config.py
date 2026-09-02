@@ -33,6 +33,7 @@ explicit rather than something each new test has to remember.
 import logging
 
 import pytest
+from pydantic import ValidationError
 
 from research_agent.config import (
     REPO_ROOT,
@@ -438,15 +439,15 @@ def test_a_mistyped_deadline_is_flagged_like_every_other_known_typo(
 
 
 def test_the_p205_280_configuration_warns(caplog):
-    from research_agent.config import warn_on_primary_context_below_prompt_budget
+    from research_agent.config import warn_on_context_below_prompt_budget
 
     s = Settings(_env_file=None, llm_primary_context_tokens=1536,
                  prompt_evidence_max_chars=12000)
     with caplog.at_level(logging.WARNING):
-        warn_on_primary_context_below_prompt_budget(s)
+        warn_on_context_below_prompt_budget(s)
 
     matches = [r for r in caplog.records
-               if "config.primary_context_below_prompt_budget" in r.message]
+               if "config.context_below_prompt_budget" in r.message]
     assert matches
     fields = matches[0].event_fields
     assert fields["setting"] == "LLM_PRIMARY_CONTEXT_TOKENS"
@@ -458,52 +459,52 @@ def test_the_p205_280_configuration_warns(caplog):
 def test_an_unconfigured_window_is_silent(caplog):
     """0 means "not configured" and makes D-93 inert -- there is nothing to
     compare, and warning would fire for every default install."""
-    from research_agent.config import warn_on_primary_context_below_prompt_budget
+    from research_agent.config import warn_on_context_below_prompt_budget
 
     s = Settings(_env_file=None, llm_primary_context_tokens=0)
     with caplog.at_level(logging.WARNING):
-        warn_on_primary_context_below_prompt_budget(s)
+        warn_on_context_below_prompt_budget(s)
 
     assert not [r for r in caplog.records
-                if "config.primary_context" in r.message]
+                if "config.context_below" in r.message]
 
 
 def test_a_window_that_actually_fits_the_budget_is_silent(caplog):
-    from research_agent.config import warn_on_primary_context_below_prompt_budget
+    from research_agent.config import warn_on_context_below_prompt_budget
 
     s = Settings(_env_file=None, llm_primary_context_tokens=8192,
                  prompt_evidence_max_chars=12000)
     with caplog.at_level(logging.WARNING):
-        warn_on_primary_context_below_prompt_budget(s)
+        warn_on_context_below_prompt_budget(s)
 
     assert not [r for r in caplog.records
-                if "config.primary_context" in r.message]
+                if "config.context_below" in r.message]
 
 
 def test_lowering_the_evidence_budget_is_the_other_way_to_satisfy_it(caplog):
     """The warning names two remedies and both must actually silence it,
     or it is telling people to do something that does not work."""
-    from research_agent.config import warn_on_primary_context_below_prompt_budget
+    from research_agent.config import warn_on_context_below_prompt_budget
 
     s = Settings(_env_file=None, llm_primary_context_tokens=1536,
                  prompt_evidence_max_chars=4000)
     with caplog.at_level(logging.WARNING):
-        warn_on_primary_context_below_prompt_budget(s)
+        warn_on_context_below_prompt_budget(s)
 
     assert not [r for r in caplog.records
-                if "config.primary_context" in r.message]
+                if "config.context_below" in r.message]
 
 
 def test_the_default_install_does_not_warn(caplog):
     """.env.example ships LLM_PRIMARY_CONTEXT_TOKENS=0, so a clean clone
     must be quiet here."""
-    from research_agent.config import warn_on_primary_context_below_prompt_budget
+    from research_agent.config import warn_on_context_below_prompt_budget
 
     with caplog.at_level(logging.WARNING):
-        warn_on_primary_context_below_prompt_budget(Settings(_env_file=None))
+        warn_on_context_below_prompt_budget(Settings(_env_file=None))
 
     assert not [r for r in caplog.records
-                if "config.primary_context" in r.message]
+                if "config.context_below" in r.message]
 
 
 
@@ -559,7 +560,7 @@ def test_something_that_is_not_a_number_is_left_for_pydantic_to_reject():
     assert _normalise_numeric("abc") == "abc"
     assert _normalise_numeric("1,23") == "1,23"
     assert _normalise_numeric("8,8765") == "8,8765"
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Settings(_env_file=None, llm_primary_context_tokens="abc")
 
 
@@ -677,4 +678,123 @@ def test_a_test_can_still_set_a_value_deliberately(monkeypatch):
 
     assert Settings().hitl_enabled is True
     assert os.environ["HITL_ENABLED"] == "true"
+
+
+
+# ---------------------------------------------------------------------------
+# D-153 -- a context window per provider slot
+#
+# D-93 shipped primary-only and said so: cloud fallbacks "have context
+# windows orders of magnitude larger ... so giving them a knob would be
+# configuration nobody needs". True of the providers it was written for;
+# not true of the SLOT, since D-114 lets the third one point at any
+# OpenAI-compatible endpoint, including a second local llama-server.
+# ---------------------------------------------------------------------------
+
+
+def test_all_three_slots_ship_unconfigured():
+    """0 means "not configured". An existing .env must behave exactly as it
+    did before these fields existed."""
+    s = Settings(_env_file=None)
+
+    assert s.llm_primary_context_tokens == 0
+    assert s.llm_mistral_context_tokens == 0
+    assert s.llm_fallback_context_tokens == 0
+
+
+def test_the_new_settings_read_their_own_env_names(monkeypatch):
+    monkeypatch.setenv("LLM_MISTRAL_CONTEXT_TOKENS", "32768")
+    monkeypatch.setenv("LLM_FALLBACK_CONTEXT_TOKENS", "8192")
+
+    s = Settings()
+
+    assert s.llm_mistral_context_tokens == 32768
+    assert s.llm_fallback_context_tokens == 8192
+    assert s.llm_primary_context_tokens == 0, "the slots are independent"
+
+
+def test_the_slot_names_match_their_siblings():
+    """LLM_FALLBACK_*, not LLM_GEMINI_*: D-114 renames that slot by
+    configuration, and every other setting for it is slot-based."""
+    names = set(Settings.model_fields)
+
+    assert "llm_fallback_context_tokens" in names
+    assert "llm_gemini_context_tokens" not in names
+    for sibling in ("llm_fallback_base_url", "llm_fallback_model",
+                    "llm_fallback_api_key"):
+        assert sibling in names
+
+
+def test_a_grouped_number_works_for_the_new_slots_too():
+    """D-148 applies to every int field, not just the one that exposed it."""
+    s = Settings(_env_file=None, llm_mistral_context_tokens="32,768")
+
+    assert s.llm_mistral_context_tokens == 32768
+
+
+# --- the D-143 check, now covering all three -------------------------------
+
+
+def test_a_misconfigured_mistral_slot_is_no_longer_silent(caplog):
+    """The reason this generalisation is not cosmetic: a check that covers
+    one of three configurable things is worse than none, because it reads
+    as coverage."""
+    from research_agent.config import warn_on_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_mistral_context_tokens=1536,
+                 prompt_evidence_max_chars=12000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_context_below_prompt_budget(s)
+
+    matches = [r for r in caplog.records
+               if "config.context_below_prompt_budget" in r.message]
+    assert matches
+    assert matches[0].event_fields["setting"] == "LLM_MISTRAL_CONTEXT_TOKENS"
+
+
+def test_a_misconfigured_fallback_slot_is_caught_too(caplog):
+    from research_agent.config import warn_on_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_fallback_context_tokens=2048,
+                 prompt_evidence_max_chars=12000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_context_below_prompt_budget(s)
+
+    settings_named = [r.event_fields["setting"] for r in caplog.records
+                      if "config.context_below_prompt_budget" in r.message]
+    assert settings_named == ["LLM_FALLBACK_CONTEXT_TOKENS"]
+
+
+def test_every_failing_slot_is_reported_not_just_the_first(caplog):
+    """Two misconfigured providers are two things to fix. Stopping at the
+    first hides the second until the first is fixed."""
+    from research_agent.config import warn_on_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_primary_context_tokens=1536,
+                 llm_mistral_context_tokens=1024,
+                 llm_fallback_context_tokens=512,
+                 prompt_evidence_max_chars=12000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_context_below_prompt_budget(s)
+
+    named = [r.event_fields["setting"] for r in caplog.records
+             if "config.context_below_prompt_budget" in r.message]
+    assert named == ["LLM_PRIMARY_CONTEXT_TOKENS",
+                     "LLM_MISTRAL_CONTEXT_TOKENS",
+                     "LLM_FALLBACK_CONTEXT_TOKENS"]
+
+
+def test_a_generous_cloud_window_stays_silent(caplog):
+    """The shipped defaults: Mistral Small is 32k, Gemini Flash far more,
+    and a compile prompt is a few thousand tokens."""
+    from research_agent.config import warn_on_context_below_prompt_budget
+
+    s = Settings(_env_file=None, llm_mistral_context_tokens=32768,
+                 llm_fallback_context_tokens=1048576,
+                 prompt_evidence_max_chars=12000)
+    with caplog.at_level(logging.WARNING):
+        warn_on_context_below_prompt_budget(s)
+
+    assert not [r for r in caplog.records
+                if "config.context_below" in r.message]
 

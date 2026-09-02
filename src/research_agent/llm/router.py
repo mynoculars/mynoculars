@@ -302,6 +302,13 @@ class FallbackRouter:
         if estimated <= limit * self.CONTEXT_SKIP_MARGIN:
             return False
         self._bump("llm_context_skips")
+        # D-153: and which provider. One integer was unambiguous while only
+        # the primary could be skipped; with three configurable windows it
+        # is not, and "3 skips" says nothing about whether the chain lost
+        # its local hop or its cloud one. Same derived-key shape D-87's
+        # tier_answers uses, so telemetry.py can rebuild the breakdown
+        # without a second accumulator to keep in step.
+        self._bump(f"llm_context_skipped_{provider.name}")
         log_event(logger, "llm.skipped_for_context", level=logging.WARNING,
                   provider=provider.name, estimated_prompt_tokens=estimated,
                   context_tokens=limit, margin=self.CONTEXT_SKIP_MARGIN)
@@ -482,17 +489,26 @@ class FallbackRouter:
             s.llm_primary_model, s.llm_primary_timeout_seconds, tracer,
             display_label=f"LOCAL PRIMARY ({s.llm_primary_model})",
             max_tokens=s.llm_max_tokens,
-            # D-93: primary only -- see the setting's own comment in
-            # config.py for why the cloud hops get no equivalent knob.
+            # D-93, and D-153 for the other two slots: every provider now
+            # carries its own window. The router already read this
+            # per-provider (see _skips_for_context's getattr) and D-151
+            # already learns it per-client; only this wiring was
+            # primary-only.
             context_tokens=s.llm_primary_context_tokens)]
 
         # See the module docstring for exactly what this tuple-of-tuples
         # loop with unpacking is doing. Each row here is one OPTIONAL
         # fallback provider; the loop body only actually adds it to `chain`
         # if its API key is non-empty.
-        for name, base, key, model, label in (
+        # D-153 adds the sixth element, `context`. It is the SLOT's
+        # window, not the vendor's: the third row is named by
+        # LLM_FALLBACK_NAME (D-114) and can point at anything
+        # OpenAI-compatible, so the setting is LLM_FALLBACK_CONTEXT_TOKENS
+        # to match LLM_FALLBACK_BASE_URL / _MODEL / _API_KEY beside it.
+        for name, base, key, model, label, context in (
             ("mistral", s.llm_mistral_base_url, s.llm_mistral_api_key,
-             s.llm_mistral_model, f"MISTRAL ({s.llm_mistral_model})"),
+             s.llm_mistral_model, f"MISTRAL ({s.llm_mistral_model})",
+             s.llm_mistral_context_tokens),
             # D-114: named from settings, not hardwired. Everything
             # downstream -- log lines, telemetry, pricing, the D-111
             # health-check row -- keys off this name, so switching the
@@ -501,12 +517,14 @@ class FallbackRouter:
             # "gemini" on calls to something else.
             (s.llm_fallback_name, s.llm_fallback_base_url,
              s.llm_fallback_api_key, s.llm_fallback_model,
-             f"{_display_label(s.llm_fallback_name)} ({s.llm_fallback_model})"),
+             f"{_display_label(s.llm_fallback_name)} ({s.llm_fallback_model})",
+             s.llm_fallback_context_tokens),
         ):
             if key:
                 chain.append(OpenAICompatibleClient(
                     name, base, key, model, s.llm_timeout_seconds, tracer,
-                    display_label=label, max_tokens=s.llm_max_tokens))
+                    display_label=label, max_tokens=s.llm_max_tokens,
+                    context_tokens=context))
 
         log_event(logger, "llm.chain_built", providers=[p.name for p in chain])
         return cls(chain, s.llm_quality_threshold, tracer)

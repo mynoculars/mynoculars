@@ -810,8 +810,8 @@ def test_the_scored_event_carries_the_reason_and_the_verdict(caplog):
 
 def _live(**over):
     from research_agent.config import Settings
-    base = dict(_env_file=None, llm_mode="live", llm_mistral_api_key="k",
-                llm_fallback_api_key="k")
+    base = {"_env_file": None, "llm_mode": "live",
+            "llm_mistral_api_key": "k", "llm_fallback_api_key": "k"}
     base.update(over)
     return Settings(**base)
 
@@ -988,3 +988,133 @@ def test_a_judge_that_dies_takes_the_provider_out_of_the_answering_chain():
     assert counters["llm_disabled_skips"] == 1.0
     assert counters["llm_provider_calls"] == 2.0, (
         "primary attempted, grok skipped, mistral attempted")
+
+
+# ---------------------------------------------------------------------------
+# D-153 -- every provider carries its own context window
+#
+# The router already READ this per-provider (_skips_for_context's getattr)
+# and D-151 already LEARNS it per client. Only from_settings was
+# primary-only.
+# ---------------------------------------------------------------------------
+
+
+def _chain_settings(**overrides):
+    from research_agent.config import Settings
+
+    base = {"_env_file": None, "llm_mode": "live",
+            "llm_mistral_api_key": "k", "llm_fallback_api_key": "k"}
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_each_slot_gets_its_own_window():
+    from research_agent.llm.router import FallbackRouter
+
+    router = FallbackRouter.from_settings(_chain_settings(
+        llm_primary_context_tokens=1536,
+        llm_mistral_context_tokens=32768,
+        llm_fallback_context_tokens=1048576))
+
+    assert {p.name: p.context_tokens for p in router.providers} == {
+        "primary": 1536, "mistral": 32768, "gemini": 1048576}
+
+
+def test_unset_slots_stay_zero_which_is_the_old_behaviour():
+    """0 means "unknown" and can never be skipped, so an existing .env
+    routes byte-identically to before D-153."""
+    from research_agent.llm.router import FallbackRouter
+
+    router = FallbackRouter.from_settings(_chain_settings(
+        llm_primary_context_tokens=1536))
+
+    assert [p.context_tokens for p in router.providers] == [1536, 0, 0]
+
+
+def test_the_window_follows_the_slot_when_the_slot_is_renamed():
+    """D-114 renames the third provider by configuration. Its window must
+    follow the SLOT, not a vendor name."""
+    from research_agent.llm.router import FallbackRouter
+
+    router = FallbackRouter.from_settings(_chain_settings(
+        llm_fallback_name="grok", llm_fallback_context_tokens=131072))
+
+    grok = [p for p in router.providers if p.name == "grok"]
+    assert grok and grok[0].context_tokens == 131072
+
+
+def test_a_middle_provider_can_now_be_skipped():
+    """The behaviour the feature exists for: a second LOCAL server in the
+    mistral slot, too small for a compile prompt."""
+    from research_agent.llm.router import FallbackRouter
+
+    router = FallbackRouter.from_settings(_chain_settings(
+        llm_mistral_context_tokens=2048))
+    mistral = [p for p in router.providers if p.name == "mistral"][0]
+    messages = [{"role": "user", "content": "x" * 40000}]  # ~10k tokens
+
+    assert router._skips_for_context(mistral, messages) is True
+
+
+class _TinyWindowClient:
+    """A provider with a window far too small for anything, that answers
+    if it is ever actually called."""
+
+    def __init__(self, name):
+        self.name = name
+        self.context_tokens = 512
+        self.calls = 0
+        self.disabled_reason = ""
+
+    def complete(self, messages, temperature=0.2):
+        self.calls += 1
+        return f"answered by {self.name}"
+
+    def complete_json(self, messages, temperature=0.0):
+        self.calls += 1
+        return {"provider": self.name}
+
+    def drain_usage(self):
+        return (0, 0)  # (prompt_tokens, completion_tokens), per D-86
+
+
+def test_the_last_provider_is_still_never_skipped():
+    """The guard that stops the chain skipping its way to zero attempts.
+
+    It was incidental while only the primary could be skipped -- there was
+    always an unskippable provider behind it. With a window on EVERY slot
+    it becomes the only thing preventing a chain that skips everything,
+    returns no candidate and no exception, and trips complete()'s own
+    `assert last_exc is not None`.
+    """
+    from research_agent.llm.router import FallbackRouter
+
+    chain = [_TinyWindowClient(n) for n in ("primary", "mistral", "gemini")]
+    router = FallbackRouter(chain, quality_threshold=0.0)
+    huge = [{"role": "user", "content": "x" * 40000}]  # ~10k tokens
+
+    answer = router.complete(huge)
+
+    assert answer == "answered by gemini"
+    assert [c.calls for c in chain] == [0, 0, 1], "only the last was attempted"
+    assert router.drain_counters()["llm_context_skips"] == 2
+
+
+def test_a_skip_records_which_provider_it_was():
+    """One integer was unambiguous with one configurable window. With three
+    it is not: "3 skips" says nothing about whether the chain lost its
+    local hop or its cloud one."""
+    from research_agent.llm.router import FallbackRouter
+
+    router = FallbackRouter.from_settings(_chain_settings(
+        llm_primary_context_tokens=512, llm_mistral_context_tokens=512))
+    huge = [{"role": "user", "content": "x" * 40000}]
+
+    for provider in router.providers[:2]:
+        router._skips_for_context(provider, huge)
+    counters = router.drain_counters()
+
+    assert counters["llm_context_skips"] == 2
+    assert counters["llm_context_skipped_primary"] == 1
+    assert counters["llm_context_skipped_mistral"] == 1
+

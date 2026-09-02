@@ -351,7 +351,7 @@ _GOAL_ID_RE = re.compile(r"g\d+", re.IGNORECASE)
 
 
 def normalise_citation_form(report: str, goals) -> tuple:
-    """Rewrite every citation the compiler wrote into the one form the
+    r"""Rewrite every citation the compiler wrote into the one form the
     rest of the system reads: `[gN]`, one goal per marker (D-99).
 
     WHY THIS EXISTS, and why its absence went unnoticed for so long.

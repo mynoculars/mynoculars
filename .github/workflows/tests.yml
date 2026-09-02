@@ -1,0 +1,65 @@
+# Run the test suite. Nothing else (D-154).
+#
+# The badge this produces means exactly one thing -- "the tests pass" -- and
+# that is the point. Ruff is configured in pyproject.toml and the repository
+# passes it cleanly, but it is deliberately NOT run here yet: a badge that
+# quietly covers two things is a badge nobody can read.
+#
+# This works with no services because the suite genuinely needs none. That
+# is not luck; it is D-140 and D-147:
+#   - stores are constructed with probe=False and open no sockets;
+#   - an autouse fixture removes the .env file and every Settings-mapped
+#     environment variable for the whole run.
+# So there is no Postgres, Qdrant, OpenSearch or API key to provision, and
+# nothing here can pass locally and fail in CI because of configuration.
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:      # so you can run it by hand from the Actions tab
+
+# A new push to the same branch cancels the run still going for the old one.
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15   # the suite takes well under a minute; this is a
+                          # ceiling for a hang, not an expectation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # pyproject.toml declares requires-python = "==3.11.*", and that
+          # is deliberate: 3.11 is what this project is actually tested on.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-websearch.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # requirements.txt is the core install. requirements-websearch.txt
+          # is included because a handful of tests import the websearch
+          # package directly; without it they skip rather than fail, so the
+          # run would be green while covering less than it appears to.
+          pip install -r requirements.txt -r requirements-websearch.txt
+          pip install pytest-xdist
+          pip install -e .
+
+      - name: Run the suite
+        # pytest.ini already sets `-n auto --dist loadfile`; nothing is
+        # passed here so that CI runs exactly what a developer runs locally.
+        run: python -m pytest tests/ -q

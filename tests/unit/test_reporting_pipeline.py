@@ -9,6 +9,8 @@ reordering the list without also reasoning about the constraint fails here
 rather than in a shipped report six weeks later.
 """
 
+import dataclasses
+
 import pytest
 
 from research_agent.reporting.pipeline import (REPORT_PASSES, PassContext,
@@ -16,9 +18,9 @@ from research_agent.reporting.pipeline import (REPORT_PASSES, PassContext,
 
 
 def _ctx(**overrides):
-    base = dict(goals=[], evidence=[], guidance="", budget_exhausted=None,
-                llm_mode="live", min_evidence_score=0.5,
-                grounded_recall_target=0.5)
+    base = {"goals": [], "evidence": [], "guidance": "",
+            "budget_exhausted": None, "llm_mode": "live",
+            "min_evidence_score": 0.5, "grounded_recall_target": 0.5}
     base.update(overrides)
     return PassContext(**base)
 
@@ -149,5 +151,5 @@ def test_the_context_cannot_be_mutated_by_a_pass():
     ordering constraints above meaningless."""
     ctx = _ctx()
 
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         ctx.goals = ["something else"]

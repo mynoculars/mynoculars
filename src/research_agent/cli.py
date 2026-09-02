@@ -55,7 +55,8 @@ from research_agent import langfuse as lf
 # startup path from a module named "cli". Keeping both names bound
 # here means every existing `from research_agent.cli import ...` call
 # site -- including any outside this repo -- keeps working unchanged.
-from research_agent.assembly import (AppBundle, build_app_and_settings,
+from research_agent.assembly import (AppBundle,  # noqa: F401 -- see above
+                                     build_app_and_settings,
                                      reject_if_thread_in_use)
 from research_agent.config import get_settings
 from research_agent.llm.router import ProviderChainExhausted
@@ -260,10 +261,7 @@ def _fmt_result_summary(telemetry: dict, report: str) -> str:
     # "0 listed / 58 retrieved" is the single most useful line in the block
     # on a run like p205.280-check, and finding it previously meant reading
     # 45 lines of JSON.
-    listed = telemetry.get("web_sources_listed")
     web_items = telemetry.get("web_sourced_items")
-    domains = telemetry.get("web_source_domains")
-    cited_goals = telemetry.get("evidence_cited")
     attached = int(telemetry.get("citations_attached") or 0)
 
     lines = [

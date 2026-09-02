@@ -42,7 +42,7 @@ one into the other):
 """
 
 import logging
-from typing import List, Optional
+from typing import List
 
 from research_agent.logging_setup import log_event
 from research_agent.websearch.provider import WebResult, coerce_results
