@@ -798,3 +798,34 @@ def test_a_generous_cloud_window_stays_silent(caplog):
     assert not [r for r in caplog.records
                 if "config.context_below" in r.message]
 
+
+
+# ---------------------------------------------------------------------------
+# D-162 -- the two decay half-lives are divisors and must be bounded
+# ---------------------------------------------------------------------------
+
+
+def test_a_zero_or_negative_half_life_is_rejected_at_startup():
+    """These were the only numerics in config.py with no validator, and
+    they are DIVISORS: decay_factor computes exp(-ln2 * age / half_life).
+
+    0 is a plausible guess for "turn decay off" and used to raise
+    ZeroDivisionError at memory_retrieve_node -- the SECOND node of every
+    run, where nothing catches it and SemanticMemory's contract says an
+    unusable memory degrades to []. A negative value was worse because it
+    was silent: the exponent's sign flips, decay becomes GROWTH, and the
+    oldest memories rank highest (measured at 70,515,084x for a 365-day
+    item against a half-life of -14)."""
+    import pytest
+    from pydantic import ValidationError
+
+    for field in ("decay_half_life_days_semi_stable",
+                  "decay_half_life_days_volatile"):
+        for bad in (0.0, -14.0):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None, **{field: bad})
+
+    # And the shipped values are still accepted.
+    settings = Settings(_env_file=None)
+    assert settings.decay_half_life_days_semi_stable == 90.0
+    assert settings.decay_half_life_days_volatile == 14.0

@@ -110,6 +110,41 @@ logger = logging.getLogger(__name__)
 _DISPUTED_FIGURE_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 MIN_FIGURE_CHARS = 3
 
+# D-162: a number that POINTS AT PART OF THE REPORT is not a figure the
+# critic is disputing, and counting it as one turned this module into the
+# opposite of what it was built to be.
+#
+# Live shape, at shipped defaults:
+#
+#   note:     "Goal g3 (defence budgets) is never addressed; section 2.1
+#              of the report is missing entirely."
+#   evidence: "China fields approximately 2.1 million active personnel."
+#
+# "2.1" is a SECTION NUMBER. It clears MIN_FIGURE_CHARS, it appears
+# verbatim in the evidence blob, so `falsified_by_evidence` reported the
+# note refuted -- and being the only note, it took the whole failing
+# verdict with it. The report shipped as a clean pass and routed to
+# memory_writer, which D-24 exists to prevent. This module's own docstring
+# promises the opposite: "a note naming no figure at all is a coverage
+# finding an LLM critic is FOR, it survives".
+#
+# A coverage note names no figure. It names a LOCATION, and a location is
+# introduced by one of a small closed set of words. Stripping those
+# references before extracting figures leaves the note with an empty
+# figure set, which is exactly the "unadjudicatable, therefore safe"
+# state disputed_figures already documents.
+#
+# Deliberately narrow: only a number IMMEDIATELY following one of these
+# words is dropped. "the 2.1 million figure in section 3" keeps 2.1
+# million -- that note really is disputing a figure, and it should still
+# be adjudicable.
+_LOCATION_REFERENCE_RE = re.compile(
+    r"\b(?:section|sections|part|parts|step|steps|figure|figures|fig\.?|"
+    r"table|tables|heading|headings|item|items|point|points|paragraph|"
+    r"paragraphs|line|lines|page|pages|bullet|bullets|goal|goals|"
+    r"appendix|chapter|note|notes)\s+#?\d[\d,]*(?:\.\d+)?",
+    re.IGNORECASE)
+
 
 def disputed_figures(note: str) -> set:
     """Numeric tokens a critic note names, normalised for comparison.
@@ -119,7 +154,10 @@ def disputed_figures(note: str) -> set:
     safe from dismissal.
     """
     found = set()
-    for raw in _DISPUTED_FIGURE_RE.findall(note or ""):
+    # D-162: drop "section 2.1"-shaped references first -- see
+    # _LOCATION_REFERENCE_RE for the live note that made this necessary.
+    scrubbed = _LOCATION_REFERENCE_RE.sub(" ", note or "")
+    for raw in _DISPUTED_FIGURE_RE.findall(scrubbed):
         cleaned = raw.replace(",", "").rstrip(".")
         if len(cleaned) >= MIN_FIGURE_CHARS:
             found.add(cleaned)

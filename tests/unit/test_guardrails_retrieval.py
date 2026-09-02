@@ -149,3 +149,48 @@ def test_single_leg_score_ceiling_matches_the_rrf_derivation():
     from research_agent.tools.corpus_search import RRF_SQUASH
 
     assert SINGLE_LEG_SCORE_CEILING == min(1.0, (1 / RRF_K) * RRF_SQUASH)
+
+
+# ---------------------------------------------------------------------------
+# D-164 -- MCP corroborates, it does not ground
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_evidence_never_counts_as_grounding():
+    """The "mcp" arm of this predicate was dead code and said otherwise.
+
+    The corpus MCP server's tool schema returns text only -- it discards
+    the score its own HybridRetriever computed -- so assembly.py stamps
+    every item with `unscored_score=min_evidence_score`, exactly the
+    floor, and passes_evidence_gate is a strict `>`. The conjunction
+    could never be true. Live: run p205.290-check carried 21 mcp evidence
+    items and `tier_answers {"web": 7}`.
+
+    Until the server sends the scores it already has, the honest reading
+    is that tier 3 corroborates in the prompt and grounds nothing."""
+    from research_agent.guardrails.retrieval import (GROUNDING_SOURCES,
+                                                     has_grounded_evidence)
+    from research_agent.state import Evidence, Volatility
+
+    assert "mcp" not in GROUNDING_SOURCES
+
+    terms = {"redis", "memcached", "session"}
+    content = "Redis and Memcached both serve session caching workloads."
+    for score in (0.5, 0.75, 0.99):
+        item = Evidence(task_key="k", goal_id="g1", source="mcp",
+                        content=content, score=score,
+                        volatility=Volatility.SEMI_STABLE)
+        assert has_grounded_evidence("g1", terms, [item], 0.5) is False, score
+
+
+def test_a_corpus_item_with_the_same_shape_still_grounds():
+    """The removal must be about PROVENANCE, not about having broken the
+    predicate for everyone."""
+    from research_agent.guardrails.retrieval import has_grounded_evidence
+    from research_agent.state import Evidence, Volatility
+
+    item = Evidence(task_key="k", goal_id="g1", source="corpus",
+                    content="Redis and Memcached both serve session caching.",
+                    score=0.75, volatility=Volatility.SEMI_STABLE)
+
+    assert has_grounded_evidence("g1", {"redis", "memcached"}, [item], 0.5) is True

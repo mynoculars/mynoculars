@@ -141,3 +141,81 @@ def test_looks_overspecific_does_not_flag_air_quality_unit_without_a_year():
     flagged, by design."""
     assert not _looks_overspecific(
         "Delhi's annual average exceeding 100 \u00b5g/m\u00b3 in multiple years.")
+
+
+# ---------------------------------------------------------------------------
+# D-163 -- admission and capability are one comparison
+# ---------------------------------------------------------------------------
+
+
+class _ConfidenceStub:
+    def __init__(self, confidence):
+        self.confidence = confidence
+
+    def set_node(self, node):
+        pass
+
+    def complete_json(self, messages):
+        return {"claims": [{"text": "A stable fact about the matter.",
+                            "confidence": self.confidence}]}
+
+
+def _admit(confidence, score=0.6, floor=0.5):
+    from research_agent.state import SearchTask
+    from research_agent.tools.model_knowledge import make_model_knowledge_tool
+
+    tool = make_model_knowledge_tool(_ConfidenceStub(confidence), score,
+                                     min_evidence_score=floor)
+    return tool(SearchTask(key="k", query="q", goal_id="g1"))
+
+
+def test_a_claim_that_could_never_cover_a_goal_is_not_admitted():
+    """This tier's whole safety argument is that a shaky item is dangerous
+    BECAUSE it can still mark a goal covered. That stopped applying to
+    half the admitted band: at the shipped 0.6/0.5 pair a claim scores
+    `min(0.6, 0.6*conf + 0.05)` against a strict `>`, so everything from
+    confidence 0.50 to 0.75 was retrieved, prompted and made citable while
+    being unable to converge anything."""
+    for confidence in (0.50, 0.60, 0.70, 0.75):
+        assert _admit(confidence) == [], confidence
+
+
+def test_a_claim_that_can_cover_is_still_admitted_and_keeps_its_score():
+    from research_agent.tools.model_knowledge import score_for_confidence
+
+    for confidence in (0.76, 0.85, 0.90, 1.0):
+        evidence = _admit(confidence)
+        assert len(evidence) == 1, confidence
+        assert evidence[0].source == "model"
+        assert evidence[0].score == score_for_confidence(confidence, 0.6)
+
+
+def test_the_rule_follows_the_thresholds_instead_of_hardcoding_them():
+    """Derived, not a second constant: lowering the coverage floor admits
+    more, raising it admits less, with no edit to this module. Two
+    constants drifting apart is exactly how the band went inert."""
+    assert _admit(0.60, score=0.6, floor=0.5) == []      # 0.41, cannot cover
+    assert len(_admit(0.60, score=0.6, floor=0.3)) == 1  # 0.41 > 0.3, covers
+    assert _admit(0.90, score=0.6, floor=0.59) == []     # 0.59 is not > 0.59
+
+
+def test_a_claim_the_model_disowns_is_dropped_whatever_the_floor_is():
+    """The self-reported confidence floor survives the derived rule for
+    the low-floor configuration: an item the model half-remembers is
+    worse than no item, and that is not a function of anyone's
+    threshold."""
+    assert _admit(0.2, score=0.6, floor=0.01) == []
+
+
+def test_dropped_claims_are_reported_not_silent(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _admit(0.60)
+
+    events = [getattr(r, "event_fields", {}) for r in caplog.records
+              if r.message == "tool.model_knowledge"]
+    assert events and events[0]["dropped_inert"] == 1, events
+    assert events[0]["claims"] == 0 and events[0]["asked"] == 1, (
+        "asked-vs-kept is what makes a mismatched pair of thresholds "
+        "visible per call")

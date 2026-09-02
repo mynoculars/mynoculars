@@ -198,7 +198,31 @@ def test_search_with_decay_builds_a_valid_formula_query_and_correct_scales():
     assert exp_decay.exp_decay.scale == 90.0 * 86400.0
     assert exp_decay.exp_decay.midpoint == 0.5
     assert exp_decay.exp_decay.x.datetime_key == "created_at_iso"
-    assert exp_decay.exp_decay.target.datetime == "now"
+    # D-162: the target must be a datetime QDRANT WILL PARSE. This
+    # assertion used to read `== "now"`, which is not a value the API
+    # accepts -- there is no `now` literal -- so every server-side-decay
+    # query raised `ValueError: Expected datetime in supported format for
+    # now` while this test passed, because it only ever checked that
+    # Pydantic would CONSTRUCT the object. Parsing it with the real
+    # client's own parser is what closes the gap between "constructible"
+    # and "evaluable".
+    import datetime as _dt
+
+    from qdrant_client.local.datetime_utils import parse as _parse_datetime
+
+    target = exp_decay.exp_decay.target.datetime
+    parsed = _parse_datetime(target)
+    assert parsed is not None, f"{target!r} is not a datetime Qdrant parses"
+    # And it is THIS instant: decay is measured from now, not from a fixed
+    # point that would freeze every age at build time.
+    assert abs((_dt.datetime.now(_dt.timezone.utc)
+                - parsed).total_seconds()) < 60
+
+    # D-162: `defaults` must supply created_at_iso, or ONE point written
+    # before P2-10 added that key aborts the whole query instead of simply
+    # not matching -- which is what ensure_payload_indexes' docstring
+    # promises would happen.
+    assert formula.defaults == {"created_at_iso": target}
 
     # The "stable" branch (half_life=None) must be a flat 1.0 multiplier,
     # not a decay expression — confirms the None-means-no-decay contract.

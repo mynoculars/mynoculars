@@ -46,7 +46,7 @@ place -- only the exact spans this codebase's own detector already
 flagged, and only where the compiler ignored the request to hedge them.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from research_agent.state import Evidence
 from research_agent.tools.model_knowledge import overspecific_span
@@ -73,6 +73,51 @@ _NUMERIC_PREFIX = "0123456789.,"
 
 def _starts_inside_a_larger_number(report: str, start: int) -> bool:
     return start > 0 and report[start - 1] in _NUMERIC_PREFIX
+
+
+def _ends_inside_a_larger_word(report: str, end: int) -> bool:
+    """The mirror of the guard above, for the RIGHT edge (D-162).
+
+    The left edge was guarded and the right edge was not, and the right
+    edge is where the damage shows. `overspecific_span` returns spans
+    ending in a UNIT WORD -- "1.9 metric ton", "20 percent" -- and
+    `_SPECIFIC_NUMBER` makes the plural optional, so the singular span is
+    a prefix of the plural the report actually wrote. `str.find` matched
+    that prefix and the marker landed mid-word:
+
+        The 2030 roadmap targets 1.9 metric ton (unverified figure)s ...
+        The share rose by 20 percent (unverified figure)age points ...
+
+    A marker inside a word is worse than a missing marker, for the same
+    reason the left-edge guard exists: it is visibly broken text in the
+    deliverable, and it makes an honest signal read as a defect.
+
+    Alphanumeric only -- a following ".", "," or ")" is ordinary
+    punctuation after a complete figure and must still be marked.
+    """
+    return end < len(report) and report[end].isalnum()
+
+
+# A plural suffix is the ONE continuation that leaves the figure the same
+# figure. "1.9 metric ton" matching inside "1.9 metric tons" is the span
+# the detector meant; "20 percent" matching inside "20 percentage points"
+# is a different quantity wearing the same prefix. Extending over the
+# first and refusing the second is what keeps this guard from trading a
+# corrupted word for a silently missing marker (D-162).
+_PLURAL_SUFFIXES = ("es", "s")
+
+
+def _plural_end(report: str, end: int) -> Optional[int]:
+    """Offset just past the figure when the overrun is only a plural.
+
+    Returns None when the continuation is anything else, which is the
+    signal to leave that occurrence alone entirely.
+    """
+    word_end = end
+    while word_end < len(report) and report[word_end].isalnum():
+        word_end += 1
+    overrun = report[end:word_end].lower()
+    return word_end if overrun in _PLURAL_SUFFIXES else None
 
 
 def _already_hedged(report_lower: str, start: int) -> bool:
@@ -109,6 +154,16 @@ def enforce_hedging(report: str, evidence: List[Evidence]) -> Tuple[str, Dict[st
         start = lower_report.find(key)
         while start != -1:
             end = start + len(span)
+            # D-162: when the match stops mid-word, mark AFTER the whole
+            # word if the only overrun is a plural ("...metric ton" inside
+            # "...metric tons"), and skip the occurrence entirely if it is
+            # anything else ("20 percent" inside "20 percentage points").
+            if _ends_inside_a_larger_word(report, end):
+                plural = _plural_end(report, end)
+                if plural is None:
+                    start = lower_report.find(key, end)
+                    continue
+                end = plural
             already_marked = report[end:end + len(_MARKER)] == _MARKER
             if (not already_marked
                     and not _already_hedged(lower_report, start)

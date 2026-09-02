@@ -503,8 +503,17 @@ class Settings(BaseSettings):
     # now covers both floors. 0.0 disables it and restores the pre-D-142
     # behaviour exactly.
     memory_min_similarity: float = Field(0.60, ge=0.0, le=1.0)
-    decay_half_life_days_semi_stable: float = 90.0
-    decay_half_life_days_volatile: float = 14.0
+    # D-162: `gt=0.0`, not bare floats. These were the only two numerics in
+    # this file with no validator, and they are DIVISORS --
+    # memory/semantic_memory.py::decay_factor computes
+    # `exp(-ln2 * age / half_life)`. 0 is a plausible guess for "turn decay
+    # off" and raises ZeroDivisionError at memory_retrieve_node, the SECOND
+    # node of every run, where nothing catches it. A negative value is
+    # worse because it is silent: the exponent's sign flips, so decay
+    # becomes GROWTH and the oldest memories rank highest -- measured at
+    # 70,515,084x for a 365-day-old item against a half-life of -14.
+    decay_half_life_days_semi_stable: float = Field(90.0, gt=0.0)
+    decay_half_life_days_volatile: float = Field(14.0, gt=0.0)
     # P2-10: server-side (Qdrant FormulaQuery) decay reranking instead of
     # the Python over-fetch-then-rerank path. Off by default — requires
     # points to carry the "created_at_iso" payload field, which only
@@ -947,6 +956,47 @@ def warn_on_web_search_band(s: "Settings") -> None:
                          "band, but the configured values are not what was meant")
 
 
+def warn_on_model_knowledge_inert(s: "Settings") -> None:
+    """WARN when no model-tier claim could ever cover a goal (D-163).
+
+    CALLED BY   get_settings(), below -- the exact shape and posture of
+                warn_on_web_search_band, which guards the byte-identical
+                invariant for the web tier. That one existed and this one
+                did not, which is why the model tier's version of the
+                failure went unnoticed.
+
+    THE INVARIANT: `model_knowledge_score` is the CEILING a claim can
+    reach (tools/model_knowledge.py::score_for_confidence caps at it), and
+    D-17's coverage predicate is a strict `>`. So if the ceiling does not
+    EXCEED min_evidence_score, not one recollection can mark a goal
+    covered no matter how confident the model is -- the tier retrieves,
+    spends a real LLM call per task, and contributes nothing to
+    convergence. That is the same silent inertness MIN_EVIDENCE_SCORE=0.0
+    was, and the same one warn_on_web_search_band catches for web.
+
+    Worse here than for web, because of a second-order effect: the
+    ladder's `ladder_exhausted` flag in agents/gathering.py is
+    `not settings.model_knowledge_enabled`, so an inert-but-ENABLED tier
+    also suppresses the no-strong-evidence escalation. The run spends its
+    whole depth budget and escalates nothing.
+
+    Only fires when the tier is actually on: with
+    MODEL_KNOWLEDGE_ENABLED=false there is no tier to be inert.
+    """
+    if not s.model_knowledge_enabled:
+        return
+    if s.model_knowledge_score <= s.min_evidence_score:
+        log_event(logger, "config.model_knowledge_tier_inert",
+                  level=logging.WARNING,
+                  setting="MODEL_KNOWLEDGE_SCORE",
+                  value=s.model_knowledge_score,
+                  min_evidence_score=s.min_evidence_score,
+                  effect="no model-tier claim can clear the D-17 coverage "
+                         "gate at any confidence; the tier will spend an "
+                         "LLM call per task and never cover a goal, and "
+                         "the ladder-exhausted escalation stays suppressed")
+
+
 def warn_on_context_below_prompt_budget(s: "Settings") -> None:
     """WARN when a provider can never serve a compile or critique (D-143).
 
@@ -1085,5 +1135,6 @@ def get_settings() -> Settings:
     warn_on_web_search_band(settings)
     warn_on_unbounded_prompt_budget(settings)  # D-131
     warn_on_unpriced_fallback(settings)  # D-114
+    warn_on_model_knowledge_inert(settings)  # D-163
     warn_on_context_below_prompt_budget(settings)  # D-143, D-153
     return settings

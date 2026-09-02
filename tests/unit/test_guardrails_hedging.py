@@ -128,3 +128,59 @@ def test_a_flagged_span_inside_a_larger_number_is_not_tagged():
     assert "15.2% (unverified figure)" not in cleaned
     assert "not 5.2% (unverified figure)" in cleaned
     assert counters["hedge_markers_inserted"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# D-162 -- the marker must not land inside a word
+# ---------------------------------------------------------------------------
+
+
+def _flagged(content):
+    from research_agent.state import Evidence, Volatility
+    return [Evidence(task_key="k", goal_id="g1", source="model", content=content,
+                     score=0.6, volatility=Volatility.SEMI_STABLE,
+                     hedge_specific=True)]
+
+
+def test_a_plural_in_the_report_is_marked_after_the_whole_word():
+    """`overspecific_span` returns "1.9 metric ton"; the report wrote
+    "tons". The span matched the prefix and the marker went in mid-word:
+    "1.9 metric ton (unverified figure)s". A plural is still the same
+    figure, so the marker moves past it rather than the occurrence being
+    skipped -- skipping would trade broken text for a missing signal,
+    which is the failure D-51 exists to prevent."""
+    from research_agent.guardrails.hedging import enforce_hedging
+
+    report = "The 2030 roadmap targets 1.9 metric tons of captured CO2 [g1]."
+    out, counters = enforce_hedging(
+        report, _flagged("By 2030 India plans to capture 1.9 metric ton of CO2."))
+
+    assert out == ("The 2030 roadmap targets 1.9 metric tons (unverified figure) "
+                   "of captured CO2 [g1].")
+    assert counters == {"hedge_markers_inserted": 1.0}
+
+
+def test_a_different_unit_sharing_a_prefix_is_left_alone_entirely():
+    """"20 percent" is a prefix of "20 percentage points" and they are NOT
+    the same quantity. Marking it would assert the flagged figure about a
+    figure the detector never saw."""
+    from research_agent.guardrails.hedging import enforce_hedging
+
+    report = "The share rose by 20 percentage points between 2015 and 2024 [g1]."
+    out, counters = enforce_hedging(
+        report, _flagged("In 2024 the share reached 20 percent of the total."))
+
+    assert out == report
+    assert counters == {}
+
+
+def test_punctuation_after_a_figure_still_marks():
+    """Only an alphanumeric continuation means "inside a word". A comma or
+    a full stop is ordinary punctuation and must not suppress the marker."""
+    from research_agent.guardrails.hedging import enforce_hedging
+
+    report = "Output was 6.7%, up on the prior year [g1]."
+    out, _counters = enforce_hedging(
+        report, _flagged("In 2024 output was 6.7% higher."))
+
+    assert out == "Output was 6.7% (unverified figure), up on the prior year [g1]."

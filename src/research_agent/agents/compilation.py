@@ -406,9 +406,26 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         # cited figures to audit, so that gate must get first refusal.
         # D-155 reads this: the deterministic figure audit's own verdict
         # on THIS report. It stays 0 when the audit is disabled or has no
-        # evidence to audit against, which is the conservative value --
-        # "no deterministic corroboration either way", and the D-155
-        # counterweight declines to act on it.
+        # evidence to audit against.
+        #
+        # D-162 CORRECTS WHAT THIS COMMENT USED TO CLAIM. It said 0 was
+        # "the conservative value ... and the D-155 counterweight declines
+        # to act on it". It does not: `resolve_verdict` returns early on
+        # `unsupported_figures` being NONZERO, so 0 is the value that lets
+        # it act -- and since claim_verification_enabled ships False, 0 is
+        # also the only value a default deployment ever produces.
+        #
+        # The behaviour is left as it is, deliberately. D-155 exists
+        # because the critic was failing CORRECT reports over faithful
+        # rounding on runs with this feature off; gating the counterweight
+        # on an off-by-default flag would switch D-155 off for everyone
+        # who has not opted in, which is precisely the population it was
+        # written for. What the guard really provides is one-way safety:
+        # if the audit DID run and DID flag something, the two checks
+        # disagree and the critic wins. When it did not run, the note-level
+        # test stands alone -- which is why D-162 also tightened
+        # `disputed_figures` so a coverage note can no longer be mistaken
+        # for a falsifiable one.
         audit_flagged = 0
         if settings.claim_verification_enabled and state.evidence:
             # D-139: the audit reads the authored body too. A figure in
@@ -1055,9 +1072,22 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         #                         wrote rather than the model (D-144). A
         #                         rescued report and a self-cited one must
         #                         never be indistinguishable.
+        #
+        # D-162: BOTH now read the SHIPPED report. `citations_attached`
+        # was read from `c` -- state.counters, which merge_counters SUMS
+        # across every compile -- while the line above it was already
+        # careful to derive its number from the artifact. So a run whose
+        # first draft needed D-144's rescue and whose FINAL draft the
+        # model cited itself reported the stale 1 from the first draft:
+        # confidence.py caps that at 60 (MODERATE) with the reason "the
+        # model wrote none of them", about a report where the model wrote
+        # all of them. Measured: MODERATE 60 against HIGH 98 for the same
+        # shipped text. last_compile_guardrails is the per-report view
+        # that already exists for exactly this distinction.
         telemetry["evidence_cited"] = len(
             cited_goal_ids_in_prose(state.final_report))
-        telemetry["citations_attached"] = int(c.get("citations_attached", 0))
+        telemetry["citations_attached"] = int(
+            state.last_compile_guardrails.get("citations_attached", 0))
         telemetry["abort_reason"] = state.abort_reason or None
         telemetry["confidence"] = score_report(telemetry)
         log_event(logger, "run.telemetry", **telemetry)

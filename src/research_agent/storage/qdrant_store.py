@@ -492,6 +492,20 @@ class QdrantStore:
         # units in memory/semantic_memory.py), so this converts once.
         SECONDS_PER_DAY = 86400.0
 
+        # D-162: the decay target is THIS INSTANT, written as RFC3339.
+        # It used to be the literal string "now", which is not a value
+        # Qdrant's datetime parser accepts -- there is no `now` literal in
+        # the API -- so every server-side-decay query raised
+        # `ValueError: Expected datetime in supported format for now`.
+        # With MEMORY_SERVER_SIDE_DECAY=true that killed the run at
+        # memory_retrieve_node, the SECOND node of every run, since
+        # agents/planning.py calls retrieve() with no try/except and
+        # SemanticMemory's contract is that an unusable memory degrades
+        # to []. The existing unit test asserted `target.datetime == "now"`
+        # -- it only ever checked that Pydantic would CONSTRUCT the
+        # object, never that Qdrant would evaluate it.
+        target_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
         def _branch(field_value: str, half_life_days: Optional[float]):
             switch = models.Filter(must=[models.FieldCondition(
                 key=decay_field, match=models.MatchValue(value=field_value))])
@@ -504,7 +518,7 @@ class QdrantStore:
                 switch,
                 models.ExpDecayExpression(exp_decay=models.DecayParamsExpression(
                     x=models.DatetimeKeyExpression(datetime_key="created_at_iso"),
-                    target=models.DatetimeExpression(datetime="now"),
+                    target=models.DatetimeExpression(datetime=target_iso),
                     scale=half_life_days * SECONDS_PER_DAY,
                     midpoint=0.5,
                 )),
@@ -517,7 +531,19 @@ class QdrantStore:
         hits = self._client.query_points(
             self.collection,
             prefetch=models.Prefetch(query=vec, limit=max(top_k * overfetch, top_k)),
-            query=models.FormulaQuery(formula=formula),
+            # D-162: `defaults` supplies created_at_iso for a point that
+            # has none. ensure_payload_indexes' docstring says such points
+            # "simply won't match a DatetimeKeyExpression built against a
+            # key they don't have" -- they do not fail to match, they
+            # abort the WHOLE query with "No value found for created_at_iso
+            # in the payload nor the formula defaults". One pre-P2-10 point
+            # (created_at written, created_at_iso not) was enough to make
+            # every server-side retrieval raise. Defaulting to now reads
+            # that point as age 0, i.e. decay 1.0, which is the same
+            # fallback search() already applies with
+            # `payload.get("created_at", now)`.
+            query=models.FormulaQuery(
+                formula=formula, defaults={"created_at_iso": target_iso}),
             limit=top_k,
         ).points
 

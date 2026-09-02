@@ -63,13 +63,37 @@ def passes_evidence_gate(score: float, floor: float) -> bool:
     return score > floor
 
 
+# D-164: which provenances count as A DOCUMENT. One tuple, one home --
+# every reader of this idea goes through has_grounded_evidence below.
+#
+# "mcp" WAS in this tuple and never once matched. The corpus MCP server's
+# tool schema returns text only (`return [e.content for e in evidence]`),
+# discarding the score its own HybridRetriever computed, so assembly.py
+# stamps every MCP item with `unscored_score=settings.min_evidence_score`
+# -- exactly the floor -- and passes_evidence_gate above is a strict `>`.
+# The conjunction could therefore never be true, which made this arm dead
+# code and `chain_answered_mcp` a counter that could not increment. Live
+# corroboration, run p205.290-check: 21 mcp evidence items, and
+# `tier_answers {"web": 7}` -- MCP answered nothing at all.
+#
+# Removing it is the HONEST half of a choice, not a downgrade of MCP. The
+# other half -- have the server send the scores it already has, making
+# tier 3 a real document tier as README's ladder table always claimed --
+# is a wire-format change to a declared public interface and was
+# deliberately deferred. Until then this tuple says what the code does.
+# `make_mcp_tool`'s own docstring has always agreed: a score that cannot
+# be raised above the threshold is a tier that corroborates, never covers.
+GROUNDING_SOURCES = ("corpus",)
+
+
 def has_grounded_evidence(goal_id: str, goal_terms: set,
                           evidence: List[Evidence], min_score: float) -> bool:
     """True if a REAL DOCUMENT, actually about this goal, covers it (G2/D-47).
 
     Three conjuncts, none of them redundant:
-      - source in ("corpus", "mcp") -- a document, not recollection and not
-        a web snippet (D-57: web COVERS but never GROUNDS).
+      - source in GROUNDING_SOURCES -- a document, not recollection and not
+        a web snippet (D-57: web COVERS but never GROUNDS). D-164 removed
+        "mcp" from that tuple; see its comment for why it never matched.
       - score above the coverage floor -- passes_evidence_gate above, so
         this and the post-fusion coverage gate can never disagree.
       - shares distinctive vocabulary with the goal's own description --
@@ -87,7 +111,7 @@ def has_grounded_evidence(goal_id: str, goal_terms: set,
     every caller shares one comparison and one floor.
     """
     return any(
-        e.goal_id == goal_id and e.source in ("corpus", "mcp")
+        e.goal_id == goal_id and e.source in GROUNDING_SOURCES
         and passes_evidence_gate(e.score, min_score)
         and (not goal_terms or goal_terms & distinctive_terms(e.content))
         for e in evidence)

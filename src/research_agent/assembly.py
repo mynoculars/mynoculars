@@ -245,7 +245,13 @@ def build_app_and_settings(tracer=None):
     # this is still one ToolFn. mcp_tool is ALSO still passed separately,
     # so an explicit tool_hint="mcp" (D-25) keeps routing straight to the
     # specialist node, bypassing the ladder, exactly as before.
-    model_tool = (make_model_knowledge_tool(router, settings.model_knowledge_score)
+    # D-163: the coverage floor is passed in, so this tier admits exactly
+    # the claims it can actually converge a goal with -- see
+    # make_model_knowledge_tool for the band that used to be retrieved,
+    # prompted and permanently inert.
+    model_tool = (make_model_knowledge_tool(
+                      router, settings.model_knowledge_score,
+                      min_evidence_score=settings.min_evidence_score)
                   if settings.model_knowledge_enabled else None)
     tool = make_retrieval_chain(
         corpus_tool, settings.min_evidence_score,

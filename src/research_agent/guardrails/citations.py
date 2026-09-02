@@ -278,16 +278,71 @@ _MIN_GLUED_WORDS = 6
 _URL_GUARD_CHARS = 60
 
 
+def _token_around(report: str, start: int) -> str:
+    """The whitespace-delimited token containing offset `start`."""
+    left = report.rfind(" ", 0, start) + 1
+    left = max(left, report.rfind("\n", 0, start) + 1)
+    right = min((i for i in (report.find(" ", start), report.find("\n", start))
+                 if i != -1), default=len(report))
+    return report[left:right]
+
+
+def _fenced_spans(report: str):
+    """(start, end) of every ``` fenced block, so code can be skipped."""
+    spans = []
+    opened = None
+    for match in re.finditer(r"^```.*$", report, re.MULTILINE):
+        if opened is None:
+            opened = match.start()
+        else:
+            spans.append((opened, match.end()))
+            opened = None
+    if opened is not None:            # unterminated fence: to end of report
+        spans.append((opened, len(report)))
+    return spans
+
+
 def _confirmed_glue_sites(report: str):
     """Yield the offset of every confirmed glue site, left to right.
 
     One definition, read by both the repair and the residual counter, so
     the two can never disagree about what a glue site is -- the same rule
     residual_paste_sites states for itself.
+
+    D-162 added the last two guards, after the pass was measured doing
+    this to ordinary prose:
+
+        standardised on TensorFlow  ->  standardised on Tensor. Flow
+        taken from OpenStreetMap    ->  taken from OpenStreet. Map
+
+    The signature was tightened against a control set (eBay, LinkedIn,
+    McKinsey, PayPal, iPhone, PostgreSQL) whose members all carry three
+    lowercase letters or fewer before the capital, so `[a-z]{4}` excluded
+    every one of them. A very large class of real names has four or more
+    and was never tested: PowerPoint, PowerShell, MasterCard, SharePoint,
+    TensorFlow, OpenStreetMap. The claim that a false positive "can never
+    cost a sentence" held; what it costs is a full stop inside a product
+    name, in the deliverable, which is its own kind of wrong.
+
+    THE DISCRIMINATOR IS THE TOKEN'S FIRST LETTER, not the boundary. A
+    glued sentence ends with an ordinary lowercase word ("...in memory" +
+    "The eviction..."), so its token starts lowercase; a CamelCase proper
+    noun is capitalised at the start. That is cheap, needs no dictionary,
+    and fails in the safe direction -- a sentence genuinely glued onto a
+    capitalised proper noun ("...visited ParisThe next day...") is now
+    left alone, which costs a missing full stop rather than a broken
+    name. Code fences are skipped for the same asymmetry: `maxmemoryPolicy`
+    in an ini block is a key, not two sentences.
     """
+    fences = _fenced_spans(report)
     for match in _GLUED_SENTENCE_RE.finditer(report):
         start = match.start()
         if "http" in report[max(0, start - _URL_GUARD_CHARS):start]:
+            continue
+        if any(lo <= start < hi for lo, hi in fences):
+            continue
+        token = _token_around(report, start)
+        if token[:1].isupper():
             continue
         end_match = _SENTENCE_END_RE.search(report, start)
         if end_match is None:

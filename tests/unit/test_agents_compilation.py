@@ -2133,3 +2133,116 @@ def test_the_verdict_is_checked_against_the_evidence_the_critic_saw():
 
     assert len(seen["evidence"]) < len(_ROUNDING_EVIDENCE), \
         "the budget must have dropped an item for this test to mean anything"
+
+
+# ---------------------------------------------------------------------------
+# D-162 -- the glue repair must not split a proper noun
+# ---------------------------------------------------------------------------
+
+
+def test_glue_repair_leaves_camelcase_product_names_alone():
+    """The signature was measured against eBay / LinkedIn / McKinsey /
+    PayPal / iPhone / PostgreSQL, all of which carry three lowercase
+    letters or fewer before the capital and so could never match. Names
+    with four or more were never tested, and were being split:
+
+        standardised on TensorFlow -> standardised on Tensor. Flow
+    """
+    from research_agent.guardrails.citations import (repair_glued_sentences,
+                                                     residual_glue_sites)
+
+    for report in (
+        "The team standardised on TensorFlow for training and on PowerPoint "
+        "for the quarterly deck [g1].",
+        "Routing data is taken from OpenStreetMap, and payment rails run "
+        "through MasterCard settlement [g2].",
+        "Deployment is scripted in PowerShell and documented in SharePoint "
+        "for the operations team [g1].",
+    ):
+        out, counters = repair_glued_sentences(report)
+        assert out == report, out
+        assert counters == {}
+        assert residual_glue_sites(report) == 0
+
+
+def test_glue_repair_still_repairs_a_genuinely_glued_sentence():
+    """The discriminator is the TOKEN'S first letter, not the boundary: a
+    glued sentence ends on an ordinary lowercase word, a CamelCase proper
+    noun is capitalised at the start. This is the case that must keep
+    working."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    out, counters = repair_glued_sentences(
+        "The cache holds session objects in memoryThe eviction policy is "
+        "LRU by default [g1].")
+
+    assert out == ("The cache holds session objects in memory. The eviction "
+                   "policy is LRU by default [g1].")
+    assert counters == {"citations_glued_sentences_repaired": 1.0}
+
+
+def test_glue_repair_skips_fenced_code():
+    """`maxmemoryPolicy` in an ini block is a key, not two sentences."""
+    from research_agent.guardrails.citations import repair_glued_sentences
+
+    report = ("Configuration below [g1].\n\n```ini\n"
+              "maxmemoryPolicy allkeys-lru and six more words follow here.\n```\n")
+    out, counters = repair_glued_sentences(report)
+
+    assert out == report
+    assert counters == {}
+
+
+def test_citations_attached_describes_the_shipped_report_not_the_whole_run():
+    """D-162. `state.counters` SUMS across every compile (merge_counters),
+    so a run whose FIRST draft needed D-144's rescue and whose FINAL draft
+    the model cited itself reported the stale 1 from the first draft.
+    confidence.py caps that at 60 (MODERATE) with the reason "the model
+    wrote none of them" -- about a report where the model wrote all of
+    them. Its neighbour `evidence_cited` was already read from the
+    artifact; this now is too."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(
+        raw_query="Compare Redis and Memcached",
+        goals=[Goal(goal_id="g1", description="Compare them")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           score=0.99, content="Redis is an in-memory store")],
+        final_report="# Report\n\nRedis persists to disk [g1].\n",
+        recall_score=1.0, iteration_depth=1,
+        # the first compile attached one marker; the LAST attached none
+        counters={"citations_attached": 1.0},
+        last_compile_guardrails={})
+
+    telemetry = node(state)["telemetry"]
+
+    assert telemetry["citations_attached"] == 0, (
+        "the shipped report's own markers were written by the model")
+    assert telemetry["confidence"]["band"] != "MODERATE" or not [
+        r for r in telemetry["confidence"]["reasons"]
+        if "attached deterministically" in r], (
+        "a self-cited report must not be capped as machine-attributed")
+
+
+def test_citations_attached_still_reports_a_real_rescue():
+    """The other direction: when the SHIPPED report's markers really were
+    attached by D-144, the cap must still fire."""
+    from research_agent.agents.compilation import build_telemetry_node
+    from research_agent.config import Settings
+
+    node = build_telemetry_node(Settings(_env_file=None))
+    state = ResearchState(
+        raw_query="Compare Redis and Memcached",
+        goals=[Goal(goal_id="g1", description="Compare them")],
+        evidence=[Evidence(task_key="t1", goal_id="g1", source="corpus",
+                           score=0.99, content="Redis is an in-memory store")],
+        final_report="# Report\n\nRedis persists to disk [g1].\n",
+        recall_score=1.0, iteration_depth=1,
+        counters={"citations_attached": 5.0},
+        last_compile_guardrails={"citations_attached": 1.0})
+
+    telemetry = node(state)["telemetry"]
+
+    assert telemetry["citations_attached"] == 1

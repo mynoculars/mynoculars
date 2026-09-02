@@ -510,3 +510,70 @@ def test_the_corpus_tools_own_counters_still_come_through():
 
     assert counts["retrieval_dense_calls"] == 1.0
     assert counts["chain_answered_corpus"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# D-162 -- the model tier's provider calls must reach telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_the_model_tier_s_router_counters_reach_the_worker_s_drain():
+    """Every LLM call in this system happens in a NODE, and every node
+    does `**router.drain_counters()` right after it. The model tier calls
+    the router from inside a fanned-out search_worker instead, where no
+    such line exists -- so its provider calls and token counts stayed on
+    that worker thread's threading.local and were never merged into
+    state.counters. D-86's llm_total_tokens under-reported, and D-132's
+    RUN_TOKEN_BUDGET could not see model-tier spend at all."""
+    from research_agent.llm.router import FallbackRouter
+    from research_agent.state import SearchTask
+    from research_agent.tools.model_knowledge import make_model_knowledge_tool
+    from research_agent.tools.retrieval_chain import make_retrieval_chain
+
+    class _Client:
+        name = "stub"
+
+        def set_trace_node(self, node):
+            pass
+
+        def complete(self, messages, temperature=0.2):
+            return '{"claims": [{"text": "A stable fact.", "confidence": 0.9}]}'
+
+        def complete_json(self, messages, temperature=0.0):
+            import json
+            return json.loads(self.complete(messages, temperature))
+
+    router = FallbackRouter([_Client()], quality_threshold=0.6)
+    chain = make_retrieval_chain(
+        lambda task: [], 0.5,
+        model=make_model_knowledge_tool(router), reformulate=False)
+
+    evidence = chain(SearchTask(key="k1", query="anything", goal_id="g1"))
+    counts = chain.drain_retrieval_counts()
+
+    assert [e.source for e in evidence] == ["model"]
+    assert counts.get("llm_provider_calls") == 1.0, counts
+    # Draining is drain-not-peek, exactly like every node's own call.
+    assert "llm_provider_calls" not in chain.drain_retrieval_counts()
+
+
+def test_a_router_without_drain_counters_is_still_a_valid_model_tier():
+    """Duck-typed on purpose: several tests pass a hand-written object
+    with only complete_json, and a telemetry detail must not break them."""
+    from research_agent.state import SearchTask
+    from research_agent.tools.model_knowledge import make_model_knowledge_tool
+    from research_agent.tools.retrieval_chain import make_retrieval_chain
+
+    class _Bare:
+        def set_node(self, name):
+            pass
+
+        def complete_json(self, messages):
+            return {"claims": [{"text": "A stable fact.", "confidence": 0.9}]}
+
+    chain = make_retrieval_chain(
+        lambda task: [], 0.5,
+        model=make_model_knowledge_tool(_Bare()), reformulate=False)
+
+    assert [e.source for e in chain(SearchTask(key="k", query="q", goal_id="g1"))] == ["model"]
+    assert chain.drain_retrieval_counts() is not None

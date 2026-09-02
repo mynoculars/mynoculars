@@ -287,11 +287,38 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
     # tolerates the attribute being absent, so present-and-empty is
     # strictly more informative than absent.
     corpus_drain = getattr(corpus, "drain_retrieval_counts", None)
+    # D-162: the MODEL tier makes real LLM calls, and until now nobody
+    # collected them. Every other LLM call in this system happens in a
+    # NODE, and every node does `**router.drain_counters()` right after
+    # it. tools/model_knowledge.py calls the router from inside a
+    # fanned-out search_worker instead, where no such line exists -- so
+    # its llm_provider_calls, llm_fallback_hops, llm_prompt_tokens and
+    # llm_completion_tokens stayed on that worker thread's
+    # threading.local and were never merged into state.counters.
+    #
+    # Two things read those numbers and were therefore wrong whenever the
+    # ladder reached tier 5: D-86's llm_total_tokens (the run's only real
+    # cost figure) under-reported, and limits.py::tokens_used -- which
+    # D-132's RUN_TOKEN_BUDGET enforces against -- could not see model-tier
+    # spend at all, so a run could overrun a budget it was told to respect.
+    #
+    # Drained through the EXISTING seam rather than a new one, exactly as
+    # D-87 added the tier counters: same attribute, same single call in
+    # search_worker, no node and no contract changes. Thread-safety is
+    # inherited -- FallbackRouter's counters are thread-local and the
+    # worker drains on the same thread that made the call.
+    model_drain = getattr(model, "drain_router_counts", None)
 
     def drain_retrieval_counts() -> Dict[str, float]:
         counts: Dict[str, float] = (dict(corpus_drain())
                                     if corpus_drain is not None else {})
         counts.update(_drain_tier_counts())
+        if model_drain is not None:
+            # ADDITIVE, not update(): the router reports llm_provider_calls
+            # under the same name a node would, and one task can reach the
+            # model tier while the corpus tier already contributed counts.
+            for key, value in model_drain().items():
+                counts[key] = counts.get(key, 0.0) + value
         return counts
 
     retrieval_chain.drain_retrieval_counts = drain_retrieval_counts  # type: ignore[attr-defined]

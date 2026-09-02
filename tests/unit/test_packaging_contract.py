@@ -173,3 +173,27 @@ def test_requirements_and_pyproject_do_not_disagree_on_a_pin():
                 f"{name}: requirements.txt pins {req[name]!r} but "
                 f"pyproject declares {spec!r} -- a consumer and a "
                 f"developer would install different versions")
+
+
+def test_no_env_example_key_is_assigned_twice():
+    """D-162: `LLM_FALLBACK_BASE_URL` was assigned twice, and dotenv takes
+    the LAST -- so editing the first one, the one under its own heading
+    and the first a reader meets, did nothing at all. It was invisible
+    only because both values happened to be identical.
+
+    No warning could have caught it: both spellings are correct, so
+    `warn_on_likely_env_typos` has nothing to compare them against. A
+    duplicate key is only ever a mistake in a file whose whole job is to
+    be copied and edited."""
+    from collections import Counter
+
+    keys = [line.split("=", 1)[0].strip()
+            for line in (REPO_ROOT / ".env.example").read_text(
+                encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#") and "=" in line]
+
+    duplicates = {key: n for key, n in Counter(keys).items() if n > 1}
+
+    assert not duplicates, (
+        f"assigned more than once in .env.example: {duplicates}. dotenv "
+        f"keeps the last, so every earlier assignment is silently dead.")

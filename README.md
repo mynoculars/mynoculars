@@ -17,7 +17,7 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
 > human-in-the-loop escalation. Nine phases of review are closed as of
-> this revision (`DECISIONS.md` D-1…D-161) -- correctness fixes,
+> this revision (`DECISIONS.md` D-1…D-165) -- correctness fixes,
 > structural simplification, and operational hardening. Release history,
 > prior test counts, and superseded claims from earlier revisions live in
 > [CHANGELOG.md](CHANGELOG.md), not here.
@@ -58,7 +58,8 @@ deliberately does not duplicate them:
 |---|---|
 | `OPERATIONS.md` | Install, the L1/L2/L3 run ladder, service startup, ingest, manual test recipes |
 | `internal/LEARNING_GUIDE.md` | Pedagogy — follow-one-query walkthrough, concept teaching, technical-evaluation framing (note: `internal/` is gitignored, so it ships only in archives) |
-| `internal/PHASE8-FEEDBACK-LOOP.md` | The most recent phase record (D-140…D-146): why a 15-minute test suite, an uncited report, a missing trust signal and unreadable code are one problem |
+| `internal/PHASE9-SHOWCASE-READINESS.md` | The most recent phase record (D-156…D-165): an outside review of the shipped ARCHIVE, one correction OF that review, and an audit that found seven further defects 1,202 passing tests could not see |
+| `internal/PHASE8-FEEDBACK-LOOP.md` | The phase before it (D-140…D-146): why a 15-minute test suite, an uncited report, a missing trust signal and unreadable code are one problem |
 | `design/Research_Agent_Design.md` | The full target architecture and D-1…D-30 rationale — a strict superset of this build |
 | **`README.md`** (this file) | What exists, how it is wired, what each store actually holds, and what is broken |
 
@@ -712,8 +713,12 @@ The diagram above is tier 1 of 5. If corpus search comes back below `min_evidenc
        │ _reformulate(), ≤6 words
        │ miss
   3  mcp                      standalone ──HTTP────► scripts/mcp_corpus_server.py
-       MCPBridge #1                                   "mcp"         YES
-       │ ...but that is the SAME ingested corpus, reached a second way
+       MCPBridge #1                                   "mcp"         no (D-164)
+       │ ...the SAME ingested corpus reached a second way -- but the
+       │ server's tool schema returns TEXT ONLY, dropping the score its
+       │ own retriever computed, so every item is stamped at exactly the
+       │ coverage floor and cannot pass a strict `>`. It corroborates in
+       │ the prompt; it never covers or grounds a goal.
        │ miss
   4  web    (Phase 4)         standalone ──HTTP────► scripts/mcp_web_search_server.py
        MCPBridge #2                                 └──► THE INTERNET
@@ -731,7 +736,7 @@ where it does rather than replacing tier 3.
 
 **The right-hand column is the honesty rail.** `recall` counts a goal
 answered by any tier; `grounded_score` (G2/D-47) and `corpus_recall` (D-43)
-count it answered *by a real document* — and only tiers 1–3 qualify. So a
+count it answered *by a real document* — and only tiers 1–2 qualify (D-164 removed tier 3; see the table above). So a
 run answered wholly from the web reads `recall 1.0 / grounded_score 0.0 /
 web_sourced_items 12`: visible rather than flattering. Tagging web results
 `source="mcp"` instead would have made every snippet inflate both metrics,

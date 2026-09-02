@@ -178,3 +178,70 @@ def test_empty_evidence_cannot_falsify_anything():
 
     assert passed is False
     assert counters == {}
+
+
+# ---------------------------------------------------------------------------
+# D-162 -- a section number is not a disputed figure
+# ---------------------------------------------------------------------------
+
+
+def _one_evidence(text):
+    from research_agent.state import Evidence, Volatility
+    return [Evidence(task_key="k", goal_id="g1", source="corpus", content=text,
+                     score=0.9, volatility=Volatility.SEMI_STABLE)]
+
+
+def test_a_coverage_note_citing_a_section_number_is_not_falsifiable():
+    """The live shape that made this module do the opposite of its job.
+
+    "section 2.1" is a LOCATION. It cleared MIN_FIGURE_CHARS, "2.1"
+    appeared in the evidence by coincidence, and the note therefore read
+    as refuted -- so a critic failure carrying nothing but a coverage
+    finding flipped to PASS and the report routed to memory_writer, which
+    D-24 exists to prevent."""
+    from research_agent.guardrails.critique import disputed_figures, resolve_verdict
+
+    note = ("Goal g3 (defence budgets) is never addressed; section 2.1 of "
+            "the report is missing entirely.")
+    evidence = _one_evidence("China fields approximately 2.1 million active personnel.")
+
+    assert disputed_figures(note) == set()
+    passed, notes, counters = resolve_verdict(False, [note], evidence, 0)
+    assert passed is False
+    assert notes == [note]
+    assert counters == {}
+
+
+def test_every_location_word_is_scrubbed_not_just_section():
+    from research_agent.guardrails.critique import disputed_figures
+
+    for phrase in ("section 2.1", "part 3.4", "step 12", "figure 4.2",
+                   "table 7.1", "item 15", "paragraph 3.2", "page 104",
+                   "goal 2.5", "appendix 1.1", "chapter 9.9", "line 250"):
+        assert disputed_figures(f"The report's {phrase} is missing.") == set(), phrase
+
+
+def test_a_real_figure_dispute_is_still_adjudicable_even_beside_a_section_ref():
+    """Deliberately narrow: only a number IMMEDIATELY after a location
+    word is dropped. A note disputing a figure must stay falsifiable, or
+    D-155's counterweight stops working for the case it was built for."""
+    from research_agent.guardrails.critique import disputed_figures, resolve_verdict
+
+    note = "The 2.1 million figure in section 3 merely restates the evidence."
+    evidence = _one_evidence("China fields approximately 2.1 million active personnel.")
+
+    assert disputed_figures(note) == {"2.1"}
+    passed, _notes, counters = resolve_verdict(False, [note], evidence, 0)
+    assert passed is True
+    assert counters == {"critique_notes_dismissed": 1.0}
+
+
+def test_a_figure_the_evidence_lacks_still_stops_the_flip():
+    from research_agent.guardrails.critique import resolve_verdict
+
+    note = "The report claims 9.87 million reservists, which no evidence supports."
+    evidence = _one_evidence("China fields approximately 2.1 million active personnel.")
+
+    passed, _notes, counters = resolve_verdict(False, [note], evidence, 0)
+    assert passed is False
+    assert counters == {}

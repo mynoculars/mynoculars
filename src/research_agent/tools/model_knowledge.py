@@ -37,6 +37,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
+from research_agent.guardrails.retrieval import passes_evidence_gate
 from research_agent.logging_setup import log_event
 from research_agent.prompts import templates
 from research_agent.state import Evidence, SearchTask, Volatility
@@ -151,9 +152,34 @@ def overspecific_span(text: str) -> Optional[str]:
 # corpus evidence always outranks recollection in the compiler's context.
 DEFAULT_MODEL_SCORE = 0.6
 
+# The bonus in the score formula below. Named because D-163's admission
+# rule and the score are now the same arithmetic and must stay so.
+CONFIDENCE_BONUS = 0.05
+
+# D-163: the confidence a claim must beat before this tier will even keep
+# it, INDEPENDENT of scoring. The derived rule below subsumes this at the
+# shipped thresholds; it survives for the low-floor configuration, where
+# `MIN_EVIDENCE_SCORE=0.1` would otherwise admit a claim the model itself
+# says it half-remembers. The module's stated principle -- an item the
+# model disowns is worse than no item -- is not a function of anyone's
+# threshold.
+MIN_SELF_REPORTED_CONFIDENCE = 0.5
+
+
+def score_for_confidence(confidence: float,
+                         score: float = DEFAULT_MODEL_SCORE) -> float:
+    """The Evidence.score a claim at `confidence` receives.
+
+    Extracted (D-163) so the admission rule can ASK this function rather
+    than re-derive its algebra -- the same M-1 reasoning that put
+    has_grounded_evidence and passes_evidence_gate in one place.
+    """
+    return round(min(score, score * confidence + CONFIDENCE_BONUS), 4)
+
 
 def make_model_knowledge_tool(router: Any, score: float = DEFAULT_MODEL_SCORE,
-                              max_claims: int = 4):
+                              max_claims: int = 4,
+                              min_evidence_score: float = 0.5):
     """Build a ToolFn backed by the LLM's own knowledge.
 
     CALLED BY   assembly.py, as the final tier handed to
@@ -174,6 +200,7 @@ def make_model_knowledge_tool(router: Any, score: float = DEFAULT_MODEL_SCORE,
             templates.model_knowledge(task.query, max_claims))
         claims = result.get("claims") or []
         evidence: List[Evidence] = []
+        dropped_inert = 0
         for claim in claims[:max_claims]:
             # The model is asked for {"text": ..., "confidence": 0..1}. A
             # bare string is accepted too: a malformed item is data, not a
@@ -193,23 +220,88 @@ def make_model_knowledge_tool(router: Any, score: float = DEFAULT_MODEL_SCORE,
             # Low-confidence recollection is dropped rather than scored
             # down: an item the model itself flags as shaky is worse than
             # no item, because it can still mark a goal covered.
-            if confidence < 0.5:
+            if confidence < MIN_SELF_REPORTED_CONFIDENCE:
+                continue
+            item_score = score_for_confidence(confidence, score)
+            # D-163: AND it must be able to do the job it was admitted for.
+            #
+            # The comment above states this tier's whole safety argument --
+            # a shaky item is dangerous BECAUSE it can still mark a goal
+            # covered. That argument silently stopped applying to half the
+            # admitted band. With the shipped 0.6/0.5 pair the score of a
+            # claim is `min(0.6, 0.6*conf + 0.05)`, and the coverage gate
+            # is a strict `>`, so:
+            #
+            #     conf 0.50 -> 0.35     conf 0.75 -> 0.50   (cannot cover)
+            #     conf 0.76 -> 0.506    conf 1.00 -> 0.60   (covers)
+            #
+            # Everything from 0.50 to 0.75 was retrieved, prompted, made
+            # citable -- and could never converge a goal. The module's own
+            # header says the opposite in as many words: model evidence
+            # "must clear settings.min_evidence_score ... so it can
+            # actually mark a goal covered -- otherwise this tier would
+            # produce evidence the coverage rule ignores [and] the gather
+            # loop would never converge". It did exactly that, and the
+            # loop paid for it: agents/gathering.py's `ladder_exhausted`
+            # is `not settings.model_knowledge_enabled`, so an
+            # inert-but-enabled tier also stopped the no-strong-evidence
+            # escalation from firing.
+            #
+            # ASKING THE GATE rather than inverting its algebra: the bar
+            # to be admitted and the bar to be useful are now one
+            # comparison, made by the same predicate progress_checker_node
+            # uses, so they cannot drift apart again the way two constants
+            # did. Re-tuning MIN_EVIDENCE_SCORE or MODEL_KNOWLEDGE_SCORE
+            # moves both at once and needs no second edit here.
+            #
+            # THE ALTERNATIVE IS CLOSED, NOT PENDING (D-165). Band-scoring
+            # this tier -- mapping confidence onto [floor, ceiling] the way
+            # websearch/scoring.py maps rank, so that everything admitted
+            # covers by construction -- was weighed in full and rejected:
+            # it would let a claim the model half-disowns converge a goal,
+            # and the band does not fit between min_evidence_score (0.5)
+            # and the web tier's floor (0.60) in any case. See DECISIONS.md
+            # "Closed, not pending". Do not re-derive it from first
+            # principles here; it has been derived.
+            if not passes_evidence_gate(item_score, min_evidence_score):
+                dropped_inert += 1
                 continue
             evidence.append(Evidence(
                 task_key=task.key, goal_id=task.goal_id, source="model",
                 content=text[:800],
                 # Scale within a narrow band so a confident recollection
                 # still cannot outrank a document both legs agreed on.
-                score=round(min(score, score * confidence + 0.05), 4),
+                score=item_score,
                 volatility=Volatility.SEMI_STABLE,
                 # Guardrail G3 -- deterministic, evaluated on the same
                 # text the model just produced, independent of (and not
                 # replacing) the confidence gate above.
                 hedge_specific=_looks_overspecific(text)))
         flagged = sum(1 for e in evidence if e.hedge_specific)
+        # D-163: `dropped_inert` is reported, never silent. A tier that
+        # keeps discarding claims for being unable to clear the coverage
+        # floor is telling you the two thresholds are mismatched, and
+        # config.py::warn_on_model_knowledge_inert says so at startup for
+        # the total case; this says it per call for the partial one.
+        #
+        # THE REMEDY IT POINTS AT IS TUNING THOSE TWO SETTINGS. A nonzero
+        # count here is not evidence for band-scoring this tier -- that
+        # design is closed, see D-165 -- it is evidence that
+        # MODEL_KNOWLEDGE_SCORE and MIN_EVIDENCE_SCORE disagree about
+        # what this tier is for.
         log_event(logger, "tool.model_knowledge", task=task.key,
                   claims=len(evidence), asked=len(claims),
+                  dropped_inert=dropped_inert,
                   hedge_specific=flagged)
         return evidence
 
+    # D-162: expose the router's own counters so the ladder can drain them
+    # (tools/retrieval_chain.py explains what was being lost and why the
+    # existing seam is the right one). getattr, not a direct reference:
+    # `router` is duck-typed here -- several tests pass a hand-written
+    # object with only complete_json -- and a tool that required a full
+    # FallbackRouter would break them for a telemetry detail.
+    drain = getattr(router, "drain_counters", None)
+    if drain is not None:
+        model_knowledge.drain_router_counts = drain  # type: ignore[attr-defined]
     return model_knowledge
