@@ -83,6 +83,67 @@ from research_agent.state import Evidence, SearchTask, Volatility
 logger = logging.getLogger(__name__)
 
 
+class McpTransportError(RuntimeError):
+    """A transport-level failure reaching the MCP server (D-159).
+
+    WHY THIS TYPE EXISTS, and it is not stylistic. An unreachable server
+    surfaces out of the anyio/httpx machinery this module sits on as
+    `asyncio.CancelledError` -- documented, and asserted, by
+    `test_mcp_bridge_surfaces_a_clear_error_for_an_unreachable_server`
+    since long before this class. Since Python 3.8 that class inherits
+    **BaseException, not Exception**, and this codebase's two containment
+    handlers are both `except Exception`:
+
+        tools/retrieval_chain.py::_try   "a dead tier is not a dead task"
+        agents/gathering.py::search_worker  "failure is data, not a crash"
+
+    So the one failure those handlers exist for was the one failure they
+    could not catch. Live, with MCP_ENABLED=true and the standalone server
+    not running (D-76 makes starting it your job, so this is an ordinary
+    Monday morning, not an exotic state), a run died at the first worker:
+    `langgraph.errors.NodeCancelledError: Node 'search_worker' raised
+    asyncio.CancelledError` -- raw traceback, exit 1, no report, no
+    telemetry, against a project whose headline claim is that it degrades
+    gracefully.
+
+    THE FIX IS HERE, NOT THERE. Widening those two handlers to
+    `except BaseException` would also swallow KeyboardInterrupt and
+    SystemExit -- a person's Ctrl-C would become a logged tier failure and
+    the run would carry on. Instead the conversion happens at THIS
+    boundary, where the fact that makes it safe is actually known: the
+    caller is a synchronous worker thread that is not running a coroutine
+    and cannot itself be cancelled, so a CancelledError arriving from the
+    bridge's OWN background loop is never this thread's cancellation -- it
+    is only ever a transport failure wearing a confusing type. Nothing
+    else is reclassified: KeyboardInterrupt, SystemExit and every ordinary
+    Exception pass through untouched.
+
+    RuntimeError rather than a bare Exception subclass so the existing
+    `raise RuntimeError(...)` for a closed bridge, three lines away, stays
+    the same category of thing to a caller that catches broadly.
+    """
+
+
+def _transport_failure(exc: BaseException, what: str, url: str
+                       ) -> Optional[McpTransportError]:
+    """Return the error to raise INSTEAD of `exc`, or None to re-raise it.
+
+    Pure and tiny on purpose: the rule it encodes -- "a CancelledError
+    crossing this boundary is a transport failure, anything else is
+    itself" -- is the whole of D-159, and it is asserted directly by its
+    own unit tests rather than inferred from a run.
+    """
+    if not isinstance(exc, asyncio.CancelledError):
+        return None
+    return McpTransportError(
+        f"MCP {what} against {url!r} failed at the transport layer "
+        f"({type(exc).__name__}: {exc}). The usual cause is that no "
+        f"server is listening there -- D-76 makes starting it your job, "
+        f"so check that the process is up and that the URL and port "
+        f"match. `python scripts/check_services.py` reports this row "
+        f"directly.")
+
+
 class MCPBridge:
     """Owns one persistent background event loop + one persistent
     Streamable-HTTP-connected ClientSession, for the process's lifetime.
@@ -177,6 +238,18 @@ class MCPBridge:
                 f"MCP server '{self._url}' did not become ready within "
                 f"{self._startup_timeout}s")
         if self._start_error is not None:
+            # D-159: the connect failure is stored as a BaseException (see
+            # _run_loop's `except BaseException`, which is correct -- it
+            # must not let a CancelledError kill the background thread
+            # silently). Re-raising it verbatim is what let a BaseException
+            # escape into the graph. See McpTransportError for why the
+            # conversion belongs here and not in the two callers.
+            transport = _transport_failure(self._start_error, "connect", self._url)
+            if transport is not None:
+                log_event(logger, "mcp.transport_unavailable",
+                          level=logging.WARNING, url=self._url, phase="connect",
+                          reason=type(self._start_error).__name__)
+                raise transport from self._start_error
             raise self._start_error
 
     def _run_loop(self) -> None:
@@ -377,6 +450,18 @@ class MCPBridge:
                       tool=name, elapsed_s=round(elapsed, 1),
                       timeout_s=timeout_seconds, arguments=args_preview)
             raise TimeoutError(message) from None
+        except asyncio.CancelledError as exc:
+            # D-159, the OTHER door: start() covers a server that was down
+            # when the bridge connected; this covers one that dies, or is
+            # restarted, DURING a call -- the coroutine's cancellation
+            # crosses back through future.result() with the same
+            # BaseException type and the same consequence. (Since 3.8
+            # concurrent.futures.CancelledError IS asyncio.CancelledError,
+            # so this one clause covers both origins.)
+            log_event(logger, "mcp.transport_unavailable", level=logging.WARNING,
+                      url=self._url, phase="call_tool", tool=name,
+                      reason=type(exc).__name__)
+            raise _transport_failure(exc, f"call_tool({name!r})", self._url) from exc
 
     def list_tools(self, timeout_seconds: float = 30.0) -> List[str]:
         """Ask the server which tools it actually exposes. Returns names.

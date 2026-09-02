@@ -778,3 +778,79 @@ def test_the_router_skips_correctly_once_the_window_is_learned():
     client._learn_context_limit(P205_282_BODY)
     assert router._skips_for_context(client, messages) is True
 
+
+
+# ---------------------------------------------------------------------------
+# D-156 — StubClient must answer every STRUCTURED task this codebase emits
+# ---------------------------------------------------------------------------
+
+
+def test_every_structured_task_tag_has_a_canned_stub_answer():
+    """The regression that would have caught D-156 at the source.
+
+    prompts/templates.py is the only place a "TASK=<tag>" line is written,
+    and StubClient._CANNED is the only place one is answered. Nothing tied
+    the two together, so `TASK=recall` shipped with no entry and every
+    offline run's tier-5 call raised JSONDecodeError instead of returning
+    evidence.
+
+    Read out of the TEMPLATE SOURCE, not out of a hand-maintained list:
+    a list would have to be updated by the same person who forgot the
+    canned answer. `compile` is the one deliberate exclusion -- it is the
+    single FREE-TEXT call in the codebase (complete(), never
+    complete_json()), and StubClient answers it with the placeholder
+    report, so requiring a JSON entry for it would be wrong rather than
+    merely unnecessary.
+    """
+    import re
+    from pathlib import Path
+
+    from research_agent.llm.client import StubClient
+    from research_agent.prompts import templates
+
+    source = Path(templates.__file__).read_text(encoding="utf-8")
+    emitted = set(re.findall(r"TASK=(\w+)", source))
+    free_text = {"compile"}
+
+    missing = emitted - free_text - set(StubClient._CANNED)
+
+    assert not missing, (
+        f"prompts/templates.py emits TASK={sorted(missing)} but "
+        f"StubClient._CANNED has no entry, so every offline run making "
+        f"that call raises JSONDecodeError instead of answering (D-156)")
+
+
+def test_the_model_knowledge_tier_answers_offline_instead_of_raising():
+    """The behaviour D-156 actually restores, exercised through the REAL
+    tool rather than by reading _CANNED back.
+
+    Two claims survive and one is dropped: the canned third carries
+    confidence 0.2, below make_model_knowledge_tool's own 0.5 floor, so
+    the confidence gate is demonstrable with zero services running."""
+    from research_agent.llm.client import StubClient
+    from research_agent.llm.router import FallbackRouter
+    from research_agent.state import SearchTask
+    from research_agent.tools.model_knowledge import make_model_knowledge_tool
+
+    tool = make_model_knowledge_tool(FallbackRouter([StubClient()], 0.6))
+
+    evidence = tool(SearchTask(key="k1", query="anything at all", goal_id="g1"))
+
+    assert len(evidence) == 2, "the 0.2-confidence claim must be dropped"
+    assert {e.source for e in evidence} == {"model"}
+    assert {e.goal_id for e in evidence} == {"g1"}
+    assert len({e.content for e in evidence}) == 2, (
+        "identical claims would be collapsed by guardrails/dedup.py and "
+        "silently become one item")
+
+
+def test_stub_recall_claims_never_trip_the_false_precision_guard():
+    """Guardrail G3 flags a year paired with a quantity. A canned claim
+    that tripped it would make every offline run insert a
+    `(unverified figure)` marker for a figure no model ever stated --
+    telemetry reporting a guardrail firing on its own fixture."""
+    from research_agent.llm.client import StubClient
+    from research_agent.tools.model_knowledge import overspecific_span
+
+    for claim in StubClient._CANNED["recall"]["claims"]:
+        assert overspecific_span(claim["text"]) is None, claim["text"]

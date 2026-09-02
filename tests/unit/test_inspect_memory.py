@@ -12,7 +12,6 @@ of that contract free to drift from the first.
 """
 
 import importlib.util
-import pathlib
 import time
 from unittest.mock import MagicMock
 
@@ -44,9 +43,16 @@ def _mock_store(points):
 
 
 def _load():
-    script_path = (pathlib.Path(__file__).parent.parent.parent
-                   / "scripts" / "inspect_memory.py")
-    spec = importlib.util.spec_from_file_location("inspect_memory", script_path)
+    # D-157: the implementation moved into the package
+    # (research_agent.ops.inspect_memory); scripts/ now holds a thin
+    # launcher, and loading THAT would exercise a six-line shim.
+    # find_spec locates the module WITHOUT executing it, and the fresh
+    # module object below is deliberate: several tests here assert on
+    # module-level caching, which a shared sys.modules entry would carry
+    # from one test into the next.
+    origin = importlib.util.find_spec("research_agent.ops.inspect_memory").origin
+    spec = importlib.util.spec_from_file_location(
+        "inspect_memory", origin)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

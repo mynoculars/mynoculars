@@ -45,11 +45,17 @@ def _mock_store(collection="test_collection"):
 
 def _load_gc_script():
     import importlib.util
-    import pathlib
 
-    script_path = (pathlib.Path(__file__).parent.parent.parent
-                  / "scripts" / "gc_memory.py")
-    spec = importlib.util.spec_from_file_location("gc_memory", script_path)
+    # D-157: the implementation moved into the package
+    # (research_agent.ops.gc_memory); scripts/ now holds a thin
+    # launcher, and loading THAT would exercise a six-line shim.
+    # find_spec locates the module WITHOUT executing it, and the fresh
+    # module object below is deliberate: several tests here assert on
+    # module-level caching, which a shared sys.modules entry would carry
+    # from one test into the next.
+    origin = importlib.util.find_spec("research_agent.ops.gc_memory").origin
+    spec = importlib.util.spec_from_file_location(
+        "gc_memory", origin)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

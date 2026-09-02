@@ -28,8 +28,16 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 
 
 def _load():
+    # D-157: the implementation moved into the package
+    # (research_agent.ops.check_services); scripts/ now holds a thin
+    # launcher, and loading THAT would exercise a six-line shim.
+    # find_spec locates the module WITHOUT executing it, and the fresh
+    # module object below is deliberate: several tests here assert on
+    # module-level caching, which a shared sys.modules entry would carry
+    # from one test into the next.
+    origin = importlib.util.find_spec("research_agent.ops.check_services").origin
     spec = importlib.util.spec_from_file_location(
-        "check_services", REPO_ROOT / "scripts" / "check_services.py")
+        "check_services", origin)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

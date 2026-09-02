@@ -330,8 +330,9 @@ def main(argv=None) -> int:
                              "to logs/trace-<run_id>.txt (also enabled by "
                              "DEBUG_TRACE=true in .env).")
     parser.add_argument("--print-graph", action="store_true",
-                        help="Print the graph's TOPOLOGY (13 node names and "
-                             "how they're wired) — not a run's output. This "
+                        help="Print the graph's TOPOLOGY (every node THIS "
+                             "build wired, and how — 13 by default, 14 with "
+                             "MCP_ENABLED) — not a run's output. This "
                              "is static structure, unrelated to telemetry, "
                              "which summarizes what happened during a run. "
                              "Combine with a query to see it before running; "

@@ -16,17 +16,18 @@ to build agentic systems that degrade gracefully and improve with oversight.
 
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
-> human-in-the-loop escalation. Eight phases of review are closed as of
-> this revision (`DECISIONS.md` D-1…D-146) -- correctness fixes,
+> human-in-the-loop escalation. Nine phases of review are closed as of
+> this revision (`DECISIONS.md` D-1…D-161) -- correctness fixes,
 > structural simplification, and operational hardening. Release history,
 > prior test counts, and superseded claims from earlier revisions live in
 > [CHANGELOG.md](CHANGELOG.md), not here.
 >
 > **Test counts are deliberately not written down in this file.** Every
-> literal one went stale (three different numbers appeared in three
-> sections, against an actual 1,130), so the rule OPERATIONS.md already
-> adopted now applies here too: run the suite and read its own summary
-> line. `python -m pytest tests/ -q`.
+> literal one went stale -- three different numbers once appeared in three
+> sections, and the sentence that replaced them promptly went stale itself
+> by quoting a fourth (D-158). So the rule OPERATIONS.md already adopted
+> applies here too: run the suite and read its own summary line.
+> `python -m pytest tests/ -q`.
 
 
 ## Overview
@@ -295,7 +296,7 @@ change the graph's topology.
 | **The relevance floor had a second door (D-150)** | `MIN_SIMILARITY` gated only the dense leg; OpenSearch hits went straight into fusion. Live: BM25 matched a Redis document at `0.92` for *"organizational structures command hierarchies Chinese People's"* — on `command` and `structures` — putting **42 corpus + 36 mcp** items into a China-vs-India run. The floor's verdict now binds both legs: if every dense candidate fell below it, the corpus does not cover that query and the keyword hits go too | The obvious fix was **measured and rejected**: a `>=2` term-overlap gate drops the Redis hits correctly but also drops `in-corpus-operational` from this repo's own golden set, a query two documents genuinely answer in different words. 5 tests, including a replay of the live shape and one pinning single-leg degradation |
 | **The context setting no longer has to be right (D-151)** | `LLM_PRIMARY_CONTEXT_TOKENS` describes the SERVER and had drifted from it — `.env` said 8876, llama-server reported `n_ctx` 1536 — so D-93 stopped skipping and spent two guaranteed-failed calls where it used to spend two free skips. The real window is now read out of the provider's own 400 and used for the rest of the process. **D-143's note in `.env.example` caused this** by saying "the model's real window"; it is corrected to the `-c` the server was started with | 11 tests keyed off the exact body the server returned. A third defect surfaced while fixing it: `looks_like_context_overflow` never matched llama.cpp's phrasing at all — `"exceeds context"` does not occur in `"exceeds the available context size"` — so a textbook context rejection read as a generic bad request |
 | **One ratio, two meanings (D-152)** | `retrieval_floor_drop_ratio >= 0.8` capped confidence with *"retrieval was starved"*. For a query the corpus covers that names a real defect; for one it does not, the identical ratio is the floor working and the message sends someone to fix a correct threshold. `tier_answers` separates them | The **cap is unchanged** either way — an answer with no corpus behind it is LOW whichever the cause. Only the remedy differs, so only the wording does |
-| **Lint config and a test workflow (D-154)** | `[tool.ruff]` in `pyproject.toml`, selecting the rules that find bugs rather than express taste (`E4, E7, E9, F, W, B, C4`) — the repository passes them with **zero violations**. `.github/workflows/tests.yml` runs the suite and nothing else, so the badge means one legible thing | Reaching zero found 35 real defects, several from this phase: 11 unused imports, 3 dead locals, a `zip()` that would silently truncate an upsert, an `assert False` that `python -O` deletes, and 4 tests asserting a blind `Exception` that would pass for a typo in the test. What is *not* selected is recorded with its count and its reason |
+| **Lint config and a test workflow (D-154)** | `[tool.ruff]` in `pyproject.toml`, selecting the rules that find bugs rather than express taste (`E4, E7, E9, F, W, B, C4`) — the repository passes them with **zero violations**. `.github/workflows/tests.yml` runs the suite and nothing else, so the badge means one legible thing. `scripts/sanity.py` (D-158) is the same three checks run LOCALLY, before a demo, since CI tells you about a push and not about the machine you are standing at | Reaching zero found 35 real defects, several from this phase: 11 unused imports, 3 dead locals, a `zip()` that would silently truncate an upsert, an `assert False` that `python -O` deletes, and 4 tests asserting a blind `Exception` that would pass for a typo in the test. What is *not* selected is recorded with its count and its reason |
 | **A context window per provider (D-153)** | D-93 shipped `LLM_PRIMARY_CONTEXT_TOKENS` alone, reasoning that cloud fallbacks never refuse on size. True of the providers it was written for, not of the **slot** — D-114 lets the fallback point at any OpenAI-compatible endpoint, including a second local `llama-server`. New `LLM_MISTRAL_CONTEXT_TOKENS` and `LLM_FALLBACK_CONTEXT_TOKENS`, both defaulting to `0` so an existing `.env` routes byte-identically. Named for the slot, not the vendor | The architecture was already per-provider — `context_tokens` has always been per client, `_skips_for_context` has always read it with `getattr`, and D-151 already learns it per client. 14 tests, including one that drives a real three-provider chain of too-small windows and asserts the last is still attempted |
 | **The critic's verdict had no counterweight (D-155)** | `passed = bool(result.get("passed", False))` was the one LLM judgement here taken unconditionally. Live, the critic failed a correct report on four notes objecting to **faithful rounding** — *"approximately 2 million"* against evidence reading *"approximately 2 million to 2.1 million"* — while D-91's deterministic audit reported `cited_figures_unsupported: 0` on the same report. The prompt now states that restating an evidence figure in different words is not unfaithful (`critic` → `v2`), and `resolve_verdict` lets a failing verdict stand **unless every note disputes a figure the evidence the critic was shown actually contains** | It resolves a disagreement, it does not overrule: a note naming no figure is a coverage finding an LLM critic is *for*, it survives, and **one survivor stops the flip**. Never fires when D-91 flagged anything. `critic.failure_not_corroborated` at WARNING plus `critique_notes_dismissed` in `run_metrics`, so a resolved verdict is never mistaken for a clean pass. 20 tests, including a replay of the live notes |
 
@@ -770,8 +771,10 @@ that already has stale duplicate points in it from before the fix).
 ┌───────────────────────────┐         ┌────────────────────────────────────┐
 │ memory_retrieve node      │◄────────┤ Qdrant                             │
 │  similarity × decay,      │         │ collection: agent_semantic_memory  │
-│  goal_id NAMESPACED on    │         │ id = uuid4()   ── DUPLICATES ──    │
-│  the way out (P2-02)      │         │ vector: fastembed(content)         │
+│  goal_id NAMESPACED on    │         │ id = uuid5(content)  ── P2-15 ──   │
+│  the way out (P2-02),     │         │   OVERWRITES on exact repeat, and  │
+│  min_similarity floor     │         │   refreshes created_at when it does│
+│  (D-142)                  │         │ vector: fastembed(content)         │
 │                           │         │ payload: content, goal_id (RAW,    │
 │ memory_writer node        ├────────►│   unnamespaced — see note),        │
 │  ONLY after a PASSED      │         │          volatility, source_query, │
@@ -878,11 +881,21 @@ still fully deterministic on its input.
   this fix). This fix only stops *future* re-ingests from adding more. To
   get back to a clean state: `scripts/reset_stores.py --yes` (drops the
   collection), then re-ingest.
-- **Memory's accumulation is unchanged, and deliberately so** —
-  `memory_writer` still calls `upsert_texts` with no `id_fn`, and that's
-  intentional: it is meant to keep accumulating fresh evidence every passed
-  run, not collapse repeats. Deduping memory is a larger, separate piece of
-  work tracked as `P2-15`, not something P2-03 touches.
+- **Memory now uses the same identity, and P2-15 is where that landed.**
+  This bullet used to say the opposite — *"`memory_writer` still calls
+  `upsert_texts` with no `id_fn` … tracked as `P2-15`, not something P2-03
+  touches"* — and it was already wrong when D-158 caught it, contradicting
+  this same file's own D-31 row further down. `SemanticMemory.store_run`
+  passes `id_fn=lambda item: content_id(item["content"])`, so a fact
+  re-discovered by a later run **overwrites its own prior point in place**
+  rather than adding a second one, and that upsert refreshes the point's
+  `created_at`/`created_at_iso` (an upsert-by-id replaces the payload, it
+  does not merge) — so a fact that keeps being re-found keeps being
+  treated as fresh, which is the intended behaviour and not a side effect
+  to be surprised by. Live proof in any passed run's log:
+  `memory.stored count=24 new=0 overwritten=24`. A genuinely NEW fact is
+  still a new point, forever — `scripts/gc_memory.py` is the separate,
+  explicit pruning step for that.
 
 **Do the chunks match between Qdrant and OpenSearch?** Yes, now on both axes.
 Neither store chunks anything — one JSONL line becomes exactly one
@@ -1699,31 +1712,46 @@ research-agent-dmp/
 │                              literal count here goes stale on the next
 │                              added test — run `pytest -q` for the real
 │                              number).
-├── scripts/ingest_sample_data.py
-├── scripts/reset_stores.py  # wipe all three stores to pristine (see above)
-├── scripts/mcp_corpus_server.py  # real MCP server wrapping the corpus tool 
-│                                    (P2-13, off by default via MCP_ENABLED=false)
-├── scripts/mcp_web_search_server.py  # Phase 4 MCP server exposing web search
-│                                    (D-57, off by default via WEB_SEARCH_ENABLED=false)
-├── scripts/analyze_runs.py       # read-only: cross-run analysis over agent_runs
-│                                 (D-92) — which tier answers, how often the
-│                                 corpus grounds anything, what a run costs.
-│                                 The reader that made a separate "strategy
-│                                 memory" store unnecessary
-├── scripts/inspect_memory.py     # read-only: what long-term memory holds, and
-│                                 what it would recall for a given question (D-90).
-│                                 The only read path into memory that does not
-│                                 require running a full research query
-├── scripts/check_services.py     # health check: Qdrant/OpenSearch/Postgres/LLM/
-│                                 MCP/web-search/API (D-33). The web-search row is
-│                                 the ONLY live verification of that path — the
-│                                 test suite is entirely offline by design
-├── scripts/eval_suite.py       # golden-set regression harness (D-136):
-│                                 runs sample_data/golden_queries.jsonl against
-│                                 THIS deployment and checks each run's telemetry
-│                                 against bands written down in advance. NOT a
-│                                 pytest test and never becomes one — D-33 keeps
-│                                 the suite offline; this needs every service up
+│   ├── servers/             # D-157: the two standalone MCP servers, which
+│   │                        used to live in scripts/ and therefore shipped
+│   │                        in no wheel at all
+│   │   ├── corpus.py        # real MCP server wrapping the corpus tool
+│   │   │                      (P2-13, off by default via MCP_ENABLED=false)
+│   │   └── web_search.py    # Phase 4 MCP server exposing web search
+│   │                          (D-57, off by default via WEB_SEARCH_ENABLED=false)
+│   ├── ops/                 # D-157: everything you RUN against a deployment.
+│   │   │                    Same reason, same move — an installed package
+│   │   │                    that cannot ingest or be health-checked is not
+│   │   │                    an installable version of this project
+│   │   ├── _paths.py        # is there a checkout? the one place that answers
+│   │   ├── ingest.py        # corpus ingest into both stores (--corpus)
+│   │   ├── reset_stores.py  # wipe all three stores to pristine (see above)
+│   │   ├── analyze_runs.py  # read-only: cross-run analysis over agent_runs
+│   │   │                      (D-92) — which tier answers, how often the
+│   │   │                      corpus grounds anything, what a run costs.
+│   │   │                      The reader that made a separate "strategy
+│   │   │                      memory" store unnecessary
+│   │   ├── inspect_memory.py # read-only: what long-term memory holds, and
+│   │   │                      what it would recall for a given question (D-90).
+│   │   │                      The only read path into memory that does not
+│   │   │                      require running a full research query
+│   │   ├── gc_memory.py     # prune points decayed past usefulness (P2-15)
+│   │   ├── check_services.py # health check: Qdrant/OpenSearch/Postgres/LLM/
+│   │   │                      MCP/web-search/API (D-33). The web-search row is
+│   │   │                      the ONLY live verification of that path — the
+│   │   │                      test suite is entirely offline by design
+│   │   ├── eval_suite.py    # golden-set regression harness (D-136):
+│   │   │                      runs a golden set against THIS deployment and
+│   │   │                      checks each run's telemetry against bands
+│   │   │                      written down in advance. NOT a pytest test and
+│   │   │                      never becomes one — D-33 keeps the suite
+│   │   │                      offline; this needs every service up
+│   │   └── sanity.py        # the offline pre-demo gate (D-158). The one
+│   │                          command here that REQUIRES a checkout
+├── scripts/                 # ten thin launchers, one per command above, so
+│                            every `python scripts/<name>.py` in this document
+│                            and in OPERATIONS.md still works from a checkout
+│                            with no install (D-157)
 ├── sample_data/corpus.jsonl # 10 docs, Redis-vs-Memcached theme
 ├── sample_data/golden_queries.jsonl  # 8 eval cases: in-corpus, off-corpus,
 │                                 partial, nonsense, cost canary. Each states WHY
@@ -1815,14 +1843,47 @@ an installed dependency (`requirements.txt`), but `LANGFUSE_ENABLED=false`
 calls. Flip it on later per [Observability — Langfuse (Phase 3)](#observability--langfuse-phase-3).
 
 Defaults are `LLM_MODE=stub` with every store unreachable, so the first run
-reports `evidence_items: 0`. **That is success for L1** — the graph is proven,
-there is simply nothing to search yet. `OPERATIONS.md` walks you up from there.
+reports `corpus_recall: 0.0` and a confidence band of `UNRELIABLE` — the
+retrieval ladder walks to its last tier and answers from the model, and the
+honesty rail says so. **That is success for L1** — the graph is proven, there
+is simply nothing to *search* yet. `OPERATIONS.md` walks you up from there,
+and its Step 1b explains each number in that first block.
 
 ## Packaging
 
 `pyproject.toml` makes this repo an installable artifact. Until it existed,
 the only way to run this code was `PYTHONPATH=src` from inside a checkout,
 which gives a *separate* project nothing to depend on.
+
+> **⚠ Handing someone a ZIP is not the same as handing them the repo, and
+> `.gitignore` does not protect you there (D-158).** `.env` is correctly
+> gitignored, so it can never reach a clone, a `git archive`, or a push —
+> but a zip of the working directory carries it, with every live key in
+> it. That is how a real archive of this project shipped a Mistral key, a
+> cloud-fallback key, a Langfuse `pk-`/`sk-` pair, an OpenSearch password
+> and a Postgres DSN to a reviewer. Build the archive from an explicit
+> exclude list, never from "zip the folder":
+>
+> ```powershell
+> # PowerShell — everything except secrets, caches and run artifacts
+> $skip = @('.env','.venv','logs','tmp','build','dist','__pycache__',
+>           '.pytest_cache','.ruff_cache','.git')
+> Get-ChildItem -Force | Where-Object { $_.Name -notin $skip } |
+>   Compress-Archive -DestinationPath ..\research-agent.zip -Force
+> ```
+> ```bash
+> # bash — same list
+> zip -r ../research-agent.zip . \
+>   -x '.env' '.venv/*' 'logs/*' 'tmp/*' 'build/*' 'dist/*' \
+>      '*/__pycache__/*' '.pytest_cache/*' '.ruff_cache/*' '.git/*'
+> ```
+>
+> `internal/` is deliberately IN that archive and deliberately out of git
+> (see the document map above), which is exactly why `git archive HEAD` is
+> not the answer here and an explicit exclude list is. **Verify before you
+> send**: `unzip -l research-agent.zip | grep -i "\.env$"` should print
+> nothing. If a `.env` did go out, the fix is not a smaller zip — it is to
+> rotate every key that was in it.
 
 **Extras.** Each is optional because its code path is off by default *and*
 its import is lazy — checked against the source, not assumed:
@@ -1837,8 +1898,47 @@ its import is lazy — checked against the source, not assumed:
 | `[dev]` | pytest | — |
 | `[all]` | everything above | matches what `requirements.txt` installs today |
 
-**Console script.** `research-agent = research_agent.cli:main`, so an
-installed package exposes the CLI without `python -m`.
+**Console scripts — ten, not one (D-157).** Until that phase the wheel held
+the library and the CLI and *nothing else needed to operate them*: both MCP
+servers, corpus ingest, the health check, the golden-set harness, the store
+reset and the two memory tools all lived in `scripts/`, outside `src/`, and
+so were absent from every wheel. `pip install research-agent[all]` produced
+an installation that could not ingest a corpus, could not serve the MCP tier
+this document describes at length, and could not be health-checked — while
+this same section told a consumer to depend on it. The implementations moved
+into `research_agent.servers` and `research_agent.ops`.
+
+| Command | Runs | Needs |
+|---|---|---|
+| `research-agent` | the CLI (unchanged) | core |
+| `research-agent-mcp-corpus --port 8765` | the corpus MCP server | `[mcp]` |
+| `research-agent-mcp-web --port 8766` | the web-search MCP server | `[websearch]` |
+| `research-agent-ingest --corpus f.jsonl` | ingest into Qdrant + OpenSearch | core |
+| `research-agent-check` | the live-service health check | core |
+| `research-agent-eval --golden f.jsonl` | the golden-set harness | core |
+| `research-agent-analyze` | cross-run analysis over `agent_runs` | core |
+| `research-agent-reset --dry-run` | wipe the stores (destructive; `--yes`) | core |
+| `research-agent-gc-memory --dry-run` | prune decayed memory points | core |
+| `research-agent-inspect-memory` | read what memory holds | core |
+
+**`scripts/` did not go away**, and that is deliberate: each name there is
+now a six-line launcher that puts the repo's own `src` on `sys.path` and
+calls the same `main()`. Every `python scripts/<name>.py` in this document
+and in OPERATIONS.md still works from a checkout, with no install and no
+`PYTHONPATH`.
+
+**What is still NOT in the wheel, and why.** `sample_data/` — the ten Redis
+documents and the eight golden queries — stays in the repository only.
+Packaging it would put a second copy of a file the golden set asserts
+against into every install, and two copies of a calibration input is the
+drift this codebase avoids everywhere else. Instead the two commands that
+read it take a path: `--corpus` and `--golden` default to the repo's copies
+**when run from a checkout** and are *required* otherwise, which is what a
+real deployment wants anyway — nobody ingests this repo's ten Redis
+documents into their own system. `scripts/sanity.py` is the one command
+that refuses to run from an install at all, and says so: it lints this
+repository and runs its test suite, and an installed package contains
+neither.
 
 **Public API — what a MAJOR version bump is owed for.** Stated explicitly
 because "it's all importable" stops being an answer once another project
@@ -1848,7 +1948,10 @@ depends on you:
   research_agent.assembly     build_app_and_settings(), AppBundle
   research_agent.api.server   /research, /resume, /health, /state/{thread_id},
                               /result/{thread_id} request+response shapes
-  the `research-agent` console script's arguments
+  every console script's NAME and arguments — all ten (D-157), not just
+                              `research-agent`. A name in someone's Dockerfile
+                              or systemd unit breaks exactly as loudly as an
+                              import does
   the .env setting NAMES in config.py
 ```
 

@@ -14,15 +14,21 @@ the offline suite would be exactly the thing it exists to prevent.
 
 import importlib.util
 import json
-import pathlib
 
 import pytest
 
 
 def _load():
-    script_path = (pathlib.Path(__file__).parent.parent.parent
-                   / "scripts" / "eval_suite.py")
-    spec = importlib.util.spec_from_file_location("eval_suite", script_path)
+    # D-157: the implementation moved into the package
+    # (research_agent.ops.eval_suite); scripts/ now holds a thin
+    # launcher, and loading THAT would exercise a six-line shim.
+    # find_spec locates the module WITHOUT executing it, and the fresh
+    # module object below is deliberate: several tests here assert on
+    # module-level caching, which a shared sys.modules entry would carry
+    # from one test into the next.
+    origin = importlib.util.find_spec("research_agent.ops.eval_suite").origin
+    spec = importlib.util.spec_from_file_location(
+        "eval_suite", origin)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

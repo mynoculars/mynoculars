@@ -46,16 +46,14 @@ Exit codes:
 """
 
 import argparse
-import pathlib
 import sys
 
-# Resolve "src" RELATIVE TO THIS FILE, never relative to the current
-# working directory. `sys.path.insert(0, "src")` only resolved when the
-# process happened to be launched from the repo root -- not guaranteed
-# for a script launched as an MCP_SERVER_COMMAND subprocess, from a
-# Windows shortcut or scheduled task, or from any other directory --
-# and failed with an opaque ModuleNotFoundError when it did not.
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
+# D-157: the `sys.path.insert(..., '<repo>/src')` bootstrap that stood
+# here is gone, and so is the reason for it. This module lives INSIDE
+# the package now, so `research_agent` is importable by definition --
+# from a checkout on PYTHONPATH, from an editable install, and from a
+# wheel, without any of them being a special case. scripts/ keeps a
+# thin launcher of the same name for `python scripts/<name>.py`.
 
 from research_agent.config import get_settings              # noqa: E402
 from research_agent.logging_setup import configure_logging  # noqa: E402

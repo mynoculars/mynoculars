@@ -203,27 +203,94 @@ def test_mcp_bridge_surfaces_a_clear_error_for_an_unreachable_server():
     clearly, not hang -- proven against the REAL connection path, not a
     mock (a mock could never demonstrate a real connection failure).
 
-    BaseException, not Exception: an unreachable server surfaces as
-    asyncio.CancelledError (a BaseException subclass since Python 3.8,
-    not an Exception subclass) bubbling up from the underlying
-    anyio/HTTP machinery -- confirmed empirically, not assumed. MCPBridge
-    itself catches BaseException in _serve() for exactly this reason
-    (see that method's own except clause); this test matches it."""
-    from research_agent.tools.mcp_client import MCPBridge
+    **Exception, not BaseException, since D-159.** This assertion used to
+    read `pytest.raises(BaseException)`, with a docstring explaining that
+    an unreachable server surfaces as `asyncio.CancelledError` -- correct
+    about the SDK, and it made the test pass while the ACTUAL contract
+    this bridge owes its callers was broken: both containment handlers
+    downstream (`retrieval_chain._try`, `search_worker`) are
+    `except Exception`, so a BaseException escaped them and killed the
+    run. Pinning `Exception` here is not tightening a test about the
+    SDK's internals; it is asserting the one property those handlers
+    depend on."""
+    from research_agent.tools.mcp_client import McpTransportError, MCPBridge
 
     port = _free_port()  # freed immediately -- guaranteed nothing is listening
     bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
                        startup_timeout_seconds=5.0)
     try:
-        # B017 is deliberate here, unlike the four others this ruleset
-        # found: what an unreachable server raises comes from the MCP SDK's
-        # own transport, and pinning a type would make this a test about
-        # the SDK's internals rather than about the bridge failing loudly
-        # instead of hanging.
-        with pytest.raises(BaseException):  # noqa: B017
+        with pytest.raises(McpTransportError) as caught:
             bridge.call_tool("search", {"query": "x"}, timeout_seconds=5.0)
+        # The property that actually matters downstream.
+        assert isinstance(caught.value, Exception)
+        # The original is preserved rather than replaced -- a diagnosis
+        # that loses the underlying cause is a worse trade than the
+        # BaseException it fixed.
+        assert caught.value.__cause__ is not None
+        assert "check_services" in str(caught.value)
     finally:
         bridge.close()  # must not itself raise, even after a failed start
+
+
+def test_a_transport_cancellation_is_reclassified_and_nothing_else_is():
+    """D-159's whole rule, asserted directly rather than inferred from a
+    run. A CancelledError crossing the bridge boundary is a transport
+    failure; KeyboardInterrupt, SystemExit and ordinary exceptions are
+    themselves and must pass through untouched -- widening the callers'
+    `except Exception` to `except BaseException` is exactly the fix that
+    would have got this wrong."""
+    import asyncio
+
+    from research_agent.tools.mcp_client import (McpTransportError,
+                                                 _transport_failure)
+
+    converted = _transport_failure(asyncio.CancelledError("scope 1"),
+                                   "connect", "http://127.0.0.1:1/mcp")
+    assert isinstance(converted, McpTransportError)
+    assert isinstance(converted, Exception)
+
+    for passed_through in (KeyboardInterrupt(), SystemExit(),
+                           ValueError("ordinary"), TimeoutError("slow")):
+        assert _transport_failure(passed_through, "connect", "url") is None
+
+
+def test_a_dead_mcp_tier_degrades_to_the_next_tier_instead_of_killing_the_run():
+    """The failure D-159 was found by, end to end through the real ladder.
+
+    MCP_ENABLED=true with the standalone server not running is an
+    ordinary state -- D-76 makes starting it your job -- and it took the
+    whole run down: `NodeCancelledError: Node 'search_worker' raised
+    asyncio.CancelledError`, no report, no telemetry. A real bridge
+    against a real dead port, so the SDK's genuine failure path is what
+    is being contained, not a fake that raises a chosen type."""
+    from research_agent.state import Evidence, SearchTask, Volatility
+    from research_agent.tools.mcp_client import MCPBridge, make_mcp_tool
+    from research_agent.tools.retrieval_chain import make_retrieval_chain
+
+    def _empty_corpus(task):
+        return []
+
+    def _model(task):
+        return [Evidence(task_key=task.key, goal_id=task.goal_id,
+                         source="model", content="recollection", score=0.6,
+                         volatility=Volatility.SEMI_STABLE)]
+
+    port = _free_port()  # nothing is listening, and nothing will be
+    bridge = MCPBridge(url=f"http://127.0.0.1:{port}/mcp",
+                       startup_timeout_seconds=5.0)
+    try:
+        chain = make_retrieval_chain(
+            _empty_corpus, 0.5,
+            mcp=make_mcp_tool(bridge, "search", call_timeout_seconds=5.0),
+            model=_model, reformulate=False)
+
+        evidence = chain(SearchTask(key="k1", query="anything", goal_id="g1"))
+
+        assert [e.source for e in evidence] == ["model"], (
+            "the dead MCP tier must be logged and stepped over, not "
+            "allowed to end the run")
+    finally:
+        bridge.close()
 
 
 def test_mcp_tool_round_trips_through_a_real_streamable_http_server():

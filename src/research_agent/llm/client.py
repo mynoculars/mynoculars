@@ -1121,7 +1121,55 @@ class StubClient:
             {"query": "practical tradeoffs", "goal_id": "g2", "priority": 1},
         ]},
         "gaps": {"tasks": []},
+        # D-156: the model-knowledge tier (D-38 tier 5) had NO entry here,
+        # and that was not a cosmetic gap. prompts/templates.py::
+        # model_knowledge emits "TASK=recall", found nothing, fell through
+        # to the free-text placeholder report below, and complete_json then
+        # raised JSONDecodeError on it -- so EVERY offline run with no
+        # corpus reachable (i.e. OPERATIONS.md Step 1b, `run.bat`, and the
+        # first command any reviewer types) ended the ladder with
+        # `chain.tier_failed ... provider chain exhausted (json call): stub
+        # JSONDecodeError` and an E3 escalation stub. The graph was correct
+        # throughout -- D-16's posture caught the exception and degraded --
+        # but the offline demo's own output read as a defect in it.
+        #
+        # THREE CLAIMS, NOT TWO, and the third is the point: at confidence
+        # 0.2 it is below make_model_knowledge_tool's own 0.5 floor and is
+        # DROPPED, so a stub run's `tool.model_knowledge` line reads
+        # `asked=3 claims=2` and the confidence gate is visible offline
+        # rather than only in tests/integration/test_model_knowledge_
+        # fallback.py's hand-written stub (whose shape this deliberately
+        # mirrors).
+        #
+        # The text SAYS it is stub output. A canned claim that read like a
+        # real fact would be recollection-shaped content with no model
+        # behind it -- the precise confusion D-38's `source="model"` tag and
+        # D-43's corpus_recall exist to prevent, reintroduced by a test
+        # fixture. Distinct strings, because guardrails/dedup.py collapses
+        # identical content and two identical claims would silently become
+        # one. Neither pairs a year with a quantity, so neither trips
+        # tools/model_knowledge.py::overspecific_span -- stub output must
+        # not manufacture a hedge marker that nothing actually hedged.
+        "recall": {"claims": [
+            {"text": "Stub-mode recollection: this claim stands in for the "
+                     "model's own knowledge, and no document backs it.",
+             "confidence": 0.9},
+            {"text": "Stub-mode recollection: a second, distinct claim, so "
+                     "the compiler receives more than one citable item.",
+             "confidence": 0.85},
+            {"text": "Stub-mode recollection: deliberately low confidence, "
+                     "dropped before it can cover a goal.",
+             "confidence": 0.2},
+        ]},
         "critique": {"passed": True, "score": 0.9, "notes": []},
+        # D-156: D-95's claim verifier reaches this the same way the recall
+        # tier did -- CLAIM_VERIFICATION_ENABLED is off by default, so it
+        # was not reachable in a default stub run, but it is one setting
+        # away and would have failed identically. Empty `unsupported` is
+        # the fail-open answer verify_figures' own docstring specifies:
+        # a stub cannot judge paraphrase, so it clears nothing and
+        # manufactures no failure.
+        "verify_figures": {"unsupported": []},
         "quality": {"score": 0.9},
         # P2-12: empty by default — stub mode has no way to judge real
         # semantic conflict, so it deterministically reports nothing

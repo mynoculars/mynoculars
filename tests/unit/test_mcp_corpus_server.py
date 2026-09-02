@@ -33,11 +33,17 @@ pytest.importorskip("opensearchpy")
 
 def _load_mcp_corpus_server():
     import importlib.util
-    import pathlib
 
-    script_path = (pathlib.Path(__file__).parent.parent.parent
-                  / "scripts" / "mcp_corpus_server.py")
-    spec = importlib.util.spec_from_file_location("mcp_corpus_server", script_path)
+    # D-157: the implementation moved into the package
+    # (research_agent.servers.corpus); scripts/ now holds a thin
+    # launcher, and loading THAT would exercise a six-line shim.
+    # find_spec locates the module WITHOUT executing it, and the fresh
+    # module object below is deliberate: several tests here assert on
+    # module-level caching, which a shared sys.modules entry would carry
+    # from one test into the next.
+    origin = importlib.util.find_spec("research_agent.servers.corpus").origin
+    spec = importlib.util.spec_from_file_location(
+        "mcp_corpus_server", origin)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

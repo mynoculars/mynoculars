@@ -209,13 +209,22 @@ Cross them and you get three meaningful levels:
 
 | Level | LLM_MODE | Services | What you get | Use it to |
 |---|---|---|---|---|
-| **L1 — Skeleton** | `stub` | down | Graph runs end-to-end, but `evidence_items: 0`, `recall: 0.0`. Empty report. | Prove the plumbing works. First thing you run. |
+| **L1 — Skeleton** | `stub` | down | Graph runs end-to-end. Both retrieval legs are down, so the D-38 ladder walks to its LAST tier and answers from the model: `tier_answers {"model": 2}`, `corpus_recall 0.0`, confidence `UNRELIABLE`. Report is the stub placeholder. | Prove the plumbing works. First thing you run. |
 | **L2 — Real retrieval** | `stub` | **up + ingested** | Graph runs, workers actually retrieve from the corpus, `evidence_items > 0`, `recall > 0`. Report is stub text but telemetry is real. | See the RESEARCH loop do work. This is the one you're missing. |
 | **L3 — Full** | `live` | up + ingested | Real Qwen/Gemini writes the report from real retrieved evidence. | Demo / real use. Needs a running model. |
 
-**When you ran it and got `evidence_items: 0` — that was L1.** The machinery
-worked; there was just nothing to search. Everything below is about getting you
-to L2 (the honest "it researches" level) and then L3.
+**When you ran it and got `corpus_recall: 0.0` — that was L1.** The machinery
+worked; there was just nothing to *search*, so the ladder fell through to the
+model tier and the honesty rail said so in the deliverable. Everything below is
+about getting you to L2 (the honest "it researches" level) and then L3.
+
+> **D-156 changed what this level prints.** Before it, `TASK=recall` had no
+> canned stub answer, so tier 5 raised `JSONDecodeError`, every L1 run logged
+> `chain.tier_failed` twice and an `escalation.stub E3`, and the telemetry read
+> `evidence_items: 0, recall: 0.0`. The graph was behaving correctly the whole
+> time — it caught the exception and degraded — but its own first-run output
+> read like a fault in it. If you are following an older copy of this document,
+> the zeros it shows you are that version.
 
 ---
 
@@ -310,14 +319,20 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
 > checkout without an install still needs. See README.md's Packaging
 > section for the full extras table and the versioning policy.
 
-**What you should see** (this is L1 — note the zeros, they are EXPECTED here):
+**What you should see** (this is L1 — note the zeros AND the `UNRELIABLE`
+verdict; both are EXPECTED here):
 ```json
 {
   "intent": "Comparison",
   "goals": 2,
   "iterations": 1,
-  "evidence_items": 0,      <-- zero because no corpus is loaded yet
-  "recall": 0.0,            <-- zero for the same reason
+  "evidence_items": 4,      <-- 2 tasks x 2 surviving stub claims (D-156)
+  "recall": 1.0,            <-- every goal is COVERED...
+  "corpus_recall": 0.0,     <-- ...and none of it came from a document
+  "grounded_score": 0.0,    <-- same fact, the routing-side number (D-47)
+  "model_sourced_items": 4,
+  "tier_answers": {"model": 2},   <-- the D-38 ladder reached its LAST tier
+  "chain_tier_failures": 0,
   "llm_node_calls": 6,
   "llm_provider_calls": 6,  <-- stub mode: 1 attempt per node call, no fallbacks
   "llm_fallback_hops": 0,
@@ -326,7 +341,7 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "retrieval_keyword_calls": 2,
   "retrieval_leg_unavailable": 4, <-- both legs down, both counted, both tasks
   "producer_rejects": 0,
-  "search_calls": 2,        <-- workers RAN, they just found nothing
+  "search_calls": 2,        <-- workers RAN, the STORES found nothing
   "search_failures": 0,
   "memory_hits": 0,
   "memory_writes": 0,
@@ -334,16 +349,35 @@ python -m research_agent.cli "Compare Redis and Memcached for session caching"
   "critique_notes_dismissed": 0,  <-- D-155; a nonzero value is explained below
   "critique_passed": true, 
   "planning_error": null,
-  "escalations": []
-
+  "escalations": [],
+  "evidence_cited": 0,
+  "confidence": {"band": "UNRELIABLE", "score": 15}
 }
 ```
 
-`search_calls: 2` with `evidence_items: 0` is the signature of L1: the workers
-executed, retrieval degraded to empty because the stores are down.
-`retrieval_leg_unavailable: 4` is the newer, more direct way to see the same
-thing (P2-07) — 2 search calls × 2 unavailable legs each = 4, without having
-to infer it from zero evidence. **This is success for L1.**
+`search_calls: 2` with `corpus_recall: 0.0` is the signature of L1: the workers
+executed, both stores were down, and the retrieval ladder fell all the way
+through to the model tier — which is exactly what D-38 says it should do when
+no document can serve a goal. `retrieval_leg_unavailable: 4` is the direct
+form of the same fact (P2-07) — 2 search calls × 2 unavailable legs each = 4.
+**This is success for L1.**
+
+**`UNRELIABLE (15%)` is also success here, and it is worth understanding before
+you see it in a real run.** Three separate mechanisms are visible in that one
+word:
+
+- `recall 1.0` with `corpus_recall 0.0` — coverage without grounding. The
+  honesty rail (D-43/D-47) refuses to let "something answered every goal" read
+  as "documents answered every goal".
+- `evidence_cited: 0` — the stub's compile output is a fixed placeholder that
+  cites nothing, so D-145's `CAP_NO_CITATIONS` caps the verdict at 15 no matter
+  what else is good. A cap is not an average; nothing else can raise it.
+- `tool.model_knowledge ... asked=3 claims=2` in the log — the third canned
+  claim carries confidence 0.2 and is dropped below the 0.5 floor, so the
+  model tier's own confidence gate is observable with zero services running.
+
+An `UNRELIABLE` verdict on a placeholder report is the system working. What
+would be alarming is a *confident* verdict here.
 
 If Step 1a already passed (and you ran it, right?), you do not need to run the
 suite again here — the graph itself is proven sound; the problem, if any,
@@ -1398,6 +1432,25 @@ but every degradation writes a log line. When confused: read stderr.
 ---
 
 ## Step 5b — Verify: the three senses of "test"
+
+**0. Or run all of the offline ones at once (D-158):**
+```bash
+python scripts/sanity.py            # ruff, the suite, one L1 run — in cost order
+python scripts/sanity.py --quick    # same, minus the slow-marked socket test
+```
+This is the gate to run before a demo. It sets `PYTHONPATH` and
+`LLM_MODE=stub` for its child processes itself (your `.env` is never
+edited), stops at the first failure, and prints one summary block that
+cannot disagree with its own exit code. It never touches a store, a
+model, or the network; that question belongs to
+`scripts/check_services.py` above.
+
+**This does not replace `.github/workflows/tests.yml`** — that runs the
+suite on every push and answers *"did that commit break anything"*. This
+answers *"is the tree in front of me demo-ready"*, which is a different
+question in two ways that matter before a walkthrough: it sees
+uncommitted edits, which CI by definition cannot, and it performs an
+actual L1 run, which CI does not.
 
 **1. Run the unit/integration test suite (proves the logic):**
 ```bash
@@ -2672,10 +2725,16 @@ to jump straight to its prompt and raw response.
 
 ## Printing the LangGraph Topology
 
-`--print-graph` prints the compiled graph's **static wiring** — the 13 node
+`--print-graph` prints the compiled graph's **static wiring** — the node
 names and how they're connected — completely independent of running any
 query. This is not telemetry (a summary of what *happened*); it's the shape
 of the graph itself, unchanged from run to run.
+
+**13 nodes, or 14.** `mcp_search_worker` is registered only when
+`MCP_ENABLED=true` (P2-14/D-25 — see `orchestration/graph.py`'s
+`if mcp_tool is not None`), so this command is also the fastest way to
+confirm which build you are actually running: the `graph.compiled` log line
+reports the same count (`nodes: 13` or `nodes: 14`).
 
 ```powershell
 
@@ -2716,9 +2775,10 @@ $env:LLM_MODE = "stub"
 python -m research_agent.cli "test"
 ```
 
-If this prints a telemetry block at all (even with `evidence_items: 0`), the
-graph, the config, and your Python environment are all fine. See **Step 1 —
-Skeleton** above for exactly what a healthy result looks like.
+If this prints a telemetry block at all (even with `corpus_recall: 0.0` and an
+`UNRELIABLE` confidence band, which is the correct L1 verdict), the graph, the
+config, and your Python environment are all fine. See **Step 1 — Skeleton**
+above for exactly what a healthy result looks like, field by field.
 
 ### 2 — A dry run before resetting your stores
 
@@ -3302,6 +3362,33 @@ because it found nothing to search at all. This is easy to mistake for
 retrieval genuinely returning empty results (the L1 "skeleton" zeros); the
 tell is `search_failures` being non-zero rather than `evidence_items` simply
 being `0` with no failures recorded.
+
+### `mcp.transport_unavailable` — the MCP or web-search server is not running
+
+```json
+{"level": "WARNING", "msg": "mcp.transport_unavailable",
+ "url": "http://127.0.0.1:8765/mcp", "phase": "connect",
+ "reason": "CancelledError"}
+```
+
+Exactly what it says: `MCP_ENABLED=true` (or `WEB_SEARCH_ENABLED=true`) and
+nothing is listening at that URL. **D-76 makes starting those servers your
+job** — see "Running the MCP servers standalone" for the T7/T8 terminal
+setup — so this is ordinary, and the run does not stop for it: the tier is
+logged as failed (`chain.tier_failed`), the ladder steps to the next one,
+and you get a report with the honesty rail reporting what actually
+answered. Start the server, or set the flag to `false`, and it goes away.
+`python scripts/check_services.py` reports the same row before a run
+rather than during one.
+
+> **This used to end the run (D-159).** An unreachable server surfaces out
+> of the MCP SDK's transport as `asyncio.CancelledError` — a
+> **BaseException**, not an Exception — so both of this codebase's
+> containment handlers (`retrieval_chain._try`, `search_worker`) missed it
+> and the run died with `langgraph.errors.NodeCancelledError: Node
+> 'search_worker' raised asyncio.CancelledError`: raw traceback, exit 1, no
+> report, no telemetry. If you see THAT instead of the warning above, you
+> are on a build from before the fix.
 
 ### `"Deserializing unregistered type research_agent.state.Goal from checkpoint"` (WARNING, not an error)
 

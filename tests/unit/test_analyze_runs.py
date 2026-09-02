@@ -11,13 +11,19 @@ design, D-33) or a mock of psycopg deep enough to be testing the mock.
 """
 
 import importlib.util
-import pathlib
 
 
 def _load():
-    script_path = (pathlib.Path(__file__).parent.parent.parent
-                   / "scripts" / "analyze_runs.py")
-    spec = importlib.util.spec_from_file_location("analyze_runs", script_path)
+    # D-157: the implementation moved into the package
+    # (research_agent.ops.analyze_runs); scripts/ now holds a thin
+    # launcher, and loading THAT would exercise a six-line shim.
+    # find_spec locates the module WITHOUT executing it, and the fresh
+    # module object below is deliberate: several tests here assert on
+    # module-level caching, which a shared sys.modules entry would carry
+    # from one test into the next.
+    origin = importlib.util.find_spec("research_agent.ops.analyze_runs").origin
+    spec = importlib.util.spec_from_file_location(
+        "analyze_runs", origin)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

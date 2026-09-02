@@ -33,7 +33,12 @@
 #     research_agent.assembly   build_app_and_settings(), AppBundle
 #     research_agent.api.server the /research, /resume, /health request and
 #                               response shapes
-#     the `research-agent` console script's arguments
+#     every console script's NAME and arguments -- all ten of them since
+#                               D-157, not just `research-agent`. A name
+#                               baked into someone's Dockerfile or systemd
+#                               unit breaks as loudly as an import does
+#     research_agent.servers    the two MCP servers' --host/--port flags and
+#                               the tool names they expose over the wire
 #     the .env setting NAMES in config.py (renaming one breaks deployments)
 # Everything else -- agents/, orchestration/, retrieval/, prompts/, and the
 # internals of langfuse/ -- is internal and may change in a MINOR release.
@@ -116,8 +121,31 @@ all = [
     "grandalf>=0.8",
 ]
 
+# D-157: ten commands, not one. Until this phase the wheel contained the
+# library and the CLI, and NOTHING ELSE that this project needs to be
+# operated -- both MCP servers, corpus ingest, the health check, the
+# golden-set harness, the store reset and the two memory tools all lived
+# in scripts/, outside src/, so `pip install research-agent[all]`
+# produced an installation that could not ingest a corpus, could not
+# serve the MCP tier it documents, and could not be health-checked. The
+# implementations moved into research_agent.servers / research_agent.ops;
+# scripts/ keeps a thin launcher for each, so every documented
+# `python scripts/<name>.py` still works from a checkout.
+#
+# NAMES ARE PART OF THE PUBLIC INTERFACE, same as `research-agent`
+# itself -- see the versioning note above. Prefixed so an installed
+# environment's PATH stays legible about where they came from.
 [project.scripts]
 research-agent = "research_agent.cli:main"
+research-agent-mcp-corpus = "research_agent.servers.corpus:main"
+research-agent-mcp-web = "research_agent.servers.web_search:main"
+research-agent-ingest = "research_agent.ops.ingest:main"
+research-agent-check = "research_agent.ops.check_services:main"
+research-agent-analyze = "research_agent.ops.analyze_runs:main"
+research-agent-eval = "research_agent.ops.eval_suite:main"
+research-agent-reset = "research_agent.ops.reset_stores:main"
+research-agent-gc-memory = "research_agent.ops.gc_memory:main"
+research-agent-inspect-memory = "research_agent.ops.inspect_memory:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -180,7 +208,11 @@ include = ["research_agent*"]
 # NOT wired into CI yet, on purpose: .github/workflows/tests.yml runs the
 # test suite and nothing else, so a green badge means the tests pass and
 # says so honestly. Add ruff to that workflow when you want the badge to
-# mean both.
+# mean both -- or run it locally, which is what scripts/sanity.py does
+# (D-158): ruff, the suite and an offline run, in cost order, stopping at
+# the first failure. CI answers "did the push break it"; the local gate
+# answers "is the machine I am about to demo from in a good state", and
+# they are different questions.
 [tool.ruff]
 target-version = "py311"
 extend-exclude = ["internal", "logs", "tmp"]
