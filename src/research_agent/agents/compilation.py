@@ -27,15 +27,16 @@ from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
 from research_agent.config import Settings
 from research_agent.guardrails.annotations import strip_machine_annotations
-from research_agent.guardrails.citations import (residual_glue_sites,
-                                                 residual_paste_sites)
+# S-13: residual_paste_sites, residual_glue_sites,
+# report_carries_grounding_notice, has_grounded_evidence,
+# count_listed_sources and distinctive_terms all moved with the block that
+# used them, to reporting/report_metrics.py. audit_cited_figures and
+# cited_goal_ids_in_prose stay -- critic_node and
+# _confirm_unsupported_figures call them independently of telemetry.
 from research_agent.guardrails.claims import (audit_cited_figures,
                                               cited_goal_ids_in_prose)
 from research_agent.guardrails.critique import resolve_verdict
 from research_agent.guardrails.dedup import dedupe_evidence
-from research_agent.guardrails.grounding import report_carries_grounding_notice
-from research_agent.guardrails.retrieval import has_grounded_evidence
-from research_agent.guardrails.sources import count_listed_sources
 from research_agent.guardrails.truncation import report_carries_truncation_notice
 from research_agent.limits import (elapsed_seconds, run_budget_exhausted,
                                    tokens_used)
@@ -47,9 +48,9 @@ from research_agent.prompts.budget import budget_evidence, budget_notes
 from research_agent.reporting.confidence import score_report
 from research_agent.reporting.metrics import count_sections
 from research_agent.reporting.pipeline import PassContext, run_report_passes
+from research_agent.reporting.report_metrics import shipped_report_metrics
 from research_agent.reporting.telemetry import (llm_metrics, retrieval_metrics,
                                                 run_metrics)
-from research_agent.retrieval.terms import distinctive_terms
 from research_agent.state import ResearchState
 
 logger = logging.getLogger(__name__)
@@ -697,147 +698,26 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
         # the number that tells you how often the opportunity arises.
         #
         # D-12 holds: every figure below is counted from state, not judged.
-        goal_ids = [g.goal_id for g in state.goals]
-        # D-59: derived from the shipped report, not from the additive
-        # counter dict -- see the web_sources_listed entry below.
-        web_sources_listed = count_listed_sources(state.final_report)
-        web_sourced_items = sum(1 for e in state.evidence
-                                if e.source == "web")
-        # corpus_recall must apply the SAME topical gate the retrieval
-        # ladder uses (D-39), not just the score floor. Live (runs
-        # p205.99/.100-check) this reported corpus_recall 1.0 against a
-        # ten-document Redis corpus for queries about armies and about
-        # India vs the US: off-topic hits still cleared score > 0.5 via
-        # cross-leg agreement, so the one metric added specifically as the
-        # honesty counterpart to recall was fooled exactly the way the
-        # chain's sufficiency test used to be. A goal counts here only if a
-        # DOCUMENT both scored above the floor and shares vocabulary with
-        # that goal's own description -- has_grounded_evidence (M-1) is
-        # the single implementation of that predicate, shared with
-        # progress_checker_node and gap_generator_node in gathering.py, so
-        # this floor and theirs can never drift apart again the way a
-        # second, hardcoded `> 0.5` copy previously let them.
-        _goal_terms = {g.goal_id: distinctive_terms(g.description)
-                       for g in state.goals}
-        _doc_covered = {
-            g.goal_id for g in state.goals
-            if has_grounded_evidence(g.goal_id, _goal_terms[g.goal_id],
-                                     state.evidence, settings.min_evidence_score)}
-        corpus_recall = (round(len([g for g in goal_ids if g in _doc_covered])
-                               / len(goal_ids), 3) if goal_ids else 0.0)
-        evidenced = {e.goal_id for e in state.evidence}
-        goals_without_evidence = [g for g in goal_ids if g not in evidenced]
-        # Ratio, not just the list, so it is trendable across runs and
-        # comparable across queries with different goal counts. Guarded
-        # against a run that produced no goals at all (a planning failure),
-        # where 0/0 is undefined rather than perfect.
-        grounding_ratio = (
-            round((len(goal_ids) - len(goals_without_evidence)) / len(goal_ids), 3)
-            if goal_ids else 0.0
-        )
-        # Guardrail G1: aggregate, run-level view of retrieval/hybrid.py's
-        # per-query "retrieval.below_floor" log lines. A single dropped
-        # query is normal (that's the floor doing its job); a run where
-        # NEARLY EVERY dense candidate is dropped means min_similarity is
-        # starving the dense leg outright — live evidence (run
-        # p205.131-check) showed floor=0.55 dropping literally 100% of
-        # dense candidates all run, invisible outside raw debug logs.
-        # candidates=0 (no dense leg ever ran, or min_similarity=0.0 so
-        # this counter was never bumped) means "nothing to report", not
-        # "starved" — ratio stays 0.0 rather than a misleading 0/0.
-        # D-66 (backstop): the deterministic critic gate above is meant to
-        # stop a zero-citation report before it ships, but a run with HITL
-        # disabled and its revision budget exhausted still ships whatever
-        # the gate last rejected (raise_or_log's stub path -- "log loudly
-        # and ship the report unreviewed" is this codebase's existing
-        # posture for an exhausted budget, unchanged here). This is the
-        # last-line-of-sight check for that case: same shape as G1/G4/G7
-        # above, purely observational, WARNs rather than blocks. Gated
-        # off in stub mode for the same reason the critic gate is (see
-        # that block's comment) -- StubClient's fixed placeholder report
-        # never carries [gN] markers by design.
-        if (settings.llm_mode != "stub" and state.evidence
-                and not cited_goal_ids_in_prose(state.final_report)):
-            log_event(logger, "report.shipped_with_no_citations",
-                      level=logging.WARNING,
-                      evidence_items=len(state.evidence))
-        # D-85, same last-line-of-sight shape as the check just above:
-        # did a run whose corpus contributed too little actually ship
-        # saying so? Read from the SHIPPED report (D-59's rule), never
-        # from a counter -- compiler_node runs once per revision and its
-        # counters merge additively, so a counter here would describe the
-        # compile attempts rather than the artifact the reader received.
-        grounding_notice_shipped = report_carries_grounding_notice(
-            state.final_report)
-        # D-91: the cited-figure audit -- the third last-line-of-sight
-        # check on the SHIPPED report, alongside the two above. For every
-        # sentence that states a figure AND cites a goal, does any
-        # evidence under that goal actually contain the figure?
-        #
-        # Run HERE rather than in compiler_node for D-59's reason: this is
-        # a property of the artifact, and compiler_node runs once per
-        # revision with additively-merged counters, so a count taken there
-        # would describe the compile attempts (exactly the D-88 problem).
-        # Taken against state.final_report it is report-scoped by
-        # construction.
-        #
-        # Stub-gated like its two neighbours: StubClient's fixed
-        # placeholder report carries no [gN] markers by design, so there
-        # is nothing here for this to audit.
-        figure_findings: list = []
-        figure_counters: Dict[str, float] = {}
-        if settings.llm_mode != "stub":
-            figure_findings, figure_counters = audit_cited_figures(
-                state.final_report, state.goals, state.evidence)
-        if figure_findings:
-            log_event(logger, "report.unsupported_cited_figures",
-                      level=logging.WARNING,
-                      unsupported=len(figure_findings),
-                      checked=int(figure_counters.get(
-                          "cited_figures_checked", 0)),
-                      # Capped: a report can state many figures, and one
-                      # log line should stay readable. The full count is
-                      # the field above; telemetry carries the same
-                      # capped sample for the run record.
-                      examples=figure_findings[:5])
-        # D-99: what the paste guard LEFT, not what it removed. A run
-        # reporting 21 removals and a run reporting 21 removals with four
-        # pastes still standing are indistinguishable in telemetry
-        # otherwise -- and live (run p205.253-check) the second one is
-        # what shipped.
-        residual_pastes = 0
-        if settings.llm_mode != "stub":
-            residual_pastes = residual_paste_sites(state.final_report,
-                                                   state.evidence)
-        if residual_pastes:
-            log_event(logger, "report.residual_pasted_evidence",
-                      level=logging.WARNING, sites=residual_pastes,
-                      removed=int(state.last_compile_guardrails.get(
-                          "citations_pasted_evidence_removed", 0)))
-        # D-137: the same question asked of the OTHER signature. The
-        # counter above read 0 on two shipped reports carrying 9 and 22
-        # welded sentence joins, because a paste was the only thing it
-        # could see. This one reads the artifact with the signature that
-        # matched them, so a repair that stops working cannot present as
-        # a clean report.
-        residual_glue = 0
-        if settings.llm_mode != "stub":
-            residual_glue = residual_glue_sites(state.final_report)
-        if residual_glue:
-            log_event(logger, "report.residual_glued_sentences",
-                      level=logging.WARNING, sites=residual_glue,
-                      repaired=int(state.last_compile_guardrails.get(
-                          "citations_glued_sentences_repaired", 0)))
-        if (settings.llm_mode != "stub" and state.evidence and state.goals
-                and corpus_recall < settings.grounded_recall_target):
-            log_event(logger, "report.shipped_ungrounded",
-                      level=logging.WARNING,
-                      corpus_recall=corpus_recall,
-                      grounded_recall_target=settings.grounded_recall_target,
-                      notice_shipped=grounding_notice_shipped,
-                      web_sourced_items=web_sourced_items,
-                      model_sourced_items=int(
-                          evidence_by_source.get("model", 0)))
+        # S-13: the report-derived half of this node lives in
+        # reporting/report_metrics.py now. It computed eleven values and
+        # fired five last-line-of-sight WARNINGs across 140 lines here;
+        # D-146 split the counter-only half out for the same reason and
+        # stopped short of this one. Unpacked into locals rather than
+        # threaded through as a dict, deliberately: not one line of the
+        # telemetry literal below changed, which is what let a key-set
+        # comparison prove the contract survived intact.
+        report_metrics = shipped_report_metrics(state, settings,
+                                                evidence_by_source)
+        corpus_recall = report_metrics["corpus_recall"]
+        goals_without_evidence = report_metrics["goals_without_evidence"]
+        grounding_ratio = report_metrics["grounding_ratio"]
+        web_sources_listed = report_metrics["web_sources_listed"]
+        web_sourced_items = report_metrics["web_sourced_items"]
+        grounding_notice_shipped = report_metrics["grounding_notice_shipped"]
+        figure_findings = report_metrics["figure_findings"]
+        figure_counters = report_metrics["figure_counters"]
+        residual_pastes = report_metrics["residual_pastes"]
+        residual_glue = report_metrics["residual_glue"]
         retrieval_dense_candidates = int(c.get("retrieval_dense_candidates", 0))
         retrieval_dropped_by_floor = int(c.get("retrieval_dropped_by_floor", 0))
         retrieval_floor_drop_ratio = (

@@ -43,7 +43,7 @@ Python mechanics used in this file, if any of this is new to you:
 """
 
 import logging
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
@@ -59,7 +59,8 @@ from research_agent.logging_setup import log_event, run_id_var
 from research_agent.orchestration.contracts import validated_worker
 from research_agent.prompts import templates
 from research_agent.retrieval.terms import distinctive_terms
-from research_agent.state import Evidence, ResearchState, SearchTask, WorkerPayload
+from research_agent.state import (Evidence, Goal, ResearchState, SearchTask,
+                                  WorkerPayload)
 
 logger = logging.getLogger(__name__)
 
@@ -521,6 +522,156 @@ def _goal_has_any_evidence(goal_id: str, evidence: List[Evidence]) -> bool:
     return any(e.goal_id == goal_id for e in evidence)
 
 
+def _no_strong_evidence_exit(state: ResearchState, settings: Settings
+                             ) -> Optional[Dict[str, Any]]:
+    """The pre-LLM give-up guard (S-19). Returns an update dict when this
+    cycle should stop WITHOUT calling the model, else None.
+
+    Closes the third convergence-failure mode gap_generator_node's own
+    docstring describes. SINGLE_LEG_SCORE_CEILING (0.5) is not a new
+    threshold -- it is the exact score an RRF rank-0 hit gets when only
+    ONE retrieval leg answered, imported from the same constant
+    compile_report's grounding rule uses. A goal whose best evidence sits
+    at or below it has no document that both legs agreed on, which is the
+    cheapest available signal that the corpus may not genuinely cover it
+    -- verified against a live trace where every surviving hit for an
+    uncovered goal was exactly this shape (dense: 0, keyword-only,
+    fused <= 1).
+
+    Deliberately checked BEFORE the LLM call, not after: skipping the call
+    entirely means an off-topic run escalates one gather cycle earlier,
+    and never hands the model a prompt built to produce exactly the
+    failure mode being guarded against.
+
+    FOUR CONDITIONS, and each one is a live defect this guard once caused:
+
+    - `not state.human_guidance`. A human who redirects after exactly this
+      guard raised E2/E3 is giving the system new information the
+      retrieved evidence never had -- e.g. compare social and political
+      aspects after an economic query came back weak. Applying the guard
+      again after a redirect made it fire identically and silently ignore
+      the guidance, re-raising the SAME escalation with the SAME reason: a
+      human's explicit instruction to try something new was treated as
+      more of the evidence that caused the original failure. The guard
+      exists to stop the MODEL from free-associating off weak evidence; it
+      was never meant to override a HUMAN telling it what to search for.
+    - `not starving`. A goal that retrieved NOTHING is a retry candidate,
+      never a reason to give up: it has no misleading tail to
+      free-associate off, and a different query formulation is the entire
+      remedy. Live, run p205.68-check: g2 retrieved zero items, which made
+      the strong-evidence test vacuously False and fired this guard on the
+      exact case it was never written for.
+    - `ladder_exhausted`. D-38: with the model tier wired, "no strong
+      evidence" is never a reason to STOP -- there is always another tier
+      that has not been tried for the goals still uncovered. Giving up
+      here is what turned a retrieval limitation into "this cannot be
+      answered".
+    - `iteration_depth > 1`. D-3/D-14: the depth budget is this loop's
+      bound, and this guard must not pre-empt it on the FIRST cycle. Runs
+      p205.66/67/68-check all ended at "iterations": 1 with MAX_DEPTH
+      entirely unused, because this fired before the gap generator had
+      produced a single new query. Give the loop one real gap cycle; if
+      the evidence is STILL only single-leg afterwards, the corpus
+      genuinely lacks the topic.
+    """
+    uncovered = [g for g in state.goals if not g.covered]
+    weak_only = [g for g in uncovered
+                 if _goal_has_any_evidence(g.goal_id, state.evidence)]
+    starving = [g for g in uncovered if g not in weak_only]
+    ladder_exhausted = not settings.model_knowledge_enabled
+    if not (ladder_exhausted and weak_only and not starving
+            and not state.human_guidance
+            and state.iteration_depth > 1
+            and not any(_uncovered_goal_has_strong_evidence(g.goal_id,
+                                                            state.evidence)
+                        for g in weak_only)):
+        return None
+    log_event(logger, "node.gaps_skipped_no_strong_evidence",
+              uncovered_goals=[g.goal_id for g in weak_only],
+              depth=state.iteration_depth)
+    update = {"pending_tasks": [], "human_guidance": ""}
+    if state.recall_score < settings.recall_target:
+        trigger = "E2" if any(g.contested for g in state.goals) else "E3"
+        # D-23 bound — see agents/escalation.py::raise_or_log. Without it
+        # this guard is the single most reachable infinite-escalation
+        # source in the graph: it fires on the FIRST gather cycle for any
+        # query the corpus does not genuinely cover, and a human redirect
+        # that fails to produce tasks lands right back on it.
+        update.update(raise_or_log(
+            state, settings, trigger,
+            reason="no_strong_evidence_for_any_uncovered_goal"))
+    return update
+
+
+def _select_target_goals(state: ResearchState, settings: Settings) -> List[Goal]:
+    """WHICH goals this cycle is actually for (D-59, S-19).
+
+    Uncovered goals are the original and still the common case -- but they
+    are not the only way gap_generator_node is reached. D-47's
+    grounded-convergence gate routes here with recall ALREADY at target
+    and every goal `covered`, purely because the coverage came from
+    web/model evidence rather than a real document. In that state
+    `uncovered` is empty, and the prompt used to render "Uncovered goals:
+    (none)" while still demanding queries for them.
+
+    That is an unanswerable instruction, and the model answered it the
+    only way it could: from the evidence tail, which is the longest and
+    most topically coherent block left in the prompt. Live (run
+    p205.203-check) the tail was dominated by off-topic Redis corpus hits
+    under an India-vs-US query, and the gap generator returned six
+    consecutive Redis/Memcached queries. The model was not
+    free-associating; it was reading the only subject the prompt still
+    showed it.
+
+    Naming the ungrounded goals instead gives the cycle the job it was
+    actually dispatched for: find a DOCUMENT for a goal currently propped
+    up by weaker provenance.
+    """
+    uncovered = [g for g in state.goals if not g.covered]
+    if uncovered:
+        return uncovered
+    goal_terms = {g.goal_id: distinctive_terms(g.description)
+                  for g in state.goals}
+    return [g for g in state.goals
+            if not has_grounded_evidence(g.goal_id,
+                                         goal_terms.get(g.goal_id, set()),
+                                         state.evidence,
+                                         settings.min_evidence_score)]
+
+
+def _escalation_for_empty_backlog(state: ResearchState, settings: Settings
+                                  ) -> Dict[str, Any]:
+    """E2/E3 when the model produced no usable tasks (S-19). Returns the
+    keys to merge into the node's update, or {} when nothing should fire.
+
+    D-23 (refined by test evidence): E3 originally guarded only the
+    depth-exhaustion exit; a run can ALSO fail to converge by running out
+    of producible tasks (the D-14 dispatch exit). Both are "cannot
+    converge below target" — so the trigger is raised here too.
+    P2-09: same disabled-mode logging parity as progress_checker_node.
+    """
+    if state.recall_score >= settings.recall_target:
+        return {}
+    trigger = "E2" if any(g.contested for g in state.goals) else "E3"
+    if state.human_guidance:
+        # A human redirected INTO this call and the guidance they gave
+        # produced nothing that survived cap_and_filter (D-2 dedup / D-16
+        # depth gate). Re-raising here asks them the identical question,
+        # with the identical payload, having silently consumed the answer
+        # they already gave — which is what "redirect does nothing" looked
+        # like from outside. Fall through to the compiler instead: an
+        # empty backlog is D-1's own terminal exit, and the report will
+        # say honestly what was and was not retrieved. Deliberately NOT
+        # raise_or_log here -- this suppression has nothing to do with the
+        # D-23 review budget, so it does not belong to that helper's
+        # suppressed/stub shape.
+        log_event(logger, "escalation.suppressed", level=logging.WARNING,
+                  trigger=trigger, reason="redirect_produced_no_tasks")
+        return {}
+    return raise_or_log(state, settings, trigger,
+                        reason="task_supply_exhausted")
+
+
 def build_gap_generator_node(router: FallbackRouter, settings: Settings,
                              debug: bool = False):
     """Build the gap generator: new tasks for uncovered goals."""
@@ -587,108 +738,14 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         if debug:
             log_event(logger, "node.enter", node="gap_generator")
 
-        # Closes the third convergence-failure mode described in this
-        # node's own docstring above. SINGLE_LEG_SCORE_CEILING (0.5) is
-        # not a new threshold -- it is the exact score an RRF rank-0 hit
-        # gets when only ONE retrieval leg answered, imported from the
-        # same constant Item 11's compile_report grounding rule uses. A
-        # goal whose best evidence sits at or below it has no document
-        # that both legs agreed on, which is the cheapest available signal
-        # that the corpus may not genuinely cover it -- verified against a
-        # live trace where every surviving hit for an uncovered goal was
-        # exactly this shape (dense: 0, keyword-only, fused <= 1).
-        #
-        # Deliberately checked BEFORE the LLM call, not after: skipping the
-        # call entirely means an off-topic run escalates one gather cycle
-        # earlier, and never hands the model a prompt built to produce
-        # exactly the failure mode being guarded against.
-        #
-        # NOT applied when human_guidance is set. Found live: a human who
-        # redirects after exactly this guard raised E2/E3 is giving the
-        # system new information the retrieved evidence never had -- e.g.
-        # compare social and political aspects after an economic query
-        # came back weak. Applying the guard again after a redirect made it
-        # fire identically and silently ignore the guidance, re-raising the
-        # SAME escalation with the SAME reason -- a human explicit
-        # instruction to try something new was treated as more of the
-        # evidence that caused the original failure. The guard exists to
-        # stop the MODEL from free-associating off weak evidence; it was
-        # never meant to override a HUMAN telling it what to search for.
-        uncovered = [g for g in state.goals if not g.covered]
-        # A goal that retrieved NOTHING is a retry candidate, never a reason
-        # to give up: it has no misleading tail to free-associate off, and a
-        # different query formulation is the entire remedy. Live, run
-        # p205.68-check: g2 retrieved zero items, which made the strong-
-        # evidence test vacuously False and fired this guard on the exact
-        # case it was never written for.
-        weak_only = [g for g in uncovered
-                     if _goal_has_any_evidence(g.goal_id, state.evidence)]
-        starving = [g for g in uncovered if g not in weak_only]
-        # D-38: with the model tier wired, "no strong evidence" is never a
-        # reason to STOP -- there is always another tier that has not been
-        # tried for the goals still uncovered. Giving up here is what turned
-        # a retrieval limitation into "this cannot be answered".
-        ladder_exhausted = not settings.model_knowledge_enabled
-        if (ladder_exhausted and weak_only and not starving
-                and not state.human_guidance
-                # D-3/D-14: the depth budget is this loop's bound, and this
-                # guard must not pre-empt it on the FIRST cycle. Runs
-                # p205.66/67/68-check all ended at "iterations": 1 with
-                # MAX_DEPTH entirely unused, because this fired before the
-                # gap generator had produced a single new query. Give the
-                # loop one real gap cycle; if the evidence is STILL only
-                # single-leg afterwards, the corpus genuinely lacks the topic.
-                and state.iteration_depth > 1
-                and not any(_uncovered_goal_has_strong_evidence(g.goal_id, state.evidence)
-                            for g in weak_only)):
-            log_event(logger, "node.gaps_skipped_no_strong_evidence",
-                      uncovered_goals=[g.goal_id for g in weak_only],
-                      depth=state.iteration_depth)
-            update = {"pending_tasks": [], "human_guidance": ""}
-            if state.recall_score < settings.recall_target:
-                trigger = "E2" if any(g.contested for g in state.goals) else "E3"
-                # D-23 bound — see agents/escalation.py::raise_or_log.
-                # Without it this guard is the single most reachable
-                # infinite-escalation source in the graph: it fires on the
-                # FIRST gather cycle for any query the corpus does not
-                # genuinely cover, and a human redirect that fails to
-                # produce tasks lands right back on it.
-                update.update(raise_or_log(
-                    state, settings, trigger,
-                    reason="no_strong_evidence_for_any_uncovered_goal"))
-            return update
-        # D-59: WHICH goals this cycle is actually for. Uncovered goals are
-        # the original and still the common case -- but they are not the
-        # only way this node is reached. D-47's grounded-convergence gate
-        # routes here with recall ALREADY at target and every goal
-        # `covered`, purely because the coverage came from web/model
-        # evidence rather than a real document. In that state `uncovered`
-        # is empty, and the prompt used to render "Uncovered goals: (none)"
-        # while still demanding queries for them.
-        #
-        # That is an unanswerable instruction, and the model answered it
-        # the only way it could: from the evidence tail, which is the
-        # longest and most topically coherent block left in the prompt.
-        # Live (run p205.203-check) the tail was dominated by off-topic
-        # Redis corpus hits under an India-vs-US query, and the gap
-        # generator returned six consecutive Redis/Memcached queries. The
-        # model was not free-associating; it was reading the only subject
-        # the prompt still showed it.
-        #
-        # Naming the ungrounded goals instead gives the cycle the job it
-        # was actually dispatched for: find a DOCUMENT for a goal currently
-        # propped up by weaker provenance.
-        goal_terms = {g.goal_id: distinctive_terms(g.description)
-                      for g in state.goals}
-        if uncovered:
-            target_goals = uncovered
-        else:
-            target_goals = [
-                g for g in state.goals
-                if not has_grounded_evidence(g.goal_id,
-                                             goal_terms.get(g.goal_id, set()),
-                                             state.evidence,
-                                             settings.min_evidence_score)]
+        # S-19: three decisions, three functions above. What is left here
+        # is the ONE LLM call this node exists to make, and the sequence
+        # around it -- which is what the docstring already describes.
+        early_exit = _no_strong_evidence_exit(state, settings)
+        if early_exit is not None:
+            return early_exit
+
+        target_goals = _select_target_goals(state, settings)
         if not target_goals and not state.human_guidance:
             # Nothing uncovered and nothing ungrounded: there is no gap for
             # this node to close, so there is no prompt worth paying for.
@@ -697,6 +754,7 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
             log_event(logger, "node.gaps_skipped_nothing_to_target",
                       depth=state.iteration_depth)
             return {"pending_tasks": [], "human_guidance": ""}
+
         # P2-14 (D-25): same reasoning as task_expander_node's identical
         # line -- settings.mcp_enabled IS the "is mcp available" signal,
         # reused directly rather than a second, separately-configured flag.
@@ -715,32 +773,8 @@ def build_gap_generator_node(router: FallbackRouter, settings: Settings,
         if rejected:
             counters["producer_rejects"] = float(rejected)
         update = {"pending_tasks": tasks, "human_guidance": "", "counters": counters}
-        # D-23 (refined by test evidence): E3 originally guarded only the
-        # depth-exhaustion exit; a run can ALSO fail to converge by running
-        # out of producible tasks (the D-14 dispatch exit). Both are "cannot
-        # converge below target" — so the trigger is raised here too.
-        # P2-09: same disabled-mode logging parity as progress_checker_node
-        # above — see that node's comment for why this branch exists.
-        if not tasks and state.recall_score < settings.recall_target:
-            trigger = "E2" if any(g.contested for g in state.goals) else "E3"
-            if state.human_guidance:
-                # A human redirected INTO this call and the guidance they
-                # gave produced nothing that survived cap_and_filter (D-2
-                # dedup / D-16 depth gate). Re-raising here asks them the
-                # identical question, with the identical payload, having
-                # silently consumed the answer they already gave — which
-                # is what "redirect does nothing" looked like from
-                # outside. Fall through to the compiler instead: an empty
-                # backlog is D-1's own terminal exit, and the report will
-                # say honestly what was and was not retrieved. Deliberately
-                # NOT raise_or_log here -- this suppression has nothing to
-                # do with the D-23 review budget, so it does not belong to
-                # that helper's suppressed/stub shape.
-                log_event(logger, "escalation.suppressed", level=logging.WARNING,
-                          trigger=trigger, reason="redirect_produced_no_tasks")
-            else:
-                update.update(raise_or_log(state, settings, trigger,
-                                           reason="task_supply_exhausted"))
+        if not tasks:
+            update.update(_escalation_for_empty_backlog(state, settings))
         return update
 
     return gap_generator_node

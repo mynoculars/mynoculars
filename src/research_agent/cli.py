@@ -63,6 +63,7 @@ from research_agent.llm.router import ProviderChainExhausted
 from research_agent.logging_setup import drain_problems, run_id_var
 from research_agent.reporting.confidence import format_line as format_confidence
 from research_agent.reporting.metrics import count_sections
+from research_agent.reporting.scores import emit_run_scores
 from research_agent.state import ResearchState
 from research_agent.tracing import NullTracer, Tracer
 from research_agent.storage.postgres import (close_checkpointer,
@@ -503,51 +504,173 @@ def _failure_record(exc: BaseException) -> dict:
     return record
 
 
+def _print_graph_topology(app) -> None:
+    """Print the compiled graph's STATIC topology (S-18).
+
+    app.get_graph() is a LangGraph/LangChain introspection call -- it walks
+    the SAME compiled graph object we are about to (maybe) run, and returns
+    node names and edges, with no dependency on any particular query or
+    run. This is why it is NOT the same thing as telemetry: telemetry is a
+    dict of COUNTS summarizing what happened during one specific invoke()
+    call (see agents/compilation.py::telemetry_node); this is the WIRING
+    itself, unchanged run to run.
+    """
+    graph_repr = app.get_graph()
+    try:
+        # draw_ascii() needs the optional `grandalf` package (not in
+        # requirements.txt) -- try it first since it is the most readable
+        # in a terminal, and fall back to Mermaid text (needs nothing
+        # extra) if that package is not installed.
+        print(graph_repr.draw_ascii())
+    except ImportError:
+        print("[install 'grandalf' for ASCII art — falling back to Mermaid text]")
+        print(graph_repr.draw_mermaid())
+
+
+def _prompt_for_decision() -> tuple:
+    """Block on stdin until the reviewer gives one of the three actions.
+
+    RETURNS (action, guidance); guidance is "" for approve and abort.
+
+    Blocking stdin IS the timeout policy for a CLI -- the deferred
+    operational decision, resolved per-interface.
+
+    The rejection message is not decoration. Silence here cost two live
+    runs (p205.80/.81-check): the reviewer typed their GUIDANCE at this
+    prompt -- a natural mistake, since the payload's own "hint" field talks
+    about guidance -- got no feedback at all, and then typed "abort". The
+    redirect they intended never happened, in either run, and the
+    transcript gave no clue why.
+    """
+    action = ""
+    while action not in ("approve", "redirect", "abort"):
+        action = input("action [approve/redirect/abort]: ").strip().lower()
+        if action not in ("approve", "redirect", "abort"):
+            print(f"  '{action}' is not one of the three actions. "
+                  f"Type 'redirect' first -- you will be asked for "
+                  f"your guidance text on the NEXT line.")
+    guidance = input("guidance: ").strip() if action == "redirect" else ""
+    if action == "redirect" and not guidance:
+        print("  [empty guidance -- gap generation will re-run with "
+              "no new direction, which usually re-raises the same "
+              "escalation]")
+    return action, guidance
+
+
+def _hitl_loop(app, config: dict, thread_id: str, result: dict) -> tuple:
+    """Drive the human-review loop until the graph finishes (D-23).
+
+    RETURNS (result, hitl_triggered).
+
+    An interrupted run surfaces "__interrupt__" instead of finishing. Show
+    the review payload, collect a decision, resume under the SAME thread_id
+    (D-20), and repeat until an invoke() returns without that key -- i.e.
+    the run has actually finished.
+
+    `result` is a plain dict here; "__interrupt__" is the one special key
+    LangGraph adds only when a node paused via interrupt(). Its value is a
+    LIST (LangGraph supports several simultaneous interrupts in richer
+    graphs, though this project's graph only ever produces one at a time);
+    [0].value is the payload agents/escalation.py::_payload_for built.
+    """
+    hitl_triggered = False
+    while "__interrupt__" in result:
+        hitl_triggered = True
+        payload = result["__interrupt__"][0].value
+        # Phase 3: HITL event -- trigger, and (once resumed) approval/
+        # rejection and how long the human took. `pause_started` is this
+        # process's own wall-clock, not a durable timestamp -- fine here
+        # since resume latency is only meaningful within one CLI session
+        # anyway (a resume from a NEW process, per Thread IDs in
+        # OPERATIONS.md, would need a durable timestamp to measure this
+        # honestly, which this event does not attempt).
+        lf.event(thread_id, "hitl.escalation_raised",
+                 input=payload, metadata={"trigger": payload.get("trigger")})
+        pause_started = time.time()
+        print("\n=== HUMAN REVIEW REQUIRED ===")
+        print(json.dumps(payload, indent=2, default=str))
+        action, guidance = _prompt_for_decision()
+        lf.event(thread_id, "hitl.resumed",
+                 metadata={"trigger": payload.get("trigger"), "action": action,
+                           "resume_latency_s": round(time.time() - pause_started, 2)})
+        # Phase 3 (#11): the event above carries the point-in-time detail
+        # (trigger, timing); this score is the aggregatable form of the
+        # SAME decision -- "what fraction of runs get approved vs
+        # redirected vs aborted" is a dashboard-shaped question the event
+        # alone does not answer as cleanly.
+        lf.score(thread_id, "human_review", action,
+                 comment=guidance if action == "redirect" else None)
+        # Command(resume={...}) is how you tell LangGraph "continue the
+        # paused run, and this is what interrupt() should return this
+        # time" -- see agents/escalation.py's docstring for exactly how
+        # that resume value flows back into the escalation node.
+        result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
+                            config=config)
+    return result, hitl_triggered
+
+
+def _report_outcome(result: dict, hitl_triggered: bool, run_started: float) -> dict:
+    """Print the report, the summary and the telemetry. Returns telemetry.
+
+    Takes `run_started` rather than an already-computed elapsed time so the
+    measurement is taken at the SAME point it always was -- after the report
+    and the summary have been printed. Terminal I/O for a long report is not
+    free, and this line has always included it.
+
+    .get(), not [] -- an interrupted-then-abandoned run, or any path that
+    ends without reaching telemetry_node, left these keys absent and turned
+    a degraded run into a bare KeyError traceback.
+    """
+    telemetry = result.get("telemetry") or {}
+    report = result.get("final_report", "(no report was produced)")
+    # The banner matches the "=== ... ===" convention this file already
+    # uses for HUMAN REVIEW REQUIRED above; the report was the only output
+    # printed with no label at all. Leading newline so it separates cleanly
+    # from whatever stderr last wrote to the terminal.
+    print("\n=== FINAL REPORT ===")
+    print(report)
+    print(_fmt_result_summary(telemetry, report))
+    elapsed_s = time.monotonic() - run_started
+    # hitl_triggered reports whether the run paused for a human at all -- a
+    # fast HITL run (instant approve) and a slow non-HITL run (a genuinely
+    # long gather loop) are both real, distinct facts this line surfaces.
+    # See _fmt_hitl_wall_time_line's own docstring for why elapsed_s
+    # includes time spent blocked on the human.
+    print(_fmt_hitl_wall_time_line(hitl_triggered, elapsed_s))
+    print("\n--- telemetry (full) ---")
+    print(json.dumps(telemetry, indent=2))
+    return telemetry
+
+
 def _run(app, settings, args, thread_id, tracer) -> int:
     """The actual run, factored out of main() so P2-08's finally/close
-    wraps it cleanly without one giant try block."""
+    wraps it cleanly without one giant try block.
+
+    S-18: the print-graph branch, the HITL loop, the stdin prompt and the
+    end-of-run printing are each their own function above. What is left
+    here is the SEQUENCE plus the two things that genuinely belong to the
+    whole run: the D-20 thread-reuse guard, and the try/except that
+    guarantees a root trace is closed and a failed run is recorded exactly
+    once.
+    """
     if args.print_graph:
-        # app.get_graph() is a LangGraph/LangChain introspection call — it
-        # walks the SAME compiled graph object we're about to (maybe) run,
-        # and returns its static topology: node names and edges, with no
-        # dependency on any particular query or run. This is why it is NOT
-        # the same thing as telemetry: telemetry is a dict of COUNTS
-        # summarizing what happened during one specific invoke() call
-        # (llm_calls, recall, etc — see agents/compilation.py::
-        # telemetry_node); this is the WIRING itself, unchanged run to run.
-        graph_repr = app.get_graph()
-        try:
-            # draw_ascii() needs the optional `grandalf` package (not in
-            # requirements.txt) — try it first since it's the most readable
-            # in a terminal, and fall back to Mermaid text (needs nothing
-            # extra) if that package isn't installed.
-            print(graph_repr.draw_ascii())
-        except ImportError:
-            print("[install 'grandalf' for ASCII art — falling back to Mermaid text]")
-            print(graph_repr.draw_mermaid())
+        _print_graph_topology(app)
         if args.query is None:
             return 0  # inspecting the wiring only — nothing to run
 
     config = {"configurable": {"thread_id": thread_id},
               "recursion_limit": settings.recursion_limit}
-    # Phase 3: one root trace per user query (Phase 3's own requirement),
-    # keyed by the SAME thread_id already used for Postgres checkpointing
-    # and structured-log correlation. No-op when observability is off.
+    # Phase 3: one root trace per user query, keyed by the SAME thread_id
+    # already used for Postgres checkpointing and structured-log
+    # correlation. No-op when observability is off.
     lf.start_trace(thread_id, "research_run", input={"query": args.query})
-    # This is the single line that actually RUNS the entire graph: PLAN,
-    # GATHER (looping as many times as needed), COMPILE, PERSIST — all of
-    # it happens inside this one call, unless a node calls interrupt()
-    # along the way (see agents/escalation.py), in which case invoke()
-    # returns EARLY with "__interrupt__" in the result instead of a
-    # finished report.
-    # Phase 3 (#2): guarantee end_trace() fires even on a genuine
-    # crash, not just the normal-completion path below. Before this,
-    # only GraphRecursionError was caught (in main(), not even here),
-    # and ANY other exception left the root span dangling -- which,
-    # in v4's OTel model, means the trace is never exported at all,
-    # not just "incomplete". This is the primary fix; Observer.
-    # shutdown()'s end-open-roots loop is the backstop for whatever
-    # this doesn't catch.
+    # Phase 3 (#2): guarantee end_trace() fires even on a genuine crash,
+    # not just the normal-completion path. Before this, only
+    # GraphRecursionError was caught (in main(), not even here), and ANY
+    # other exception left the root span dangling -- which, in v4's OTel
+    # model, means the trace is never exported at all, not just
+    # "incomplete". This is the primary fix; Observer.shutdown()'s
+    # end-open-roots loop is the backstop for whatever this does not catch.
     try:
         # D-20 guard (M-2: shared with api/server.py via
         # assembly.reject_if_thread_in_use — see its docstring for why).
@@ -562,85 +685,21 @@ def _run(app, settings, args, thread_id, tracer) -> int:
                 file=sys.stderr)
             return 3
         # Wall-clock timer for the "HITL triggered | Total wall time: ..."
-        # line printed once the run finishes, below. time.monotonic(), not
+        # line printed once the run finishes. time.monotonic(), not
         # time.time(): a wall-clock elapsed measurement must never go
         # backwards or jump if the system clock is adjusted mid-run (NTP
-        # sync, DST) -- the same reasoning pause_started below already
+        # sync, DST) -- the same reasoning pause_started in _hitl_loop
         # uses time.time() for, since THAT measurement is reported on its
         # own (human review latency), not accumulated into a total.
         run_started = time.monotonic()
-        hitl_triggered = False
+        # This is the single line that actually RUNS the entire graph:
+        # PLAN, GATHER (looping as many times as needed), COMPILE, PERSIST
+        # -- all of it happens inside this one call, unless a node calls
+        # interrupt() along the way (see agents/escalation.py), in which
+        # case invoke() returns EARLY with "__interrupt__" in the result
+        # instead of a finished report, and _hitl_loop takes over.
         result = app.invoke(ResearchState(raw_query=args.query), config=config)
-
-        # HITL loop (D-23): an interrupted run surfaces "__interrupt__" instead
-        # of finishing. Show the review payload, collect a decision, resume under
-        # the SAME thread_id (D-20). Blocking stdin IS the timeout policy for a
-        # CLI — the deferred operational decision, resolved per-interface.
-        #
-        # `while "__interrupt__" in result:` — result is a plain dict here;
-        # this checks for the presence of that one special key, which LangGraph
-        # adds only when a node paused via interrupt(). The loop keeps calling
-        # invoke() again (each time with a human's decision) until a call
-        # finally returns a result WITHOUT that key — i.e. the run has actually
-        # finished.
-        while "__interrupt__" in result:
-            hitl_triggered = True
-            # result["__interrupt__"] is a list (LangGraph supports multiple
-            # simultaneous interrupts in more advanced graphs, though this
-            # project's graph only ever produces one at a time); [0] takes the
-            # first one, and .value is the actual payload dict
-            # agents/escalation.py::_payload_for built.
-            payload = result["__interrupt__"][0].value
-            # Phase 3: HITL event -- trigger, and (once resumed) approval/
-            # rejection and how long the human took. `pause_started` is this
-            # process's own wall-clock, not a durable timestamp -- fine here
-            # since resume latency is only meaningful within one CLI session
-            # anyway (a resume from a NEW process, per Thread IDs in
-            # OPERATIONS.md, would need a durable timestamp to measure this
-            # honestly, which this event does not attempt).
-            lf.event(thread_id, "hitl.escalation_raised",
-                     input=payload, metadata={"trigger": payload.get("trigger")})
-            pause_started = time.time()
-            print("\n=== HUMAN REVIEW REQUIRED ===")
-            print(json.dumps(payload, indent=2, default=str))
-            action = ""
-            # This loop keeps asking until the user types one of exactly three
-            # valid words — input(...) blocks (pauses this Python process
-            # entirely) until the person at the keyboard presses Enter.
-            while action not in ("approve", "redirect", "abort"):
-                action = input("action [approve/redirect/abort]: ").strip().lower()
-                if action not in ("approve", "redirect", "abort"):
-                    # Silence here cost two live runs (p205.80/.81-check):
-                    # the reviewer typed their GUIDANCE at this prompt --
-                    # a natural mistake, since the payload's own "hint"
-                    # field talks about guidance -- got no feedback at
-                    # all, and then typed "abort". The redirect they
-                    # intended never happened, in either run, and the
-                    # transcript gave no clue why.
-                    print(f"  '{action}' is not one of the three actions. "
-                          f"Type 'redirect' first -- you will be asked for "
-                          f"your guidance text on the NEXT line.")
-            guidance = input("guidance: ").strip() if action == "redirect" else ""
-            if action == "redirect" and not guidance:
-                print("  [empty guidance -- gap generation will re-run with "
-                      "no new direction, which usually re-raises the same "
-                      "escalation]")
-            lf.event(thread_id, "hitl.resumed",
-                     metadata={"trigger": payload.get("trigger"), "action": action,
-                               "resume_latency_s": round(time.time() - pause_started, 2)})
-            # Phase 3 (#11): the event above carries the point-in-time
-            # detail (trigger, timing); this score is the aggregatable
-            # form of the SAME decision -- "what fraction of runs get
-            # approved vs redirected vs aborted" is a dashboard-shaped
-            # question the event alone doesn't answer as cleanly.
-            lf.score(thread_id, "human_review", action,
-                    comment=guidance if action == "redirect" else None)
-            # Command(resume={...}) is how you tell LangGraph "continue the
-            # paused run, and this is what interrupt() should return this
-            # time" — see agents/escalation.py's docstring for exactly how that
-            # resume value flows back into the escalation node.
-            result = app.invoke(Command(resume={"action": action, "guidance": guidance}),
-                                config=config)
+        result, hitl_triggered = _hitl_loop(app, config, thread_id, result)
 
         # D-113: the flush that used to sit here has moved into main()'s
         # finally block, which is now the SINGLE flush site. D-100 added
@@ -662,29 +721,7 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         # every test used a fake tracer that counted calls instead of a
         # real buffer that could be emptied.
 
-        # .get(), not [] — an interrupted-then-abandoned run, or any path that
-        # ends without reaching telemetry_node, left these keys absent and
-        # turned a degraded run into a bare KeyError traceback.
-        telemetry = result.get("telemetry") or {}
-        report = result.get("final_report", "(no report was produced)")
-        # The banner matches the "=== ... ===" convention this file already
-        # uses for HUMAN REVIEW REQUIRED above; the report was the only
-        # output printed with no label at all. Leading newline so it
-        # separates cleanly from whatever stderr last wrote to the terminal.
-        print("\n=== FINAL REPORT ===")
-        print(report)
-        print(_fmt_result_summary(telemetry, report))
-        # Total wall-clock time from the first app.invoke() call to the
-        # run actually finishing; hitl_triggered reports whether the run
-        # paused for a human at all -- a fast HITL run (instant approve)
-        # and a slow non-HITL run (a genuinely long gather loop) are both
-        # real, distinct facts this line surfaces. See
-        # _fmt_hitl_wall_time_line's own docstring for why elapsed_s
-        # includes time spent blocked on the human.
-        elapsed_s = time.monotonic() - run_started
-        print(_fmt_hitl_wall_time_line(hitl_triggered, elapsed_s))
-        print("\n--- telemetry (full) ---")
-        print(json.dumps(telemetry, indent=2))
+        telemetry = _report_outcome(result, hitl_triggered, run_started)
         # D-103: .get("recall") without a default. The old 0.0 fallback
         # wrote a number nothing measured into the recall column, and a
         # run that genuinely retrieved nothing recorded the identical
@@ -692,31 +729,13 @@ def _run(app, settings, args, thread_id, tracer) -> int:
         # looks like.
         record_run(settings.postgres_dsn, thread_id, args.query,
                    telemetry.get("recall"), telemetry)
-
-        # Phase 3: custom scores pulled straight from the SAME telemetry dict
-        # the report already printed above -- D-12's own rule ("aggregate,
-        # never invent") applies here too: these scores repeat numbers
-        # telemetry already computed, they never derive new ones.
-        if "recall" in telemetry:
-            lf.score(thread_id, "recall", telemetry["recall"])
-        if "critique_passed" in telemetry:
-            lf.score(thread_id, "critique_passed", bool(telemetry["critique_passed"]))
-        if telemetry.get("evidence_items", 0) and telemetry.get("goals", 0):
-            lf.score(thread_id, "evidence_per_goal",
-                     telemetry["evidence_items"] / telemetry["goals"])
-        if telemetry.get("search_calls", 0):
-            memory_hit_rate = telemetry.get("memory_hits", 0) / telemetry["search_calls"]
-            lf.score(thread_id, "memory_hit_rate", memory_hit_rate)
-        # Trendable across prompt revisions -- which is what item 5's
-        # prompt_name/prompt_version tagging on every generation was for.
-        # The comment carries WHICH goals were unevidenced, so a low score
-        # in the Langfuse UI is actionable without opening the run's logs.
-        if "grounding_ratio" in telemetry:
-            unevidenced = telemetry.get("goals_without_evidence") or []
-            lf.score(thread_id, "grounding_ratio", telemetry["grounding_ratio"],
-                     comment=f"unevidenced={','.join(unevidenced) or 'none'}")
-        lf.end_trace(thread_id, output={"final_report": report, "telemetry": telemetry})
-
+        # S-17: the five scores live in reporting/scores.py, called by this
+        # file AND by api/server.py, so the two interfaces cannot drift.
+        emit_run_scores(thread_id, telemetry)
+        lf.end_trace(thread_id,
+                     output={"final_report": result.get("final_report",
+                                                        "(no report was produced)"),
+                             "telemetry": telemetry})
         return 0 if telemetry else 1
     except Exception as exc:
         lf.end_trace(thread_id, metadata={"error": f"{type(exc).__name__}: {str(exc)[:300]}"})

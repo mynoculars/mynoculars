@@ -746,6 +746,305 @@ class OpenAICompatibleClient:
                          "server was actually started with (-c) to avoid "
                          "the wasted call entirely")
 
+    # ------------------------------------------------------------------
+    # complete(), in five steps (S-16)
+    #
+    # This was ONE 301-line method at cyclomatic complexity 27, doing four
+    # unrelated jobs: build and send the request, classify and log an HTTP
+    # error, extract and validate the response, and instrument the call.
+    # The error branch alone was 105 lines carrying D-93, D-110, D-119,
+    # D-130 and D-151, and it sat between the POST and the parse, so
+    # reading "what does complete() return" meant scrolling past all of it.
+    #
+    # Split by concern, with complete() left as the sequence. Every comment
+    # moved with the code it explains -- they are the record of five live
+    # defects and are the most valuable thing in this file.
+    # ------------------------------------------------------------------
+
+    def _record_error_response(self, resp, messages: List[Message]) -> None:
+        """Classify, log, and learn from a 4xx/5xx. Raises nothing.
+
+        CALLED BY   complete(), immediately before raise_for_status() --
+                    so this only ever ADDS diagnostics; the exception the
+                    router hops on is still raised by httpx, one line
+                    later, exactly as this class's contract promises.
+        """
+        # D-151: believe the server over the configuration, whichever
+        # branch below claims this error.
+        #
+        # LLM_PRIMARY_CONTEXT_TOKENS is a person's description of the
+        # server and can drift from it. Live (p205.282-check) it said
+        # 8876 while the server reported n_ctx 1536, so D-93 stopped
+        # skipping and the run made two guaranteed-failed calls
+        # instead of two free skips -- strictly worse than before the
+        # setting was touched. The 400 body carries the real number
+        # and cannot drift, because the server wrote it. Adopting it
+        # for the rest of THIS process means one wasted call teaches
+        # the chain rather than repeating.
+        #
+        # Never persisted: this is what the running server reports
+        # today, not a configuration change to make on someone's
+        # behalf. Silent unless the body actually names a window.
+        #
+        # S-16: this call used to appear TWICE -- here, and again inside
+        # the else-branch below for the same status 400. The second was
+        # unreachable as an effect rather than merely redundant, because
+        # _learn_context_limit guards on self._context_tokens_learned and
+        # this call has always already run. Removed, not deduplicated:
+        # there was only ever one call that could do anything.
+        if resp.status_code == 400:
+            self._learn_context_limit(resp.text)
+        if looks_like_context_overflow(resp.text):
+            # D-93: the SAME exception the caller already handles (the
+            # router hops on any Exception) -- this only makes the log say
+            # which KIND of failure it was. Logged here, where the body is
+            # still in hand, rather than left for the router to guess.
+            log_event(logger, "llm.context_overflow", level=logging.WARNING,
+                      provider=self.name, node=self._trace_node,
+                      estimated_prompt_tokens=estimate_prompt_tokens(messages),
+                      configured_context_tokens=self.context_tokens,
+                      status=resp.status_code, body=resp.text[:200])
+            return
+        # D-110: every OTHER 4xx/5xx, which until now was recorded
+        # nowhere at all. The branch above was the only place a
+        # status code or a response body was ever logged, so a
+        # provider failing for any other reason surfaced as the
+        # bare string "HTTPStatusError" and nothing else.
+        #
+        # Live cost of that (runs p205.260/.261): gemini returned
+        # 4xx on every call it was ever given -- always as the
+        # quality judge, since D-93's context skips mean it is
+        # never reached as an answerer -- and the logs could not
+        # distinguish a retired model name (404) from a bad key
+        # (401/403) from an exhausted quota (429). The quality
+        # gate had been inert for five consecutive runs and the
+        # reason was unknowable from the run record.
+        #
+        # The body is the PROVIDER's error text, capped at 300
+        # characters: enough for a JSON error envelope's message
+        # field, short enough that one bad call cannot flood a
+        # log. It is not request content and does not carry the
+        # API key -- the key travels in an Authorization header,
+        # which is never read here.
+        # D-119: kind and hint alongside the number, so the log
+        # line names the failure class an operator has to act on
+        # (credentials, permission, quota, model name, outage)
+        # instead of leaving them to decode a status by hand.
+        kind, hint = classify_http_failure(resp.status_code)
+        log_event(logger, "llm.http_error", level=logging.WARNING,
+                  provider=self.name, node=self._trace_node,
+                  model=self._model, status=resp.status_code,
+                  kind=kind, hint=hint,
+                  body=resp.text[:_ERROR_BODY_CHARS])
+        # D-130: a kind that cannot recover on its own takes this
+        # provider out of the chain for the rest of the PROCESS.
+        # Recorded here, where the status and the body are already
+        # in hand, rather than in the router, which sees only an
+        # exception -- and recorded on the CLIENT rather than on
+        # the router so it holds however this provider was reached:
+        # as an answerer, or as evaluation/quality.py's judge,
+        # whose exception the fail-open path swallows before the
+        # router could ever see it.
+        #
+        # Logged ONCE, at WARNING, on the transition only. The
+        # per-skip lines the router then emits are INFO, for
+        # D-107's reason: a level is a claim about significance,
+        # and five WARNINGs for one already-reported fact is how a
+        # real one gets scrolled past.
+        if kind in _NON_TRANSIENT_KINDS and self.disabled_reason is None:
+            self.disabled_reason = f"{resp.status_code} {kind}"
+            log_event(logger, "llm.provider_disabled",
+                      level=logging.WARNING, provider=self.name,
+                      model=self._model, status=resp.status_code,
+                      kind=kind, hint=hint,
+                      effect="this provider is skipped for the rest "
+                             "of this process (it is never skipped "
+                             "as the LAST hop, which has nowhere to "
+                             "fall through to); restart after fixing "
+                             "the account or the model name")
+
+    def _record_usage(self, data: Dict[str, Any]) -> tuple:
+        """Stash this call's token usage for the router and return it.
+
+        RETURNS (prompt_tokens, completion_tokens, reasoning_tokens).
+
+        D-86: stashed for FallbackRouter to drain (llm/router.py::
+        _bump_usage) one line after complete() returns.
+
+        On self._raw -- the threading.local() this class ALREADY keeps --
+        and for exactly the reason its own comment gives for _raw.text:
+        one client instance is shared across the parallel search_worker
+        fan-out, so a plain attribute would let one thread drain another
+        thread's usage. Reusing the existing holder rather than adding a
+        second one keeps "per-call state that must not race" in one place.
+
+        A provider that reports no usage block (some OpenAI-compatible
+        servers omit it) yields (0, 0) rather than None, so the router
+        never has to special-case it -- an unreported call simply adds
+        nothing to the run total, which is honest: we genuinely do not
+        know what it cost.
+
+        D-102: reasoning models spend the output budget on tokens that
+        `completion_tokens` does not report. The OpenAI-compatible field
+        for them is usage.completion_tokens_details.reasoning_tokens;
+        providers that have no such concept simply omit it, and this
+        stays None. Returned for the truncation check ONLY -- it is
+        deliberately NOT added to _bump_usage's totals, which count what
+        the provider billed as prompt/completion and must not start
+        meaning something else.
+        """
+        usage = data.get("usage", {})
+        pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        details = usage.get("completion_tokens_details") or {}
+        self._raw.usage = (int(pt or 0), int(ct or 0))
+        return pt, ct, details.get("reasoning_tokens")
+
+    def _raise_if_cut_off(self, data: Dict[str, Any], text: str, raw_text: str,
+                          ct, reasoning_tokens) -> None:
+        """Refuse a generation the PROVIDER itself reported as truncated.
+
+        FIX-2 (run p205.211 root cause, third link in the chain). Nothing
+        in this class ever looked at finish_reason, so a generation the
+        PROVIDER itself reported as cut off was returned as a finished
+        answer. Observed live: gemini-3.5-flash returned 162 completion
+        tokens ending mid-number ("...moderate slightly to around 6") and
+        160 tokens ending mid-sentence, and both shipped as the final
+        report because gemini is last in the chain and the last provider
+        has no quality gate.
+
+        Raising here is the correct layer: this class's contract is
+        already "raise upward, the router owns fallback policy". A hard
+        error makes the router hop, and — with FIX-3 — fall back to the
+        best earlier answer instead of shipping a fragment.
+
+        The `text == raw_text` guard matters: when _truncate_at_sentinel
+        DID trim something, the model reached its own end-of-turn and
+        then ran away, so `length` describes the discarded runaway tail,
+        not the answer. Only an untrimmed response is genuinely cut off.
+        """
+        finish_reason = (data.get("choices") or [{}])[0].get("finish_reason")
+        if finish_reason != "length" or text != raw_text:
+            return
+        # D-102: WHOSE ceiling was hit. As first written this line
+        # reported max_tokens unconditionally, which reads as "we hit
+        # our own limit" and sends you to .env. Live (p205.254-check)
+        # that was false both times it fired: gemini-3.5-flash
+        # reported finish_reason=length at completion_tokens 616 and
+        # 2150 against max_tokens 8192. Our generation budget was
+        # demonstrably NOT the binding constraint -- the ceiling came
+        # from the provider side (its own output cap, a gateway limit,
+        # or reasoning tokens spending a budget completion_tokens does
+        # not report). Raising LLM_MAX_TOKENS would not have helped,
+        # and the log line said to go and try.
+        #
+        # cap_source is DERIVED, never guessed: "ours" only when the
+        # provider actually reached the number we sent. Anything short
+        # of it means something else stopped the generation, and the
+        # only honest thing to say is that it was not us.
+        # reasoning_tokens counts toward the budget where a provider
+        # reports it, so it is added before the comparison; where it
+        # is absent this is exactly the old completion_tokens check.
+        billed = (ct or 0) + (reasoning_tokens or 0)
+        if self._max_tokens is None:
+            cap_source = "provider"      # we sent no cap at all
+        elif ct is None:
+            cap_source = "unknown"       # nothing to compare against
+        elif billed >= self._max_tokens:
+            cap_source = "ours"
+        else:
+            cap_source = "provider"
+        log_event(logger, "llm.truncated_by_token_limit", level=logging.WARNING,
+                  provider=self.name, node=self._trace_node,
+                  completion_tokens=ct, reasoning_tokens=reasoning_tokens,
+                  max_tokens=self._max_tokens, cap_source=cap_source,
+                  kept_chars=len(text))
+        # The same attribution in the exception text, because on the
+        # chain-exhaustion path this string is what a human actually
+        # reads (D-101 puts it in main()'s message).
+        whose = {"ours": f"OUR max_tokens={self._max_tokens}",
+                 "provider": "the PROVIDER's own ceiling, not our "
+                             f"max_tokens={self._max_tokens}",
+                 "unknown": "an unattributable ceiling"}[cap_source]
+        raise TruncatedGenerationError(
+            f"{self.name}/{self._model} stopped at the token limit "
+            f"(finish_reason=length, completion_tokens={ct}"
+            + (f", reasoning_tokens={reasoning_tokens}"
+               if reasoning_tokens is not None else "")
+            + f"); cap was {whose}; the answer is "
+            f"incomplete and must not be used")
+
+    def _log_runaway_trim(self, raw_text: str, text: str) -> None:
+        """Report what _truncate_at_sentinel discarded, at a level
+        proportional to how much that was.
+
+        D-107: live (p205.254-check) this fired at WARNING on ALL FIVE
+        local-primary calls, discarding 10, 10, 11, 11 and 11 characters
+        -- 54->44, 694->684, 790->779, 1084->1073. That is the model
+        emitting its own end-of-turn sentinel as literal text, a
+        chat-template quirk of this build, and not the thing
+        _truncate_at_sentinel exists to catch. Five WARNINGs a run for a
+        non-event is how a real one gets scrolled past.
+
+        An absolute threshold, not a ratio: the observed trims ranged
+        from 1% to 18% of the response depending only on how short the
+        response was, so a ratio would have flagged the 54-character
+        classify call and cleared the identical 1,084-character one.
+        What separates the two cases is the SIZE of the discarded tail --
+        a genuine runaway hallucinates an entire further conversation,
+        hundreds to thousands of characters, while a bare sentinel is a
+        token.
+        """
+        if text == raw_text:
+            return
+        discarded = len(raw_text) - len(text)
+        level = (logging.WARNING if discarded > _RUNAWAY_WARN_CHARS
+                 else logging.INFO)
+        log_event(logger, "llm.truncated_runaway_generation", level=level,
+                  provider=self.name, node=self._trace_node,
+                  raw_chars=len(raw_text), kept_chars=len(text),
+                  discarded_chars=discarded)
+
+    def _instrument(self, messages: List[Message], raw_text: str, text: str,
+                    pt, ct, latency: float, wall_start: float,
+                    temperature: float) -> None:
+        """The one log line and the one Langfuse generation for this call.
+
+        ONE instrumentation call for this LLM call, not two:
+        prompt_messages/response used to go to a SEPARATE recorder
+        (self._tracer.record_llm) with its own file format. Now they are
+        extra fields on the SAME log_event call the summary fields already
+        needed — only attached when a real Tracer is enabled, so a
+        non-debug run's JSON line is byte-identical in shape to before
+        this existed (JsonLineFormatter drops these two keys from the JSON
+        view regardless; NarrativeFormatter is what renders them, only
+        when present). See tracing.py and logging_setup.py's module
+        docstrings for the full "one instrumentation path" design.
+
+        Phase 3: one Langfuse generation per real provider call -- the
+        SAME provider/model/latency/token figures the log line just
+        recorded, so this can never drift from what is already logged.
+        thread_id comes from run_id_var, the SAME ContextVar log_event
+        itself reads (see logging_setup.py) -- reusing it here means this
+        class still knows nothing about the graph or about cli.py's
+        thread_id, exactly as its own docstring says.
+        """
+        trace_fields = ({"prompt_messages": messages, "response": raw_text}
+                        if self._tracer is not None and self._tracer.enabled else {})
+        log_event(logger, "llm.call", provider=self.name, model=self._model,
+                  label=self._label, node=self._trace_node,
+                  latency_s=round(latency, 3),
+                  prompt_tokens=pt, completion_tokens=ct, **trace_fields)
+        meta = {"label": self._label, "temperature": temperature}
+        meta.update(_prompt_tag_for_node(self._trace_node))
+        lf.generation(
+            run_id_var.get(), self._trace_node or "llm",
+            provider=self.name, model=self._model,
+            input=messages, output=text,
+            prompt_tokens=pt or 0, completion_tokens=ct or 0,
+            start_time=wall_start, end_time=wall_start + latency,
+            metadata=meta,
+        )
+
     def complete(self, messages: List[Message], temperature: float = 0.2) -> str:
         """POST the transcript; return assistant text. Raises httpx errors
         upward — the router owns retry/fallback policy, not this class.
@@ -771,113 +1070,13 @@ class OpenAICompatibleClient:
         resp = self._http.post("/chat/completions", json=payload)
         # raise_for_status() raises an httpx.HTTPStatusError if the response
         # code is 4xx or 5xx (i.e. the server reported an error) — it does
-        # nothing (returns None) for a normal 2xx success response.
+        # nothing (returns None) for a normal 2xx success response. Every
+        # decision about WHAT that error means is _record_error_response's;
+        # this method only decides that it is one.
         if resp.status_code >= 400:
-            # D-151: believe the server over the configuration, whichever
-            # branch below claims this error.
-            #
-            # LLM_PRIMARY_CONTEXT_TOKENS is a person's description of the
-            # server and can drift from it. Live (p205.282-check) it said
-            # 8876 while the server reported n_ctx 1536, so D-93 stopped
-            # skipping and the run made two guaranteed-failed calls
-            # instead of two free skips -- strictly worse than before the
-            # setting was touched. The 400 body carries the real number
-            # and cannot drift, because the server wrote it. Adopting it
-            # for the rest of THIS process means one wasted call teaches
-            # the chain rather than repeating.
-            #
-            # Never persisted: this is what the running server reports
-            # today, not a configuration change to make on someone's
-            # behalf. Silent unless the body actually names a window.
-            if resp.status_code == 400:
-                self._learn_context_limit(resp.text)
-            if looks_like_context_overflow(resp.text):
-                # D-93: the SAME exception the caller already handles (the
-                # router hops on any Exception) -- this only makes the log say
-                # which KIND of failure it was. Logged here, where the body is
-                # still in hand, rather than left for the router to guess.
-                log_event(logger, "llm.context_overflow", level=logging.WARNING,
-                          provider=self.name, node=self._trace_node,
-                          estimated_prompt_tokens=estimate_prompt_tokens(messages),
-                          configured_context_tokens=self.context_tokens,
-                          status=resp.status_code, body=resp.text[:200])
-            else:
-                # D-110: every OTHER 4xx/5xx, which until now was recorded
-                # nowhere at all. The branch above was the only place a
-                # status code or a response body was ever logged, so a
-                # provider failing for any other reason surfaced as the
-                # bare string "HTTPStatusError" and nothing else.
-                #
-                # Live cost of that (runs p205.260/.261): gemini returned
-                # 4xx on every call it was ever given -- always as the
-                # quality judge, since D-93's context skips mean it is
-                # never reached as an answerer -- and the logs could not
-                # distinguish a retired model name (404) from a bad key
-                # (401/403) from an exhausted quota (429). The quality
-                # gate had been inert for five consecutive runs and the
-                # reason was unknowable from the run record.
-                #
-                # The body is the PROVIDER's error text, capped at 300
-                # characters: enough for a JSON error envelope's message
-                # field, short enough that one bad call cannot flood a
-                # log. It is not request content and does not carry the
-                # API key -- the key travels in an Authorization header,
-                # which is never read here.
-                # D-119: kind and hint alongside the number, so the log
-                # line names the failure class an operator has to act on
-                # (credentials, permission, quota, model name, outage)
-                # instead of leaving them to decode a status by hand.
-                kind, hint = classify_http_failure(resp.status_code)
-                log_event(logger, "llm.http_error", level=logging.WARNING,
-                          provider=self.name, node=self._trace_node,
-                          model=self._model, status=resp.status_code,
-                          kind=kind, hint=hint,
-                          body=resp.text[:_ERROR_BODY_CHARS])
-                # D-151: believe the server over the configuration.
-                #
-                # If this 400 says the prompt did not fit, it also says
-                # what WOULD have fit -- and that number came from the
-                # process actually serving requests, where
-                # LLM_PRIMARY_CONTEXT_TOKENS is a person's description of
-                # it and can be wrong. Adopting it for the rest of THIS
-                # process means D-93 skips correctly from the next call
-                # on, so one wasted call teaches the chain instead of
-                # repeating.
-                #
-                # Never persisted and never written back to .env: this is
-                # what the running server reports today, not a
-                # configuration change to make on someone's behalf. The
-                # WARNING names both numbers so the operator can fix the
-                # file themselves.
-                if resp.status_code == 400:
-                    self._learn_context_limit(resp.text)
-                # D-130: a kind that cannot recover on its own takes this
-                # provider out of the chain for the rest of the PROCESS.
-                # Recorded here, where the status and the body are already
-                # in hand, rather than in the router, which sees only an
-                # exception -- and recorded on the CLIENT rather than on
-                # the router so it holds however this provider was reached:
-                # as an answerer, or as evaluation/quality.py's judge,
-                # whose exception the fail-open path swallows before the
-                # router could ever see it.
-                #
-                # Logged ONCE, at WARNING, on the transition only. The
-                # per-skip lines the router then emits are INFO, for
-                # D-107's reason: a level is a claim about significance,
-                # and five WARNINGs for one already-reported fact is how a
-                # real one gets scrolled past.
-                if kind in _NON_TRANSIENT_KINDS and self.disabled_reason is None:
-                    self.disabled_reason = f"{resp.status_code} {kind}"
-                    log_event(logger, "llm.provider_disabled",
-                              level=logging.WARNING, provider=self.name,
-                              model=self._model, status=resp.status_code,
-                              kind=kind, hint=hint,
-                              effect="this provider is skipped for the rest "
-                                     "of this process (it is never skipped "
-                                     "as the LAST hop, which has nowhere to "
-                                     "fall through to); restart after fixing "
-                                     "the account or the model name")
+            self._record_error_response(resp, messages)
         resp.raise_for_status()
+
         data = resp.json()
         latency = time.perf_counter() - started
         raw_text: str = data["choices"][0]["message"]["content"]
@@ -891,161 +1090,11 @@ class OpenAICompatibleClient:
         # issue) but RETURN the truncated version, since the raw text is
         # never a legitimate answer past its first sentinel.
         text = _truncate_at_sentinel(raw_text)
-        usage = data.get("usage", {})
-        pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
-        # D-102: reasoning models spend the output budget on tokens that
-        # `completion_tokens` does not report. The OpenAI-compatible field
-        # for them is usage.completion_tokens_details.reasoning_tokens;
-        # providers that have no such concept simply omit it, and this
-        # stays None. Read here, used ONLY by the truncation branch below
-        # -- it is deliberately NOT added to _bump_usage's totals, which
-        # count what the provider billed as prompt/completion and must not
-        # start meaning something else.
-        _details = usage.get("completion_tokens_details") or {}
-        reasoning_tokens = _details.get("reasoning_tokens")
-        # D-86: stash this call's token usage for FallbackRouter to drain
-        # (llm/router.py::_bump_usage) one line after this method returns.
-        #
-        # On self._raw -- the threading.local() this class ALREADY keeps --
-        # and for exactly the reason its own comment gives for _raw.text:
-        # one client instance is shared across the parallel search_worker
-        # fan-out, so a plain attribute would let one thread drain another
-        # thread's usage. Reusing the existing holder rather than adding a
-        # second one keeps "per-call state that must not race" in one
-        # place.
-        #
-        # A provider that reports no usage block (some OpenAI-compatible
-        # servers omit it) yields (0, 0) rather than None, so the router
-        # never has to special-case it -- an unreported call simply adds
-        # nothing to the run total, which is honest: we genuinely do not
-        # know what it cost.
-        self._raw.usage = (int(pt or 0), int(ct or 0))
-        # FIX-2 (run p205.211 root cause, third link in the chain). Nothing
-        # in this class ever looked at finish_reason, so a generation the
-        # PROVIDER itself reported as cut off was returned as a finished
-        # answer. Observed live: gemini-3.5-flash returned 162 completion
-        # tokens ending mid-number ("...moderate slightly to around 6") and
-        # 160 tokens ending mid-sentence, and both shipped as the final
-        # report because gemini is last in the chain and the last provider
-        # has no quality gate.
-        #
-        # Raising here is the correct layer: this class's contract is
-        # already "raise upward, the router owns fallback policy". A hard
-        # error makes the router hop, and — with FIX-3 — fall back to the
-        # best earlier answer instead of shipping a fragment.
-        #
-        # The `text == raw_text` guard matters: when _truncate_at_sentinel
-        # DID trim something, the model reached its own end-of-turn and
-        # then ran away, so `length` describes the discarded runaway tail,
-        # not the answer. Only an untrimmed response is genuinely cut off.
-        finish_reason = (data.get("choices") or [{}])[0].get("finish_reason")
-        if finish_reason == "length" and text == raw_text:
-            # D-102: WHOSE ceiling was hit. As first written this line
-            # reported max_tokens unconditionally, which reads as "we hit
-            # our own limit" and sends you to .env. Live (p205.254-check)
-            # that was false both times it fired: gemini-3.5-flash
-            # reported finish_reason=length at completion_tokens 616 and
-            # 2150 against max_tokens 8192. Our generation budget was
-            # demonstrably NOT the binding constraint -- the ceiling came
-            # from the provider side (its own output cap, a gateway limit,
-            # or reasoning tokens spending a budget completion_tokens does
-            # not report). Raising LLM_MAX_TOKENS would not have helped,
-            # and the log line said to go and try.
-            #
-            # cap_source is DERIVED, never guessed: "ours" only when the
-            # provider actually reached the number we sent. Anything short
-            # of it means something else stopped the generation, and the
-            # only honest thing to say is that it was not us.
-            # reasoning_tokens counts toward the budget where a provider
-            # reports it, so it is added before the comparison; where it
-            # is absent this is exactly the old completion_tokens check.
-            billed = (ct or 0) + (reasoning_tokens or 0)
-            if self._max_tokens is None:
-                cap_source = "provider"      # we sent no cap at all
-            elif ct is None:
-                cap_source = "unknown"       # nothing to compare against
-            elif billed >= self._max_tokens:
-                cap_source = "ours"
-            else:
-                cap_source = "provider"
-            log_event(logger, "llm.truncated_by_token_limit", level=logging.WARNING,
-                      provider=self.name, node=self._trace_node,
-                      completion_tokens=ct, reasoning_tokens=reasoning_tokens,
-                      max_tokens=self._max_tokens, cap_source=cap_source,
-                      kept_chars=len(text))
-            # The same attribution in the exception text, because on the
-            # chain-exhaustion path this string is what a human actually
-            # reads (D-101 puts it in main()'s message).
-            whose = {"ours": f"OUR max_tokens={self._max_tokens}",
-                     "provider": "the PROVIDER's own ceiling, not our "
-                                 f"max_tokens={self._max_tokens}",
-                     "unknown": "an unattributable ceiling"}[cap_source]
-            raise TruncatedGenerationError(
-                f"{self.name}/{self._model} stopped at the token limit "
-                f"(finish_reason=length, completion_tokens={ct}"
-                + (f", reasoning_tokens={reasoning_tokens}"
-                   if reasoning_tokens is not None else "")
-                + f"); cap was {whose}; the answer is "
-                f"incomplete and must not be used")
-        if text != raw_text:
-            # D-107: the level is now proportional to what was actually
-            # discarded. Live (p205.254-check) this fired at WARNING on
-            # ALL FIVE local-primary calls, discarding 10, 10, 11, 11 and
-            # 11 characters -- 54->44, 694->684, 790->779, 1084->1073.
-            # That is the model emitting its own end-of-turn sentinel as
-            # literal text, a chat-template quirk of this build, and not
-            # the thing _truncate_at_sentinel exists to catch. Five
-            # WARNINGs a run for a non-event is how a real one gets
-            # scrolled past.
-            #
-            # An absolute threshold, not a ratio: the observed trims
-            # ranged from 1% to 18% of the response depending only on how
-            # short the response was, so a ratio would have flagged the
-            # 54-character classify call and cleared the identical
-            # 1,084-character one. What separates the two cases is the
-            # SIZE of the discarded tail -- a genuine runaway hallucinates
-            # an entire further conversation, hundreds to thousands of
-            # characters, while a bare sentinel is a token.
-            discarded = len(raw_text) - len(text)
-            level = (logging.WARNING if discarded > _RUNAWAY_WARN_CHARS
-                     else logging.INFO)
-            log_event(logger, "llm.truncated_runaway_generation", level=level,
-                      provider=self.name, node=self._trace_node,
-                      raw_chars=len(raw_text), kept_chars=len(text),
-                      discarded_chars=discarded)
-        # ONE instrumentation call for this LLM call, not two: prompt_messages/
-        # response used to go to a SEPARATE recorder (self._tracer.record_llm,
-        # below this comment until this change) with its own file format.
-        # Now they're extra fields on the SAME log_event call the summary
-        # fields already needed — only attached when a real Tracer is
-        # enabled, so a non-debug run's JSON line is byte-identical in shape
-        # to before this existed (JsonLineFormatter drops these two keys
-        # from the JSON view regardless; NarrativeFormatter is what renders
-        # them, only when present). See tracing.py and logging_setup.py's
-        # module docstrings for the full "one instrumentation path" design.
-        trace_fields = ({"prompt_messages": messages, "response": raw_text}
-                        if self._tracer is not None and self._tracer.enabled else {})
-        log_event(logger, "llm.call", provider=self.name, model=self._model,
-                  label=self._label, node=self._trace_node,
-                  latency_s=round(latency, 3),
-                  prompt_tokens=pt, completion_tokens=ct, **trace_fields)
-        # Phase 3: one Langfuse generation per real provider call -- the
-        # SAME provider/model/latency/token figures the log line above
-        # just recorded, so this can never drift from what's already
-        # logged. thread_id comes from run_id_var, the SAME ContextVar
-        # log_event itself reads (see logging_setup.py) -- reusing it
-        # here means this class still knows nothing about the graph or
-        # about cli.py's thread_id, exactly as its own docstring says.
-        meta = {"label": self._label, "temperature": temperature}
-        meta.update(_prompt_tag_for_node(self._trace_node))
-        lf.generation(
-            run_id_var.get(), self._trace_node or "llm",
-            provider=self.name, model=self._model,
-            input=messages, output=text,
-            prompt_tokens=pt or 0, completion_tokens=ct or 0,
-            start_time=wall_start, end_time=wall_start + latency,
-            metadata=meta,
-        )
+        pt, ct, reasoning_tokens = self._record_usage(data)
+        self._raise_if_cut_off(data, text, raw_text, ct, reasoning_tokens)
+        self._log_runaway_trim(raw_text, text)
+        self._instrument(messages, raw_text, text, pt, ct, latency,
+                         wall_start, temperature)
         return text
 
     def complete_json(self, messages: List[Message], temperature: float = 0.0) -> Dict[str, Any]:

@@ -481,35 +481,54 @@ class NarrativeFormatter(logging.Formatter):
                 lines.append(f"      {'body':<{width}} : {body}")
         return "\n".join(lines)
 
-    def render_all(self, events: list) -> str:
-        """One pass over a whole run's buffered events -> the full
-        narrative file body. See class docstring for the grouping rules.
+    # ------------------------------------------------------------------
+    # render_all, in three phases (S-12)
+    #
+    # This used to be ONE 247-line method at cyclomatic complexity 74 and
+    # nesting depth 7 -- by a factor of 1.7 the most complex block in the
+    # codebase, and the only depth-7 one. It did six jobs at once:
+    # partition the event stream, group fan-out spans, choose and inline
+    # three different renderers, keep gather-lap/critique-attempt phase
+    # bookkeeping, maintain a rolling `context` so a span's INPUT shows the
+    # PREVIOUS span's output, and build the `timeline` two later renderers
+    # consume. Six mutable variables were threaded through one loop, and
+    # the plan preview had to be written as a `None` placeholder into `out`
+    # and back-patched at the end -- the tell that the loop needed a value
+    # it could only compute after itself.
+    #
+    # Split into partition -> plan -> render. The first two are pure and
+    # independently testable; the back-patch is gone because planning
+    # finishes before rendering starts. NOTHING about the output changed --
+    # that is the point, and tests/unit/test_reporting_narrative.py is what
+    # holds it to that.
+    # ------------------------------------------------------------------
+
+    def _partition(self, events: list) -> tuple:
+        """Phase 1 (pure): split a run's events into their three regions.
+
+        RETURNS (prelude, graph_blocks, orphans, spans) where
+                prelude      events before the first node.enter/graph.*
+                graph_blocks consecutive runs of graph.* events
+                orphans      events in the span region before any node.enter
+                             -- surfaced rather than silently dropped, which
+                             is what the original's `current is None` arm did
+                spans        [{"node", "count", "events"}], consecutive
+                             node.enter's for the SAME fan-out node folded
+                             into one span with count > 1
         """
-        out: list = []
-        context: dict = {}
-        self._llm_call_counter = 0
-        groups: list = []  # list of dicts: {node, events, count}
-
-        # Pass 1: split into a leading "startup" section (everything
-        # before the first node.enter) and node-grouped spans.
+        prelude, graph_blocks, orphans, spans = [], [], [], []
         i, n = 0, len(events)
-        while i < n and not (events[i].msg == "node.enter" or events[i].msg.startswith("graph.")):
-            out.append(self.render_event(events[i]))
-            i += 1
 
-        # D-117: rendered from the WHOLE event list, and placed before the
-        # execution plan so it is the first thing after the header.
-        out.append(self.render_problems(events))
-        plan_index = len(out)
-        out.append(None)  # placeholder — filled in below once `timeline` exists,
-                          # but positioned here so the condensed overview reads
-                          # FIRST, before the detailed graph-construction listing.
+        while i < n and not (events[i].msg == "node.enter"
+                             or events[i].msg.startswith("graph.")):
+            prelude.append(events[i])
+            i += 1
 
         while i < n and events[i].msg.startswith("graph."):
             graph_start = i
             while i < n and events[i].msg.startswith("graph."):
                 i += 1
-            out.append(self._render_graph_build(events[graph_start:i]))
+            graph_blocks.append(events[graph_start:i])
 
         current = None
         while i < n:
@@ -522,211 +541,345 @@ class NarrativeFormatter(logging.Formatter):
                     current["events"].append(ev)
                 else:
                     if current is not None:
-                        groups.append(current)
+                        spans.append(current)
                     current = {"node": node, "count": 1, "events": [ev]}
             elif current is not None:
                 current["events"].append(ev)
             else:
                 # An event before any node.enter fired in this segment
-                # (shouldn't normally happen once past startup) — surface
-                # it rather than silently drop it.
-                out.append(self.render_event(ev))
+                # (shouldn't normally happen once past startup).
+                orphans.append(ev)
             i += 1
         if current is not None:
-            groups.append(current)
+            spans.append(current)
+        return prelude, graph_blocks, orphans, spans
 
-        gather_lap = 1
+    @staticmethod
+    def _fold_context(gevents: list, context: dict) -> int:
+        """Fold one span's events into the rolling context. Returns how many
+        tasks this span's producer emitted, for the run-level total.
+
+        CALLED BY _plan, AFTER a span is planned, so the NEXT span's INPUT
+        shows this span's output and never itself. That ordering is the
+        whole reason the context is threaded rather than recomputed.
+        """
+        produced = 0
+        for e in gevents:
+            if e.msg == "node.classify":
+                context["intent"] = e.fields.get("intent")
+            elif e.msg == "memory.retrieved":
+                context["memory_hits"] = e.fields.get("count")
+            elif e.msg == "node.progress":
+                context["recall"] = e.fields.get("recall")
+                context["depth"] = e.fields.get("depth")
+            elif e.msg in ("node.expand", "node.gaps"):
+                context["tasks_produced"] = e.fields.get("produced")
+                produced += e.fields.get("produced") or 0
+            elif e.msg == "node.critique":
+                context["revision_count"] = e.fields.get("revision")
+        return produced
+
+    def _decision_text_for(self, decision_ev, route_ev) -> "str | None":
+        """The DECISION line for a span, or None if it has no story to tell.
+
+        Two sources, in priority order: a real decision event gets its
+        prose form (_decision_text / _PROSE); failing that, a bare
+        route.decision is summarised from whatever fields it carries BEYOND
+        the four the TRANSITION block already prints. When that leaves
+        nothing, the caller falls back to printing the route's reason in
+        full -- see _render_decision_span.
+        """
+        if decision_ev is not None:
+            return self._decision_text(decision_ev.msg, decision_ev.fields)
+        if route_ev is None:
+            return None
+        extra = {k: v for k, v in route_ev.fields.items()
+                 if k not in ("from_node", "to_node", "reason",
+                              "escalation_trigger")}
+        return (", ".join(f"{k}: {v}" for k, v in extra.items())
+                if extra else None)
+
+    @staticmethod
+    def _phase_boundaries(route_ev, laps: dict) -> tuple:
+        """Loop/critique boundary bookkeeping for one span.
+
+        CALLED BY _plan, once per span. MUTATES `laps` -- the gather-lap
+        counter, the critique-attempt counter and the "the next fan-out
+        starts a new lap" flag -- and RETURNS (trailers, exits): the phase
+        summaries that follow this span, and the __EXIT__ markers its
+        timeline entry is followed by.
+
+        Driven entirely by the SAME route.decision fields _render_route
+        already uses, never a new inference. Pulled out of _plan because
+        these seven conditions were the bulk of its complexity while being
+        the part least entangled with everything else: they read one event
+        and three integers.
+        """
+        trailers: list = []
+        exits: list = []
+        if route_ev is None:
+            return trailers, exits
+        frm = route_ev.fields.get("from_node")
+        to = route_ev.fields.get("to_node")
+        exit_marker = (f"__EXIT__:{route_ev.fields.get('reason')}",
+                       None, route_ev.ts)
+
+        if frm == "gap_generator" and to not in ("compiler",
+                                                 "human_escalation"):
+            laps["gather"] += 1
+            laps["pending_label"] = True
+        # Two ways the gather loop can end: progress_checker reaching
+        # target/depth, or gap_generator's own dispatch escalating (E2/E3,
+        # task supply exhausted). Same summary either way.
+        gather_done = (
+            (frm == "progress_checker"
+             and to in ("compiler", "human_escalation"))
+            or (frm == "gap_generator" and to == "human_escalation"))
+        if gather_done:
+            trailers.append(("GATHER PHASE", laps["gather"], route_ev.fields))
+            exits.append(exit_marker)
+
+        if frm == "critic" and to == "compiler":
+            laps["critique"] += 1
+        if frm == "critic" and to in ("memory_writer", "telemetry",
+                                      "human_escalation"):
+            trailers.append(("CRITIQUE PHASE", laps["critique"] + 1,
+                             route_ev.fields))
+            exits.append(exit_marker)
+        return trailers, exits
+
+    def _plan(self, spans: list) -> tuple:
+        """Phase 2 (pure): everything the renderer needs to know, decided
+        before any string is built.
+
+        RETURNS (planned, timeline, tasks_generated_total).
+
+        This is where the cross-span bookkeeping lives, so that phase 3
+        carries none of it: the rolling `context` (see _fold_context), the
+        gather-lap and critique-attempt counters (see _phase_boundaries),
+        and the `timeline` that the plan preview and the final timeline
+        both read.
+
+        Each planned span carries its own `trailers` -- the phase summaries
+        that follow it -- rather than the renderer re-deriving them from
+        route fields it would otherwise have to inspect twice.
+        """
+        planned: list = []
+        timeline: list = []
+        context: dict = {}
+        laps = {"gather": 1, "critique": 0, "pending_label": True}
         tasks_generated_total = 0
-        pending_lap_label = True
-        critique_attempt = 0
-        timeline: list = []  # (label, decision_text_or_None)
 
-        for gi, g in enumerate(groups):
+        for gi, g in enumerate(spans):
             node, count, gevents = g["node"], g["count"], g["events"]
 
-            # Update running context from whatever this span's events carry
-            # — done BEFORE rendering INPUT so a span's own decision isn't
-            # mistaken for its input.
-            span_input = {k: context[k] for k in self._CONTEXT_KEYS if k in context}
+            # Context snapshot BEFORE this span's own events are folded in,
+            # so a span's decision is never mistaken for its input.
+            span_input = {k: context[k] for k in self._CONTEXT_KEYS
+                          if k in context}
             enter_ev = next((e for e in gevents if e.msg == "node.enter"), None)
             if enter_ev is not None and enter_ev.fields.get("query"):
                 span_input = {"query": enter_ev.fields["query"], **span_input}
 
-            decision_ev = next((e for e in gevents if e.msg in self._DECISION_EVENTS), None)
-            route_ev = next((e for e in gevents if e.msg == "route.decision"), None)
+            decision_ev = next((e for e in gevents
+                                if e.msg in self._DECISION_EVENTS), None)
+            route_ev = next((e for e in gevents
+                             if e.msg == "route.decision"), None)
+            decision_text = self._decision_text_for(decision_ev, route_ev)
 
-            # Fan-out group (search_worker x N): correlate every event back
-            # to the task that produced it, then render one SEARCH TASK
-            # block per task instead of a flat interleaved stream — see
-            # _render_fanout's own docstring for exactly how correlation
-            # works and its one honest limitation (retrieval-layer events
-            # carry no task field at all, only a query string).
+            to_node = route_ev.fields.get("to_node") if route_ev else None
+            if to_node is None and gi + 1 < len(spans):
+                to_node = spans[gi + 1]["node"]
+
             if count > 1:
-                label = f"{node} x {count}"
-                if pending_lap_label:
-                    timeline.append((f"__LOOP__:{gather_lap}", None, gevents[0].ts))
-                    pending_lap_label = False
-                timeline.append((label, None, gevents[0].ts))
-                out.append(f"[Step {gi + 1}/{len(groups)}]\n"
-                          + self._render_fanout(node, gevents, count))
+                kind = "fanout"
+                if laps["pending_label"]:
+                    timeline.append((f"__LOOP__:{laps['gather']}", None,
+                                     gevents[0].ts))
+                    laps["pending_label"] = False
+                timeline.append((f"{node} x {count}", None, gevents[0].ts))
             elif decision_ev is not None or route_ev is not None:
-                # Architectural decision point (detected from event TYPE,
-                # not node name — see _DECISION_EVENTS).
-                duration = gevents[-1].ts - gevents[0].ts
-                lines = [self._BANNER, f"NODE: {node}  [Step {gi + 1}/{len(groups)}]",
-                        self._BANNER,
-                        f"Started : {self._fmt_ts(gevents[0].ts)}",
-                        f"Finished: {self._fmt_ts(gevents[-1].ts)}",
-                        f"Elapsed : {duration:.2f}s"]
-                if span_input:
-                    lines.append("\nINPUT")
-                    lines.append(self._THIN)
-                    for k, v in span_input.items():
-                        lines.append(f"{k}: {v}")
-                # Sub-events (LLM calls, retrievals) render HERE — before
-                # the Decision/Next lines below, not after — because the
-                # decision is a CONSEQUENCE of what these calls returned,
-                # not the other way around. Chronological order, not
-                # arrival order in the log stream.
-                for e in gevents:
-                    if e is decision_ev or e is route_ev or e.msg == "node.enter":
-                        continue
-                    # D-116: the allowlist here was ("llm.call",
-                    # "retrieval.raw") plus graph.* -- three event names,
-                    # and EVERYTHING else inside a node span was silently
-                    # dropped from the human-readable narrative. That
-                    # included every WARNING the run produced.
-                    #
-                    # Measured on run p205.265-check: 12 warnings were
-                    # logged, 10 of them never reached logs/run-*.txt --
-                    # among them the two llm.http_error lines carrying a
-                    # 403 whose body said, in plain English, that the
-                    # provider account had no credits. render_event has
-                    # routed WARNING and above to _render_alert's banner
-                    # since the file was written; nothing ever called it
-                    # for a warning raised inside a node.
-                    #
-                    # An allowlist of event NAMES cannot stay correct as
-                    # events are added -- D-110's llm.http_error did not
-                    # exist when this list was written. Severity does not
-                    # have that problem: a warning is a warning whatever
-                    # it is called.
-                    if (e.level in ("WARNING", "ERROR", "CRITICAL")
-                            or e.msg in ("llm.call", "retrieval.raw")
-                            or e.msg.startswith("graph.")):
-                        lines.append("")
-                        lines.append(self.render_event(e))
-                decision_text = None
-                if decision_ev is not None:
-                    decision_text = self._decision_text(decision_ev.msg, decision_ev.fields)
-                elif route_ev is not None:
-                    extra = {k: v for k, v in route_ev.fields.items()
-                             if k not in ("from_node", "to_node", "reason",
-                                          "escalation_trigger")}
-                    if extra:
-                        decision_text = ", ".join(f"{k}: {v}" for k, v in extra.items())
-                if decision_text:
-                    lines.append("\nDECISION")
-                    lines.append(self._THIN)
-                    lines.append(decision_text)
-                to_node = route_ev.fields.get("to_node") if route_ev else None
-                if to_node is None and gi + 1 < len(groups):
-                    to_node = groups[gi + 1]["node"]
-                reason = route_ev.fields.get("reason") if route_ev else None
-                if decision_text:
-                    # The DECISION line above already explains WHY — repeating
-                    # it as a "Reason:" under TRANSITION was pure duplication
-                    # (review: "Decision / Transition / Reason" all said the
-                    # same thing three times). Just name what's next.
-                    lines.append("\nNEXT")
-                    lines.append(self._THIN)
-                    lines.append(to_node or "(next node)")
-                else:
-                    # No dedicated DECISION text exists for this span (the
-                    # generic route.decision fallback had nothing extra to
-                    # show) — the reason is the ONLY explanation available,
-                    # so it stays, in full.
-                    lines.append("\nTRANSITION")
-                    lines.append(self._THIN)
-                    lines.append(f"{node}\n      |\n      v\n{to_node or '(next node)'}")
-                    lines.append(f"\nReason:\n{reason or '(fixed edge)'}")
-                out.append("\n".join(lines))
+                kind = "decision"
                 timeline.append((node, decision_text, gevents[0].ts))
             else:
-                # Ordinary node, no decision of its own (memory_retrieve,
-                # merger, memory_writer, telemetry, human_escalation): a
-                # plain heading plus whatever it logged, unchanged.
-                duration = gevents[-1].ts - gevents[0].ts
-                out.append(f"{self._THIN}\nNODE: {node}  [Step {gi + 1}/{len(groups)}]\n"
-                          f"Started : {self._fmt_ts(gevents[0].ts)}\n"
-                          f"Finished: {self._fmt_ts(gevents[-1].ts)}\n"
-                          f"Elapsed : {duration:.2f}s\n{self._THIN}")
-                raw_hit_count = None
-                for e in gevents:
-                    if e.msg == "node.enter":
-                        continue
-                    if e.msg == "retrieval.raw" and "memory" in str(e.fields.get("source", "")):
-                        raw_hit_count = e.fields.get("hit_count")
-                        out.append(self.render_event(e))
-                        continue
-                    if e.msg == "memory.retrieved" and raw_hit_count is not None:
-                        # Clarifies a genuinely confusing pair: the retrieval
-                        # layer's raw hit count (Qdrant, no filtering) vs
-                        # semantic_memory.py's own count (after its dedup/
-                        # quality filtering) — same two numbers already
-                        # logged two events apart, just stated as one
-                        # sentence instead of two easily-misread ones.
-                        kept = e.fields.get("count")
-                        out.append(f"[{e.where}] Qdrant returned {raw_hit_count}, "
-                                  f"kept {kept} after quality/dedup filtering")
-                        continue
-                    out.append(self.render_event(e))
+                kind = "plain"
                 timeline.append((node, None, gevents[0].ts))
 
-            # Loop/critique boundary bookkeeping — driven entirely by the
-            # SAME route.decision fields _render_route already uses, never
-            # a new inference.
-            if route_ev is not None:
-                frm, to = route_ev.fields.get("from_node"), route_ev.fields.get("to_node")
-                if frm == "gap_generator" and to not in ("compiler", "human_escalation"):
-                    gather_lap += 1
-                    pending_lap_label = True
-                if frm == "progress_checker" and to in ("compiler", "human_escalation"):
-                    out.append(self._phase_summary("GATHER PHASE", gather_lap,
-                                                    route_ev.fields))
-                    timeline.append((f"__EXIT__:{route_ev.fields.get('reason')}", None, route_ev.ts))
-                elif frm == "gap_generator" and to == "human_escalation":
-                    # The OTHER way the gather loop can end: gap_generator's
-                    # own dispatch escalates (E2/E3, task supply exhausted)
-                    # instead of progress_checker reaching target/depth.
-                    out.append(self._phase_summary("GATHER PHASE", gather_lap,
-                                                    route_ev.fields))
-                    timeline.append((f"__EXIT__:{route_ev.fields.get('reason')}", None, route_ev.ts))
-                if frm == "critic" and to == "compiler":
-                    critique_attempt += 1
-                if frm == "critic" and to in ("memory_writer", "telemetry", "human_escalation"):
-                    out.append(self._phase_summary("CRITIQUE PHASE", critique_attempt + 1,
-                                                    route_ev.fields))
-                    timeline.append((f"__EXIT__:{route_ev.fields.get('reason')}", None, route_ev.ts))
+            trailers, exits = self._phase_boundaries(route_ev, laps)
+            timeline.extend(exits)
 
-            # Update context AFTER rendering this span, so the NEXT span's
-            # INPUT sees this span's own output, not itself.
-            for e in gevents:
-                if e.msg == "node.classify":
-                    context["intent"] = e.fields.get("intent")
-                elif e.msg == "memory.retrieved":
-                    context["memory_hits"] = e.fields.get("count")
-                elif e.msg == "node.progress":
-                    context["recall"] = e.fields.get("recall")
-                    context["depth"] = e.fields.get("depth")
-                elif e.msg in ("node.expand", "node.gaps"):
-                    context["tasks_produced"] = e.fields.get("produced")
-                    tasks_generated_total += e.fields.get("produced") or 0
-                elif e.msg == "node.critique":
-                    context["revision_count"] = e.fields.get("revision")
+            planned.append({
+                "index": gi, "node": node, "count": count, "events": gevents,
+                "kind": kind, "span_input": span_input,
+                "decision_ev": decision_ev, "route_ev": route_ev,
+                "decision_text": decision_text, "to_node": to_node,
+                "reason": route_ev.fields.get("reason") if route_ev else None,
+                "trailers": trailers,
+            })
 
-        out[plan_index] = self._render_plan_preview(timeline)
-        out.append(self._render_timeline(events, timeline, tasks_generated_total))
+            tasks_generated_total += self._fold_context(gevents, context)
+
+        return planned, timeline, tasks_generated_total
+
+    def _span_header(self, node: str, index: int, total: int,
+                     gevents: list, rule: str, *,
+                     rule_under_title: bool) -> list:
+        """The NODE:/Started/Finished/Elapsed block, defined ONCE.
+
+        It used to be written out twice, ninety lines apart, and the two
+        copies disagreed in BOTH ways -- which is exactly why one
+        definition is worth having:
+
+          decision span   rule / NODE / rule / Started / Finished / Elapsed
+          plain span      rule / NODE / Started / Finished / Elapsed / rule
+
+        and the rule itself is `_BANNER` (=) for one and `_THIN` (-) for
+        the other. Neither difference is a bug and both are preserved
+        byte-for-byte -- caught by diffing a real rendered narrative
+        before and after this extraction, not by the unit tests, which do
+        not assert on the header layout. `rule_under_title` is keyword-only
+        so a call site can never silently pass the wrong shape positionally.
+        """
+        duration = gevents[-1].ts - gevents[0].ts
+        title = [rule, f"NODE: {node}  [Step {index + 1}/{total}]"]
+        stamps = [f"Started : {self._fmt_ts(gevents[0].ts)}",
+                  f"Finished: {self._fmt_ts(gevents[-1].ts)}",
+                  f"Elapsed : {duration:.2f}s"]
+        if rule_under_title:
+            return title + [rule] + stamps
+        return title + stamps + [rule]
+
+    def _render_decision_span(self, sp: dict, total: int) -> str:
+        """An architectural decision point -- detected from event TYPE, not
+        node name (see _DECISION_EVENTS)."""
+        gevents = sp["events"]
+        lines = self._span_header(sp["node"], sp["index"], total, gevents,
+                                  self._BANNER, rule_under_title=True)
+        if sp["span_input"]:
+            lines.append("\nINPUT")
+            lines.append(self._THIN)
+            for k, v in sp["span_input"].items():
+                lines.append(f"{k}: {v}")
+        # Sub-events (LLM calls, retrievals) render HERE -- before the
+        # Decision/Next lines below, not after -- because the decision is a
+        # CONSEQUENCE of what these calls returned, not the other way
+        # around. Chronological order, not arrival order in the log stream.
+        for e in gevents:
+            if (e is sp["decision_ev"] or e is sp["route_ev"]
+                    or e.msg == "node.enter"):
+                continue
+            # D-116: the allowlist here was ("llm.call", "retrieval.raw")
+            # plus graph.* -- three event names, and EVERYTHING else inside
+            # a node span was silently dropped from the human-readable
+            # narrative. That included every WARNING the run produced.
+            #
+            # Measured on run p205.265-check: 12 warnings were logged, 10 of
+            # them never reached logs/run-*.txt -- among them the two
+            # llm.http_error lines carrying a 403 whose body said, in plain
+            # English, that the provider account had no credits.
+            # render_event has routed WARNING and above to _render_alert's
+            # banner since the file was written; nothing ever called it for
+            # a warning raised inside a node.
+            #
+            # An allowlist of event NAMES cannot stay correct as events are
+            # added -- D-110's llm.http_error did not exist when this list
+            # was written. Severity does not have that problem: a warning is
+            # a warning whatever it is called.
+            if (e.level in ("WARNING", "ERROR", "CRITICAL")
+                    or e.msg in ("llm.call", "retrieval.raw")
+                    or e.msg.startswith("graph.")):
+                lines.append("")
+                lines.append(self.render_event(e))
+        if sp["decision_text"]:
+            lines.append("\nDECISION")
+            lines.append(self._THIN)
+            lines.append(sp["decision_text"])
+            # The DECISION line above already explains WHY -- repeating it
+            # as a "Reason:" under TRANSITION was pure duplication (review:
+            # "Decision / Transition / Reason" all said the same thing three
+            # times). Just name what's next.
+            lines.append("\nNEXT")
+            lines.append(self._THIN)
+            lines.append(sp["to_node"] or "(next node)")
+        else:
+            # No dedicated DECISION text exists for this span (the generic
+            # route.decision fallback had nothing extra to show) -- the
+            # reason is the ONLY explanation available, so it stays, in full.
+            lines.append("\nTRANSITION")
+            lines.append(self._THIN)
+            lines.append(f"{sp['node']}\n      |\n      v\n"
+                         f"{sp['to_node'] or '(next node)'}")
+            lines.append(f"\nReason:\n{sp['reason'] or '(fixed edge)'}")
+        return "\n".join(lines)
+
+    def _render_plain_span(self, sp: dict, total: int) -> list:
+        """An ordinary node with no decision of its own (memory_retrieve,
+        merger, memory_writer, telemetry, human_escalation): a plain
+        heading plus whatever it logged. Returns a LIST of `out` entries,
+        because its sub-events are separate blocks rather than one string.
+        """
+        gevents = sp["events"]
+        header = self._span_header(sp["node"], sp["index"], total, gevents,
+                                   self._THIN, rule_under_title=False)
+        out = ["\n".join(header)]
+        raw_hit_count = None
+        for e in gevents:
+            if e.msg == "node.enter":
+                continue
+            if (e.msg == "retrieval.raw"
+                    and "memory" in str(e.fields.get("source", ""))):
+                raw_hit_count = e.fields.get("hit_count")
+                out.append(self.render_event(e))
+                continue
+            if e.msg == "memory.retrieved" and raw_hit_count is not None:
+                # Clarifies a genuinely confusing pair: the retrieval
+                # layer's raw hit count (Qdrant, no filtering) vs
+                # semantic_memory.py's own count (after its dedup/quality
+                # filtering) -- same two numbers already logged two events
+                # apart, just stated as one sentence instead of two easily-
+                # misread ones.
+                kept = e.fields.get("count")
+                out.append(f"[{e.where}] Qdrant returned {raw_hit_count}, "
+                           f"kept {kept} after quality/dedup filtering")
+                continue
+            out.append(self.render_event(e))
+        return out
+
+    def render_all(self, events: list) -> str:
+        """One pass over a whole run's buffered events -> the full
+        narrative file body. See class docstring for the grouping rules,
+        and the comment block above _partition for why this is three
+        phases rather than one loop.
+        """
+        self._llm_call_counter = 0
+        prelude, graph_blocks, orphans, spans = self._partition(events)
+        planned, timeline, tasks_generated = self._plan(spans)
+
+        out: list = [self.render_event(ev) for ev in prelude]
+        # D-117: rendered from the WHOLE event list, and placed before the
+        # execution plan so it is the first thing after the header.
+        out.append(self.render_problems(events))
+        # The plan preview reads FIRST, before the detailed graph-
+        # construction listing -- and is now computed before it is placed,
+        # rather than written as a None placeholder and back-patched.
+        out.append(self._render_plan_preview(timeline))
+        out.extend(self._render_graph_build(b) for b in graph_blocks)
+        out.extend(self.render_event(ev) for ev in orphans)
+
+        total = len(planned)
+        for sp in planned:
+            if sp["kind"] == "fanout":
+                out.append(f"[Step {sp['index'] + 1}/{total}]\n"
+                           + self._render_fanout(sp["node"], sp["events"],
+                                                 sp["count"]))
+            elif sp["kind"] == "decision":
+                out.append(self._render_decision_span(sp, total))
+            else:
+                out.extend(self._render_plain_span(sp, total))
+            for title, number, route_fields in sp["trailers"]:
+                out.append(self._phase_summary(title, number, route_fields))
+
+        out.append(self._render_timeline(events, timeline, tasks_generated))
         return "\n\n".join(out)
 
     def _render_plan_preview(self, timeline: list) -> str:

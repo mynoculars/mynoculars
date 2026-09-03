@@ -66,6 +66,7 @@ from pydantic import BaseModel, Field
 from research_agent import langfuse as lf
 from research_agent.assembly import AppBundle, build_app_and_settings, reject_if_thread_in_use
 from research_agent.logging_setup import log_event, run_id_var
+from research_agent.reporting.scores import emit_run_scores
 from research_agent.state import ResearchState
 from research_agent.storage.postgres import close_checkpointer, record_run
 
@@ -508,21 +509,13 @@ def _record_scores(thread_id: str, response: dict) -> None:
     """
     if response.get("status") != "done":
         return
-    telemetry = response.get("telemetry") or {}
-    if "recall" in telemetry:
-        lf.score(thread_id, "recall", telemetry["recall"])
-    if "critique_passed" in telemetry:
-        lf.score(thread_id, "critique_passed", bool(telemetry["critique_passed"]))
-    if telemetry.get("evidence_items", 0) and telemetry.get("goals", 0):
-        lf.score(thread_id, "evidence_per_goal",
-                 telemetry["evidence_items"] / telemetry["goals"])
-    if telemetry.get("search_calls", 0):
-        lf.score(thread_id, "memory_hit_rate",
-                 telemetry.get("memory_hits", 0) / telemetry["search_calls"])
-    if "grounding_ratio" in telemetry:
-        unevidenced = telemetry.get("goals_without_evidence") or []
-        lf.score(thread_id, "grounding_ratio", telemetry["grounding_ratio"],
-                 comment=f"unevidenced={','.join(unevidenced) or 'none'}")
+    # S-17: the five scores themselves live in reporting/scores.py. This
+    # file and cli.py::_run each carried an identical copy until now, which
+    # meant adding a sixth score to one interface silently made runs served
+    # by the other incomparable. What stays HERE is the only thing that is
+    # genuinely API-specific: a still-interrupted response has no telemetry
+    # to score yet and is skipped entirely rather than scored as zeros.
+    emit_run_scores(thread_id, response.get("telemetry") or {})
 
 
 class ResumeRequest(BaseModel):

@@ -1258,7 +1258,7 @@ all.
 
 ### Resetting all three stores
 
-`scripts/reset_stores.py` (with `reset.bat` for Windows) is the supported way
+`scripts/reset_stores.py` (with `reset_stores.bat` for Windows) is the supported way
 back to a pristine, re-ingestable state. Because corpus ingest is still not
 idempotent by default (see Ingest identity above), this is not an optional
 convenience — it is the only way to reload a corpus without silently
@@ -1279,7 +1279,10 @@ PYTHONPATH=src python scripts/reset_stores.py --yes --keep-memory
 PYTHONPATH=src python scripts/reset_stores.py --yes --qdrant
 ```
 
-Windows: `reset.bat` previews; `reset.bat --yes` resets **and** re-ingests.
+Windows: `reset_stores.bat` previews; `reset_stores.bat --yes` resets **and**
+re-ingests. (This file, and the batch script's own usage header, said
+`reset.bat` until now; the shipped filename is `reset_stores.bat` and the
+filename is what a reader can actually run.)
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -1772,7 +1775,7 @@ research-agent-dmp/
 ├── requirements.txt          # core; does NOT install the web-search client
 ├── requirements-websearch.txt  # Phase 4 only: ddgs + mcp. Install into the SAME
 │                              venv that runs the agent — see Setup
-├── .env.example  run.bat  reset.bat
+├── .env.example  run.bat  reset_stores.bat
 └── DECISIONS.md             # populated: D-1..D-165, sourced from code comments
 ```
 
