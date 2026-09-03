@@ -666,7 +666,13 @@ class Settings(BaseSettings):
     web_mcp_call_timeout_seconds: float = 45.0
     # Debug tracing: when true (or --debug on the CLI), dump the exact prompt,
     # raw response, provider, tokens and latency of every LLM call, plus every
-    # retrieval engine's hits, to logs/trace-<run_id>.txt. Off by default.
+    # retrieval engine's hits, to logs/run-<run_id>.txt. Off by default.
+    #
+    # The filename is run-, NOT trace-. It has been run- since narrative
+    # rendering moved out of tracing.py; D-120 corrected exactly this
+    # stale string in internal/GLOSSARY.md and did not reach this comment
+    # or cli.py's --debug help text, both of which still said trace-.
+    # logging_setup.py's own module docstring is the authority.
     debug_trace: bool = False
 
     log_level: str = "INFO"

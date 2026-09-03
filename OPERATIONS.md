@@ -1544,7 +1544,7 @@ re-run the example query after each so you can attribute any change.
 
 Everything above uses the CLI (`python -m research_agent.cli`). This
 codebase ALSO ships a FastAPI app (`api/server.py`) with `/health`,
-`/research`, `/resume`, `/state/{thread_id}` and `/result/{thread_id}` — a genuinely separate, optional way to run
+`/research`, `/resume` and `/state/{thread_id}` — a genuinely separate, optional way to run
 this codebase, not required for L1/L2/L3 or for anything else in this
 manual. Skip this section entirely if you only ever use the CLI.
 
@@ -1660,52 +1660,29 @@ loosen it). It is deployment hygiene for a repo that gets cloned and run.
 Anything needing per-tenant isolation still belongs behind a gateway, which
 is what the README has always said.
 
-**Not waiting for the answer (D-134, optional).** A research run takes
-minutes -- `p205.267-check` took 237 seconds -- and `POST /research` holds
-the HTTP connection open for all of it. Set a pool size to allow the
-non-blocking form:
+**⚠ `POST /research` BLOCKS FOR THE WHOLE RUN. There is no async mode
+in this build.** A research run takes minutes -- `p205.267-check` took
+237 seconds -- and the HTTP connection is held open for all of it. Set
+your client's read timeout accordingly (`Invoke-RestMethod
+-TimeoutSec 600`, `curl --max-time 600`), and prefer a small
+`MAX_DEPTH`/`MAX_FANOUT` or a `RUN_DEADLINE_SECONDS` (D-132) if you need
+a bounded response time.
 
-```powershell
-# .env
-API_ASYNC_WORKERS=2
-RUN_DEADLINE_SECONDS=600   # strongly recommended alongside; see below
-```
+This section previously documented a non-blocking form -- `{"wait":
+false}` returning `202`, `API_ASYNC_WORKERS` as a pool bound, and
+`GET /result/{thread_id}` for polling -- as though it shipped. **It does
+not exist in this build.** `api/server.py` registers no `/result` route,
+`config.py` declares no `api_async_workers`, and `ResearchRequest` has no
+`wait` field, so sending `wait: false` is not refused with the documented
+`501`: pydantic's default `extra="ignore"` discards it silently and the
+call runs inline. Following the old recipe here produced a `404` on the
+second step, which is why it is gone rather than merely footnoted.
 
-```powershell
-# 1. Accept the job -- returns immediately, HTTP 202
-$body = @{ query = "Compare Redis and Memcached"; thread_id = "job-1"; wait = $false } | ConvertTo-Json
-Invoke-RestMethod -Uri http://127.0.0.1:8000/research -Method Post `
-  -ContentType "application/json" -Body $body
-#   thread_id  status    status_url
-#   job-1      accepted  /result/job-1
-
-# 2. Poll until it settles
-Invoke-RestMethod -Uri http://127.0.0.1:8000/result/job-1
-#   status: running -> done         (report + telemetry)
-#                   -> interrupted  (review payload; then POST /resume as usual)
-#                   -> failed       (error names what raised)
-```
-
-`API_ASYNC_WORKERS=0` (the default) refuses `wait: false` with a `501`
-naming the setting, rather than silently running it synchronously and
-returning a shape you did not ask for. Omitting `wait` entirely behaves
-exactly as it always has.
-
-> **⚠ Run this with ONE uvicorn worker and a durable Postgres
-> checkpointer.** There is no job table, deliberately: the checkpointer is
-> the authoritative record, which is why a finished run stays readable
-> after a restart. But `running`, `failed` and an interrupted run's review
-> payload live in the accepting process's memory only. With
-> `uvicorn --workers 4` a poll can land on a worker that never saw the job
-> and will report `running` with no payload; with Postgres unreachable
-> (`durable: false` in `/health`) nothing survives a restart at all. Same
-> constraint `/resume` has always had, for the same reason.
->
-> **Shutdown waits for in-flight runs.** Ctrl-C drains the pool rather
-> than tearing the checkpointer out from under a running superstep, so a
-> server with a 4-minute run in flight takes up to 4 minutes to stop.
-> `RUN_DEADLINE_SECONDS` (D-132) is what bounds that wait -- which is why
-> the two settings belong together.
+The design is not withdrawn, only its shipped status: `DECISIONS.md`
+D-134 keeps the rationale (no job table, the checkpointer as the
+authoritative record, one setting serving as both switch and pool bound),
+and `tests/unit/test_packaging_contract.py` is what will notice if the
+`.env.example` key ever reappears without a field behind it.
 
 ## Enabling Web Search (Phase 4, optional)
 
@@ -3507,7 +3484,8 @@ free to service other requests while one call is mid-flight.
 `MCP_ENABLED=false` (the default) was always unaffected. If you still
 see slow first calls: that's the one-time ~13s cold start building the
 real `QdrantStore`/`OpenSearchStore`/embedding model on the server's
-first request (see `mcp_corpus_server.py::_get_corpus_tool`), not the
+first request (see `research_agent/servers/corpus.py::_get_corpus_tool`
+-- D-157 left `scripts/mcp_corpus_server.py` a launcher only), not the
 concurrency issue above — raise `MCP_CALL_TIMEOUT_SECONDS` (e.g. 120+)
 for that instead.
 

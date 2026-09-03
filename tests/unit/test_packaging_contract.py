@@ -48,16 +48,19 @@ def _pyproject() -> dict:
 # deliberately -- the same shape as
 # test_config.py::test_max_task_retries_no_longer_exists_at_all.
 #
-# API_ASYNC_WORKERS is D-134's async-run switch. That decision record
-# describes `POST /research {"wait": false}`, `GET /result/{thread_id}`
-# and a bounded worker pool, and names `api/server.py` and `config.py` as
-# where it lives -- but in this tree `config.py` declares no such field
-# and `api/server.py` registers no such route, so the key in
-# `.env.example` is inert: setting it to any value does nothing, and
-# nothing says so. Either the feature lands and this entry goes, or the
-# key goes; this list is here so that choice gets made rather than
-# forgotten again.
-KNOWN_UNMAPPED_ENV_KEYS = {"API_ASYNC_WORKERS"}
+# EMPTY, and that is the point. It held exactly one entry --
+# API_ASYNC_WORKERS, D-134's async-run switch -- from D-161 until now.
+# That decision record describes `POST /research {"wait": false}`,
+# `GET /result/{thread_id}` and a bounded worker pool, and names
+# `api/server.py` and `config.py` as where it lives; neither the field
+# nor the route exists in this tree. D-161 pinned it here rather than
+# editing four documents on the strength of one snapshot (D-160's rule).
+# THE CHOICE HAS NOW BEEN MADE: the key is gone from `.env.example` and
+# README/OPERATIONS say the feature is designed and not built, so there
+# is nothing left to pin. The design itself survives in DECISIONS.md
+# D-134; if it is built, add the Settings field FIRST and the
+# `.env.example` key second, and this set stays empty.
+KNOWN_UNMAPPED_ENV_KEYS: set = set()
 
 
 def test_every_env_example_key_maps_to_a_real_setting():

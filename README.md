@@ -241,7 +241,7 @@ change the graph's topology.
 
 | Item | What changed | Verified how |
 |---|---|---|
-| **Grounded convergence** | `state.py::ResearchState.grounded_score` (new field) is computed every gather cycle in `agents/gathering.py::progress_checker_node`, alongside the existing `recall_score`: a goal only counts toward it if at least one covering evidence item is `source in ("corpus", "mcp")` **and** shares distinctive vocabulary with the goal's own description — the same topical-overlap check `telemetry_node` already applied for `corpus_recall`, reused here (`tools/retrieval_chain.py::_distinctive_terms`) so the two numbers can never disagree. `orchestration/graph.py::route_convergence` will not treat `recall_score` reaching target as full convergence unless `grounded_score` also clears `settings.grounded_recall_target` (new, default `0.5`); otherwise it spends remaining depth budget on another gather cycle instead of compiling on ungrounded evidence | Unit tests on `route_convergence` and `progress_checker_node` directly, including the exact live shape that motivated it (a corpus hit topically unrelated to the goal it was credited against, scoring above the floor); confirmed live across six consecutive real runs — `grounded_score` correctly stayed `0.0` while `recall_score` reached `1.0`, and the router correctly kept looping instead of compiling early |
+| **Grounded convergence** | `state.py::ResearchState.grounded_score` (new field) is computed every gather cycle in `agents/gathering.py::progress_checker_node`, alongside the existing `recall_score`: a goal only counts toward it if at least one covering evidence item is `source in ("corpus", "mcp")` **and** shares distinctive vocabulary with the goal's own description — the same topical-overlap check `telemetry_node` already applied for `corpus_recall`, reused here (`retrieval/terms.py::distinctive_terms` — S-7 moved it out of `tools/retrieval_chain.py`, where it was underscore-prefixed while four other modules imported it) so the two numbers can never disagree. `orchestration/graph.py::route_convergence` will not treat `recall_score` reaching target as full convergence unless `grounded_score` also clears `settings.grounded_recall_target` (new, default `0.5`); otherwise it spends remaining depth budget on another gather cycle instead of compiling on ungrounded evidence | Unit tests on `route_convergence` and `progress_checker_node` directly, including the exact live shape that motivated it (a corpus hit topically unrelated to the goal it was credited against, scoring above the floor); confirmed live across six consecutive real runs — `grounded_score` correctly stayed `0.0` while `recall_score` reached `1.0`, and the router correctly kept looping instead of compiling early |
 | **Retrieval-floor telemetry** | `retrieval/hybrid.py::HybridRetriever` now counts `retrieval_dense_candidates` / `retrieval_dropped_by_floor` (thread-local, same pattern as the existing P2-07 counters). `agents/compilation.py::telemetry_node` computes the drop ratio and logs a WARNING (`retrieval.floor_starvation`) once it clears `settings.retrieval_floor_warn_ratio` (new, default `0.8`) — purely observational, no routing change | Unit tests for both the counter and the WARNING threshold; confirmed live — a run with `retrieval_floor_drop_ratio: 0.902` correctly logged the WARNING, an earlier run at `0.75` correctly did not |
 | **False-precision flag** | `tools/model_knowledge.py::overspecific_span` (renamed from a private `_looks_overspecific` boolean check so `guardrails/hedging.py` — Phase 2 — can reuse the same definition) flags a model-tier claim pairing a specific year with a specific quantity — percentages, energy/mass/area/air-quality units — as `Evidence.hedge_specific=True`. Deliberately narrow: a bare year or a bare rounded figure alone is not flagged, only the pairing that reads as verified fact while being unverifiable model recollection | Unit tests covering every unit class added, plus a regression test for a real `%`-matching bug found while widening the unit list (a trailing `\b` that never matched real text with a space after the sign); confirmed live across every run this session — `hedge_specific_items` reliably nonzero whenever the model tier contributed evidence |
 | **Orphaned-task guard** | `agents/task_utils.py::cap_and_filter` now rejects a well-formed task whose `goal_id` isn't one of `state.goals`' actual ids — found live: `gap_generator` emitted a task tagged with a goal id that was never produced by `goal_manager`, and it was retrieved, scored, and merged into evidence anyway, permanently uncoverable. Folds into the existing `producer_rejects` counter; empty `state.goals` skips the check (nothing to validate against) rather than rejecting everything | Unit tests reproducing the exact live shape (a task tagged with a nonexistent goal id) plus the empty-goals safety case |
@@ -1704,19 +1704,6 @@ research-agent-dmp/
 │   │                        half of the telemetry record) and
 │   │                        confidence.py (the composed per-run verdict)
 │   ├── evaluation/          # answer quality, judged cross-provider
-│   ├── api/server.py        # FastAPI: /health, /research, /resume
-│   └── cli.py               # CLI entry + dependency assembly + HITL loop
-├── tests/                   # offline. Organized by module,
-│                              mirroring src/research_agent/'s own layout:
-│                              tests/unit/<module>.py (one file per source
-│                              module) + tests/integration/<scenario>.py
-│                              (full graph.invoke() runs). See
-│                              OPERATIONS.md "Running and Interpreting the
-│                              Test Suite" for the full file-by-file map
-│                              and how to read the current count (M-4: a
-│                              literal count here goes stale on the next
-│                              added test — run `pytest -q` for the real
-│                              number).
 │   ├── servers/             # D-157: the two standalone MCP servers, which
 │   │                        used to live in scripts/ and therefore shipped
 │   │                        in no wheel at all
@@ -1753,6 +1740,20 @@ research-agent-dmp/
 │   │   │                      offline; this needs every service up
 │   │   └── sanity.py        # the offline pre-demo gate (D-158). The one
 │   │                          command here that REQUIRES a checkout
+│   ├── api/server.py        # FastAPI: /health, /research, /resume,
+│   │                        /state/{thread_id}
+│   └── cli.py               # CLI entry + dependency assembly + HITL loop
+├── tests/                   # offline. Organized by module,
+│                              mirroring src/research_agent/'s own layout:
+│                              tests/unit/<module>.py (one file per source
+│                              module) + tests/integration/<scenario>.py
+│                              (full graph.invoke() runs). See
+│                              OPERATIONS.md "Running and Interpreting the
+│                              Test Suite" for the full file-by-file map
+│                              and how to read the current count (M-4: a
+│                              literal count here goes stale on the next
+│                              added test — run `pytest -q` for the real
+│                              number).
 ├── scripts/                 # ten thin launchers, one per command above, so
 │                            every `python scripts/<name>.py` in this document
 │                            and in OPERATIONS.md still works from a checkout
@@ -1772,7 +1773,7 @@ research-agent-dmp/
 ├── requirements-websearch.txt  # Phase 4 only: ddgs + mcp. Install into the SAME
 │                              venv that runs the agent — see Setup
 ├── .env.example  run.bat  reset.bat
-└── DECISIONS.md             # populated: D-1..D-79, sourced from code comments
+└── DECISIONS.md             # populated: D-1..D-165, sourced from code comments
 ```
 
 ## Setup
@@ -1853,6 +1854,75 @@ retrieval ladder walks to its last tier and answers from the model, and the
 honesty rail says so. **That is success for L1** — the graph is proven, there
 is simply nothing to *search* yet. `OPERATIONS.md` walks you up from there,
 and its Step 1b explains each number in that first block.
+
+## Sample Output
+
+Two runs, both real, both reproducible. They are here because a research
+agent's README should show what the agent actually produces, and this one
+did not.
+
+**L1 — offline, zero services, zero API keys** (`LLM_MODE=stub`). Seven
+seconds on a cold container with no Postgres, no Qdrant, no OpenSearch:
+
+```text
+Confidence   : UNRELIABLE (15%)  — the report cites no evidence despite 4 item(s)
+                                   retrieved; no goal was answered from the corpus
+Recall       : 1.0   grounding_ratio 1.0   grounded 0.0   corpus_recall 0.0
+Evidence     : 4 item(s) -- model 4
+tier_answers : {"model": 2}
+```
+
+That is **success for L1**, and the honesty rail is the reason: recall is
+1.0 because every goal got *something*, `corpus_recall` is 0.0 because
+nothing came from a document, and the verdict is `UNRELIABLE` rather than
+a confident answer built on recollection.
+
+**L3 — live providers, real corpus, deliberately off-topic question.**
+"Compare the Armies of China and India" asked against this repo's
+ten-document Redis corpus, so the corpus genuinely cannot answer it:
+
+```text
+Confidence   : LOW (40%)  — 3 cited figure(s) appear in no cited evidence; the
+                            corpus has no material on this subject
+Citations    : 3 goal(s) cited in the prose   [59 evidence item(s) available]
+Sources      : 25 listed / 35 web item(s) across 24 domain(s)
+Critique     : PASSED after 1 revision cycle(s)
+Recall       : 1.0   grounding_ratio 1.0   grounded 0.0   corpus_recall 0.0
+Evidence     : 59 item(s) -- mcp 21 / web 35 / corpus 3
+```
+
+```json
+"retrieval_dense_candidates": 42,  "retrieval_dropped_by_floor": 41,
+"tier_answers": {"web": 7},        "grounding_notice_shipped": true,
+"cited_figures_checked": 7,        "cited_figures_unsupported": 3,
+"unsupported_figures": [{"figure": "1.45", "goals": ["g1"]},
+                        {"figure": "1.15", "goals": ["g1"]},
+                        {"figure": "2.5",  "goals": ["g1"]}]
+```
+
+**Read that block as the pitch, because it is one.** The relevance floor
+dropped 41 of 42 dense candidates — correctly, the corpus is about Redis.
+The web tier answered instead, and `grounded_score` stayed at `0.0`
+because a snippet is not a curated document. The run shipped a provenance
+notice saying so, in the report, not just in telemetry. And the LLM critic
+**passed** this report while the deterministic figure audit caught three
+fabricated numbers in it — which is exactly why that audit exists and why
+`grounding_ratio: 1.0` is documented as measuring evidence *presence*,
+not relevance.
+
+The `## Sources` block that ships below such a report lists each cited
+page under the goal it backed:
+
+```text
+## Sources
+
+1. [g3] Modernization of the People's Liberation Army - Wikipedia (en.wikipedia.org) — https://…
+2. [g1] People's Liberation Army - Wikipedia (en.wikipedia.org) — https://…
+5. [g2] Theater command - Wikipedia (en.wikipedia.org) — https://…
+```
+
+Reproduce the first block yourself with no services and no keys:
+`python -m research_agent.cli "Compare Redis and Memcached for session caching"`.
 
 ## Packaging
 
@@ -1951,8 +2021,11 @@ depends on you:
 
 ```text
   research_agent.assembly     build_app_and_settings(), AppBundle
-  research_agent.api.server   /research, /resume, /health, /state/{thread_id},
-                              /result/{thread_id} request+response shapes
+  research_agent.api.server   /research, /resume, /health, /state/{thread_id}
+                              request+response shapes. NOT /result/{thread_id}:
+                              D-134 designed it, this build does not register
+                              it, and a route that does not exist cannot be a
+                              promise to a consumer (see Limitations 8)
   every console script's NAME and arguments — all ten (D-157), not just
                               `research-agent`. A name in someone's Dockerfile
                               or systemd unit breaks exactly as loudly as an
@@ -2068,7 +2141,7 @@ This table lists only decisions with code behind them here.
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
 `DECISIONS.md` (populated as of P2-09, extended in every pass since) is the
-authoritative consolidated log, currently D-1 through D-79 — this table is a
+authoritative consolidated log, currently D-1 through D-165 — this table is a
 curated subset for readability, not a replacement.
 
 ## Limitations
@@ -2208,8 +2281,12 @@ visible rather than deleted, so the history stays auditable.
 **MCP corpus server concurrency — fixed, kept visible for auditability**
 
 29. ~~MCP corpus server serialized under concurrent load~~ — **P2-13,
-    Tier 3, fixed.** `scripts/mcp_corpus_server.py`'s tool handler used
-    to be synchronous; FastMCP called it directly on its single event
+    Tier 3, fixed.** *(Implementation now lives in
+    `src/research_agent/servers/corpus.py`; D-157 reduced
+    `scripts/mcp_corpus_server.py` to a 28-line launcher, so read the
+    package module for every code detail named below — the command you
+    RUN is still `python scripts/mcp_corpus_server.py`.)* The tool
+    handler used to be synchronous; FastMCP called it directly on its single event
     loop with no thread offload (confirmed by reading
     `func_metadata.py::call_fn_with_arg_validation` — `fn(**args)`
     called inline, not via `asyncio.to_thread`). Result: one real MCP
@@ -2222,7 +2299,7 @@ visible rather than deleted, so the history stays auditable.
     `_get_corpus_tool()` thundering-herd race, both since fixed) found
     and fixed along the way but NOT the cause of this specific slowdown.
     Never a correctness bug — every request always completed correctly,
-    just slowly. Fixed by making `mcp_corpus_server.py::search` `async
+    just slowly. Fixed by making `servers/corpus.py::search` `async
     def` and offloading the blocking `hits_for_query` call to a
     dedicated `ThreadPoolExecutor` sized by the new `mcp_max_workers`
     setting (default 6, matching `MAX_FANOUT`) via
@@ -2246,9 +2323,9 @@ visible rather than deleted, so the history stays auditable.
     antivirus file-hash scanning, and `CREATE_NO_WINDOW` plus a stripped
     subprocess environment -- were tested directly and ruled out). Fixed
     by importing `qdrant_client` and `opensearchpy` eagerly, on the main
-    thread, at module load time in `scripts/mcp_corpus_server.py`,
-    before `mcp.run()` starts the event loop -- see that file's module
-    docstring ("First-import gotcha") for the full account. **Do not
+    thread, at module load time in `src/research_agent/servers/corpus.py`
+    (lines 137-138), before `mcp.run()` starts the event loop -- see that
+    file's module docstring ("First-import gotcha") for the full account. **Do not
     remove those two imports as "dead code"**; they look redundant with
     `QdrantStore`/`OpenSearchStore`'s own lazy imports but are
     load-order-critical. This also loosened
@@ -2353,20 +2430,28 @@ visible rather than deleted, so the history stays auditable.
    this anywhere reachable, put it behind a gateway that terminates auth and
    rate-limits.** The graph has no notion of a caller identity, so there is
    nothing inside the application to fall back on.
-8. **Async mode's job state is in-process (D-134).** `POST /research` with
-   `{"wait": false}` returns `202` and runs on a bounded background pool
-   (`API_ASYNC_WORKERS`, `0` = off and the feature is refused with a `501`);
-   `GET /result/{thread_id}` polls it. There is deliberately **no job
-   table** — the checkpointer is the authoritative record, so a finished
-   run is readable after a restart and from any worker. What is NOT durable
-   is the in-memory overlay: `running`, `failed`, and an interrupted run's
-   review payload live in the accepting process only. With
-   `uvicorn --workers N` a poll can land elsewhere and see `running` with no
-   payload; with a degraded `MemorySaver` checkpointer nothing survives a
-   restart. **A single worker plus durable Postgres is the configuration
-   this is built for** — the same constraint `/resume` has carried since
-   P2-08. Shutdown waits for in-flight runs, so pair it with
-   `RUN_DEADLINE_SECONDS` (D-132), which is what bounds that wait.
+8. **Async mode (D-134) is DESIGNED AND NOT BUILT — `POST /research`
+   always runs inline.** This entry described a shipped feature until
+   now, and that was the most consequential documentation defect in this
+   repository: `api/server.py` registers no `GET /result/{thread_id}`,
+   `config.py` declares no `api_async_workers`, and `ResearchRequest`
+   has no `wait` field — so `{"wait": false}` is not refused with a
+   `501` as claimed, it is silently swallowed by pydantic's default
+   `extra="ignore"` and the caller gets a synchronous run it did not ask
+   for. `tests/unit/test_packaging_contract.py` had already caught the
+   orphaned `API_ASYNC_WORKERS` key and D-161 pinned it rather than
+   editing four documents on one snapshot; this is that edit, made once
+   the gap was confirmed against a clean checkout with the suite green.
+   **A research run therefore holds its HTTP connection for its whole
+   duration** — a live run took 237 seconds — which is the real standing
+   limitation, and the honest one to state. The design itself is sound
+   and stays recorded in `DECISIONS.md` D-134: no job table, the
+   checkpointer as the authoritative record, one setting as both switch
+   and pool bound. If it is built, the in-process overlay (`running`,
+   `failed`, an interrupted run's review payload) is what will NOT be
+   durable, and a single worker plus durable Postgres will be the
+   supported configuration — the same constraint `/resume` has carried
+   since P2-08.
 9. **The test suite proves mechanics, never answer quality — and the golden
    set only narrows that gap (D-136).** `python -m pytest -q` is entirely
    offline (D-33) and can say nothing about whether a report is any good;

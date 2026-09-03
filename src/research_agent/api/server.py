@@ -576,9 +576,16 @@ def read_state(thread_id: str) -> dict:
     versioned commitment, not a debugging convenience that can be
     reshaped later.
 
-    ⚠ NO AUTH, like every other endpoint here (see README's Limitations).
-    Behind a gateway that terminates auth, this is a progress view; open
-    to the internet it is a live feed of what a caller is researching.
+    ⚠ GUARDED BY API_KEY WHEN ONE IS SET, and open when none is (D-133) --
+    see require_api_key, which this endpoint declares as a dependency.
+    This paragraph read "NO AUTH, like every other endpoint here" until
+    now: it predated D-133 and contradicted this function's own
+    decorator, which is the worst shape a comment can take -- a reader
+    checking whether /state is protected would have believed it was not.
+    The DEFAULT posture is still open, and the deployment advice is
+    unchanged: behind a gateway that terminates auth this is a progress
+    view; open to the internet it is a live feed of what a caller is
+    researching.
     """
     _ensure_built()
     snapshot = _graph.get_state(_config(thread_id))

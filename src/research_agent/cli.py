@@ -327,7 +327,7 @@ def main(argv=None) -> int:
     parser.add_argument("--debug", action="store_true",
                         help="Dump exact prompts, raw responses, provider, "
                              "tokens/latency, and every retrieval engine's hits "
-                             "to logs/trace-<run_id>.txt (also enabled by "
+                             "to logs/run-<run_id>.txt (also enabled by "
                              "DEBUG_TRACE=true in .env).")
     parser.add_argument("--print-graph", action="store_true",
                         help="Print the graph's TOPOLOGY (every node THIS "
