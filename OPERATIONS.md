@@ -50,37 +50,37 @@ shown.
 ## Contents
 
   - [How to use this document](#how-to-use-this-document)
-- **[Part 0 — Before you start](#part-0-before-you-start)**
+- **Part 0 — Before you start**
   - [The One Thing Nobody Told You: There Are THREE Run Levels](#the-one-thing-nobody-told-you-there-are-three-run-levels)
-- **[Part 1 — Get it running](#part-1-get-it-running)**
-  - [Step 1 — Skeleton (L1): run this first, it needs nothing](#step-1-skeleton-l1-run-this-first-it-needs-nothing)
-  - [Step 2 — Real retrieval (L2): the level you actually want to see](#step-2-real-retrieval-l2-the-level-you-actually-want-to-see)
-  - [Step 3 — Calibrate the retrieval floor (required before trusting any result)](#step-3-calibrate-the-retrieval-floor-required-before-trusting-any-result)
-  - [Step 4 — Full (L3): real report text from a real model](#step-4-full-l3-real-report-text-from-a-real-model)
-  - [Step 5 — Verify: service health checklist](#step-5-verify-service-health-checklist)
-  - [Step 5b — Verify: the three senses of "test"](#step-5b-verify-the-three-senses-of-test)
-- **[Part 2 — Optional capabilities](#part-2-optional-capabilities)**
+- **Part 1 — Get it running**
+  - [Step 1 — Skeleton (L1): run this first, it needs nothing](#step-1--skeleton-l1-run-this-first-it-needs-nothing)
+  - [Step 2 — Real retrieval (L2): the level you actually want to see](#step-2--real-retrieval-l2-the-level-you-actually-want-to-see)
+  - [Step 3 — Calibrate the retrieval floor (required before trusting any result)](#step-3--calibrate-the-retrieval-floor-required-before-trusting-any-result)
+  - [Step 4 — Full (L3): real report text from a real model](#step-4--full-l3-real-report-text-from-a-real-model)
+  - [Step 5 — Verify: service health checklist](#step-5--verify-service-health-checklist)
+  - [Step 5b — Verify: the three senses of "test"](#step-5b--verify-the-three-senses-of-test)
+- **Part 2 — Optional capabilities**
   - [Running the HTTP API (optional)](#running-the-http-api-optional)
   - [Enabling Web Search (Phase 4, optional)](#enabling-web-search-phase-4-optional)
   - [Running the MCP servers standalone (D-76)](#running-the-mcp-servers-standalone-d-76)
   - [Enabling Langfuse Observability (Phase 3, optional)](#enabling-langfuse-observability-phase-3-optional)
-- **[Part 3 — Tuning `.env`](#part-3-tuning-env)**
-- **[Part 4 — Reference & debugging](#part-4-reference-debugging)**
+- **Part 3 — Tuning `.env`**
+- **Part 4 — Reference & debugging**
   - [Which Software Runs, And Why (the whole inventory)](#which-software-runs-and-why-the-whole-inventory)
   - [Running and Interpreting the Test Suite](#running-and-interpreting-the-test-suite)
   - [Running the Golden-Set Eval Sweep (D-136)](#running-the-golden-set-eval-sweep-d-136)
   - [Using Debug Mode](#using-debug-mode)
-  - [Understanding and Interpreting the Debug Logs — Node by Node](#understanding-and-interpreting-the-debug-logs-node-by-node)
+  - [Understanding and Interpreting the Debug Logs — Node by Node](#understanding-and-interpreting-the-debug-logs--node-by-node)
   - [Debugging a Workflow Execution](#debugging-a-workflow-execution)
   - [Printing the LangGraph Topology](#printing-the-langgraph-topology)
   - [Performing a Dry Run](#performing-a-dry-run)
-  - [Guardrails — What To Expect In The Logs](#guardrails-what-to-expect-in-the-logs)
-  - [Thread IDs — Usage, Lifecycle, and Reuse Considerations](#thread-ids-usage-lifecycle-and-reuse-considerations)
+  - [Guardrails — What To Expect In The Logs](#guardrails--what-to-expect-in-the-logs)
+  - [Thread IDs — Usage, Lifecycle, and Reuse Considerations](#thread-ids--usage-lifecycle-and-reuse-considerations)
   - [Writing Your Own Test Corpus](#writing-your-own-test-corpus)
   - [Troubleshooting Common Errors](#troubleshooting-common-errors)
-  - [Appendix A — Terms and Acronyms](#appendix-a-terms-and-acronyms)
-  - [Appendix B — DBeaver Setup (optional GUI database access)](#appendix-b-dbeaver-setup-optional-gui-database-access)
-  - [Appendix C — Version History](#appendix-c-version-history)
+  - [Appendix A — Terms and Acronyms](#appendix-a--terms-and-acronyms)
+  - [Appendix B — DBeaver Setup (optional GUI database access)](#appendix-b--dbeaver-setup-optional-gui-database-access)
+  - [Appendix C — Version History](#appendix-c--version-history)
 
 ## How to use this document
 
@@ -692,7 +692,7 @@ add reach — see Part 2.)
 
 ---
 
-See **[Running the MCP servers standalone](#running-the-mcp-servers-standalone-d-75-optional)** (Part 2) for the full start/stop workflow and the `.env` for both modes.
+See **[Running the MCP servers standalone](#running-the-mcp-servers-standalone-d-76)** (Part 2) for the full start/stop workflow and the `.env` for both modes.
 
 ---
 
@@ -1241,6 +1241,20 @@ cd D:\work\CONFIDENTAIL\KREUPASANAM\digital-evaluation_ai\llama-precompiled
 # USE THIS — stable on 8 GB VRAM: -c 1536, typically ~28 GPU layers (~4 layers remain in RAM)
 .\llama-server.exe -m ..\models\qwen\cogito\deepcogito_cogito-v1-preview-llama-8B-Q5_K_M.gguf -ngl 28 -c 1536 --chat-template chatml --port 8080 > ..\logs\llama-server_cogito.log 2>&1
 
+# ⚠ ONE SLOT. This invocation omits --parallel, so llama-server serves ONE
+# request at a time -- and the graph's search_worker fan-out issues up to
+# MAX_FANOUT (6) SIMULTANEOUS model-tier calls. See "Context size has been
+# exceeded on a tiny prompt" in Troubleshooting: the extra requests are
+# refused with a 500 whose message names the context, not the queue.
+#
+# --parallel N SPLITS -c ACROSS N SLOTS. `-c 1536 --parallel 6` gives each
+# slot 256 tokens, which is worse than the problem. To actually serve six
+# concurrent calls at this window you need -c 9216 (6 x 1536), which will
+# not fit alongside 28 GPU layers on an 8 GB card. On this hardware the
+# honest options are to lower MAX_FANOUT, or to let the surplus calls fall
+# back to a cloud provider (which is what happens today, and it completes
+# the run -- it just makes the local model look flaky in a walkthrough).
+
 # DIAGNOSTICS
 curl http://127.0.0.1:8080/v1/models
 
@@ -1501,7 +1515,7 @@ query can make it converge cleanly instead of escalating. For the full
 story of why this specific documented query didn't escalate on an earlier
 revision, what was fixed, and one honest caveat about which trigger a real
 escalation has actually been confirmed on, see README.md's
-[The HITL Investigation](../README.md#the-hitl-investigation) section.
+[The HITL Investigation](README.md#the-hitl-investigation) section.
 
 **A fourth sense, once you are at L3: the golden-set eval sweep.** The three
 above verify that YOUR setup works. `python scripts/eval_suite.py --run`
@@ -2076,7 +2090,7 @@ Both must be right. Raising one to compensate for the other produces a system
 that looks calibrated and is not. **For the RRF math behind why
 `MIN_EVIDENCE_SCORE` cannot act as a relevance gate** — every hit from two
 healthy retrieval legs scores 0.968 or above, regardless of relevance — see
-**[Step 3 — Why `recall` can still read 1.0](#why-recall-can-still-read-10-and-which-knob-actually-moves-it)**.
+**[Step 3 — Why `recall` can still read 1.0](#why-recall-can-still-read-10--and-which-knob-actually-moves-it)**.
 
 ### A safe tuning loop
 
@@ -2426,7 +2440,7 @@ nothing re-checking the ones that used to work.
 deployment, each checked against a band written down in advance.
 
 > **This needs a full L3 setup** — Qdrant, OpenSearch, Postgres and a live
-> model, exactly as [Step 4](#step-4-full-l3-real-report-text-from-a-real-model)
+> model, exactly as [Step 4](#step-4--full-l3-real-report-text-from-a-real-model)
 > leaves you. It is **not** a pytest test and must never become one: a check
 > that needs four services has no business silently skipping (or silently
 > running) inside a suite whose whole guarantee is that it needs none.
@@ -2838,7 +2852,7 @@ wasn't necessarily quality-checked on the way there.
  "warn_threshold": 40, "revision_cycles": 3, "escalations": 2}
 ```
 
-Purely observational — see [Guardrails](../README.md#guardrails) in
+Purely observational — see [Guardrails](README.md#guardrails) in
 `README.md` for why this is a WARNING and not a circuit breaker. No run
 observed to date has come close to the default threshold (18 calls is the
 highest seen); if this fires routinely for you, `revision_cycles` and
@@ -3402,9 +3416,9 @@ you're seeing this with an unmodified `.env.example`, confirm your `.env`
 isn't overriding it back down (an old copy from before this repo shipped
 `0.35`, for instance). This is not a troubleshooting-time fix; it is a
 setup-time one. See
-**[Step 3 — Calibrate the retrieval floor](#step-3-calibrate-the-retrieval-floor-required-before-trusting-any-result)**
+**[Step 3 — Calibrate the retrieval floor](#step-3--calibrate-the-retrieval-floor-required-before-trusting-any-result)**
 for the full measurement procedure, and
-**[Part 3 — Tuning `.env`](#part-3-tuning-env)** for the two-filter
+**Part 3 — Tuning `.env`** for the two-filter
 distinction (`MIN_SIMILARITY` vs `MIN_EVIDENCE_SCORE`) that trips people up
 here — raising `MIN_EVIDENCE_SCORE` will NOT fix this; it filters a
 different stage entirely.
@@ -3433,6 +3447,77 @@ independent of this setting.
 $env:LLM_PRIMARY_TIMEOUT_SECONDS = "150"
 python -m research_agent.cli "your question" --debug
 ```
+
+### `Context size has been exceeded` (HTTP 500) on a prompt far smaller than `-c`
+
+**Signature.** Several `llm.context_overflow` WARNINGs at once, all with
+`status: 500`, `node: null`, and an `estimated_prompt_tokens` well under
+`configured_context_tokens`:
+
+```text
+llm.context_overflow  estimated_prompt_tokens=439  configured_context_tokens=1536  status=500
+llm.context_overflow  estimated_prompt_tokens=450  configured_context_tokens=1536  status=500
+llm.context_overflow  estimated_prompt_tokens=434  configured_context_tokens=1536  status=500
+llm.context_overflow  estimated_prompt_tokens=437  configured_context_tokens=1536  status=500
+```
+
+**This is not a context-size problem, and the prompt-token number is a red
+herring.** Read the timestamps: in run `p205.299-check` all four landed
+within ONE MILLISECOND of each other, and two further calls of the SAME
+size (421 and 412 tokens) succeeded a second and a half later, once they
+were no longer simultaneous. Identical prompts, opposite outcomes, split
+only by concurrency.
+
+**Cause.** `llama-server` serves `--parallel N` requests at a time (default
+**1**). The graph's `search_worker` fan-out issues up to `MAX_FANOUT`
+simultaneous model-tier calls -- one per worker. Requests that find no free
+slot are refused, and llama-server's message for that condition names the
+context rather than the queue, which is what makes it read as a sizing bug.
+`node: null` is the tell: these are retrieval-ladder calls made from inside
+the parallel fan-out, not from a named graph node.
+
+**Fix.** Match the server's concurrency to the fan-out, or the fan-out to
+the server:
+
+| | |
+|---|---|
+| Lower the fan-out | `MAX_FANOUT=2` in `.env`. Costs breadth per gather cycle; costs no VRAM. |
+| Raise the server's slots | `--parallel 6` AND `-c 9216` — `--parallel` DIVIDES `-c`, so raising it alone makes every slot smaller. Needs the VRAM for a 6x context. |
+| Do nothing | The run still completes: the refused calls fall through to the cloud provider (visible as `llm_fallback_hops`). Correct behaviour, but it makes the local model look unreliable in a walkthrough. |
+
+**What it is NOT.** Not a faulty token estimator -- it produced 421 for a
+call that succeeded and 439 for one that failed, and both were accurate.
+Not a server that fails to honour its own `-c`.
+
+**A related gap, worth knowing.** `_learn_context_limit` (D-151) adopts the
+window a server reports back, but it is gated on HTTP **400**. These
+arrive as **500**, so nothing is learned from them -- which is correct
+here, since there is no wrong window to learn.
+
+### All six web searches fail in one gather cycle
+
+**Signature.** `web_search.tool_reported_error` repeated once per task in a
+single cycle, and `tier_answers` showing the model tier answering the tasks
+the web tier did not.
+
+**Same cause as the entry above, different service.** `MAX_FANOUT` and
+`WEB_SEARCH_MAX_WORKERS` both default to 6, so six DDGS queries leave at
+once. DDGS is an unofficial client against an endpoint that promises it
+nothing (see `requirements-websearch.txt`); throttling under that burst is
+expected rather than exceptional.
+
+**The run is not broken by this.** The retrieval ladder falls through to the
+model tier, `search_failures` stays 0, and `chain_tier_failures` stays 0 --
+graceful degradation working as designed. What you lose is web evidence for
+that cycle.
+
+**Fix.** Lower `MAX_FANOUT`, or lower `WEB_SEARCH_MAX_WORKERS` on the
+search server so the tier self-limits without narrowing the graph's fan-out.
+
+**⚠ The log line is currently INFO and carries no reason** -- no status, no
+body, no exception text -- so a total web-tier failure does not appear in
+the run's PROBLEMS summary and cannot be diagnosed from the log alone. That
+is a known gap, not something you are missing.
 
 ### Local model generates fake follow-up turns after its answer
 
@@ -3465,7 +3550,7 @@ Root cause (confirmed by reading `mcp/server/fastmcp/utilities/
 func_metadata.py::call_fn_with_arg_validation`): a synchronous tool
 handler is called directly on FastMCP's single event loop, with no
 thread offload (`fn(**args)`, not `asyncio.to_thread(fn, **args)`). A
-synchronous `scripts/mcp_corpus_server.py::search()` doing real, blocking
+synchronous `servers/corpus.py::search()` doing real, blocking
 Qdrant/OpenSearch I/O (~13s+ per call) therefore blocked the ENTIRE
 server for one in-flight request — `MAX_FANOUT` concurrent
 search_worker calls fully serialized instead of running in parallel.
@@ -3746,7 +3831,7 @@ current one.
 > for the follow-up run that confirmed both halves of that distinction.
 
 > **This is a hands-on manual, not the honesty audit.** `README.md`'s
-> [Limitations](../README.md#limitations) section is the authoritative,
+> [Limitations](README.md#limitations) section is the authoritative,
 > itemized account of what's fixed vs. still broken (28 fixed items, plus
 > a short list of genuine open gaps — most notably that self-critique can
 > still pass a report whose claims aren't backed by any retrieved

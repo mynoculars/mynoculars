@@ -62,6 +62,11 @@ def _pyproject() -> dict:
 # `.env.example` key second, and this set stays empty.
 KNOWN_UNMAPPED_ENV_KEYS: set = set()
 
+# Settings fields deliberately absent from `.env.example`. Empty, and the
+# test below asserts equality, so leaving one out is a decision someone has
+# to record here rather than an omission that goes unnoticed.
+KNOWN_UNDOCUMENTED_SETTINGS: set = set()
+
 
 def test_every_env_example_key_maps_to_a_real_setting():
     """A key in `.env.example` that no field reads is documentation of a
@@ -78,6 +83,44 @@ def test_every_env_example_key_maps_to_a_real_setting():
         f"nobody -- extra='ignore' means setting it is silently a no-op. "
         f"Add the Settings field, remove the key, or (only with a reason) "
         f"add it to KNOWN_UNMAPPED_ENV_KEYS.")
+
+
+def test_every_setting_is_documented_in_env_example():
+    """The OTHER direction, which nothing checked (S-20).
+
+    The test above catches a key with no field behind it. It cannot catch
+    the inverse -- a real, readable Settings field that `.env.example`
+    never mentions -- and that is the direction this project actually
+    drifts, because a field is added in `config.py` where the code needs
+    it and the example file is a separate edit nobody is forced to make.
+
+    IT HAD FOUND SEVEN when this test was written: MEMORY_WRITE_MIN_SCORE,
+    QUALITY_JUDGE_WARN_RATIO, MODEL_KNOWLEDGE_SCORE,
+    QUERY_REFORMULATION_ENABLED, MAX_ESCALATIONS, RUN_CALL_BUDGET_WARN and
+    CLAIM_VERIFICATION_ENABLED. Two of those (QUALITY_JUDGE_WARN_RATIO,
+    RUN_CALL_BUDGET_WARN) are documented in README's own guardrails table,
+    so the README offered a control the example file did not, and
+    MODEL_KNOWLEDGE_SCORE has a dedicated startup warning
+    (warn_on_model_knowledge_inert, D-163) for a misconfiguration you could
+    not reach `.env.example` to cause.
+
+    Equality, not subset, and the allowlist is empty: a field deliberately
+    left out has to be named here, so the choice is made rather than
+    forgotten -- the same shape as KNOWN_UNMAPPED_ENV_KEYS above.
+    """
+    from dotenv import dotenv_values
+
+    keys = set(dotenv_values(REPO_ROOT / ".env.example").keys())
+    fields = {name.upper() for name in Settings.model_fields}
+
+    undocumented = fields - keys
+
+    assert undocumented == KNOWN_UNDOCUMENTED_SETTINGS, (
+        f"undocumented settings changed: {sorted(undocumented)}. A field "
+        f"with no key in .env.example is a tunable nobody reading that "
+        f"file can discover. Add the key with a comment saying what it "
+        f"guards, or (only with a reason) add it to "
+        f"KNOWN_UNDOCUMENTED_SETTINGS.")
 
 
 def test_every_console_script_resolves_to_a_real_module_and_main():
