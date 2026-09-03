@@ -214,7 +214,11 @@ class NarrativeFormatter(logging.Formatter):
         lines.append(self._THIN)
         status = "PASSED" if f.get("critique_passed") else "FAILED"
         lines.append(f"Result           : {status}")
-        lines.append(f"Revision cycles  : {f.get('revision_cycles')}")
+        # D-176: named for what the counter holds. "Revision cycles" read
+        # as revisions and is one greater than that on every run; the
+        # timeline block below already called the same number "Critique
+        # loops", which was right.
+        lines.append(f"Critique passes  : {f.get('revision_cycles')}")
         if f.get("escalations"):
             lines.append("\nEscalations")
             lines.append(self._THIN)

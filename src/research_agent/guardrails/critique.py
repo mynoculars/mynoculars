@@ -223,3 +223,49 @@ def resolve_verdict(passed: bool, notes: List[str],
                      "cited figure, so the failure had no corroboration; "
                      "the report passes and this line is the record")
     return True, notes, {"critique_notes_dismissed": float(dismissed)}
+# D-181: the critic's own vocabulary for asserting that a claim is FINE.
+# Deliberately a support assertion plus the absence of a negation, not a
+# keyword hunt: "so the claim is unsupported" contains none of these, and
+# would survive even if it did, because _NOT_SUPPORTED vetoes.
+_SUPPORTED_RE = re.compile(
+    r"\b(is faithful|are faithful|evidence supports|is supported by"
+    r"|supported by the evidence|claim is supported)\b", re.IGNORECASE)
+_NOT_SUPPORTED_RE = re.compile(
+    r"\b(not supported|unsupported|does not support|do not support"
+    r"|no evidence|not present|does not contain|absent from"
+    r"|never supplied|cannot be found)\b", re.IGNORECASE)
+
+
+def drop_affirmations(entries: List[str]):
+    """(violations, dropped) -- entries that record a claim is FINE go.
+
+    CALLED BY   agents/compilation.py::critic_node, on whatever the model
+                returned, before those strings become critique_notes.
+
+    THIS IS DEFENCE IN DEPTH, NOT THE FIX. The fix is the contract:
+    templates.critique now asks for `violations` and says in words that
+    the list is violations only (D-181). This exists because the failure
+    it guards against is silent and expensive -- templates.compile
+    renders every entry under "A reviewer rejected the previous draft.
+    Address every note", so an affirmation becomes an instruction to
+    change something that is correct, and nothing downstream can tell
+    the two apart. Live (p205.308-check) 21 of 23 entries were
+    affirmations, 2,809 of 3,108 characters.
+
+    The count is returned rather than swallowed, and reaches telemetry as
+    `critique_affirmations_dropped`. A nonzero value means the model is
+    not honouring the contract, which is the thing worth knowing: this
+    filter is meant to sit at zero, and a run where it does not is a
+    prompt to fix, not a filter to widen.
+
+    An entry is dropped only when it asserts support AND does not deny
+    it, so a note reading "evidence does not support this" is kept
+    whatever else it says.
+    """
+    violations, dropped = [], 0
+    for entry in entries:
+        if _SUPPORTED_RE.search(entry) and not _NOT_SUPPORTED_RE.search(entry):
+            dropped += 1
+            continue
+        violations.append(entry)
+    return violations, dropped

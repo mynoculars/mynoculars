@@ -49,7 +49,8 @@ def test_a_failed_critique_says_so_in_words():
     # "critique_passed": false 40 lines deep in JSON; nobody reads that.
     out = _fmt_result_summary(_P205_212, _REPORT)
     assert "FAILED" in out
-    assert "2 revision cycle(s)" in out
+    # D-176: two CRITIC PASSES over one report is one revision.
+    assert "1 revision(s)" in out
 
 
 def test_a_passed_critique_says_so_too():
@@ -295,4 +296,24 @@ def test_an_empty_telemetry_dict_still_renders():
 
     assert "=== RESULT ===" in out
     assert "Confidence   : n/a" in out
+def test_a_single_critic_pass_is_not_reported_as_a_revision():
+    """D-176, the p205.302-check defect.
 
+    `revision_cycles` is bumped once per critic INVOCATION, including the
+    first, so a run whose execution plan is a single compiler -> critic
+    pass arrives here with 1. It reported "PASSED after 1 revision
+    cycle(s)" -- a revision that never happened, on the one line of the
+    run summary a showcase audience actually reads.
+    """
+    out = _fmt_result_summary({**_P205_212, "critique_passed": True,
+                               "revision_cycles": 1}, _REPORT)
+
+    assert "PASSED" in out
+    assert "revision" not in out
+
+
+def test_three_critic_passes_report_two_revisions():
+    out = _fmt_result_summary({**_P205_212, "critique_passed": True,
+                               "revision_cycles": 3}, _REPORT)
+
+    assert "2 revision(s)" in out

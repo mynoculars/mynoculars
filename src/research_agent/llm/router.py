@@ -588,6 +588,72 @@ class FallbackRouter:
 
     # -- routed calls -------------------------------------------------------
 
+    def _skip_reason(self, i: int, provider: ChatClient,
+                     messages: List[Message]) -> Optional[str]:
+        """Why hop `i` is skipped without being called, or None.
+
+        SHARED BY   complete() and complete_json() -- both walk the same
+                    chain and must skip on the same terms. Before S-26
+                    this was two verbatim copies whose *comments* had
+                    already drifted apart, which is how that kind of
+                    duplication usually announces itself.
+        RETURNS     the D-101 outcome string the caller appends, or None
+                    when the provider should actually be called.
+
+        The LAST provider is never skipped: with nothing behind it there is
+        no next hop to fall back to, so skipping would be a silent failure
+        rather than a fallback. That `i + 1 < len(...)` guard also means the
+        two _skips_for_* helpers -- and the llm_disabled_skips /
+        llm_context_skips counters they bump -- are not consulted at all on
+        the final hop. Unchanged from the inline versions this replaces.
+
+        D-130 is checked BEFORE D-93: a provider already known to be dead is
+        not "skipped for context", and reporting it that way would send an
+        operator to the wrong setting.
+        """
+        if i + 1 >= len(self.providers):
+            return None
+        if self._skips_for_disabled(provider):            # D-130
+            return "skipped_disabled"
+        if self._skips_for_context(provider, messages):   # D-93
+            return "skipped_for_context"
+        return None
+
+    def _log_fallback(self, frm: str, to: Optional[str],
+                      reason: str, mode: str) -> None:
+        """Emit one llm.fallback record to both sinks.
+
+        SHARED BY   the three places a hop is left behind: an error in
+                    complete_json, an error in complete, and a
+                    below-threshold quality score in complete. All three
+                    carried their own byte-identical pair of calls.
+        """
+        log_event(logger, "llm.fallback", from_provider=frm,
+                  to_provider=to, reason=reason, mode=mode)
+        lf.event(run_id_var.get(), "llm.fallback",
+                metadata={"from_provider": frm, "to_provider": to,
+                          "reason": reason, "mode": mode})
+
+    def _record_hop(self, i: int, provider: ChatClient, exc: Exception,
+                    mode: str, outcomes: List[Tuple[str, str]]) -> None:
+        """Record one FAILED hop: outcome, hop counter, and the log record.
+
+        SHARED BY   complete() and complete_json() (S-26); `mode` was the
+                    only thing that differed between the two copies.
+        MUTATES     `outcomes` in place, and bumps llm_fallback_hops.
+
+        llm_fallback_hops is bumped only when a next provider exists: P2-07
+        counts real hops, and the last provider failing is a dead end, not a
+        hop. The caller keeps its own `last_exc = exc` -- rebinding a
+        caller's local is not something a helper can do for it.
+        """
+        outcomes.append((provider.name, type(exc).__name__))  # D-101
+        nxt = (self.providers[i + 1].name
+               if i + 1 < len(self.providers) else None)
+        if nxt is not None:
+            self._bump("llm_fallback_hops")  # P2-07: a real hop, not a dead end
+        self._log_fallback(provider.name, nxt, type(exc).__name__, mode)
+
     def complete_json(self, messages: List[Message]) -> Dict[str, Any]:
         """Structured call. Step down the chain on error/unparseable JSON.
 
@@ -617,22 +683,12 @@ class FallbackRouter:
         # both the position `i` (0, 1, 2...) and the `provider` object on
         # each pass, in the fixed order the chain was built in.
         for i, provider in enumerate(self.providers):
-            # D-130 before D-93: a provider already known to be dead is
-            # not "skipped for context", and reporting it that way would
-            # send an operator to the wrong setting. Checked first, and --
-            # like the context skip below -- BEFORE llm_provider_calls is
-            # bumped, since a hop never attempted must not be counted as
-            # an attempt. Its own llm_disabled_skips counter records it.
-            if (i + 1 < len(self.providers)
-                    and self._skips_for_disabled(provider)):
-                outcomes.append((provider.name, "skipped_disabled"))
-                continue
-            # D-93: checked BEFORE llm_provider_calls is bumped -- a hop
-            # never attempted must not be counted as an attempt. Its own
-            # llm_context_skips counter records it instead.
-            if (i + 1 < len(self.providers)
-                    and self._skips_for_context(provider, messages)):
-                outcomes.append((provider.name, "skipped_for_context"))
+            # D-130 before D-93, and both BEFORE llm_provider_calls is
+            # bumped -- a hop never attempted must not be counted as an
+            # attempt. See _skip_reason for the full rationale.
+            skip = self._skip_reason(i, provider, messages)
+            if skip is not None:
+                outcomes.append((provider.name, skip))
                 continue
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
@@ -649,16 +705,7 @@ class FallbackRouter:
                 # provider, whatever its exact type, should trigger the same
                 # fallback behaviour: try the next one.
                 last_exc = exc
-                outcomes.append((provider.name, type(exc).__name__))  # D-101
-                nxt = (self.providers[i + 1].name
-                       if i + 1 < len(self.providers) else None)
-                if nxt is not None:
-                    self._bump("llm_fallback_hops")  # P2-07: a real hop, not the last dead end
-                log_event(logger, "llm.fallback", from_provider=provider.name,
-                          to_provider=nxt, reason=type(exc).__name__, mode="json")
-                lf.event(run_id_var.get(), "llm.fallback",
-                        metadata={"from_provider": provider.name, "to_provider": nxt,
-                                  "reason": type(exc).__name__, "mode": "json"})
+                self._record_hop(i, provider, exc, "json", outcomes)
         # If we reach this line, every provider in the loop above raised.
         # `assert last_exc is not None` is a sanity check for a human reader
         # (and for tools like mypy) that this line is only reachable when
@@ -715,13 +762,12 @@ class FallbackRouter:
         candidates: List[Tuple[str, str, Optional[float]]] = []
 
         for i, provider in enumerate(self.providers):
-            if (i + 1 < len(self.providers)                      # D-130
-                    and self._skips_for_disabled(provider)):
-                outcomes.append((provider.name, "skipped_disabled"))
-                continue
-            if (i + 1 < len(self.providers)                      # D-93
-                    and self._skips_for_context(provider, messages)):
-                outcomes.append((provider.name, "skipped_for_context"))
+            # D-130 before D-93, and both BEFORE llm_provider_calls is
+            # bumped -- a hop never attempted must not be counted as an
+            # attempt. See _skip_reason for the full rationale.
+            skip = self._skip_reason(i, provider, messages)
+            if skip is not None:
+                outcomes.append((provider.name, skip))
                 continue
             self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
             try:
@@ -733,16 +779,7 @@ class FallbackRouter:
                 self._bump_usage(provider)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                outcomes.append((provider.name, type(exc).__name__))  # D-101
-                nxt = (self.providers[i + 1].name
-                       if i + 1 < len(self.providers) else None)
-                if nxt is not None:
-                    self._bump("llm_fallback_hops")
-                log_event(logger, "llm.fallback", from_provider=provider.name,
-                          to_provider=nxt, reason=type(exc).__name__, mode="text")
-                lf.event(run_id_var.get(), "llm.fallback",
-                        metadata={"from_provider": provider.name, "to_provider": nxt,
-                                  "reason": type(exc).__name__, "mode": "text"})
+                self._record_hop(i, provider, exc, "text", outcomes)
                 continue
 
             has_next = i + 1 < len(self.providers)
@@ -760,13 +797,9 @@ class FallbackRouter:
                     return answer
                 candidates.append((provider.name, answer, score))
                 self._bump("llm_fallback_hops")
-                log_event(logger, "llm.fallback", from_provider=provider.name,
-                          to_provider=self.providers[i + 1].name,
-                          reason="low_quality", mode="text")
-                lf.event(run_id_var.get(), "llm.fallback",
-                        metadata={"from_provider": provider.name,
-                                  "to_provider": self.providers[i + 1].name,
-                                  "reason": "low_quality", "mode": "text"})
+                self._log_fallback(provider.name,
+                                   self.providers[i + 1].name,
+                                   "low_quality", "text")
                 continue
 
             # Last provider in the chain -- no further hop to fall back to.

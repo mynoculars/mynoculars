@@ -1185,6 +1185,99 @@ def test_a_cleared_figure_falls_through_to_the_normal_critique():
     assert "critique_passed" in result
 
 
+class _PromptCapturingJudge(_JudgeRouter):
+    """_JudgeRouter that keeps the prompt it was handed."""
+
+    def __init__(self, unsupported=None):
+        super().__init__(unsupported=unsupported)
+        self.judge_prompt = ""
+
+    def complete_json(self, messages, temperature=0.0):
+        if self.json_calls == 0:
+            self.judge_prompt = messages[-1]["content"]
+        return super().complete_json(messages, temperature)
+
+
+def test_the_judge_is_shown_deduplicated_evidence():
+    """D-175, the p205.303-check defect.
+
+    templates.verify_figures shows the judge at most 8 evidence items per
+    flagged figure. Byte-identical duplicates each consume one of those
+    slots, so evidence the figure actually rests on can be crowded out of
+    the prompt entirely -- D-46's defect, in the one path added after
+    D-46 was fixed. Live, six of the eight slots shown for one figure
+    were three corpus items repeated twice.
+
+    The audit itself is deliberately NOT deduplicated: it folds evidence
+    into a set of figures per goal, where a duplicate cannot change the
+    verdict. Only the bounded prompt cares.
+    """
+    from research_agent.agents.compilation import build_critic_node
+
+    noise = "An unrelated corpus item about cache eviction."
+    state = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1")],
+        evidence=([_e("g1", noise, source="corpus", score=0.9)] * 8
+                  + [_e("g1", "The PLA fields about 2,000,000 personnel",
+                        source="corpus", score=0.9)]),
+        final_report="# R\n\nThe PLA fields 2,300,000 personnel [g1].\n")
+
+    router = _PromptCapturingJudge(unsupported=[])
+    build_critic_node(router, _settings())(state)
+
+    assert router.judge_prompt.count(noise) == 1, "duplicates collapsed"
+    assert "2,000,000" in router.judge_prompt, (
+        "the evidence the figure rests on survived the 8-item cap")
+
+
+def _misattributed_state():
+    """975,000 retrieved under g3; the report cites g1 (p205.308-check)."""
+    return ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1"), _g("g3")],
+        evidence=[
+            _e("g1", "China's armed forces have over 2.1 million active "
+                     "personnel.", source="web", score=0.9),
+            _e("g3", "the People's Liberation Army Ground Force (PLAGF) is "
+                     "estimated to have a deployed force of 975,000 troops.",
+               source="web", score=0.71)],
+        final_report=("# R\n\nThe PLAGF is estimated to deploy roughly "
+                      "975,000 troops [g1].\n"))
+
+
+def test_a_misattributed_figure_is_never_put_to_the_judge():
+    """D-179. verify_figures shows the judge the CITED goal's evidence and
+    asks whether it supports the figure "in any form" -- for a figure
+    filed under another goal that is a question whose answer is fixed
+    before it is asked. Live, the judge confirmed 975000 as unsupported
+    while the run held an item reading "a deployed force of 975,000
+    troops", and the compiler deleted a true figure."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _JudgeRouter(unsupported=["975000"])
+    result = build_critic_node(router, _settings())(_misattributed_state())
+
+    assert router.json_calls == 1, "the ordinary critique only -- no judge call"
+    assert "975000" not in str(result.get("critique_notes", ""))
+
+
+def test_a_misattribution_alone_does_not_spend_a_revision():
+    """A citation pointing at the wrong goal is a smaller fault than an
+    invented number, and the run already reports it."""
+    from research_agent.agents.compilation import build_critic_node
+
+    # _VerdictRouter, not _JudgeRouter: with no judge call to make,
+    # the single JSON call IS the ordinary critique and must be
+    # answered as one.
+    router = _VerdictRouter([], passed=True)
+    result = build_critic_node(router, _settings())(_misattributed_state())
+
+    assert router.json_calls == 1
+    assert result["critique_passed"] is True
+    assert result["revision_count"] == 1, "one critic pass, no revision"
+
+
 def test_the_gate_is_off_by_default():
     """D-54: the false-positive rate has not been measured on real
     reports, so this ships inert -- the same posture
@@ -2106,6 +2199,98 @@ def test_a_clean_pass_is_untouched():
 
     assert result["critique_passed"] is True
     assert "critique_notes_dismissed" not in result["counters"]
+
+
+def test_the_counterweight_defers_to_the_audit_even_with_the_gate_off():
+    """D-178. D-155's stated safety property, made real by default.
+
+    Same shape as the resolution test above -- both notes dispute a
+    figure the evidence contains, so they WOULD be dismissed -- except
+    the report also states a figure no evidence supports, which D-91
+    flags. Before D-178 the audit only ran when
+    claim_verification_enabled was set, so with the flag off (the
+    shipped default) `audit_flagged` was 0 on every run and the
+    counterweight was free to overrule the critic on a report the
+    deterministic check would have condemned. It never learned there
+    was anything to defer to.
+
+    Live: p205.304-check ran with the flag unset and shipped a report
+    scoring cited_figures_unsupported: 2.
+    """
+    from research_agent.agents.compilation import build_critic_node
+
+    report = ("# R\n\nThe PLA fields approximately 2 million personnel "
+              "[g1], and was founded in 1948 [g1]. It operates 4,317 main "
+              "battle tanks [g1].\n")
+    router = _VerdictRouter(_ROUNDING_NOTES)
+
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(report, _ROUNDING_EVIDENCE))
+
+    assert result["critique_passed"] is False, \
+        "the audit flagged 4,317; the critic's failure must stand"
+    assert "critique_notes_dismissed" not in result["counters"]
+
+
+def test_the_gate_off_still_costs_no_model_call():
+    """D-178 buys the audit, not a call. audit_cited_figures is string
+    matching over one report -- the flag gates the JUDGE and the GATING,
+    and with it off neither happens however much the audit flags."""
+    from research_agent.agents.compilation import build_critic_node
+
+    report = ("# R\n\nThe PLA fields approximately 2 million personnel "
+              "[g1]. It operates 4,317 main battle tanks [g1].\n")
+    router = _JudgeRouter(unsupported=["4317"])
+
+    build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(report, _ROUNDING_EVIDENCE))
+
+    assert router.json_calls == 1, "only the ordinary critique call"
+
+
+class _ViolationsRouter(_FakeRouter):
+    """A critic answering the D-181 `violations` key."""
+
+    def __init__(self, entries, passed=False):
+        super().__init__("unused")
+        self._entries, self._passed = entries, passed
+
+    def complete_json(self, messages, temperature=0.0):
+        return {"passed": self._passed, "score": 0.7,
+                "violations": self._entries}
+
+
+def test_the_critic_reads_the_violations_key():
+    """D-181. The contract field, not the legacy one."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _ViolationsRouter(["g1: the figure 8,000 is not supported."])
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(_ROUNDING_REPORT, _ROUNDING_EVIDENCE))
+
+    assert result["critique_passed"] is False
+    assert result["critique_notes"] == ["g1: the figure 8,000 is not supported."]
+
+
+def test_an_affirmation_never_becomes_an_instruction_to_the_next_compile():
+    """p205.308-check: 21 of 23 entries said a claim was faithful, and
+    templates.compile renders every entry under "Address every note"."""
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _ViolationsRouter([
+        "g1: evidence shows 14,55,550 active troops, so the claim is faithful.",
+        "g1: the ranking is not supported by any evidence item.",
+    ])
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(
+            _corroboration_state(_ROUNDING_REPORT, _ROUNDING_EVIDENCE))
+
+    assert result["critique_notes"] == [
+        "g1: the ranking is not supported by any evidence item."]
+    assert result["counters"]["critique_affirmations_dropped"] == 1.0
 
 
 def test_the_verdict_is_checked_against_the_evidence_the_critic_saw():

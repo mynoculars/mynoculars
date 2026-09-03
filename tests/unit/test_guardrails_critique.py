@@ -245,3 +245,65 @@ def test_a_figure_the_evidence_lacks_still_stops_the_flip():
     passed, _notes, counters = resolve_verdict(False, [note], evidence, 0)
     assert passed is False
     assert counters == {}
+# --------------------------------------------------------------------------
+# D-181: an entry means "this is wrong, fix it". templates.compile renders
+# every one under "Address every note", so an affirmation becomes an
+# instruction to change something correct.
+# --------------------------------------------------------------------------
+
+
+# Verbatim from p205.308-check's second critique: 23 entries, 21 of them
+# recording that a claim IS supported.
+_P205_308_AFFIRMATIONS = [
+    "g1: The report states China's PLA has over 2.1 million active "
+    "personnel; evidence shows 2,035,000 active personnel and 3,170,900 "
+    "total soldiers, so the claim is faithful.",
+    "g1: The report states India's active troops are 1,455,550; evidence "
+    "shows 14,55,550 active troops, so the claim is faithful.",
+    "g1: The report states the PLAGF has 975,000 deployed troops; evidence "
+    "shows 975,000 troops, so the claim is faithful.",
+    "g2: The report states the CMC is the supreme military leadership "
+    "body; evidence supports this claim.",
+    "g3: The report states the U.S. DoD refers to China as the 'pacing "
+    "challenge'; evidence supports this claim.",
+]
+_P205_308_VIOLATIONS = [
+    "g1: The report states China's PLA is the third largest standing army; "
+    "evidence does not explicitly state this ranking, so the claim is "
+    "unsupported.",
+    "g1: The report states India is the fourth-largest military power "
+    "globally; evidence does not explicitly state this ranking, so the "
+    "claim is unsupported.",
+]
+
+
+def test_affirmations_are_dropped_and_violations_survive():
+    from research_agent.guardrails.critique import drop_affirmations
+
+    kept, dropped = drop_affirmations(
+        _P205_308_AFFIRMATIONS + _P205_308_VIOLATIONS)
+
+    assert kept == _P205_308_VIOLATIONS
+    assert dropped == len(_P205_308_AFFIRMATIONS)
+
+
+def test_a_denial_of_support_is_never_dropped():
+    """The veto. An entry that denies support is kept whatever else it
+    says -- including the word "supported" inside "unsupported"."""
+    from research_agent.guardrails.critique import drop_affirmations
+
+    kept, dropped = drop_affirmations([
+        "g1: evidence supports the surrounding sentence but the figure "
+        "8,000 is not supported by any evidence item.",
+        "g2: the claim is unsupported.",
+    ])
+
+    assert dropped == 0
+    assert len(kept) == 2
+
+
+def test_a_clean_critique_is_untouched():
+    from research_agent.guardrails.critique import drop_affirmations
+
+    assert drop_affirmations([]) == ([], 0)
+    assert drop_affirmations(_P205_308_VIOLATIONS) == (_P205_308_VIOLATIONS, 0)

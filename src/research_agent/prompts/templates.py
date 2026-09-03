@@ -535,7 +535,9 @@ def model_knowledge(query: str, max_claims: int = 4) -> List[Message]:
 def critique(query: str, report: str, goals: List[Goal],
              evidence: List[Evidence]) -> List[Message]:
     """Report critique, scoped to faithfulness/completeness only (D-22).
-    Schema: {"passed": bool, "score": float, "notes": [str]}.
+    Schema: {"passed": bool, "score": float, "violations": [str]}.
+    `notes` is still read as a fallback (compilation.py) so a model
+    answering the old key is not silently treated as clean.
 
     CALLED BY   agents/compilation.py::critic_node.
     Note the explicit instruction below telling the model NOT to judge
@@ -617,7 +619,29 @@ def critique(query: str, report: str, goals: List[Goal],
             f"the report phrased its own way. Before writing a note that "
             f"names a figure, find that figure in the EVIDENCE block; if "
             f"it is there in any wording, do not raise it. "
-            'JSON schema: {"passed": <bool>, "score": <0..1>, "notes": ["..."]}'}]
+            # D-181: the field was called `notes`, and a model asked for
+            # notes writes notes. Live (p205.308-check) the critic
+            # returned 23 of them and 21 -- 2,809 of 3,108 characters --
+            # were AFFIRMATIONS: "evidence shows 14,55,550 active troops,
+            # so the claim is faithful". templates.compile renders every
+            # one under "A reviewer rejected the previous draft. Address
+            # every note", so the next compile would have been told to
+            # fix twenty-one things that were not broken. That run only
+            # escaped it because E4 fired before another compile.
+            #
+            # Renaming the field is the fix, not a filter over prose: the
+            # word names what belongs in the list. The sentence below
+            # says the rest out loud, because "violations" alone still
+            # leaves "no violation here" expressible.
+            f"The list contains VIOLATIONS ONLY. Do not write an entry "
+            f"to record that a claim IS supported, or to show your "
+            f"working: an entry means 'this is wrong, fix it', and the "
+            f"writer of the next draft is instructed to change "
+            f"everything you list. If a claim is fine, say nothing about "
+            f"it. An empty list is the correct answer for a report with "
+            f"nothing wrong. "
+            'JSON schema: {"passed": <bool>, "score": <0..1>, '
+            '"violations": ["..."]}'}]
 
 
 def verify_figures(findings: List[dict], evidence: List[Evidence]) -> List[Message]:

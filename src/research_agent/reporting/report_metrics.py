@@ -135,6 +135,41 @@ def _audit_figures(state: ResearchState, settings: Settings) -> tuple:
     if settings.llm_mode != "stub":
         findings, counters = audit_cited_figures(
             state.final_report, state.goals, state.evidence)
+    # D-174: the audit examined nothing, and there WERE figures it could
+    # not reach. Distinct from a clean report, and the two were until
+    # now indistinguishable in telemetry -- both reported
+    # cited_figures_checked: 0. WARNING rather than a finding: nothing
+    # here says the report is wrong, only that this check did not get
+    # to judge it, which an operator reading a confident-looking run
+    # record needs to know. CAP_UNSUPPORTED_FIGURES in
+    # reporting/confidence.py cannot fire on a run in this state.
+    outside = int(counters.get("figures_outside_citation_scope", 0))
+    if outside and not counters.get("cited_figures_checked"):
+        log_event(logger, "report.figure_audit_saw_nothing",
+                  level=logging.WARNING,
+                  figures_outside_citation_scope=outside,
+                  effect="no cited figure could be checked; the "
+                         "unsupported-figure confidence cap cannot "
+                         "apply to this run")
+    # D-179: reported separately because the remedies are opposite.
+    # An operator reading "unsupported" reaches for the report; an
+    # operator reading "misattributed" reaches for the citation, and
+    # the figure itself is fine. Merging them cost a true figure
+    # live (p205.308-check).
+    misattributed = [f for f in findings
+                     if f.get("kind") == "misattributed"]
+    if misattributed:
+        log_event(logger, "report.misattributed_cited_figures",
+                  level=logging.WARNING,
+                  misattributed=int(counters.get(
+                      "cited_figures_misattributed", 0)),
+                  checked=int(counters.get("cited_figures_checked", 0)),
+                  effect="the figures are supported by evidence this "
+                         "run retrieved, under a goal the sentence "
+                         "does not cite; the citation is wrong, not "
+                         "the figure",
+                  examples=misattributed[:5])
+    findings = [f for f in findings if f.get("kind") != "misattributed"]
     if findings:
         log_event(logger, "report.unsupported_cited_figures",
                   level=logging.WARNING,

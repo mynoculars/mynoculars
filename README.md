@@ -17,7 +17,7 @@ to build agentic systems that degrade gracefully and improve with oversight.
 > **Status:** Core build. Implements the workflow graph, hybrid retrieval,
 > semantic memory, LLM fallback routing, the self-critique loop, and
 > human-in-the-loop escalation. Nine phases of review are closed as of
-> this revision (`DECISIONS.md` D-1…D-170) -- correctness fixes,
+> this revision (`DECISIONS.md` D-1…D-181) -- correctness fixes,
 > structural simplification, and operational hardening. Release history,
 > prior test counts, and superseded claims from earlier revisions live in
 > [CHANGELOG.md](CHANGELOG.md), not here.
@@ -381,7 +381,7 @@ both `build_app_and_settings` and `AppBundle`, so every existing
                                        │  config={thread_id, recursion_limit}
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                     LangGraph workflow  —  13 nodes, fixed                   │
+│         LangGraph workflow — 13 nodes fixed (14 with MCP_ENABLED)            │
 └──────┬──────────────────┬───────────────────┬───────────────────┬────────────┘
        │                  │                   │                   │
        ▼                  ▼                   ▼                   ▼
@@ -957,7 +957,7 @@ research_agent/langfuse/
                            │                              │ end_trace()
                            ▼                              │ (root, per thread_id)
 ┌─────────────────────────────────────────────────────┐   │
-│       LangGraph workflow — 13 nodes, fixed          │◄──┤ traced_node() wraps
+│  13 nodes fixed (14 with MCP_ENABLED)               │◄──┤ traced_node() wraps
 └───────┬──────────────────┬────────────────────┬─────┘   │ EVERY add_node() call
         │                  │                    │         │ (span per node)
         ▼                  ▼                    ▼         │
@@ -1491,7 +1491,9 @@ describe is now closed, on both the LLM side and the retrieval side:
 | `web_sourced_items` *(D-57)* | count of `state.evidence` entries with `source == "web"` — results from the Phase 4 search tier. Read together with `corpus_recall` and `grounded_score`: a run showing `recall: 1.0, grounded_score: 0.0, web_sourced_items: 12` is telling you precisely and honestly that the web answered it and the corpus did not. Web evidence deliberately does NOT count toward `corpus_recall` or `grounded_score` — a snippet is retrieval, not curation | `agents/compilation.py::telemetry_node` |
 | `web_source_domains` *(D-57)* | how many DISTINCT domains that evidence came from. Twelve items from one domain is one source repeated, not twelve agreeing — `websearch/filtering.py::cap_by_domain` limits this at retrieval time (`WEB_SEARCH_MAX_PER_DOMAIN`, default 2) and this field makes it visible after the fact | same |
 | `web_sources_listed` / `web_sources_suppressed` *(D-57)* | from `compiler_node`’s `append_web_sources` pass: how many web pages the report actually attributed in its `## Sources` section, versus how many were retrieved but belonged to goals the compiler never cited. A high suppressed count against a low listed count is the signature of the web tier doing work that never reached the report | `guardrails/sources.py` |
-| `cited_figures_checked` / `cited_figures_unsupported` / `unsupported_figures` *(D-91)* | the claim-level check. `checked` is how many cited figures the shipped report stated at all; `unsupported` how many appear in no evidence under the goal the sentence cites; `unsupported_figures` is a capped sample naming WHICH, so the number is actionable without re-running anything. **`0 / 0` means the report stated no cited figures — not that it passed.** Read against `corpus_recall` and `grounding_notice_shipped`: a run answering from the web with unsupported figures in its prose is a very different artifact from one answering from the corpus with none | `guardrails/claims.py` |
+| `cited_figures_checked` / `cited_figures_unsupported` / `unsupported_figures` *(D-91)* | the claim-level check. `checked` is how many cited figures the shipped report stated at all; `unsupported` how many DISTINCT figures (D-180) appear in no evidence under **any** goal the report cites — a figure the run did retrieve, under a goal this sentence did not cite, is counted as `cited_figures_misattributed` instead (D-179) and does not cap confidence, because the claim is supported by evidence this run holds; the citation is what is wrong; `unsupported_figures` is a capped sample naming WHICH, so the number is actionable without re-running anything. **`0 / 0` does NOT mean the report passed.** It means one of two things, and `figures_outside_citation_scope` (next row) is what separates them: the report stated no cited figures, or it stated them where this audit does not look. Read against `corpus_recall` and `grounding_notice_shipped`: a run answering from the web with unsupported figures in its prose is a very different artifact from one answering from the corpus with none | `guardrails/claims.py` |
+| `figures_outside_citation_scope` *(D-174)* | figures stated in a sentence that carries no `[gN]` marker and sits under no cited heading — the audit above cannot reach them, because an uncited sentence asserts nothing about any goal's evidence and there is nothing to falsify. **Nonzero beside `cited_figures_checked: 0` means the check was blind, not that the report was clean**, and `report.figure_audit_saw_nothing` fires at WARNING. Live (`p205.302-check`) the compiler cited at the end of each paragraph rather than after each sentence as the prompt instructs, so all three of the report's numeric claims sat outside scope and the audit examined nothing; the run four minutes later, same prompt and same query, cited on its headings and audited normally. `CAP_UNSUPPORTED_FIGURES` cannot apply to a run in this state | `guardrails/claims.py` |
+| `cited_figures_misattributed` / `misattributed_figures` *(D-179)* | a figure the run DID retrieve, cited to a goal whose evidence does not carry it. A citation defect, not an invented number, and the two have **opposite remedies** — delete the figure, versus cite the goal that supports it. Collapsed into one finding, this made the system destroy correct content: live (`p205.308-check`) an evidence item read *"a deployed force of 975,000 troops"* under `g3`, the report cited `[g1]`, the verification judge — shown only `g1`'s evidence and asked whether the evidence supports it *in any form* — confirmed it as unsupported, and the rewrite deleted a true figure and asserted *"No retrieved evidence supports the specific figure of 975,000 troops"*. Deliberately does NOT trip `CAP_UNSUPPORTED_FIGURES` | `guardrails/claims.py` |
 | `grounding_notice_shipped` *(D-85)* | whether the SHIPPED report carries the deterministic provenance notice. Derived from `state.final_report`, never from a counter — D-59's rule, because `compiler_node` runs once per revision and its counters merge additively. Read together with `corpus_recall`: `corpus_recall 0.0` with this `true` is a run that answered from the web or from recollection **and told its reader so**; the same pair reading `false` is a deliverable that claimed nothing about its own provenance, which `report.shipped_ungrounded` now WARNs about | `guardrails/grounding.py` |
 | `run_budget_exhausted` *(D-132)* | `"deadline"`, `"tokens"`, or `null` — what STOPPED this run, `null` being every run that finished on its own terms. Read it FIRST when a report looks thin: a deadline stop and a genuinely empty corpus produce the same low recall and are not the same finding. `null` unless `RUN_DEADLINE_SECONDS`/`RUN_TOKEN_BUDGET` are set | `limits.py`, `agents/gathering.py::progress_checker_node`, `agents/compilation.py::compiler_node` |
 | `run_elapsed_seconds` / `run_paused_seconds` *(D-132)* | research time and human-review time, separately. Elapsed EXCLUDES time paused at an `interrupt()` — a reviewer's reading time is never charged to the run's budget — and the pause is reported alongside rather than hidden, so a 300-second run that waited 240 seconds for a human reads honestly | `limits.py::elapsed_seconds` |
@@ -2044,7 +2046,7 @@ This table lists only decisions with code behind them here.
 | D-23/D-28 | Escalation via `interrupt()`; nothing non-idempotent precedes the interrupt | The node re-executes on resume — history is appended in the resume update only |
 | D-24 | Memory decay = rerank by volatility class, never an age filter | One TTL is wrong for both stable and volatile facts. Coverage-matching by goal_id is now namespaced away from this rerank (P2-02) — the two are independent axes |
 | D-29 | `ConfigDict(extra="forbid")` on all state models | Construction-time pollution and worker-return pollution are two failure modes; two layers |
-| D-31 | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script AND memory writes (P2-15). Evidence.task_key for memory items is the one identity-related thing NOT yet fixed this way (still `hash()`-based) |
+| D-31 | Store writes carry stable, content-derived identity, not a fresh random id per call | Re-ingesting unchanged content should overwrite in place, not accumulate duplicates — now implemented for the corpus ingest script AND memory writes (P2-15), and for `Evidence.task_key` on memory items, which `SemanticMemory.retrieve` builds as `memory-<content_id>`. **This row said `task_key` was "still `hash()`-based" long after it stopped being true** -- `hash()` appears nowhere in `src/` -- while the Limitations section three screens down said "fixed". An external reviewer found the contradiction; the Limitations entry was the correct one |
 | D-32 | Provider output normalization happens at the client boundary (`llm/client.py`), never inside a node or the router | Chat-template sentinels and runaway free-text generation are transport/template artefacts, not content — nodes should never have to know a specific model's quirks. This session extended the same principle to the compiler's free-text output (`strip_code_fence`) |
 | D-35 *(Phase 3)* | All Langfuse SDK usage isolated in one package (`langfuse/`); every business module imports only thin, always-safe functions and never sees an SDK/trace/span object | Non-invasive observability must not leak a third-party SDK's shape into business logic, and must be safe to call even when disabled or misconfigured |
 | D-36 | External MCP tool inputs travel to the LLM inside an `<external_data>` fence, treated as data never instructions | Prompt-injection surface from third-party tool output must not be trusted at the same level as system/user turns |
@@ -2063,7 +2065,7 @@ This table lists only decisions with code behind them here.
 | — | Stub LLM mode | Deterministic offline demo + honest tests using real prompts/schemas |
 
 `DECISIONS.md` (populated as of P2-09, extended in every pass since) is the
-authoritative consolidated log, currently D-1 through D-165 — this table is a
+authoritative consolidated log, currently D-1 through D-181 — this table is a
 curated subset for readability, not a replacement.
 
 ## Limitations
@@ -2110,6 +2112,21 @@ stays auditable without crowding out the part a reader needs before a demo.
    a deterministic pass (D-45) that strips citations glued directly onto
    evidence text with no delimiter, and drops `[gN]` markers naming a
    goal with zero evidence.
+   **THE DETERMINISTIC GATE FOR THIS EXISTS AND SHIPS OFF:
+   `CLAIM_VERIFICATION_ENABLED` (D-95).** With it on, D-91's cited-figure
+   audit runs against the authored report inside `critic_node`; anything
+   it flags goes to a judge that may only CONFIRM or CLEAR, never add
+   findings of its own; and a confirmed figure sets
+   `critique_passed: False` with notes naming it, spends a revision, and
+   raises **E4** once revisions are exhausted -- i.e. exactly the
+   "an unsupported figure must not coexist with a passed critique" rule,
+   including the human-review escalation. It is off by default because
+   the false-positive rate has never been measured on real reports
+   (D-54's rule), and a gate that fails correct reports is worse than a
+   warning that names them. **A run showing `cited_figures_unsupported: 1`
+   alongside `critique_passed: true` is this setting being off, not the
+   check being absent** -- turn it on for a walkthrough where that
+   distinction will be asked about.
    **What remains open, precisely:** none of this is a programmatic,
    claim-by-claim relevance check. D-43/D-46's critic check is still an
    LLM judging another LLM's output against evidence — it helps and it
@@ -2167,8 +2184,9 @@ stays auditable without crowding out the part a reader needs before a demo.
    `llm_fallback_hops` rather than the occasional one.
 7. **The HTTP API is unauthenticated BY DEFAULT — and now optionally is not
    (D-133).** `api/server.py` exposes `POST /research`, `POST /resume`,
-   `GET /state/{thread_id}`, `GET /result/{thread_id}` (D-134) and
-   `GET /health`. Setting `API_KEY` guards everything except `/health`
+   `GET /state/{thread_id}` and `GET /health` -- **not**
+   `GET /result/{thread_id}`, which D-134 designed and this build does not
+   register (see item 8). Setting `API_KEY` guards everything except `/health`
    (`X-API-Key` or `Authorization: Bearer`, compared in constant time); leaving it unset keeps the original open posture and logs
    `api.unauthenticated` at WARNING on startup so the choice is visible.
    There is still no CORS policy (FastAPI sends no CORS headers by default,

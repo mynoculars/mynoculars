@@ -211,7 +211,9 @@ def test_no_evidence_at_all_is_a_clean_no_op():
 
     assert findings == []
     assert counters == {"cited_figures_checked": 0.0,
-                        "cited_figures_unsupported": 0.0}
+                        "cited_figures_unsupported": 0.0,
+                        "cited_figures_misattributed": 0.0,
+                        "figures_outside_citation_scope": 0.0}
 
 
 def test_findings_name_the_figure_the_goals_and_a_bounded_sentence():
@@ -222,7 +224,8 @@ def test_findings_name_the_figure_the_goals_and_a_bounded_sentence():
     findings, _ = audit_cited_figures(
         report, [_goal()], [_ev("The PLA is large.")])
 
-    assert set(findings[0]) == {"figure", "goals", "sentence"}
+    assert set(findings[0]) == {"figure", "goals", "sentence", "kind"}
+    assert findings[0]["kind"] == "unsupported"
     assert len(findings[0]["sentence"]) <= 200
 
 
@@ -436,3 +439,225 @@ def test_an_exact_match_never_reaches_the_scale_comparison():
 
     assert findings == []
     assert counters["cited_figures_checked"] == 1.0
+# --------------------------------------------------------------------------
+# D-174: the audit's own blind spot, counted. Live p205.302-check cited at
+# the end of each paragraph rather than after each sentence, so every
+# numeric claim sat outside any citation scope and the audit examined
+# nothing while reporting a clean report.
+# --------------------------------------------------------------------------
+
+
+def test_a_figure_in_an_uncited_sentence_is_counted_not_flagged():
+    """It is a blind spot, not a finding.
+
+    An uncited sentence asserts nothing about any goal's evidence, so
+    there is nothing to falsify and no finding is correct. But the figure
+    is real and the audit could not reach it, which is what the counter
+    records.
+    """
+    report = ("# R\n\n"
+              "China fields around 3.2 million personnel in total. "
+              "The force is large [g1].\n")
+    ev = [_ev("The PLA is large.", "g1")]
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert findings == []
+    assert counters["cited_figures_checked"] == 0.0
+    assert counters["figures_outside_citation_scope"] == 1.0
+
+
+def test_the_same_figure_inside_a_cited_sentence_is_checked_instead():
+    """The contrast that makes the counter mean something.
+
+    Identical figure, identical evidence -- only the marker moves, onto
+    the sentence that states the number. p205.303-check did this (via a
+    cited heading) four minutes after p205.302-check did not.
+    """
+    report = ("# R\n\n"
+              "China fields around 3.2 million personnel in total [g1]. "
+              "The force is large.\n")
+    ev = [_ev("The PLA is large.", "g1")]
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["figure"] for f in findings] == ["3.2"]
+    assert counters["cited_figures_checked"] == 1.0
+    assert counters["figures_outside_citation_scope"] == 0.0
+
+
+def test_a_cited_heading_pulls_the_paragraph_into_scope():
+    """The supported paragraph-level style still audits normally."""
+    report = ("# R\n\n## Size [g1]\n\n"
+              "China fields around 3.2 million personnel in total.\n")
+    ev = [_ev("The PLA is large.", "g1")]
+
+    _, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert counters["cited_figures_checked"] == 1.0
+    assert counters["figures_outside_citation_scope"] == 0.0
+# --------------------------------------------------------------------------
+# D-177: digit grouping. The old grammar could not say "I do not
+# understand this token", so on a grouping it did not recognise it
+# matched a SUBSTRING and returned a different quantity.
+# --------------------------------------------------------------------------
+
+
+def test_indian_digit_grouping_reads_as_the_number_it_denotes():
+    """The four forms p205.304-check actually retrieved, 38 times.
+
+    Read as 55550 / 11550 / 25270 / 35000 before this -- wrong by
+    factors of 26, 100, 100 and 58.
+    """
+    assert figures_in("14,55,550 active troops") == {"1455550"}
+    assert figures_in("11,55000 reserve soldiers") == {"1155000"}
+    assert figures_in("25,27000 paramilitary forces") == {"2527000"}
+    assert figures_in("20,35,000 active personnel") == {"2035000"}
+
+
+def test_western_grouping_is_unchanged():
+    assert figures_in("2,535,000 troops") == {"2535000"}
+    assert figures_in("about 2,300 units") == {"2300"}
+
+
+def test_a_grouping_that_is_not_a_grouping_contributes_nothing():
+    """A single-digit group is a list, not a thousands separator.
+
+    Rejected outright rather than read as 123 -- the whole point of
+    D-177 is that a token the parser cannot account for must contribute
+    NOTHING, never a plausible-looking substring of itself.
+    """
+    assert figures_in("chapters 1,2,3 cover this") == set()
+
+
+def test_the_year_comma_fix_survives_the_new_grammar():
+    """D-97's regression, re-pinned. The token may not end on a
+    separator, so "2015," is read as 2015 and then dropped as a year."""
+    assert figures_in("reforms since 2015, emphasizing jointness") == set()
+    assert figures_in("2,535,000 troops, deployed") == {"2535000"}
+
+
+def test_a_correctly_rounded_figure_is_not_flagged_against_indian_grouping():
+    """p205.304-check, replayed. The run shipped at LOW (40%) reporting
+    "2 cited figure(s) appear in no cited evidence"; both figures were
+    supported by the evidence it had retrieved and cited."""
+    ev = [_ev("The Indian Army is the second-largest standing army in the "
+              "world with 14,55,550 active troops, 11,55000 reserve "
+              "soldiers and 25,27000 paramilitary forces.")]
+    report = ("# R\n\nIndia fields approximately 1.46 million active "
+              "troops [g1]. It maintains roughly 2.53 million paramilitary "
+              "personnel [g1].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert findings == []
+    assert counters["cited_figures_checked"] == 2.0
+
+
+def test_a_substring_of_a_grouped_number_is_no_longer_confirmed_by_it():
+    """The dangerous direction, and the reason this is a correctness fix
+    rather than a coverage one. Evidence saying 1,455,550 must not
+    vouch for a report claiming 55,550."""
+    ev = [_ev("The Indian Army has 14,55,550 active troops.")]
+    report = "# R\n\nIndia fields 55,550 active troops [g1].\n"
+
+    findings, _ = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["figure"] for f in findings] == ["55550"]
+
+
+def test_scale_comparison_uses_the_same_normalisation():
+    """figures_in and scaled_values must agree on what a token denotes,
+    or _confirmed_by_scale looks up a key that is not there."""
+    assert scaled_values("with 14,55,550 active troops") == {1455550.0}
+    assert scaled_values("about 2,035,000 troops") == {2035000.0}
+    assert scaled_values("chapters 1,2,3") == set()
+# --------------------------------------------------------------------------
+# D-179: two failure modes with opposite remedies, told apart.
+# --------------------------------------------------------------------------
+
+
+def _goals3():
+    return [_goal("g1", "size"), _goal("g2", "structure"),
+            _goal("g3", "modernisation")]
+
+
+_PLAGF = ("The Indian Army has the world's largest ground force, comprising "
+          "1.4 million personnel while the People's Liberation Army Ground "
+          "Force (PLAGF) is estimated to have a deployed force of 975,000 "
+          "troops.")
+
+
+def test_a_figure_retrieved_under_another_goal_is_misattributed_not_invented():
+    """p205.308-check, replayed.
+
+    The run retrieved "a deployed force of 975,000 troops" under g3 and
+    the report cited g1. The audit was right that g1's evidence does not
+    contain it -- and calling that "appears in no cited evidence" led the
+    compiler to DELETE a true figure and to write "No retrieved evidence
+    supports the specific figure of 975,000 troops" into the shipped
+    report, which was false.
+    """
+    ev = [_ev("China's armed forces have over 2.1 million active personnel.",
+              "g1"),
+          _ev(_PLAGF, "g3")]
+    report = ("# R\n\nThe PLAGF is estimated to deploy roughly 975,000 "
+              "troops [g1].\n")
+
+    findings, counters = audit_cited_figures(report, _goals3(), ev)
+
+    assert [f["kind"] for f in findings] == ["misattributed"]
+    assert findings[0]["supported_by"] == ["g3"]
+    assert counters["cited_figures_misattributed"] == 1.0
+    assert counters["cited_figures_unsupported"] == 0.0, \
+        "a figure the run retrieved must not trip CAP_UNSUPPORTED_FIGURES"
+
+
+def test_a_figure_no_goal_retrieved_is_still_unsupported():
+    """The other half. 2.3 appeared nowhere in p205.308-check's evidence;
+    the report invented the top of its own range."""
+    ev = [_ev("China's armed forces have over 2.1 million active personnel.",
+              "g1")]
+    report = ("# R\n\nThe PLA has 2.1 million to 2.3 million active "
+              "personnel [g1].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["figure"] for f in findings] == ["2.3"]
+    assert findings[0]["kind"] == "unsupported"
+    assert "supported_by" not in findings[0]
+    assert counters["cited_figures_unsupported"] == 1.0
+
+
+def test_misattribution_is_recognised_through_a_scale_restatement():
+    """The other goal's evidence need not spell the figure the same way:
+    the same interval logic that clears a rounding within a goal decides
+    whether another goal supports it."""
+    ev = [_ev("India has around 1.4 million soldiers.", "g1"),
+          _ev("The Indian Army has 14,55,550 active troops.", "g3")]
+    report = "# R\n\nIndia fields roughly 1.46 million troops [g1].\n"
+
+    findings, _ = audit_cited_figures(report, _goals3(), ev)
+
+    assert [(f["figure"], f["kind"]) for f in findings] == \
+        [("1.46", "misattributed")]
+
+
+# --------------------------------------------------------------------------
+# D-180: the count says figures, so it counts figures.
+# --------------------------------------------------------------------------
+
+
+def test_one_figure_in_three_sentences_is_one_unsupported_figure():
+    """p205.306-check printed "7 cited figure(s) appear in no cited
+    evidence" for 7 findings over fewer distinct figures -- 1.35 alone
+    took two of the five sample slots."""
+    ev = [_ev("India has around 1.4 million soldiers.")]
+    report = ("# R\n\nIndia fields 1.35 million troops [g1]. "
+              "Elsewhere: roughly 1.35 million [g1]. "
+              "And again 1.35 million [g1].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert len(findings) == 3, "one finding per sentence stays -- each is a fix"
+    assert counters["cited_figures_unsupported"] == 1.0

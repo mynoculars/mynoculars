@@ -1118,3 +1118,94 @@ def test_a_skip_records_which_provider_it_was():
     assert counters["llm_context_skipped_primary"] == 1
     assert counters["llm_context_skipped_mistral"] == 1
 
+# --------------------------------------------------------------------------
+# S-26: the skip decision and the failed-hop record, extracted from the two
+# copies that complete() and complete_json() each carried. These test the
+# shared units directly; the cascade tests above still cover them in situ.
+# --------------------------------------------------------------------------
+
+
+class _Skippable:
+    """Duck-typed provider exposing only what _skip_reason reads."""
+
+    def __init__(self, name, context_tokens=0, disabled_reason=None):
+        self.name = name
+        self.context_tokens = context_tokens
+        self.disabled_reason = disabled_reason
+
+    def complete(self, messages, temperature=0.2):
+        return "answer from " + self.name
+
+    def complete_json(self, messages, temperature=0.0):
+        return {"ok": self.name}
+
+
+_BIG = [{"role": "user", "content": "x " * 4000}]
+
+
+def test_skip_reason_never_skips_the_last_provider():
+    """No next hop means a skip would be a silent failure, not a fallback.
+
+    Both flags are set on p1 and it is still returned as callable, because
+    it is last: this is the invariant _skips_for_context's docstring calls
+    out (skipping it would leave complete() with no candidate and no
+    exception, tripping its own `assert last_exc is not None`).
+    """
+    router = FallbackRouter(
+        [_Skippable("p0"), _Skippable("p1", context_tokens=4,
+                                      disabled_reason="http_400")],
+        quality_threshold=0.6,
+    )
+
+    assert router._skip_reason(1, router.providers[1], _BIG) is None
+
+
+def test_skip_reason_reports_disabled_before_context():
+    """D-130 wins over D-93 when a provider trips both.
+
+    A provider already known to be dead is not "skipped for context", and
+    reporting it that way sends an operator to the wrong setting.
+    """
+    router = FallbackRouter(
+        [_Skippable("p0", context_tokens=4, disabled_reason="http_400"),
+         _Skippable("p1")],
+        quality_threshold=0.6,
+    )
+
+    assert router._skip_reason(0, router.providers[0], _BIG) == "skipped_disabled"
+
+
+def test_skip_reason_returns_none_for_a_callable_provider():
+    router = FallbackRouter([_Skippable("p0"), _Skippable("p1")],
+                            quality_threshold=0.6)
+
+    assert router._skip_reason(0, router.providers[0], _BIG) is None
+
+
+def test_record_hop_bumps_the_counter_only_when_a_next_hop_exists():
+    """P2-07 counts real hops; the last provider failing is a dead end.
+
+    Same router, same call, two positions -- the only difference is whether
+    there is anywhere left to fall through to.
+    """
+    router = FallbackRouter([_Skippable("p0"), _Skippable("p1")],
+                            quality_threshold=0.6)
+    outcomes = []
+
+    router._record_hop(0, router.providers[0], RuntimeError("x"), "text", outcomes)
+    assert router.drain_counters()["llm_fallback_hops"] == 1
+
+    router._record_hop(1, router.providers[1], RuntimeError("x"), "text", outcomes)
+    assert router.drain_counters().get("llm_fallback_hops", 0) == 0
+
+
+def test_record_hop_appends_the_exception_type_in_chain_order():
+    """D-101: outcomes is built alongside last_exc, not reconstructed."""
+    router = FallbackRouter([_Skippable("p0"), _Skippable("p1")],
+                            quality_threshold=0.6)
+    outcomes = []
+
+    router._record_hop(0, router.providers[0], ValueError("a"), "json", outcomes)
+    router._record_hop(1, router.providers[1], KeyError("b"), "json", outcomes)
+
+    assert outcomes == [("p0", "ValueError"), ("p1", "KeyError")]

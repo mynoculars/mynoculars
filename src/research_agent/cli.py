@@ -228,8 +228,18 @@ def _fmt_result_summary(telemetry: dict, report: str) -> str:
         verdict = "FAILED"
     else:
         verdict = "n/a (run did not reach the critic)"
-    if cycles:
-        verdict += f" after {cycles} revision cycle(s)"
+    # D-176: `revision_cycles` counts CRITIC PASSES -- critic_node bumps
+    # it once per invocation, including the first, where nothing has been
+    # revised yet. Rendering it as "revision cycle(s)" made a run that
+    # revised NOTHING report "PASSED after 1 revision cycle(s)"
+    # (p205.302-check, whose execution plan shows a single
+    # compiler -> critic pass). The counter is left alone -- it is a
+    # telemetry contract, tests assert on it, and past run records mean
+    # what they meant. Only this line, which turns it into English for a
+    # human, is corrected: n passes over one report is n-1 revisions.
+    revisions = max(0, int(cycles or 0) - 1)
+    if revisions:
+        verdict += f" after {revisions} revision(s)"
 
     # "E4 -> approve, E1 -> redirect", or "none". Reads the same list the
     # JSON shows; the arrow is the only thing added.

@@ -262,6 +262,20 @@ def route_convergence(state: ResearchState, settings: Settings
     the very first below-target measurement, which deserves its one
     attempt), route to compiler instead of spending remaining depth
     budget on a condition already shown not to move.
+
+    THIS EXIT IS NOT AN ESCALATION, AND HITL_ENABLED DOES NOT CHANGE IT.
+    Every other branch here that can reach `human_escalation` does so
+    because a NODE already set `escalation_trigger` (E2/E3) -- routers
+    only read, they never raise. Nothing sets a trigger for a grounding
+    stall, so the run compiles whether or not HITL is on. That is
+    deliberate, and it is the same reasoning D-85 gives for its notice
+    being a notice rather than a failure: a human cannot make evidence
+    grounded either, so pausing to tell someone the corpus does not cover
+    the question spends a person's attention on a fact the report is
+    about to state anyway -- `grounding_notice_shipped`, `corpus_recall
+    0.0`, and a confidence band capped at LOW. An external review read
+    this exit as "the HITL-disabled behaviour"; it is not, because there
+    is no HITL path here to disable.
     """
     if state.escalation_trigger in ("E2", "E3"):
         to_node, reason = "human_escalation", f"{state.escalation_trigger} raised by progress_checker"

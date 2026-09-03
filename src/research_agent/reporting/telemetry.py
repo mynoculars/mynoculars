@@ -119,4 +119,9 @@ def run_metrics(c: Dict[str, float]) -> Dict[str, Any]:
         "revision_cycles": int(c.get("revision_cycles", 0)),
         "producer_rejects": int(c.get("producer_rejects", 0)),
         "critique_notes_dismissed": int(c.get("critique_notes_dismissed", 0)),
+        # D-181: nonzero means the critic wrote entries recording that a
+        # claim IS supported, which the contract forbids. Meant to sit at
+        # zero; a run where it does not is a prompt to fix.
+        "critique_affirmations_dropped": int(
+            c.get("critique_affirmations_dropped", 0)),
     }

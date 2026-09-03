@@ -127,12 +127,66 @@ _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s")
 # figure "2015,", whose comma then satisfied _substantive's
 # thousands-separator rule and smuggled a year past the year exclusion
 # below.
-_FIGURE_RE = re.compile(
-    r"\b(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"\s*(%|percent|per cent)?", re.IGNORECASE)
+# D-177: ONE grammar, shared by both regexes below, and it matches the
+# WHOLE numeric token rather than the longest prefix that happens to look
+# well-formed. The previous pattern -- `\d{1,3}(?:,\d{3})+|\d+` -- had no
+# way to say "this token is not a number I understand", so on a grouping
+# it did not recognise it silently matched a SUBSTRING and returned a
+# different quantity. Live (p205.304-check) the web returned Indian digit
+# grouping and the audit read `14,55,550` as 55550, `11,55000` as 11550
+# and `25,27000` as 25270 -- wrong by factors of 26, 100 and 100 -- across
+# 38 occurrences in one run. That is worse than not matching in BOTH
+# directions: it flagged two correct figures (capping the run at LOW 40%
+# with "2 cited figure(s) appear in no cited evidence", both statements
+# false), and it would equally have CONFIRMED a report claiming "55,550
+# active troops" against evidence that says 1,455,550.
+#
+# The token may not end on a separator, which is what keeps D-97's fix:
+# live (p205.251-check) "reforms since 2015, emphasizing" matched as the
+# figure "2015,", whose comma then satisfied _substantive's separator
+# rule and smuggled a year past the year exclusion below.
+_NUMBER = r"\b(\d(?:[\d,]*\d)?(?:\.\d+)?)"
+_PERCENT = r"\s*(%|percent|per cent)?"
+
+_FIGURE_RE = re.compile(_NUMBER + _PERCENT, re.IGNORECASE)
 
 
-def _substantive(raw: str, percent_marker: Optional[str]) -> bool:
+def _digits_of(raw: str) -> Optional[str]:
+    """The digits a written figure denotes, or None if its commas are
+    not thousands separators at all (D-177).
+
+    Returning None is the point. A comma inside a number is a VISUAL
+    separator in every convention that uses one, so stripping it is
+    correct wherever the grouping is a grouping -- Western `1,455,550`,
+    Indian `14,55,550` and the malformed `25,27000` real sources emit
+    all denote what their digits say. What must never happen is reading
+    PART of such a token as the whole number, so anything that is not a
+    separator pattern is rejected outright and contributes nothing.
+
+    The test for "a grouping" is deliberately loose -- a leading group
+    of one to three digits, then groups of two or more -- because it
+    has to admit conventions this codebase did not anticipate. It is
+    tight in the one place that matters: a group of a SINGLE digit is
+    never a thousands separator, so "chapters 1,2,3" is rejected rather
+    than read as 123.
+    """
+    intpart, dot, frac = raw.partition(".")
+    if dot and not frac.isdigit():
+        return None
+    if "," in intpart:
+        head, *groups = intpart.split(",")
+        if not (head.isdigit() and 1 <= len(head) <= 3):
+            return None
+        if not all(g.isdigit() and len(g) >= 2 for g in groups):
+            return None
+        intpart = head + "".join(groups)
+    elif not intpart.isdigit():
+        return None
+    return intpart + (dot + frac if dot else "")
+
+
+def _substantive(raw: str, digits: str,
+                 percent_marker: Optional[str]) -> bool:
     """Is this number a CLAIM, or incidental formatting?
 
     Kept narrow on purpose -- a noisy guardrail is worse than no
@@ -164,24 +218,22 @@ def _substantive(raw: str, percent_marker: Optional[str]) -> bool:
         separator or a decimal is not a year, and still counts.
 
     Known to still slip through, stated rather than hidden: a version
-    number and a port number read as three-digit figures, and a figure
-    the evidence states at a different SCALE ("2.5 million" against a
-    source saying "2,535,000") reads as unsupported. None of the first
-    two is common in a research report's prose, the third is a real
-    limitation, and every one of them shows up in the finding text where
-    a reader can see what it was -- which is the posture G1/G4/G7
-    already take toward their own imprecision.
+    number and a port number read as three-digit figures. Neither is
+    common in a research report's prose, and both show up in the finding
+    text where a reader can see what it was -- the posture G1/G4/G7
+    already take toward their own imprecision. (The scale mismatch this
+    paragraph used to list third -- "2.5 million" against a source
+    saying "2,535,000" -- is handled: see scaled_claims below.)
     """
-    normalised = raw.replace(",", "")
     if percent_marker:
         return True
-    if "." in normalised:
+    if "." in digits:
         return True
     if "," in raw:
         return True
-    if len(normalised) == 4 and 1500 <= int(normalised) <= 2200:
+    if len(digits) == 4 and 1500 <= int(digits) <= 2200:
         return False
-    return len(normalised) >= 3
+    return len(digits) >= 3
 
 
 def figures_in(text: str) -> Set[str]:
@@ -199,8 +251,11 @@ def figures_in(text: str) -> Set[str]:
     found: Set[str] = set()
     for match in _FIGURE_RE.finditer(text):
         raw, percent_marker = match.group(1), match.group(2)
-        if _substantive(raw, percent_marker):
-            found.add(raw.replace(",", ""))
+        digits = _digits_of(raw)
+        if digits is None:
+            continue                                          # D-177
+        if _substantive(raw, digits, percent_marker):
+            found.add(digits)
     return found
 
 
@@ -210,27 +265,32 @@ def figures_in(text: str) -> Set[str]:
 # collides with metres and the rescue below is worth having only while
 # it stays conservative.
 #
-# `lakh` and `crore` are absent for a stronger reason, and it is a
-# limitation rather than an oversight. This corpus's subject matter uses
-# them constantly, but two things about how they are written defeat the
-# grammar here: Indian digit grouping ("2,10,000" = 210,000) does not
-# fit the three-digit-group pattern _FIGURE_RE and _SCALED_RE share, and
-# they COMPOUND -- "7.85 lakh crore" is 7.85e12, not 7.85e5. A one-word
-# lookup gets both wrong, and a wrong scale is worse here than no scale:
-# it could confirm a figure against evidence that says something else
-# entirely. Left out, those figures simply carry no scale, which costs
-# nothing -- a figure with no magnitude word gets an interval a fraction
-# of a unit wide, so only its own exact value can confirm it, and the
-# exact path already did that. Supporting them properly means parsing
-# the grouping and the compound together, which is its own change.
+# `lakh` and `crore` as MAGNITUDE WORDS are still absent, and it is a
+# limitation rather than an oversight. D-98 gave two reasons; D-177
+# removed the first, so only the second stands and it stands alone.
+#
+# GONE: "Indian digit grouping does not fit the three-digit-group
+# pattern". It does now -- _digits_of accepts any grouping whose groups
+# are two digits or more, so "2,10,000" reads as 210000, and a grouping
+# it cannot parse contributes NOTHING rather than a wrong substring.
+#
+# STANDS: they COMPOUND -- "7.85 lakh crore" is 7.85e12, not 7.85e5, and
+# a one-word lookup gets it wrong. A wrong scale is worse here than no
+# scale: it could confirm a figure against evidence that says something
+# else entirely, which is precisely the failure D-177 was written to end.
+# Left out, those figures simply carry no scale, which costs nothing --
+# a figure with no magnitude word gets an interval a fraction of a unit
+# wide, so only its own exact value can confirm it, and the exact path
+# already does that. Supporting them means parsing the compound, which
+# is its own change and is not needed for any defect yet observed.
 _SCALE_WORDS = {"thousand": 1e3, "million": 1e6,
                 "billion": 1e9, "trillion": 1e12}
 
-# The same figure grammar as _FIGURE_RE, plus the percent marker and an
-# optional trailing magnitude word.
+# The same grammar as _FIGURE_RE -- literally the same constants, so the
+# two can no longer drift apart (D-177) -- plus an optional trailing
+# magnitude word.
 _SCALED_RE = re.compile(
-    r"\b(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"\s*(%|percent|per cent)?"
+    _NUMBER + _PERCENT +
     r"\s*(thousands?|millions?|billions?|trillions?)?",
     re.IGNORECASE)
 
@@ -244,7 +304,12 @@ _RANGE_JOIN_RE = re.compile(r"^\s*(?:[-\u2013\u2014]|to|and|through)\s*$",
 
 
 def _scaled_matches(text: str):
-    """[(raw, scale, percent_marker)] for every substantive figure.
+    """[(digits, scale, percent_marker)] for every substantive figure.
+
+    `digits` is _digits_of's normalised form (D-177), so it is the same
+    string figures_in produces for the same number -- which is what lets
+    _confirmed_by_scale look a figure up in scaled_claims' spans at all.
+    A token _digits_of rejects is skipped here too, by construction.
 
     `scale` is the multiplier the figure's magnitude word implies, or
     None when it has none. Range members inherit the scale written after
@@ -253,18 +318,20 @@ def _scaled_matches(text: str):
     hits = []
     for match in _SCALED_RE.finditer(text):
         raw, percent_marker, word = match.group(1, 2, 3)
-        if not _substantive(raw, percent_marker):
+        digits = _digits_of(raw)
+        if digits is None or not _substantive(raw, digits, percent_marker):
             continue
         scale = None
         if word:
             scale = _SCALE_WORDS.get(word.lower().rstrip("s"))
-        hits.append([match.start(), match.end(), raw, scale, percent_marker])
+        hits.append([match.start(), match.end(), digits, scale,
+                     percent_marker])
     for i in range(len(hits) - 2, -1, -1):
         if hits[i][3] is None and hits[i + 1][3] is not None:
             if _RANGE_JOIN_RE.match(text[hits[i][1]:hits[i + 1][0]]):
                 hits[i][3] = hits[i + 1][3]
-    return [(raw, scale, percent_marker)
-            for _start, _end, raw, scale, percent_marker in hits]
+    return [(digits, scale, percent_marker)
+            for _start, _end, digits, scale, percent_marker in hits]
 
 
 def scaled_values(text: str) -> Set[float]:
@@ -279,7 +346,7 @@ def scaled_values(text: str) -> Set[float]:
     which the exact path already answers correctly by disagreeing.
     """
     values: Set[float] = set()
-    for raw, scale, percent_marker in _scaled_matches(text):
+    for digits, scale, percent_marker in _scaled_matches(text):
         if percent_marker:
             continue
         # Rounded because a scale multiply is not exact in binary --
@@ -287,7 +354,7 @@ def scaled_values(text: str) -> Set[float]:
         # compared against interval BOUNDARIES below. Six decimal places
         # is far finer than any quantity a report states and removes the
         # representation noise entirely.
-        values.add(round(float(raw.replace(",", "")) * (scale or 1.0), 6))
+        values.add(round(float(digits) * (scale or 1.0), 6))
     return values
 
 
@@ -311,10 +378,9 @@ def scaled_claims(text: str) -> Dict[str, Tuple[float, float]]:
     openly declared themselves imprecise.
     """
     spans: Dict[str, Tuple[float, float]] = {}
-    for raw, scale, percent_marker in _scaled_matches(text):
+    for digits, scale, percent_marker in _scaled_matches(text):
         if percent_marker:
             continue
-        digits = raw.replace(",", "")
         multiplier = scale or 1.0
         value = round(float(digits) * multiplier, 6)
         decimals = len(digits.split(".")[1]) if "." in digits else 0
@@ -441,6 +507,19 @@ def iter_cited_sentences(body: str):
             yield sentence, (inline or scope)
 
 
+_CITATION_MARKER_RE = re.compile(r"\[g\d+[^\]]*\]")
+
+
+def _strip_markers(sentence: str) -> str:
+    """Drop `[gN]` markers before reading a sentence's figures.
+
+    Citations carry no figures of their own under D-40's [gN]-only
+    rule, but a report that slipped a `[g1 | corpus | score=0.90]` form
+    past clean_citations would otherwise contribute "0.90" as a claim.
+    """
+    return _CITATION_MARKER_RE.sub(" ", sentence)
+
+
 def audit_cited_figures(report: str, goals: List[Goal],
                         evidence: List[Evidence]
                         ) -> Tuple[List[Dict[str, object]], Dict[str, float]]:
@@ -465,7 +544,9 @@ def audit_cited_figures(report: str, goals: List[Goal],
     condition. Reporting it again here would be a third count of one
     fact.
     """
-    counters = {"cited_figures_checked": 0.0, "cited_figures_unsupported": 0.0}
+    counters = {"cited_figures_checked": 0.0, "cited_figures_unsupported": 0.0,
+                "cited_figures_misattributed": 0.0,
+                "figures_outside_citation_scope": 0.0}
     if not report or not evidence:
         return [], counters
 
@@ -482,6 +563,25 @@ def audit_cited_figures(report: str, goals: List[Goal],
     findings: List[Dict[str, object]] = []
     for sentence, cited in iter_cited_sentences(report_body(report)):
         if not cited:
+            # D-174: a numeric claim in a sentence this function cannot
+            # reach. NOT a finding -- an uncited sentence asserts nothing
+            # about any goal's evidence, so there is nothing to falsify.
+            # It is counted because `cited_figures_checked: 0` otherwise
+            # reads identically for "the report states no figures" and
+            # "every figure landed where the audit does not look", and
+            # only the second is a blind spot. Live (p205.302-check) the
+            # compiler cited at the END OF EACH PARAGRAPH rather than
+            # after each sentence as templates.compile instructs, and
+            # marked no headings either, so all three of the report's
+            # numeric claims -- 3.2 million, 1.4 million, 0.6 million --
+            # sat in unmarked mid-paragraph sentences. The audit reported
+            # a clean report having examined nothing, and the run four
+            # minutes later (p205.303-check, same prompt, same query)
+            # cited on its headings and audited normally. Coverage was
+            # decided by prose style, silently. This counter is what
+            # makes that visible; report_metrics.py warns on it.
+            counters["figures_outside_citation_scope"] += float(
+                len(figures_in(_strip_markers(sentence))))
             continue
         # Only goals that exist AND retrieved something can settle a
         # figure either way -- see the docstring on why the other cases
@@ -504,11 +604,7 @@ def audit_cited_figures(report: str, goals: List[Goal],
         for goal_id in checkable:
             supported |= figures_by_goal[goal_id]
             supported_values |= values_by_goal[goal_id]
-        # Citations carry no figures of their own under D-40's [gN]-only
-        # rule, but a report that slipped a `[g1 | corpus | score=0.90]`
-        # form past clean_citations would otherwise contribute "0.90"
-        # as a claim. Strip the markers before reading figures.
-        prose = re.sub(r"\[g\d+[^\]]*\]", " ", sentence)
+        prose = _strip_markers(sentence)
         stated = figures_in(prose)
         if not stated:
             continue
@@ -524,10 +620,36 @@ def audit_cited_figures(report: str, goals: List[Goal],
                 figure for figure in unsupported
                 if not _confirmed_by_scale(figure, spans, supported_values)}
         for figure in sorted(unsupported):
-            findings.append({
+            # D-179: WHICH failure is this? Two things look identical
+            # here and have OPPOSITE remedies. A figure the run never
+            # retrieved is invented, and the fix is to delete it. A
+            # figure the run DID retrieve, under a goal this sentence
+            # did not cite, is a citation error, and the fix is to cite
+            # the goal that carries it. Collapsing the two told the
+            # compiler to delete true content.
+            elsewhere = sorted(
+                g for g in figures_by_goal
+                if g not in checkable
+                and (figure in figures_by_goal[g]
+                     or _confirmed_by_scale(figure, spans,
+                                            values_by_goal[g])))
+            finding: Dict[str, object] = {
                 "figure": figure,
                 "goals": sorted(checkable),
                 "sentence": " ".join(sentence.split())[:200],
-            })
-    counters["cited_figures_unsupported"] = float(len(findings))
+                "kind": "misattributed" if elsewhere else "unsupported",
+            }
+            if elsewhere:
+                finding["supported_by"] = elsewhere
+            findings.append(finding)
+    # D-179 + D-180: counted by DISTINCT FIGURE, not by finding. One
+    # figure stated in three sentences is one unsupported figure, and
+    # "3 cited figure(s) appear in no cited evidence" -- the line this
+    # number prints on the terminal -- would be false. The findings
+    # list still carries one entry per sentence, which is what makes
+    # the finding actionable; only the COUNT collapses.
+    counters["cited_figures_unsupported"] = float(len(
+        {f["figure"] for f in findings if f["kind"] == "unsupported"}))
+    counters["cited_figures_misattributed"] = float(len(
+        {f["figure"] for f in findings if f["kind"] == "misattributed"}))
     return findings, counters

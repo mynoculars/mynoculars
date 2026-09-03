@@ -21,7 +21,7 @@ Responsibilities:
 
 import logging
 from collections import Counter
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from research_agent import langfuse as lf
 from research_agent.agents.escalation import raise_or_log
@@ -35,7 +35,8 @@ from research_agent.guardrails.annotations import strip_machine_annotations
 # _confirm_unsupported_figures call them independently of telemetry.
 from research_agent.guardrails.claims import (audit_cited_figures,
                                               cited_goal_ids_in_prose)
-from research_agent.guardrails.critique import resolve_verdict
+from research_agent.guardrails.critique import (drop_affirmations,
+                                                resolve_verdict)
 from research_agent.guardrails.dedup import dedupe_evidence
 from research_agent.guardrails.truncation import report_carries_truncation_notice
 from research_agent.limits import (elapsed_seconds, run_budget_exhausted,
@@ -406,45 +407,108 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         # Ordered AFTER D-66 deliberately: a report citing nothing has no
         # cited figures to audit, so that gate must get first refusal.
         # D-155 reads this: the deterministic figure audit's own verdict
-        # on THIS report. It stays 0 when the audit is disabled or has no
-        # evidence to audit against.
+        # on THIS report. `resolve_verdict` returns early when it is
+        # NONZERO -- if the audit flagged something, the two checks
+        # disagree and the critic's failure stands.
         #
-        # D-162 CORRECTS WHAT THIS COMMENT USED TO CLAIM. It said 0 was
-        # "the conservative value ... and the D-155 counterweight declines
-        # to act on it". It does not: `resolve_verdict` returns early on
-        # `unsupported_figures` being NONZERO, so 0 is the value that lets
-        # it act -- and since claim_verification_enabled ships False, 0 is
-        # also the only value a default deployment ever produces.
+        # D-178: THE AUDIT NOW RUNS REGARDLESS OF THE FLAG, and that is
+        # the whole change. D-162 recorded, correctly, that 0 is the
+        # value which LETS the counterweight act, and that
+        # claim_verification_enabled shipping False made 0 the only
+        # value a default deployment ever produced -- so D-155's stated
+        # one-way safety property ("never fires when D-91 flagged
+        # anything") was, by default, guarding nothing. It could not
+        # fire on a flagged report because it never learned of one.
         #
-        # The behaviour is left as it is, deliberately. D-155 exists
-        # because the critic was failing CORRECT reports over faithful
-        # rounding on runs with this feature off; gating the counterweight
-        # on an off-by-default flag would switch D-155 off for everyone
-        # who has not opted in, which is precisely the population it was
-        # written for. What the guard really provides is one-way safety:
-        # if the audit DID run and DID flag something, the two checks
-        # disagree and the critic wins. When it did not run, the note-level
-        # test stands alone -- which is why D-162 also tightened
-        # `disputed_figures` so a coverage note can no longer be mistaken
-        # for a falsifiable one.
-        audit_flagged = 0
-        if settings.claim_verification_enabled and state.evidence:
+        # D-162 then weighed two options and picked the lesser harm:
+        # gate the counterweight on the flag (which switches D-155 off
+        # for everyone who has not opted in -- the population it was
+        # written for), or leave the guard vacuous. There was a third,
+        # and it costs nothing: RUN THE AUDIT. audit_cited_figures is
+        # string matching over one report -- no model call, no network,
+        # no counters of its own here -- and report_metrics.py already
+        # runs it unconditionally on the shipped report a few nodes
+        # later. The flag was never about affording the audit; it gates
+        # the JUDGE (an LLM call) and the GATING (failing a critique),
+        # and those two are what stay behind it below.
+        #
+        # So D-155 keeps working for the default population AND its
+        # safety property becomes real for them. Live evidence that this
+        # was not hypothetical: p205.304-check ran with the flag unset,
+        # and the report it shipped scored cited_figures_unsupported: 2
+        # at telemetry. Had the critic failed it on notes disputing those
+        # two figures, the counterweight would have been free to dismiss
+        # them and pass the report, precisely because the check meant to
+        # veto that had not been asked.
+        flagged: List[Dict[str, object]] = []
+        misattributed: List[Dict[str, object]] = []
+        if state.evidence:
             # D-139: the audit reads the authored body too. A figure in
             # the Sources block belongs to a URL this system printed, and
             # asking the model to defend it is the same unanswerable note.
-            flagged, _ = audit_cited_figures(
+            audited, _ = audit_cited_figures(
                 authored, state.goals, state.evidence)
-            audit_flagged = len(flagged)
+            # D-179: only a figure the run never retrieved is a question
+            # for the judge. templates.verify_figures shows it the CITED
+            # goal's evidence and asks whether that evidence supports the
+            # figure "in any form" -- for a MISATTRIBUTED figure that is
+            # a question whose answer is fixed before it is asked, since
+            # the evidence it is shown is by definition the evidence that
+            # lacks the figure. Live (p205.308-check) the judge confirmed
+            # 975000 as unsupported while the run held an evidence item
+            # reading "a deployed force of 975,000 troops" under g3; the
+            # compiler then DELETED a true, retrieved figure and wrote
+            # "No retrieved evidence supports the specific figure of
+            # 975,000 troops" into the shipped report, which was false.
+            flagged = [f for f in audited if f["kind"] == "unsupported"]
+            misattributed = [f for f in audited
+                             if f["kind"] == "misattributed"]
+        # Both kinds count for D-155/D-178: either is the deterministic
+        # check having something to say about this report.
+        audit_flagged = len(flagged) + len(misattributed)
+        if settings.claim_verification_enabled and flagged:
+            # D-175: the JUDGE is shown deduplicated evidence, the AUDIT
+            # above is not, and the asymmetry is deliberate.
+            # audit_cited_figures folds evidence into a SET of figures per
+            # goal, so a duplicate cannot change its verdict. The judge
+            # sees a bounded LIST -- templates.verify_figures shows at
+            # most 8 items per figure -- where a duplicate costs a slot
+            # that a different evidence item would otherwise have had.
+            # This is D-46 exactly, in the one path added after D-46 was
+            # fixed. Live (p205.303-check) six of the eight slots shown
+            # for figure 205000 were three corpus items repeated twice,
+            # leaving two for material on the actual subject; the same
+            # run logged guardrail.evidence_deduplicated dropped=4.
+            # Counters dropped, exactly as at the critic prompt below:
+            # the run's evidence_deduplicated figure describes the
+            # prompt behind the REPORT, not the sum of every prompt.
+            verifier_evidence, _ = dedupe_evidence(state.evidence)
             confirmed = _confirm_unsupported_figures(router, flagged,
-                                                     state.evidence)
+                                                     verifier_evidence)
             if confirmed:
                 revision = state.revision_count + 1
                 notes = [
-                    f"Figure {f} appears in no evidence cited by its own "
-                    f"sentence, and a verification pass confirmed the "
-                    f"evidence does not support it in any form. Remove it, "
-                    f"or attribute it to evidence that does."
+                    f"Figure {f} appears in no evidence under any goal "
+                    f"this report cites, and a verification pass "
+                    f"confirmed the evidence does not support it in any "
+                    f"form. Remove it."
                     for f in confirmed]
+                # D-179: the other remedy, for the other defect. A
+                # misattributed figure is TRUE and RETRIEVED -- asking
+                # for it to be removed destroys correct content, which
+                # is exactly what p205.308-check did. These notes ride
+                # along on a revision that is happening anyway; a
+                # misattribution never spends a revision of its own,
+                # because a citation pointing at the wrong goal is a
+                # smaller fault than an invented number and the run
+                # already reports it (cited_figures_misattributed).
+                notes += [
+                    f"Figure {f['figure']} is cited to "
+                    f"{'/'.join(f['goals'])} whose evidence does not "
+                    f"contain it, but the evidence for "
+                    f"{'/'.join(f['supported_by'])} does. Cite the goal "
+                    f"that supports it. Do NOT remove the figure."
+                    for f in misattributed]
                 update = {
                     "critique_passed": False,
                     "revision_count": revision,
@@ -491,7 +555,25 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             state.raw_query, authored, state.goals,
             prompt_evidence))
         passed = bool(result.get("passed", False))
-        notes = [str(n) for n in result.get("notes", [])]
+        # D-181: `violations` is the contract; `notes` is read as a
+        # fallback so a model answering the old key is not silently
+        # treated as having found nothing. drop_affirmations is the
+        # backstop behind the contract, and it reports what it did
+        # rather than doing it quietly -- a nonzero count is a prompt
+        # to fix, not a filter to widen.
+        raw_notes = result.get("violations")
+        if raw_notes is None:
+            raw_notes = result.get("notes", [])
+        notes, affirmations = drop_affirmations(
+            [str(n) for n in raw_notes])
+        if affirmations:
+            log_event(logger, "critic.affirmations_dropped",
+                      level=logging.WARNING, dropped=affirmations,
+                      kept=len(notes),
+                      effect="entries recording that a claim IS "
+                             "supported were removed before they "
+                             "could be rendered to the next compile "
+                             "as things to fix")
         # D-155: the one LLM judgement in this codebase that had no
         # deterministic counterweight now gets one. resolve_verdict only
         # ever acts when EVERY note disputes a figure the evidence itself
@@ -506,6 +588,8 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             "critique_passed": passed,
             "revision_count": revision,
             "counters": {"llm_node_calls": 1, "revision_cycles": 1,
+                        "critique_affirmations_dropped":
+                            float(affirmations),
                         **verdict_counters,
                         **router.drain_counters()},
         }
@@ -574,6 +658,35 @@ def build_memory_writer_node(memory: SemanticMemory, settings,
         return {"counters": {"memory_writes": float(written)}}
 
     return memory_writer_node
+
+
+def _distinct_figures(findings: List[Dict[str, object]],
+                      kind: str, limit: int = 5) -> List[Dict[str, object]]:
+    """Up to `limit` DISTINCT figures of one kind, first mention wins.
+
+    CALLED BY   telemetry_node, for both figure samples (D-180).
+    WHY         audit_cited_figures reports one finding per SENTENCE, so
+                a figure the report states three times is three findings.
+                That is right for the findings list -- each one names a
+                different sentence to fix -- and wrong for a capped
+                sample whose whole job is to say WHICH figures.
+
+    Order is the order the audit found them, which is document order, so
+    the sample reads as the report reads.
+    """
+    out: List[Dict[str, object]] = []
+    seen = set()
+    for f in findings:
+        if f.get("kind") != kind or f["figure"] in seen:
+            continue
+        seen.add(f["figure"])
+        entry = {"figure": f["figure"], "goals": f["goals"]}
+        if kind == "misattributed":
+            entry["supported_by"] = f.get("supported_by", [])
+        out.append(entry)
+        if len(out) == limit:
+            break
+    return out
 
 
 def build_telemetry_node(settings: Settings, debug: bool = False):
@@ -886,13 +999,34 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                 figure_counters.get("cited_figures_checked", 0)),
             "cited_figures_unsupported": int(
                 figure_counters.get("cited_figures_unsupported", 0)),
+            # D-179: a figure the run DID retrieve, cited to a goal
+            # whose evidence does not carry it. A citation defect,
+            # not an invented number, and deliberately NOT counted in
+            # cited_figures_unsupported -- it does not trip
+            # CAP_UNSUPPORTED_FIGURES, because the claim is supported
+            # by evidence this run actually holds.
+            "cited_figures_misattributed": int(
+                figure_counters.get("cited_figures_misattributed", 0)),
+            "misattributed_figures": _distinct_figures(
+                figure_findings, "misattributed"),
+            # D-174: figures the audit could not reach, because their
+            # sentence carries no citation and sits under no cited
+            # heading. Read it beside cited_figures_checked: 0 and 0 is
+            # a clean report; 0 and a nonzero here is a blind one.
+            "figures_outside_citation_scope": int(
+                figure_counters.get("figures_outside_citation_scope", 0)),
             # A capped sample, so the run record shows WHICH figures
             # rather than only how many -- the difference between a
             # number you can act on and one you have to reproduce.
-            "unsupported_figures": [
-                {"figure": f["figure"], "goals": f["goals"]}
-                for f in figure_findings[:5]
-            ],
+            # D-180: five DISTINCT figures, not the first five
+            # findings. This sample exists so the record shows WHICH
+            # figures rather than only how many, and one figure
+            # stated in three sentences used to spend three of its
+            # five slots saying the same thing -- live
+            # (p205.306-check) "1.35" appeared twice in a sample of
+            # five, which is the sample defeating its own purpose.
+            "unsupported_figures": _distinct_figures(
+                figure_findings, "unsupported"),
             # Guardrail G3: model-tier items whose own text paired a
             # specific year with a specific quantity — flagged, not
             # dropped (see tools/model_knowledge.py::_looks_overspecific).
