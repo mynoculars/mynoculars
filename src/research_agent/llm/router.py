@@ -16,6 +16,14 @@ Responsibilities:
         3. quality score (judged by the NEXT provider in the chain, never
            the answering one — P2-11) below llm_quality_threshold
            (free-text answers only; see evaluation/quality.py).
+    - D-183: before treating a 429 as case 1 above, wait out the provider's
+      OWN named cooldown (capped at LLM_RETRY_AFTER_MAX_SECONDS) and retry
+      that SAME provider once. Only a retry that ALSO fails, or a 429 that
+      names no duration at all, becomes a real hop.
+    - D-184: once a hop IS real, pace it -- a fixed LLM_HOP_DELAY_SECONDS
+      pause before the next provider is actually called, on every hop
+      (error or low-quality), whether or not that failure named a
+      duration for D-183 to act on. Off (0) by default.
     - Log every hop so runs are auditable (which provider served, why we moved).
 
 Design decisions:
@@ -64,6 +72,7 @@ Python mechanics used in this file, if any of this is new to you:
 
 import logging
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from research_agent.config import Settings
@@ -153,17 +162,36 @@ class FallbackRouter:
     """
 
     def __init__(self, providers: List[ChatClient], quality_threshold: float,
-                 tracer: Optional[Tracer] = None):
+                 tracer: Optional[Tracer] = None,
+                 retry_after_max_seconds: float = 0.0,
+                 hop_delay_seconds: float = 0.0):
         """`providers` is the fallback ORDER: index 0 is tried first, and each
         subsequent provider is a fallback for the ones before it. Must be
         non-empty. A single-element chain simply never falls back. `tracer`
         (optional) is forwarded to the clients for debug tracing.
+
+        `retry_after_max_seconds` (D-183): the cap this router will actually
+        SLEEP for when a 429 names its own cooldown, before retrying that
+        SAME provider once. 0.0 (the default) disables the feature entirely
+        -- every existing caller that does not pass this argument gets
+        byte-identical behaviour to before D-183 existed: a 429 hops
+        immediately, same as any other error. See _retry_after_seconds.
+
+        `hop_delay_seconds` (D-184): a FIXED pause before calling the NEXT
+        provider, on every hop -- distinct from retry_after_max_seconds
+        above, which paces a retry of the SAME provider against a duration
+        THAT PROVIDER named. This one never reads a response; it applies to
+        every hop uniformly, including one whose failure named no duration
+        at all (Mistral's observed shape). 0.0 (the default) disables it
+        and restores byte-identical pre-D-184 behaviour. See _log_fallback.
         """
         if not providers:
             raise ValueError("FallbackRouter needs at least one provider")
         self.providers = providers
         self.quality_threshold = quality_threshold
         self.tracer = tracer or NullTracer()
+        self.retry_after_max_seconds = retry_after_max_seconds
+        self.hop_delay_seconds = hop_delay_seconds
         # P2-07: boundary-scoped telemetry. This router is the ONE place
         # that actually knows how many real provider requests, fallback
         # hops, and quality-scoring calls happened underneath a single
@@ -482,7 +510,9 @@ class FallbackRouter:
         apply here).
         """
         if s.llm_mode == "stub":
-            return cls([StubClient(tracer=tracer)], s.llm_quality_threshold, tracer)
+            return cls([StubClient(tracer=tracer)], s.llm_quality_threshold, tracer,
+                       retry_after_max_seconds=s.llm_retry_after_max_seconds,
+                       hop_delay_seconds=s.llm_hop_delay_seconds)
 
         chain: List[ChatClient] = [OpenAICompatibleClient(
             "primary", s.llm_primary_base_url, s.llm_primary_api_key,
@@ -527,7 +557,9 @@ class FallbackRouter:
                     context_tokens=context))
 
         log_event(logger, "llm.chain_built", providers=[p.name for p in chain])
-        return cls(chain, s.llm_quality_threshold, tracer)
+        return cls(chain, s.llm_quality_threshold, tracer,
+                   retry_after_max_seconds=s.llm_retry_after_max_seconds,
+                   hop_delay_seconds=s.llm_hop_delay_seconds)
 
     # -- internals ----------------------------------------------------------
 
@@ -621,18 +653,39 @@ class FallbackRouter:
 
     def _log_fallback(self, frm: str, to: Optional[str],
                       reason: str, mode: str) -> None:
-        """Emit one llm.fallback record to both sinks.
+        """Emit one llm.fallback record to both sinks, then (D-184) pace
+        the NEXT provider call by hop_delay_seconds if one is configured.
 
         SHARED BY   the three places a hop is left behind: an error in
                     complete_json, an error in complete, and a
                     below-threshold quality score in complete. All three
-                    carried their own byte-identical pair of calls.
+                    carried their own byte-identical pair of calls -- and
+                    now all three get the D-184 pause for free from the
+                    same shared call, rather than three more copies of it.
+
+        `to is None` (the last provider in the chain failed, nowhere left
+        to hop to) never sleeps -- there is no next call to space out.
+        hop_delay_seconds == 0.0 (the default) never sleeps either, so an
+        existing caller that never set the setting sees byte-identical
+        behaviour to before D-184 existed.
+
+        This is independent of, and runs AFTER, D-183's same-provider
+        retry wait: a provider that named a cooldown, got retried via
+        _call_with_retry, and failed again reaches this method exactly
+        once for that hop, so the two waits stack rather than double-fire.
         """
         log_event(logger, "llm.fallback", from_provider=frm,
                   to_provider=to, reason=reason, mode=mode)
         lf.event(run_id_var.get(), "llm.fallback",
                 metadata={"from_provider": frm, "to_provider": to,
                           "reason": reason, "mode": mode})
+        if to is not None and self.hop_delay_seconds > 0:
+            self._bump("llm_hop_delay_sleeps")
+            self._bump("llm_hop_delay_seconds_total", self.hop_delay_seconds)
+            log_event(logger, "llm.hop_delay_sleep", from_provider=frm,
+                      to_provider=to, seconds=round(self.hop_delay_seconds, 3),
+                      mode=mode)
+            time.sleep(self.hop_delay_seconds)
 
     def _record_hop(self, i: int, provider: ChatClient, exc: Exception,
                     mode: str, outcomes: List[Tuple[str, str]]) -> None:
@@ -653,6 +706,144 @@ class FallbackRouter:
         if nxt is not None:
             self._bump("llm_fallback_hops")  # P2-07: a real hop, not a dead end
         self._log_fallback(provider.name, nxt, type(exc).__name__, mode)
+
+    # D-183: on a 429, wait once, then retry the SAME provider before
+    # advancing to the next hop.
+    #
+    # WHY THIS EXISTS. Live (p205.315/.316/.317-check) a compile or a
+    # critique burned the ENTIRE fallback chain every time Gemini's
+    # per-minute quota was mid-window: Mistral 429'd with no timing signal
+    # at all, Gemini 429'd right behind it naming a cooldown as short as
+    # 8.98s, and the run then failed outright (ProviderChainExhausted) or
+    # limped in on whatever the chain had left -- while the actual fix,
+    # waiting under nine seconds, was sitting in the response the whole
+    # time, unread. Immediately burning the chain on a limit that is about
+    # to clear is not "the router hopped correctly"; it is the router
+    # discarding information the provider handed it for free.
+    #
+    # WHY ONLY ONCE, AND ONLY WHEN THE PROVIDER NAMES ITS OWN DURATION.
+    # A second consecutive 429 after the wait already elapsed is treated
+    # exactly like any other failure -- see the `retried_this_hop` guard at
+    # both call sites -- because a provider that is still rate-limited
+    # immediately after honouring its own stated cooldown is telling you
+    # something worse than "wait longer": either the number it gave was
+    # wrong, or the account is contended by something outside this
+    # process's control, and burning more wall-clock guessing at either is
+    # not this router's job. A provider with NO duration at all (Mistral's
+    # observed shape) is never retried and hops immediately, unchanged from
+    # before this existed -- see _retry_after_seconds.
+    def _retry_after_seconds(self, provider: ChatClient) -> Optional[float]:
+        """How long to wait before retrying THIS SAME provider once more,
+        or None to hop to the next provider immediately, exactly as every
+        failure was handled before D-183 existed.
+
+        CALLED BY   complete() and complete_json(), from inside the
+                    per-hop retry loop, exactly once per hop (guarded by
+                    each caller's own `retried_this_hop` flag) -- never a
+                    second time for the same hop, so a provider that is
+                    still rate-limited after its own named cooldown
+                    elapsed falls through to _record_hop like any other
+                    failure instead of being waited on again.
+
+        READS provider.drain_retry_after() -- the same duck-typed,
+        drain-not-peek optional capability drain_usage already
+        established (llm/client.py). ALWAYS drains when the capability
+        exists, whether or not the value ends up being used below: a
+        value this call chooses not to act on (too long, feature
+        disabled) must not linger to be misread against a later,
+        unrelated failure -- see client.py::drain_retry_after's own
+        docstring for the client-side half of that guarantee.
+
+        retry_after_max_seconds == 0.0 (the default) disables this
+        entirely and returns None unconditionally -- an existing caller
+        that never set the setting sees byte-identical behaviour to
+        before D-183 existed.
+
+        A signal LARGER than the cap is deliberately NOT clamped and
+        retried anyway: a provider naming an eight-minute cooldown is
+        telling you this hop is dead for far longer than waiting is worth
+        when another provider in the chain is ready to try RIGHT NOW.
+        Hopping -- not a truncated wait that will just fail again -- is
+        what today's behaviour already does for that shape; this only
+        logs and counts the decision instead of leaving it silent.
+        """
+        drain = getattr(provider, "drain_retry_after", None)
+        if drain is None:
+            return None
+        wait = drain()
+        if wait is None:
+            return None
+        if self.retry_after_max_seconds <= 0:
+            return None
+        if wait > self.retry_after_max_seconds:
+            self._bump("llm_retry_after_skipped_too_long")
+            log_event(logger, "llm.retry_after_too_long", provider=provider.name,
+                      node=self._node, seconds=round(wait, 3),
+                      cap=self.retry_after_max_seconds)
+            return None
+        return wait
+
+    def _sleep_for_retry(self, provider: ChatClient, seconds: float,
+                         mode: str) -> None:
+        """Actually wait, then let the caller's loop retry `provider`.
+
+        CALLED BY   complete() and complete_json(), immediately after
+                    _retry_after_seconds above returns a duration worth
+                    waiting for. Counted BEFORE sleeping, not after -- a
+                    process killed mid-wait (deadline, signal) should
+                    still show the attempt was made, the same reasoning
+                    llm_provider_calls is bumped before the call it counts.
+        """
+        self._bump("llm_retry_after_sleeps")
+        self._bump("llm_retry_after_seconds_total", seconds)
+        log_event(logger, "llm.retry_after_sleep", provider=provider.name,
+                  node=self._node, seconds=round(seconds, 3), mode=mode)
+        lf.event(run_id_var.get(), "llm.retry_after_sleep",
+                metadata={"provider": provider.name, "seconds": seconds,
+                          "mode": mode})
+        time.sleep(seconds)
+
+    def _call_with_retry(self, i: int, provider: ChatClient, call,
+                         mode: str, outcomes: List[Tuple[str, str]]
+                         ) -> Tuple[bool, Any]:
+        """Call `call()` (a zero-arg thunk: provider.complete(messages) or
+        provider.complete_json(messages)), retrying `provider` once more
+        on a 429 that names its own cooldown (D-183) before giving up on
+        this hop.
+
+        SHARED BY   complete() and complete_json() -- the retry LOOP
+                    itself, not just the decision (_retry_after_seconds)
+                    or the wait (_sleep_for_retry), for the same reason
+                    S-26 shares _skip_reason/_record_hop/_log_fallback
+                    between them: two copies of a loop drift, and this one
+                    has three exits (success, retry, give up) to keep in
+                    step rather than one.
+
+        RETURNS (True, result) on success -- `call()`'s own return value,
+        untouched. (False, exc) once this hop is exhausted, INCLUDING its
+        one retry -- `_record_hop` has already run by the time this
+        returns False, so the caller only needs to keep `exc` as its own
+        `last_exc` and move to the next `i`. Never raises itself.
+        """
+        retried_this_hop = False
+        while True:
+            self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
+            try:
+                return True, call()
+            except Exception as exc:  # noqa: BLE001 -- any failure steps to next
+                # Catching the broad `Exception` here is DELIBERATE (the
+                # noqa comment tells a linter "yes, I meant to do this, stop
+                # warning me about it") — any kind of failure from this
+                # provider, whatever its exact type, should trigger the same
+                # fallback behaviour: try the next one.
+                wait = (None if retried_this_hop
+                        else self._retry_after_seconds(provider))
+                if wait is not None:
+                    retried_this_hop = True
+                    self._sleep_for_retry(provider, wait, mode)
+                    continue
+                self._record_hop(i, provider, exc, mode, outcomes)
+                return False, exc
 
     def complete_json(self, messages: List[Message]) -> Dict[str, Any]:
         """Structured call. Step down the chain on error/unparseable JSON.
@@ -690,22 +881,21 @@ class FallbackRouter:
             if skip is not None:
                 outcomes.append((provider.name, skip))
                 continue
-            self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
-            try:
-                result = provider.complete_json(messages)
-                self._bump_usage(provider)  # D-86
-                if i > 0:
-                    log_event(logger, "llm.served_by_fallback",
-                              provider=provider.name, position=i, mode="json")
-                return result
-            except Exception as exc:  # noqa: BLE001 -- any failure steps to next
-                # Catching the broad `Exception` here is DELIBERATE (the
-                # noqa comment tells a linter "yes, I meant to do this, stop
-                # warning me about it") — any kind of failure from this
-                # provider, whatever its exact type, should trigger the same
-                # fallback behaviour: try the next one.
-                last_exc = exc
-                self._record_hop(i, provider, exc, "json", outcomes)
+            # D-183: one retry of THIS provider on a named 429 cooldown
+            # before falling through to the next hop -- see
+            # _call_with_retry for the shared loop and its own docstring
+            # for why a second consecutive 429 is not waited on again.
+            ok, outcome = self._call_with_retry(
+                i, provider, lambda p=provider: p.complete_json(messages),
+                "json", outcomes)
+            if not ok:
+                last_exc = outcome
+                continue
+            self._bump_usage(provider)  # D-86
+            if i > 0:
+                log_event(logger, "llm.served_by_fallback",
+                          provider=provider.name, position=i, mode="json")
+            return outcome
         # If we reach this line, every provider in the loop above raised.
         # `assert last_exc is not None` is a sanity check for a human reader
         # (and for tools like mypy) that this line is only reachable when
@@ -769,18 +959,22 @@ class FallbackRouter:
             if skip is not None:
                 outcomes.append((provider.name, skip))
                 continue
-            self._bump("llm_provider_calls")  # P2-07: one real attempt, win or lose
-            try:
-                answer = provider.complete(messages)
-                # D-86: drained here, BEFORE any quality scoring
-                # below, so the judge's own call (also counted, in
-                # _score_quality) can never be attributed to the
-                # provider that produced the answer.
-                self._bump_usage(provider)
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                self._record_hop(i, provider, exc, "text", outcomes)
+            # D-183: one retry of THIS provider on a named 429 cooldown
+            # before falling through to the next hop -- see
+            # _call_with_retry for the shared loop and its own docstring
+            # for why a second consecutive 429 is not waited on again.
+            ok, outcome = self._call_with_retry(
+                i, provider, lambda p=provider: p.complete(messages),
+                "text", outcomes)
+            if not ok:
+                last_exc = outcome
                 continue
+            answer = outcome
+            # D-86: drained here, BEFORE any quality scoring below, so
+            # the judge's own call (also counted, in _score_quality) can
+            # never be attributed to the provider that produced the
+            # answer.
+            self._bump_usage(provider)
 
             has_next = i + 1 < len(self.providers)
 

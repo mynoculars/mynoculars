@@ -234,6 +234,50 @@ class Settings(BaseSettings):
     # wrong.
     llm_primary_timeout_seconds: float = Field(120.0, gt=0.0)   # local Cogito
     llm_timeout_seconds: float = Field(90.0, gt=0.0)            # Mistral, Gemini
+    # D-183: the cap FallbackRouter will actually SLEEP for when a 429
+    # names its own cooldown, before retrying that SAME provider once
+    # rather than immediately burning the rest of the chain. Read out of
+    # the 429's own Retry-After header or, failing that, its body (see
+    # llm/client.py::parse_retry_after_seconds) -- never invented.
+    #
+    # Live (p205.315/.316/.317-check): Gemini's own reported cooldown was
+    # 0.059s, then 35.36s, then 8.98s across three separate runs -- a
+    # short, rolling per-minute window, and every one of those numbers
+    # comfortably under a one-minute cap. Mistral's 429 (observed 4-for-4
+    # in the same session) names no duration at all and is never retried
+    # regardless of this setting -- see _retry_after_seconds's own
+    # docstring.
+    #
+    # 0 DISABLES the feature entirely and restores the pre-D-183 behaviour
+    # (every 429 hops immediately, same as any other error), the same
+    # documented escape hatch every other 0-disables setting in this file
+    # provides. A signal LARGER than this cap is deliberately NOT clamped
+    # and retried anyway -- it is treated as "too long to be worth
+    # waiting for" and the router hops immediately instead, since another
+    # provider ready to try right now beats a truncated wait that will
+    # probably fail again.
+    llm_retry_after_max_seconds: float = Field(60.0, ge=0.0)
+    # D-184: a FIXED pause before the router calls the NEXT provider in the
+    # chain, on EVERY hop (an error, or -- free-text calls only -- a
+    # below-threshold quality score). Distinct from llm_retry_after_max_seconds
+    # above, which paces a retry of the SAME provider against a duration THAT
+    # PROVIDER named; this paces the move to a DIFFERENT provider and never
+    # reads anything from a response -- it fires whether or not a 429 was
+    # even involved, and stacks after the D-183 wait when both apply (a
+    # provider that named a cooldown, got retried, and failed again pays the
+    # retry wait, then this one, before the next provider is tried).
+    #
+    # WHY: back-to-back calls across two rate-limited cloud providers in the
+    # same request can trip a provider's OWN limiter with no evidence in its
+    # response to react to (Mistral's observed 429 names no duration at all
+    # -- llm_retry_after_max_seconds has nothing to work with there). A
+    # small fixed gap between hops is the operator's own lever for that,
+    # independent of what any one provider's error body says.
+    #
+    # 0 (the default) DISABLES this entirely and restores byte-identical
+    # pre-D-184 behaviour -- hops happen back-to-back with no pause, same as
+    # every other 0-disables setting in this file.
+    llm_hop_delay_seconds: float = Field(0.0, ge=0.0)
     llm_max_tokens: int = Field(4096, ge=1)  # D-54: request-level generation cap
     # D-131 (P6-2): how many characters of EVIDENCE may enter one prompt.
     # The other half of llm_max_tokens above -- that one bounds what a

@@ -20,6 +20,7 @@ import pytest
 
 from research_agent.llm.client import TruncatedGenerationError
 from research_agent.llm.router import FallbackRouter, ProviderChainExhausted
+from research_agent.llm import router as _router_module
 
 # ---------------------------------------------------------------------------
 # Basic fallback: error -> next provider, first success wins
@@ -1209,3 +1210,349 @@ def test_record_hop_appends_the_exception_type_in_chain_order():
     router._record_hop(1, router.providers[1], KeyError("b"), "json", outcomes)
 
     assert outcomes == [("p0", "ValueError"), ("p1", "KeyError")]
+
+
+# ---------------------------------------------------------------------------
+# D-183 -- on a 429, wait once (per the provider's OWN named cooldown), then
+# retry the SAME provider before advancing to the next hop.
+#
+# Live (p205.315/.316/.317-check): Gemini named a cooldown as short as
+# 8.98s and the chain was burned anyway because nothing ever read it.
+# Mistral names none at all (observed 4-for-4 in the same session) and
+# must never be waited on -- see _NoRetryAfter below, the shape a plain
+# httpx.HTTPStatusError from a real 429-with-no-signal takes once
+# llm/client.py has classified it.
+# ---------------------------------------------------------------------------
+
+
+class _RetryAfterProvider:
+    """A provider whose failures name a cooldown the same way
+    OpenAICompatibleClient.drain_retry_after does: a value that is handed
+    back exactly once, then None, UNLESS `sticky=True`, in which case every
+    failure re-names the same duration (the shape a provider that is STILL
+    rate-limited after its own cooldown elapsed would produce).
+
+    Fails on the first `fail_times` calls, then answers `reply`/`json_reply`.
+    fail_times=None means it never recovers (chain-exhaustion tests).
+    """
+
+    def __init__(self, name, retry_after, fail_times=1, sticky=False,
+                 reply="answer", json_reply=None):
+        self.name = name
+        self._retry_after = retry_after
+        self._sticky = sticky
+        self._fail_times = fail_times
+        self.calls = 0
+        self._reply = reply
+        self._json_reply = json_reply if json_reply is not None else {"ok": True}
+        self.drain_calls = 0
+
+    def _maybe_fail(self):
+        self.calls += 1
+        if self._fail_times is None or self.calls <= self._fail_times:
+            raise RuntimeError("429 rate limited")
+
+    def complete(self, messages, temperature=0.2):
+        self._maybe_fail()
+        return self._reply
+
+    def complete_json(self, messages, temperature=0.0):
+        self._maybe_fail()
+        return self._json_reply
+
+    def drain_retry_after(self):
+        self.drain_calls += 1
+        if self._sticky:
+            return self._retry_after
+        value, self._retry_after = self._retry_after, None
+        return value
+
+    def set_trace_node(self, node):
+        pass
+
+
+class _NoRetryAfter:
+    """Mistral's observed shape: a 429 that fails but names NO duration
+    anywhere. drain_retry_after exists (unlike a plain hand-written fake
+    without the capability at all -- see test_a_provider_without_the_
+    capability_is_unaffected below) and always returns None."""
+
+    def __init__(self, name, fail_times=None, reply="mistral answer",
+                 json_reply=None):
+        self.name = name
+        self._fail_times = fail_times
+        self.calls = 0
+        self._reply = reply
+        self._json_reply = json_reply if json_reply is not None else {"ok": "mistral"}
+
+    def _maybe_fail(self):
+        self.calls += 1
+        if self._fail_times is None or self.calls <= self._fail_times:
+            raise RuntimeError("429 rate limited, no signal")
+
+    def complete(self, messages, temperature=0.2):
+        self._maybe_fail()
+        return self._reply
+
+    def complete_json(self, messages, temperature=0.0):
+        self._maybe_fail()
+        return self._json_reply
+
+    def drain_retry_after(self):
+        return None
+
+    def set_trace_node(self, node):
+        pass
+
+
+def _mock_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(_router_module.time, "sleep", lambda s: sleeps.append(s))
+    return sleeps
+
+
+def test_a_named_cooldown_is_waited_out_then_the_same_provider_retried(monkeypatch):
+    """The core behaviour: a 429 that names 5s is slept for 5s, then the
+    SAME provider (not the next one) answers -- no hop at all."""
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=5.0, fail_times=1)
+    fallback = _RetryAfterProvider("fallback", retry_after=None, fail_times=0)
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert primary.calls == 2, "one failed attempt, one retried attempt"
+    assert fallback.calls == 0, "never reached -- the retry on primary succeeded"
+    assert sleeps == [5.0]
+    counters = router.drain_counters()
+    assert counters["llm_retry_after_sleeps"] == 1.0
+    assert counters["llm_retry_after_seconds_total"] == 5.0
+    assert counters["llm_provider_calls"] == 2.0
+    assert "llm_fallback_hops" not in counters, "same-provider retry is not a hop"
+
+
+def test_the_free_text_path_also_retries_before_hopping(monkeypatch):
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=8.98, fail_times=1)
+    router = FallbackRouter([primary], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    result = router.complete([{"role": "user", "content": "q"}])
+
+    assert result == "answer"
+    assert primary.calls == 2
+    assert sleeps == [8.98]
+    assert router.drain_counters()["llm_retry_after_sleeps"] == 1.0
+
+
+def test_a_second_consecutive_429_is_not_waited_on_again(monkeypatch):
+    """A provider still rate-limited immediately after its own cooldown
+    elapsed hops like any other failure -- one retry per hop, not a loop."""
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=5.0, fail_times=None,
+                                  sticky=True)
+    fallback = _RetryAfterProvider("fallback", retry_after=None, fail_times=0)
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert primary.calls == 2, "the original attempt plus exactly one retry"
+    assert sleeps == [5.0], "only ONE sleep, not one per failure"
+    counters = router.drain_counters()
+    assert counters["llm_retry_after_sleeps"] == 1.0
+    assert counters["llm_fallback_hops"] == 1.0, "the second failure IS a real hop"
+
+
+def test_zero_disables_the_feature_entirely(monkeypatch):
+    """The default (retry_after_max_seconds=0.0, unset by any existing
+    caller) must be byte-identical to pre-D-183 behaviour: hop immediately,
+    never read or act on the signal."""
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=5.0, fail_times=None)
+    fallback = _RetryAfterProvider("fallback", retry_after=None, fail_times=0)
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert primary.calls == 1, "no retry -- straight to the next provider"
+    assert sleeps == []
+    counters = router.drain_counters()
+    assert "llm_retry_after_sleeps" not in counters
+    assert counters["llm_fallback_hops"] == 1.0
+
+
+def test_a_signal_larger_than_the_cap_hops_instead_of_waiting(monkeypatch):
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=999.0, fail_times=None)
+    fallback = _RetryAfterProvider("fallback", retry_after=None, fail_times=0)
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert primary.calls == 1, "the 999s signal is too long -- hop, don't wait"
+    assert sleeps == []
+    counters = router.drain_counters()
+    assert counters["llm_retry_after_skipped_too_long"] == 1.0
+    assert "llm_retry_after_sleeps" not in counters
+    assert counters["llm_fallback_hops"] == 1.0
+
+
+def test_a_provider_with_no_named_duration_is_never_retried(monkeypatch):
+    """Mistral's live shape (4-for-4, no signal in header or body): the
+    duck-typed capability exists and always drains to None, so this must
+    behave exactly like the pre-D-183 immediate hop."""
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _NoRetryAfter("primary")
+    fallback = _RetryAfterProvider("fallback", retry_after=None, fail_times=0)
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert primary.calls == 1
+    assert sleeps == []
+    assert router.drain_counters()["llm_fallback_hops"] == 1.0
+
+
+def test_a_provider_without_the_capability_is_unaffected(monkeypatch):
+    """drain_retry_after is optional and duck-typed, exactly like
+    drain_usage and disabled_reason -- StubClient and every hand-written
+    test fake in this file that predates D-183 must keep working."""
+    sleeps = _mock_sleep(monkeypatch)
+    router = FallbackRouter([_Boom(), _Fine()], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    assert router.complete_json([{"role": "user", "content": "x"}]) == {"ok": True}
+    assert sleeps == []
+
+
+def test_a_single_provider_chain_still_raises_after_its_one_retry(monkeypatch):
+    """No fallback to hop to -- the retry happens, still fails, and
+    ProviderChainExhausted is raised exactly as it always was."""
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=5.0, fail_times=None,
+                                  sticky=True)
+    router = FallbackRouter([primary], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0)
+
+    with pytest.raises(ProviderChainExhausted):
+        router.complete_json([{"role": "user", "content": "q"}])
+
+    assert primary.calls == 2, "the original attempt plus exactly one retry"
+    assert sleeps == [5.0]
+
+
+def test_from_settings_wires_the_cap_through(monkeypatch):
+    """The setting has to actually reach the router for any of the above
+    to matter in a real run -- from_settings is the only place that's
+    wired, so this is the seam a silent typo there would hide behind."""
+    from research_agent.config import Settings
+
+    router = FallbackRouter.from_settings(
+        Settings(llm_mode="stub", llm_retry_after_max_seconds=42.0))
+    assert router.retry_after_max_seconds == 42.0
+
+
+# ---------------------------------------------------------------------------
+# D-184 -- a FIXED pause before the router calls the NEXT provider, on every
+# hop, whether or not the failure that caused it named any duration for
+# D-183 to act on (Mistral's observed shape names none at all).
+# ---------------------------------------------------------------------------
+
+
+def test_a_configured_hop_delay_fires_before_the_next_provider(monkeypatch):
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _Boom()
+    fallback = _Fine()
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6,
+                            hop_delay_seconds=3.5)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert sleeps == [3.5]
+    counters = router.drain_counters()
+    assert counters["llm_hop_delay_sleeps"] == 1.0
+    assert counters["llm_hop_delay_seconds_total"] == 3.5
+
+
+def test_zero_hop_delay_is_the_default_and_stays_disabled(monkeypatch):
+    """No existing caller passes hop_delay_seconds -- this must be
+    byte-identical to every test above that predates D-184."""
+    sleeps = _mock_sleep(monkeypatch)
+    router = FallbackRouter([_Boom(), _Fine()], quality_threshold=0.6)
+
+    router.complete_json([{"role": "user", "content": "q"}])
+
+    assert sleeps == []
+    assert "llm_hop_delay_sleeps" not in router.drain_counters()
+
+
+def test_the_last_provider_failing_never_sleeps(monkeypatch):
+    """Nothing to pace before -- there is no next call. A single-element
+    chain (or the last hop of a longer one) must not sleep at all."""
+    sleeps = _mock_sleep(monkeypatch)
+    router = FallbackRouter([_Boom()], quality_threshold=0.6,
+                            hop_delay_seconds=5.0)
+
+    with pytest.raises(ProviderChainExhausted):
+        router.complete_json([{"role": "user", "content": "q"}])
+
+    assert sleeps == []
+    assert "llm_hop_delay_sleeps" not in router.drain_counters()
+
+
+def test_the_free_text_low_quality_hop_also_gets_the_delay(monkeypatch):
+    """The low-quality hop in complete() is a THIRD call site for
+    _log_fallback, distinct from the two error-hop call sites -- it must
+    not have been missed. Same shape as
+    test_chain_steps_on_low_quality_then_serves_next: mistral (the JUDGE,
+    P2-11) scores primary's answer "low", which hops to mistral itself as
+    the next -- and last -- provider."""
+    sleeps = _mock_sleep(monkeypatch)
+    router = FallbackRouter(
+        [_Named("primary", "answer"), _Named("mistral", "low")],
+        quality_threshold=0.6, hop_delay_seconds=2.0)
+
+    result = router.complete([{"role": "user", "content": "q"}])
+
+    assert result == "answer from mistral"
+    assert sleeps == [2.0]
+    assert router.drain_counters()["llm_hop_delay_sleeps"] == 1.0
+
+
+def test_the_hop_delay_stacks_after_a_d183_retry_on_the_same_hop(monkeypatch):
+    """A provider that named a cooldown, got retried via D-183, and failed
+    AGAIN pays both waits for that one hop: the retry-after wait first,
+    then the hop-delay pause before the next provider is tried."""
+    sleeps = _mock_sleep(monkeypatch)
+    primary = _RetryAfterProvider("primary", retry_after=4.0, fail_times=None,
+                                  sticky=True)
+    fallback = _RetryAfterProvider("fallback", retry_after=None, fail_times=0)
+    router = FallbackRouter([primary, fallback], quality_threshold=0.6,
+                            retry_after_max_seconds=60.0, hop_delay_seconds=1.5)
+
+    result = router.complete_json([{"role": "user", "content": "q"}])
+
+    assert result == {"ok": True}
+    assert sleeps == [4.0, 1.5], "retry-after wait, THEN the hop-delay pause"
+    counters = router.drain_counters()
+    assert counters["llm_retry_after_sleeps"] == 1.0
+    assert counters["llm_hop_delay_sleeps"] == 1.0
+    assert counters["llm_fallback_hops"] == 1.0
+
+
+def test_from_settings_wires_the_hop_delay_through():
+    from research_agent.config import Settings
+
+    router = FallbackRouter.from_settings(
+        Settings(llm_mode="stub", llm_hop_delay_seconds=7.0))
+    assert router.hop_delay_seconds == 7.0
