@@ -78,6 +78,28 @@ CAP_NO_CITATIONS = 15
 CAP_CRITIQUE_FAILED = 45
 CAP_FLOOR_STARVED = 45
 CAP_UNSUPPORTED_FIGURES = 40
+# D-190: the audit ran and SAW NOTHING. D-174 already names this state --
+# every figure the report stated sat in a sentence carrying no [gN]
+# marker and under no cited heading, so `cited_figures_checked` is 0 not
+# because the report was clean but because nothing was reachable -- and
+# report_metrics.py already fires `report.figure_audit_saw_nothing` at
+# WARNING when it happens.
+#
+# Nothing read that flag. Live (p205.325-check): 13 figures outside
+# citation scope, 0 checked, and this function returned **HIGH (98%)** --
+# the top band, on a report with thirteen unexamined numeric claims,
+# while the run's own log carried a warning saying the check was blind.
+# This module's docstring lists `cited_figures_unsupported 0 of 0 -- the
+# audit could not run at all` among the signals p205.280-check emitted
+# and nothing combined; that was the one it went on not to combine.
+#
+# 60 (MODERATE), not CAP_UNSUPPORTED_FIGURES' 40: a blind audit is
+# ABSENCE of evidence, not evidence of fabrication. It must not read as
+# HIGH, and it must not be confused with a report whose figures were
+# checked and failed. The remedy is also different -- the compiler cited
+# at paragraph or heading level instead of per sentence, so the fix is
+# the prompt, not the prose.
+CAP_FIGURE_AUDIT_BLIND = 60
 # D-144's attachment pass only runs when the model cited NOTHING, so a
 # nonzero citations_attached means every marker in the prose was written by
 # this codebase, not by the model. That is a rescue and it is far better
@@ -180,6 +202,18 @@ def score_report(telemetry: Dict) -> Dict[str, object]:
         caps.append((CAP_UNSUPPORTED_FIGURES,
                      f"{int(unsupported)} cited figure(s) appear in no cited "
                      f"evidence"))
+    # D-190. Ordered AFTER the cap above and deliberately not merged with
+    # it: both concern figures and they are opposite findings. That one
+    # says the audit looked and found something wrong; this one says the
+    # audit could not look. A run can only ever be in one of the two
+    # states -- `figures_outside_citation_scope` counts figures the audit
+    # could not reach, and it is checked here only when it reached NONE.
+    if (_num(telemetry, "figures_outside_citation_scope")
+            and not _num(telemetry, "cited_figures_checked")):
+        outside = int(_num(telemetry, "figures_outside_citation_scope"))
+        caps.append((CAP_FIGURE_AUDIT_BLIND,
+                     f"{outside} stated figure(s) sit outside citation "
+                     f"scope, so no cited figure could be checked"))
     if _num(telemetry, "retrieval_floor_drop_ratio") >= 0.8:
         # D-152: the same ratio means two different things, and the wording
         # has to say which.

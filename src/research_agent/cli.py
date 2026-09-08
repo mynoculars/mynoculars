@@ -131,12 +131,26 @@ def _fmt_problems(records, dropped: int) -> str:
                     "effect"):
             if shown.get(key) not in (None, ""):
                 lines.append(f"    {key:<{width}} : {shown.pop(key)}")
+        # `body` is a provider's own error text; `message` is a
+        # third-party library's full warning, preserved whole by
+        # ProblemCollector when only its first line became the heading.
+        # Both print LAST and unabbreviated, for the same reason: they
+        # are the field that said "this team has no credits" (run
+        # p205.265-check) while the heading said only 403.
         body = shown.pop("body", None)
+        message = shown.pop("message", None)
         rest = "  ".join(f"{k}={v}" for k, v in shown.items())
         if rest:
             lines.append(f"    {'detail':<{width}} : {rest}")
-        if body:
-            lines.append(f"    {'body':<{width}} : {body}")
+        for label, text in (("body", body), ("message", message)):
+            if not text:
+                continue
+            # Indent continuation lines under the label so a multi-line
+            # value stays visibly part of one entry rather than reading
+            # as several unlabelled problems.
+            first, *more = str(text).splitlines() or [""]
+            lines.append(f"    {label:<{width}} : {first}")
+            lines.extend(f"    {'':<{width}}   {line}" for line in more)
     return "\n".join(lines)
 
 

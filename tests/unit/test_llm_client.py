@@ -854,3 +854,195 @@ def test_stub_recall_claims_never_trip_the_false_precision_guard():
 
     for claim in StubClient._CANNED["recall"]["claims"]:
         assert overspecific_span(claim["text"]) is None, claim["text"]
+
+
+# ---------------------------------------------------------------------------
+# D-183: the client half of the retry-after signal.
+#
+# THESE TESTS EXIST BECAUSE THE FEATURE SHIPPED WITHOUT THEM. The router
+# half (FallbackRouter._retry_after_seconds / _call_with_retry) landed
+# complete and covered; the client half -- parse_retry_after_seconds and
+# drain_retry_after -- was never written, and nothing detected that,
+# because test_llm_router.py's _RetryAfterProvider fakes DEFINE
+# drain_retry_after themselves. The router's getattr therefore found the
+# capability in every test and found nothing in production, so
+# LLM_RETRY_AFTER_MAX_SECONDS was inert on every real 429 while README,
+# .env.example, config.py and DECISIONS.md all documented it as live.
+#
+# The lesson generalises past this one feature, and
+# test_provider_implements_every_capability_the_router_probes_for at the
+# end of this block is the generalisation: when a fake supplies an
+# optional capability the real class lacks, the suite proves the fake.
+# ---------------------------------------------------------------------------
+
+
+def test_retry_after_reads_the_standard_header_first():
+    """RFC 7231 delta-seconds. Tried before either body shape because it
+    is the portable one -- no provider observed here sends it, and the
+    next one might."""
+    from research_agent.llm.client import parse_retry_after_seconds
+    assert parse_retry_after_seconds({"Retry-After": "30"}, "") == 30.0
+    assert parse_retry_after_seconds({"Retry-After": " 7.5 "}, "") == 7.5
+
+
+def test_retry_after_accepts_the_headers_other_legal_form_a_date():
+    """RFC 7231 allows an HTTP-date instead of a count. Converted against
+    the current clock, so a date in the PAST yields None rather than a
+    negative sleep."""
+    import time as _time
+    from email.utils import formatdate
+    from research_agent.llm.client import parse_retry_after_seconds
+
+    soon = formatdate(_time.time() + 45, usegmt=True)
+    seconds = parse_retry_after_seconds({"Retry-After": soon}, "")
+    assert seconds is not None and 30 < seconds <= 46
+
+    past = formatdate(_time.time() - 600, usegmt=True)
+    assert parse_retry_after_seconds({"Retry-After": past}, "") is None
+
+
+def test_retry_after_reads_googles_body_shape():
+    """The shape actually observed live (p205.315/.316/.317-check): a
+    protobuf RetryInfo nested in error.details, carrying a Duration
+    string. Found by KEY, not by pinning that exact path."""
+    from research_agent.llm.client import parse_retry_after_seconds
+    body = json.dumps({"error": {
+        "code": 429, "status": "RESOURCE_EXHAUSTED",
+        "message": "You exceeded your current quota.",
+        "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure"},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo",
+             "retryDelay": "35.36s"},
+        ]}})
+    assert parse_retry_after_seconds({}, body) == 35.36
+
+
+def test_retry_after_falls_back_to_prose_but_only_near_a_retry_verb():
+    """Third and last resort. Deliberately narrow: the number must sit
+    within a short run of a retry verb, so an unrelated quantity in an
+    error message can never become a sleep instruction."""
+    from research_agent.llm.client import parse_retry_after_seconds
+    assert parse_retry_after_seconds(
+        {}, "Rate limited. Please retry in 8.98s.") == 8.98
+    assert parse_retry_after_seconds(
+        {}, "quota of 100000 requests exceeded for this project") is None
+
+
+def test_a_429_that_names_no_duration_returns_none_and_is_never_invented():
+    """Mistral's observed shape, 4-for-4 in one live session: no header,
+    no duration anywhere in the body. None is as load-bearing here as a
+    real number is for Google's shape -- inventing one would be a guess
+    dressed as a signal, and the router hops instead."""
+    from research_agent.llm.client import parse_retry_after_seconds
+    body = json.dumps({"message": "Requests rate limit exceeded",
+                       "request_id": "abc123"})
+    assert parse_retry_after_seconds({}, body) is None
+    assert parse_retry_after_seconds({}, "") is None
+    assert parse_retry_after_seconds(None, None) is None
+
+
+def test_a_nonsense_duration_is_not_a_duration():
+    """Zero, negative and absurd values are parsing accidents (a unix
+    timestamp, a token count), not cooldowns. The router's own cap is a
+    separate, much smaller bound applied on top of whatever survives."""
+    from research_agent.llm.client import parse_retry_after_seconds
+    assert parse_retry_after_seconds({"Retry-After": "0"}, "") is None
+    assert parse_retry_after_seconds({"Retry-After": "-5"}, "") is None
+    assert parse_retry_after_seconds(
+        {}, json.dumps({"retryDelay": 1788773113})) is None
+    assert parse_retry_after_seconds(
+        {}, json.dumps({"retryDelay": True})) is None
+
+
+def _retry_after_client(status, body, headers=None):
+    def handler(request):
+        return httpx.Response(status, content=body,
+                              headers=headers or {})
+    return _client_with_mock_transport(handler)
+
+
+def test_a_live_429_stashes_the_duration_for_the_router_to_drain():
+    """The end-to-end client path the router actually depends on: a real
+    complete() call, a real 429 response, and the parsed duration
+    available through the duck-typed drain the router probes for."""
+    client = _retry_after_client(
+        429, json.dumps({"error": {"details": [
+            {"retryDelay": "12.5s"}]}}))
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([{"role": "user", "content": "hi"}])
+    assert client.drain_retry_after() == 12.5
+
+
+def test_draining_resets_so_one_signal_is_never_read_twice():
+    """Drain-not-peek, the same contract drain_usage already holds. A
+    duration the router declined to act on must not linger."""
+    client = _retry_after_client(
+        429, json.dumps({"retryDelay": "3s"}))
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([{"role": "user", "content": "hi"}])
+    assert client.drain_retry_after() == 3.0
+    assert client.drain_retry_after() is None
+
+
+def test_a_500_carrying_a_retry_after_is_not_waited_on():
+    """A 5xx means the provider broke on its own side -- D-130's
+    exclusion list already records that it should hop. Honouring a
+    Retry-After here would turn an outage into a stall."""
+    client = _retry_after_client(503, "", headers={"Retry-After": "60"})
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([{"role": "user", "content": "hi"}])
+    assert client.drain_retry_after() is None
+
+
+def test_a_transport_failure_cannot_inherit_an_earlier_429s_cooldown():
+    """THE RESET'S REASON, and why it sits at the top of complete()
+    rather than in _record_error_response where D-183's write-up put it.
+
+    _record_error_response only runs for a 4xx/5xx, so a timeout or a
+    reset connection never reaches it. With the reset placed there, a
+    duration parsed from an earlier 429 would survive to be drained
+    against a later, unrelated transport failure, and the router would
+    sleep on a signal that failure never sent."""
+    responses = [
+        httpx.Response(429, content=json.dumps({"retryDelay": "30s"})),
+    ]
+
+    def handler(request):
+        if responses:
+            return responses.pop()
+        raise httpx.ConnectError("connection reset")
+
+    client = _client_with_mock_transport(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([{"role": "user", "content": "hi"}])
+    # The router declines to act on it (say, it already spent its one
+    # retry for that hop), so the value is never drained.
+    with pytest.raises(httpx.ConnectError):
+        client.complete([{"role": "user", "content": "hi"}])
+    assert client.drain_retry_after() is None
+
+
+def test_provider_implements_every_capability_the_router_probes_for():
+    """THE GENERALISATION, and the test that would have caught D-183.
+
+    FallbackRouter reaches into its providers with getattr for a set of
+    OPTIONAL, duck-typed capabilities. That pattern is deliberate --
+    it is what lets StubClient and hand-written test fakes stay simple.
+    Its cost is that a capability the REAL client never implements
+    degrades silently to "feature off", forever, with no error anywhere:
+    drain_retry_after was absent for the whole life of D-183 and every
+    router test passed, because the fakes supplied it themselves.
+
+    Asserting the real class satisfies the whole probe set turns that
+    class of defect from invisible into a failing test. Add to this
+    tuple whenever the router learns to probe for something new."""
+    probed = ("complete", "complete_json", "set_trace_node", "close",
+              "drain_usage", "drain_retry_after")
+    for name in probed:
+        assert callable(getattr(OpenAICompatibleClient, name, None)), (
+            f"FallbackRouter probes providers for {name!r}, but "
+            f"OpenAICompatibleClient does not implement it -- the "
+            f"feature behind it is inert in production while router "
+            f"tests using fakes still pass")
+    assert hasattr(OpenAICompatibleClient("p", "http://x", "k", "m"),
+                   "disabled_reason")

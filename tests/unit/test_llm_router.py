@@ -1556,3 +1556,78 @@ def test_from_settings_wires_the_hop_delay_through():
     router = FallbackRouter.from_settings(
         Settings(llm_mode="stub", llm_hop_delay_seconds=7.0))
     assert router.hop_delay_seconds == 7.0
+
+
+def test_the_real_client_and_the_router_actually_wait_out_a_429(monkeypatch):
+    """D-183 END TO END, with the REAL OpenAICompatibleClient rather than
+    a fake that supplies drain_retry_after itself.
+
+    Every other retry-after test in this file builds _RetryAfterProvider,
+    which DEFINES the capability the router probes for. That is what let
+    the client half of D-183 be missing entirely while these tests stayed
+    green: the router's getattr found the method on the fake and found
+    nothing in production, so the feature was inert on every real 429.
+
+    This test closes the loop -- real client, real 429 body, real parse,
+    real drain, real router decision -- and would fail the moment the
+    client stops carrying the signal again."""
+    import httpx
+    from research_agent.llm.client import OpenAICompatibleClient
+
+    slept = []
+    monkeypatch.setattr(_router_module.time, "sleep", slept.append)
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, content=json.dumps({"error": {
+                "details": [{"retryDelay": "9s"}]}}))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"recovered": true}'}}]})
+
+    client = OpenAICompatibleClient("primary", "http://x", "k", "m")
+    client._http = httpx.Client(transport=httpx.MockTransport(handler),
+                                base_url="http://x")
+    fallback = _Fixed("fallback", answer="never reached")
+    router = FallbackRouter([client, fallback], quality_threshold=0.0,
+                            retry_after_max_seconds=60.0)
+
+    answer = router.complete_json([{"role": "user", "content": "hi"}])
+    assert answer == {"recovered": True}
+    counters = router.drain_counters()
+    assert slept == [9.0], "the router did not wait out the provider's own cooldown"
+    assert counters["llm_retry_after_sleeps"] == 1
+    assert counters["llm_retry_after_seconds_total"] == 9.0
+    # The SAME provider served it on the retry, so this is not a hop.
+    assert counters.get("llm_fallback_hops", 0) == 0
+    assert calls["n"] == 2
+
+
+def test_a_cooldown_longer_than_the_cap_hops_instead_of_waiting(monkeypatch):
+    """A signal larger than LLM_RETRY_AFTER_MAX_SECONDS is deliberately
+    NOT clamped and retried -- another provider ready right now beats a
+    truncated wait that will probably fail again. Verified through the
+    real client, so the counter is driven by a genuinely parsed body."""
+    import httpx
+    from research_agent.llm.client import OpenAICompatibleClient
+
+    slept = []
+    monkeypatch.setattr(_router_module.time, "sleep", slept.append)
+
+    def handler(request):
+        return httpx.Response(429, content=json.dumps({"retryDelay": "600s"}))
+
+    client = OpenAICompatibleClient("primary", "http://x", "k", "m")
+    client._http = httpx.Client(transport=httpx.MockTransport(handler),
+                                base_url="http://x")
+    fallback = _Fixed("fallback", answer='{"ok": true}')
+    router = FallbackRouter([client, fallback], quality_threshold=0.0,
+                            retry_after_max_seconds=60.0)
+
+    router.complete_json([{"role": "user", "content": "hi"}])
+    counters = router.drain_counters()
+    assert slept == [], "a 600s cooldown must not be waited on"
+    assert counters["llm_retry_after_skipped_too_long"] == 1
+    assert counters["llm_fallback_hops"] == 1

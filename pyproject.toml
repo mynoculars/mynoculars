@@ -121,7 +121,7 @@ all = [
     "grandalf>=0.8",
 ]
 
-# D-157: ten commands, not one. Until this phase the wheel contained the
+# D-157: ten commands, not one (eleven since D-190's packaging step). Until this phase the wheel contained the
 # library and the CLI, and NOTHING ELSE that this project needs to be
 # operated -- both MCP servers, corpus ingest, the health check, the
 # golden-set harness, the store reset and the two memory tools all lived
@@ -146,6 +146,7 @@ research-agent-eval = "research_agent.ops.eval_suite:main"
 research-agent-reset = "research_agent.ops.reset_stores:main"
 research-agent-gc-memory = "research_agent.ops.gc_memory:main"
 research-agent-inspect-memory = "research_agent.ops.inspect_memory:main"
+research-agent-package = "research_agent.ops.package:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

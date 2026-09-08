@@ -158,13 +158,48 @@ class ProblemCollector(logging.Handler):
         self.records: list = []
         self.dropped = 0
 
+    # A THIRD-PARTY warning's name is its whole message, and that can be
+    # any length and any number of lines. cli.py::_fmt_problems groups by
+    # this value and prints it as a heading, so an unbounded one takes
+    # over the block: live, psycopg's pool warning is six lines of
+    # connection detail repeated for every retry, and it rendered as the
+    # largest thing on a demo screen with the actual event names beneath
+    # it. Bounded to one line here, at the point of capture, so both the
+    # grouping key and the heading stay heading-shaped.
+    _MAX_NAME_CHARS = 96
+
+    @staticmethod
+    def _name_and_fields(record: logging.LogRecord) -> tuple:
+        """(heading, fields) for one record.
+
+        A log_event record's message IS its event name -- short, stable,
+        already a heading -- and its detail is in event_fields. Anything
+        else (a library warning) has neither, so its first line becomes
+        the heading and the FULL message is preserved as a field rather
+        than truncated away: the part that got cut is often the part that
+        says what to fix, which is D-115's lesson about error bodies
+        applied to the same problem one layer up.
+        """
+        fields = dict(getattr(record, "event_fields", None) or {})
+        message = record.getMessage()
+        if hasattr(record, "event_fields"):
+            return message, fields          # a log_event call; name is the event
+        first_line = message.splitlines()[0] if message else record.name
+        heading = first_line[:ProblemCollector._MAX_NAME_CHARS].rstrip()
+        if len(first_line) > ProblemCollector._MAX_NAME_CHARS:
+            heading += " ..."
+        # `logger` names WHICH library, which the message alone may not.
+        fields.setdefault("logger", record.name)
+        if message != heading:
+            fields.setdefault("message", message)
+        return heading, fields
+
     def emit(self, record: logging.LogRecord) -> None:
         if len(self.records) >= self._MAX_PROBLEMS:
             self.dropped += 1
             return
-        self.records.append(
-            (record.levelname, record.getMessage(),
-             dict(getattr(record, "event_fields", None) or {})))
+        name, fields = self._name_and_fields(record)
+        self.records.append((record.levelname, name, fields))
 
 
 _problem_collector: "ProblemCollector | None" = None

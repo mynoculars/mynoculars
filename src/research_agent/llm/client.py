@@ -197,6 +197,146 @@ def classify_http_failure(status: int) -> tuple:
     return ("http_error", "")
 
 
+# D-183: the shapes a provider uses to say "wait this long before asking
+# again". Read, never invented -- a provider that names no duration
+# returns None from parse_retry_after_seconds below and is hopped past
+# exactly as it was before this existed.
+#
+# THREE SOURCES, IN DESCENDING ORDER OF STANDARDNESS:
+#   1. the `Retry-After` HTTP header (RFC 7231) -- delta-seconds, or an
+#      HTTP-date. Portable to any compliant provider, so it is tried
+#      first even though no provider observed here has actually sent one.
+#   2. a duration keyed in the JSON error envelope. Google's shape is a
+#      protobuf RetryInfo in `error.details[]` carrying
+#      `retryDelay: "35.36s"`; the search below is key-based and
+#      depth-first rather than pinned to that exact path, so a provider
+#      nesting the same fact elsewhere is still read.
+#   3. prose in the message ("...please retry in 8.98s"). Last, and
+#      deliberately narrow -- it must sit within a few words of a retry
+#      verb, so an unrelated number in an error message cannot become a
+#      sleep instruction.
+_RETRY_AFTER_BODY_KEYS = ("retryDelay", "retry_delay",
+                          "retryAfter", "retry_after")
+# "35.36s", "35.36", "35s" -- a protobuf Duration serialises with a
+# trailing "s", and a bare number means seconds too.
+_RETRY_AFTER_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*s?\s*$")
+# A retry verb, then at most a short run of non-sentence text, then the
+# number. The bound is what stops "quota of 1000 requests exceeded,
+# please retry later" from yielding 1000.
+_RETRY_AFTER_PROSE_RE = re.compile(
+    r"(?:retry|try\s+again|wait)\b[^.\n]{0,40}?"
+    r"(\d+(?:\.\d+)?)\s*(?:s\b|sec\b|secs\b|second)",
+    re.IGNORECASE)
+# Nothing beyond this is treated as a duration a provider actually meant.
+# A day-long cooldown expressed in seconds is a real answer; 10^9 is a
+# parsing accident (a unix timestamp, a token count) and sleeping on it
+# would hang the run. The ROUTER still applies its own, much smaller cap
+# (LLM_RETRY_AFTER_MAX_SECONDS) on top of whatever survives here -- this
+# bound only separates "a duration" from "not a duration".
+_RETRY_AFTER_MAX_PLAUSIBLE_SECONDS = 86_400.0
+
+
+def _duration_from(value) -> Optional[float]:
+    """One candidate value -> seconds, or None if it is not a duration."""
+    if isinstance(value, bool):          # bool is an int; never a duration
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    elif isinstance(value, str):
+        match = _RETRY_AFTER_DURATION_RE.match(value)
+        if not match:
+            return None
+        seconds = float(match.group(1))
+    else:
+        return None
+    if seconds <= 0 or seconds > _RETRY_AFTER_MAX_PLAUSIBLE_SECONDS:
+        return None
+    return seconds
+
+
+def _retry_after_in_payload(payload) -> Optional[float]:
+    """Depth-first search of a decoded JSON body for a duration key.
+
+    Key-based rather than path-based: Google puts `retryDelay` inside
+    `error.details[<RetryInfo>]`, but pinning that exact path would make
+    the parser wrong for the next provider that reports the same fact one
+    level up. The keys are distinctive enough that a false positive would
+    itself be a duration.
+    """
+    if isinstance(payload, dict):
+        for key in _RETRY_AFTER_BODY_KEYS:
+            if key in payload:
+                seconds = _duration_from(payload[key])
+                if seconds is not None:
+                    return seconds
+        for value in payload.values():
+            found = _retry_after_in_payload(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _retry_after_in_payload(item)
+            if found is not None:
+                return found
+    return None
+
+
+def parse_retry_after_seconds(headers, body: str) -> Optional[float]:
+    """How long THIS provider says to wait, or None if it did not say.
+
+    CALLED BY   OpenAICompatibleClient._record_error_response, for status
+                429 only -- see D-183 and _NON_TRANSIENT_KINDS' own note
+                on why a 429 is the one failure worth waiting out rather
+                than hopping past.
+    RETURNS     seconds, always > 0, or None. NEVER a guess: a response
+                that names no duration anywhere returns None, and the
+                router then hops immediately, byte-identically to the
+                behaviour before this function existed. Mistral's
+                observed 429 (no header, no duration in the body) is
+                exactly that case.
+
+    Pure and header/body-shaped rather than response-shaped, so it is
+    testable without constructing an httpx.Response -- and so the same
+    parser can be pointed at a recorded body from a log line.
+    """
+    header = ""
+    try:
+        header = (headers or {}).get("Retry-After") or ""
+    except AttributeError:               # not a mapping; treat as absent
+        header = ""
+    if header:
+        seconds = _duration_from(header.strip())
+        if seconds is not None:
+            return seconds
+        # RFC 7231's other form: an HTTP-date. Converted against the
+        # CURRENT clock, so a date already in the past yields None rather
+        # than a negative sleep.
+        try:
+            from email.utils import parsedate_to_datetime
+            when = parsedate_to_datetime(header.strip())
+        except (TypeError, ValueError):
+            when = None
+        if when is not None:
+            now = time.time()
+            delta = when.timestamp() - now
+            if 0 < delta <= _RETRY_AFTER_MAX_PLAUSIBLE_SECONDS:
+                return delta
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        payload = None
+    if payload is not None:
+        found = _retry_after_in_payload(payload)
+        if found is not None:
+            return found
+    match = _RETRY_AFTER_PROSE_RE.search(body)
+    if match:
+        return _duration_from(match.group(1))
+    return None
+
+
 # D-115: how much of a failing provider's error body to keep. 300 was the
 # original guess and it was measurably too short: Google's 429 spends its
 # first ~300 characters on boilerplate and a documentation URL, then names
@@ -701,6 +841,35 @@ class OpenAICompatibleClient:
         self._raw.usage = None
         return usage or (0, 0)
 
+    def drain_retry_after(self) -> Optional[float]:
+        """Seconds THIS provider asked us to wait after its last 429 on
+        this thread, or None. Read-and-reset (D-183).
+
+        CALLED BY   llm/router.py::FallbackRouter._retry_after_seconds,
+                    from inside the per-hop failure handler. Duck-typed
+                    and looked up with getattr there, exactly like
+                    drain_usage above -- so StubClient and every
+                    hand-written test fake stay unaffected by its
+                    existence.
+
+        WHY DRAIN AND NOT PEEK, and this is the load-bearing half: a
+        duration the router chose NOT to act on (it had already spent
+        its one retry for this hop, or the value exceeded
+        LLM_RETRY_AFTER_MAX_SECONDS) must not linger to be misread
+        against a LATER, unrelated failure on the same thread. Draining
+        makes "each failure reports only its own signal" structurally
+        true rather than something the router has to remember.
+
+        On self._raw -- the SAME threading.local() the usage stash
+        already uses, and for the identical reason its comment gives:
+        one client instance is shared across the parallel search_worker
+        fan-out, so a plain attribute would let one thread drain
+        another's.
+        """
+        seconds = getattr(self._raw, "retry_after_seconds", None)
+        self._raw.retry_after_seconds = None
+        return seconds
+
     def close(self) -> None:
         """Close the underlying httpx.Client. Safe to call twice.
 
@@ -794,6 +963,25 @@ class OpenAICompatibleClient:
         # there was only ever one call that could do anything.
         if resp.status_code == 400:
             self._learn_context_limit(resp.text)
+        # D-183: stash the provider's OWN named cooldown, for 429 only.
+        # DIAGNOSTIC, not a decision -- this class's contract is
+        # unchanged ("raise upward, the router owns retry/fallback
+        # policy"); it only makes one more fact available, exactly as it
+        # already does for disabled_reason (D-130).
+        #
+        # Only a 429 is read. A 500 can carry a Retry-After too, and
+        # honouring it would turn an outage into a stall; D-130's
+        # exclusion list already records that a 5xx should hop, not wait.
+        if resp.status_code == 429:
+            seconds = parse_retry_after_seconds(resp.headers, resp.text)
+            if seconds is not None:
+                self._raw.retry_after_seconds = seconds
+                log_event(logger, "llm.retry_after_parsed",
+                          provider=self.name, node=self._trace_node,
+                          seconds=round(seconds, 3),
+                          effect="the router may wait this out once and "
+                                 "retry this same provider, subject to "
+                                 "LLM_RETRY_AFTER_MAX_SECONDS")
         if looks_like_context_overflow(resp.text):
             # D-93: the SAME exception the caller already handles (the
             # router hops on any Exception) -- this only makes the log say
@@ -1062,6 +1250,18 @@ class OpenAICompatibleClient:
                 NO decision about what to do next; that decision belongs
                 entirely to FallbackRouter (llm/router.py).
         """
+        # D-183: clear any cooldown left over from an EARLIER failure on
+        # this thread, before this call can produce one of its own.
+        #
+        # DELIBERATELY HERE AND NOT IN _record_error_response, which is
+        # where D-183's own write-up put it. That method only ever runs
+        # for a 4xx/5xx, so a transport failure -- a timeout, a reset
+        # connection, a dead port -- never reaches it, and a duration
+        # parsed from an earlier 429 would survive to be drained against
+        # that unrelated failure. The router would then sleep on a
+        # signal no part of this failure ever sent. Resetting at the top
+        # of every attempt makes the value describe THIS call or nothing.
+        self._raw.retry_after_seconds = None
         started = time.perf_counter()
         wall_start = time.time()
         payload = {"model": self._model, "messages": messages, "temperature": temperature}

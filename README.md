@@ -1517,10 +1517,10 @@ describe is now closed, on both the LLM side and the retrieval side:
 | `truncation_notice_shipped` *(D-132)* | whether the SHIPPED report carries the deterministic "stopped early" notice. Same shape and same reasoning as `grounding_notice_shipped` above: derived from `state.final_report`, never from a counter, because `compiler_node` runs once per revision and its counters merge additively | `guardrails/truncation.py` |
 | `llm_context_skips` *(D-93)* | provider hops SKIPPED because the prompt clearly could not fit that provider's configured context window. `0` unless `LLM_PRIMARY_CONTEXT_TOKENS` is set. A nonzero value is the count of guaranteed-failed provider calls this run did **not** make — read against `llm_provider_calls`, which no longer includes them | `llm/router.py::_skips_for_context` |
 | `llm_disabled_skips` *(D-130)* | provider hops SKIPPED because that provider already answered with a failure that **cannot recover on its own** — a rejected key (401), a refused permission (403), a retired model name (404). `0` on every healthy run. A 429 or a 5xx deliberately does NOT disable a provider: a quota refills and an outage ends, so those still hop and are retried on the next node. Live (p205.267-check): grok answered 403 to three compiler calls and three judge calls in one run — six guaranteed-failed requests. Read alongside the single `llm.provider_disabled` WARNING, which names the provider, the status and the operator action | `llm/client.py` (the verdict), `llm/router.py::_skips_for_disabled` (the skip) |
-| `llm_retry_after_sleeps` / `llm_retry_after_seconds_total` *(D-183)* | how many times a 429 named its own cooldown and the router actually waited it out before retrying that SAME provider, and the total seconds spent waiting. `0` unless a provider's 429 carries a `Retry-After` header or (Google's shape) a body-embedded `retryDelay`/prose duration — Mistral's observed 429 carries neither and never contributes here. A successful same-provider retry does **not** bump `llm_fallback_hops`: it served the SAME provider, not the next one. Live (p205.315/.316/.317-check): Gemini's own reported cooldown was 0.059s, then 35.36s, then 8.98s across three runs against the same free-tier per-minute limit | `llm/router.py::_sleep_for_retry` |
+| `llm_retry_after_sleeps` / `llm_retry_after_seconds_total` *(D-183)* | how many times a 429 named its own cooldown and the router actually waited it out before retrying that SAME provider, and the total seconds spent waiting. `0` unless a provider's 429 carries a `Retry-After` header or (Google's shape) a body-embedded `retryDelay`/prose duration — Mistral's observed 429 carries neither and never contributes here. A successful same-provider retry does **not** bump `llm_fallback_hops`: it served the SAME provider, not the next one. **D-191: these three, and D-184's `llm_hop_delay_sleeps`/`llm_hop_delay_seconds_total`, were bumped by the router and emitted by nothing until now** -- `reporting/telemetry.py::llm_metrics` never carried them out of `state.counters`, so this row documented fields that read back `null`. Invisible because they only appear once a provider actually 429s. Live (p205.315/.316/.317-check): Gemini's own reported cooldown was 0.059s, then 35.36s, then 8.98s across three runs against the same free-tier per-minute limit | `llm/router.py::_sleep_for_retry` |
 | `llm_retry_after_skipped_too_long` *(D-183)* | a 429 named a duration, but it exceeded `LLM_RETRY_AFTER_MAX_SECONDS` (default 60), so the router hopped immediately instead of waiting — the judgement that another provider ready right now beats a truncated wait likely to fail again. `0` when every named duration fits the cap, or when `LLM_RETRY_AFTER_MAX_SECONDS=0` (feature disabled, and this counter never fires) | `llm/router.py::_retry_after_seconds` |
 | `llm_prompt_tokens` / `llm_completion_tokens` / `llm_total_tokens` *(D-86)* | what the run actually COST, as opposed to how many requests it made. `llm_provider_calls` cannot distinguish three cheap `classify` calls from three 7,000-token `compiler` calls; these can. Counted at the router boundary from the usage each provider reports, judge calls included. Tokens rather than dollars deliberately: every `LANGFUSE_PRICE_*` defaults to `0.0`, so a spend figure built on them would be structurally zero, while tokens are real whether or not a rate was ever configured | `llm/router.py::_bump_usage` |
-| `tier_answers` / `chain_tier_failures` / `chain_exhausted` *(D-87)* | WHICH tier of the D-38 ladder actually answered, as `{tier: count}` — previously readable only by grepping `chain.answered` out of a debug trace. Read against `corpus_recall`: `{"corpus": 6}` at `corpus_recall 1.0` is a healthy corpus run; `{"web": 6}` at `corpus_recall 0.0` is the p205.246-check shape, now one field instead of three inferred ones. A tier that answered nothing is omitted rather than reported as `0`. Note `chain_tier_failures` counts TIER attempts, not tasks — tiers 1 and 2 are the same tool, so one dead corpus fails both | `tools/retrieval_chain.py` |
+| `tier_answers` / `chain_tier_failures` / `chain_exhausted` *(D-87)* | WHICH tier of the D-38 ladder actually answered, as `{tier: count}` — previously readable only by grepping `chain.answered` out of a debug trace. Read against `corpus_recall`: `{"corpus": 6}` at `corpus_recall 1.0` is a healthy corpus run; `{"web": 6}` at `corpus_recall 0.0` is the p205.246-check shape, now one field instead of three inferred ones. A tier that answered nothing is omitted rather than reported as `0`. Note `chain_tier_failures` counts TIER attempts, not tasks — tiers 1 and 2 are the same tool, so one dead corpus fails both. **D-189: the TERMINAL model tier counts here only when it actually cleared the coverage floor and the topical gate** -- a tier-5 attempt that returned something weaker lands in the new `chain_model_insufficient` instead, because returning is not answering. An empty `tier_answers` beside a nonzero `chain_model_insufficient` is the honest shape of "every tier was tried, none sufficed"; the offline L1 demo used to report that state as `{"model": 2}` while its own verdict read UNRELIABLE | `tools/retrieval_chain.py` |
 | `model_sourced_items` *(D-38)* | count of `state.evidence` entries with `source == "model"` — the LLM's own knowledge, retrieved deliberately because no document served that goal. Read together with `corpus_recall`: `corpus_recall: 0.0, model_sourced_items: 24` means the whole report rests on recollection, attributed as such in the prose (D-40) | same |
 | `last_compile_guardrails` *(D-45, D-88)* | every deterministic repair the SHIPPED report needed, as one nested dict: `citations_pasted_evidence_removed` (verbatim evidence text the compiler glued onto a claim with no delimiter, e.g. `"...the whole session blobRedis is an in-memory data store..."`), `citations_to_unevidenced_goals` (`[gN]` markers removed because goal N retrieved no evidence at all), `hedge_markers_inserted`, `evidence_deduplicated`, `evidence_prompt_dropped` (D-131: items the evidence budget kept out of THIS compile's prompt — `state.evidence` and every telemetry figure still count what was actually retrieved), `grounding_notice_inserted`. **Corrected in D-88:** earlier revisions of this table documented the first two as top-level telemetry fields; they were never emitted there at all, and reading them out of `counters` would have been wrong anyway — `compiler_node` runs once per REVISION and `counters` merges additively, so that view sums every compile ATTEMPT. This field is replace-on-write and describes the artifact the reader received. A key absent means that repair wasn't needed on the final pass | `state.py::last_compile_guardrails` |
 
@@ -1812,13 +1812,25 @@ Confidence   : UNRELIABLE (15%)  — the report cites no evidence despite 4 item
                                    retrieved; no goal was answered from the corpus
 Recall       : 1.0   grounding_ratio 1.0   grounded 0.0   corpus_recall 0.0
 Evidence     : 4 item(s) -- model 4
-tier_answers : {"model": 2}
+tier_answers : {}   chain_model_insufficient : 2
 ```
 
 That is **success for L1**, and the honesty rail is the reason: recall is
 1.0 because every goal got *something*, `corpus_recall` is 0.0 because
 nothing came from a document, and the verdict is `UNRELIABLE` rather than
 a confident answer built on recollection.
+
+**`tier_answers` is empty here, and that is the point.** This block used
+to read `tier_answers : {"model": 2}`, which said the model tier
+*answered* — while the same run's own confidence verdict said
+`UNRELIABLE` and every one of those recollections logged
+`sufficient: false`. The ladder's terminal tier returns whatever it has
+(there is no tier 6 to escalate to), and returning is not answering:
+nothing cleared the coverage floor or the topical gate, so no tier
+answered, and `chain_model_insufficient` is where the work it did shows
+up instead. An empty `tier_answers` beside a nonzero count there is the
+honest shape of "every tier was tried, none of them sufficed" — now
+distinguishable from a run that never reached tier 5 at all.
 
 **L3 — live providers, real corpus, deliberately off-topic question.**
 "Compare the Armies of China and India" asked against this repo's
@@ -1882,26 +1894,40 @@ which gives a *separate* project nothing to depend on.
 > and a Postgres DSN to a reviewer. Build the archive from an explicit
 > exclude list, never from "zip the folder":
 >
-> ```powershell
-> # PowerShell — everything except secrets, caches and run artifacts
-> $skip = @('.env','.venv','logs','tmp','build','dist','__pycache__',
->           '.pytest_cache','.ruff_cache','.git')
-> Get-ChildItem -Force | Where-Object { $_.Name -notin $skip } |
->   Compress-Archive -DestinationPath ..\research-agent.zip -Force
-> ```
+> **D-190: there is now a command for this, and it is the answer.** The
+> two shell snippets that used to sit here were correct, and were still
+> skipped -- which is how the archive described above shipped. One
+> command builds from the exclude list, scans what is about to travel for
+> credential-shaped values, and then **re-opens the file it just wrote**
+> to prove no forbidden path is inside it:
+>
 > ```bash
-> # bash — same list
-> zip -r ../research-agent.zip . \
->   -x '.env' '.venv/*' 'logs/*' 'tmp/*' 'build/*' 'dist/*' \
->      '*/__pycache__/*' '.pytest_cache/*' '.ruff_cache/*' '.git/*'
+> python scripts/package.py --dry-run      # see exactly what would travel
+> python scripts/package.py                # -> ../research-agent.zip
 > ```
+> ```powershell
+> # identical on Windows -- it is Python, not a shell script
+> python scripts\package.py
+> ```
+>
+> It **refuses** rather than warns: nonzero exit, no file, nothing
+> half-written left behind for someone to pick up and send. Measured
+> against the two archives in question -- the one that shipped carried
+> 423 entries, **197 of them forbidden** (192 `.pyc`, 2 under `logs/`, 2
+> under `tmp/`, and the `.env`); the packaged one carries 201 entries and
+> **0**.
 >
 > `internal/` is deliberately IN that archive and deliberately out of git
 > (see the document map above), which is exactly why `git archive HEAD` is
-> not the answer here and an explicit exclude list is. **Verify before you
-> send**: `unzip -l research-agent.zip | grep -i "\.env$"` should print
-> nothing. If a `.env` did go out, the fix is not a smaller zip — it is to
-> rotate every key that was in it.
+> not the answer here and an explicit list applied to the working tree is.
+> `sample_data/`, `design/`, `.github/` and `.env.example` travel too;
+> `.env` does not, and neither does anything under `logs/` or `tmp/`.
+>
+> **If a `.env` did go out, the fix is not a smaller zip -- it is to
+> rotate every key that was in it.** The command says exactly that when it
+> finds one, and deliberately never prints the value it found: a tool
+> whose failure output leaks the secret it is protecting has moved the
+> problem, not solved it.
 
 **Extras.** Each is optional because its code path is off by default *and*
 its import is lazy — checked against the source, not assumed:
@@ -1916,7 +1942,7 @@ its import is lazy — checked against the source, not assumed:
 | `[dev]` | pytest | — |
 | `[all]` | everything above | matches what `requirements.txt` installs today |
 
-**Console scripts — ten, not one (D-157).** Until that phase the wheel held
+**Console scripts — eleven, not one (D-157, plus D-190's packaging step).** Until that phase the wheel held
 the library and the CLI and *nothing else needed to operate them*: both MCP
 servers, corpus ingest, the health check, the golden-set harness, the store
 reset and the two memory tools all lived in `scripts/`, outside `src/`, and
@@ -1938,6 +1964,7 @@ into `research_agent.servers` and `research_agent.ops`.
 | `research-agent-reset --dry-run` | wipe the stores (destructive; `--yes`) | core |
 | `research-agent-gc-memory --dry-run` | prune decayed memory points | core |
 | `research-agent-inspect-memory` | read what memory holds | core |
+| `research-agent-package --dry-run` | build the reviewer's archive, verified (D-190) | core |
 
 **`scripts/` did not go away**, and that is deliberate: each name there is
 now a six-line launcher that puts the repo's own `src` on `sys.path` and
@@ -2176,10 +2203,21 @@ stays auditable without crowding out the part a reader needs before a demo.
    `memory/semantic_memory.py::retrieve` builds `memory-<content_id>`;
    `hash()` appears nowhere in `src/` any more. This entry was already
    stale when D-60/D-61 landed and is corrected rather than deleted.
-4. Reusing the same `--thread-id` across unrelated runs silently accumulates
-   reducer-backed state (`evidence`, `counters`, etc.) — see the Postgres
-   section above for the full explanation and a live example. Not addressed
-   by any Tier; no P2-xx item currently scoped to it.
+4. ~~Reusing the same `--thread-id` across unrelated runs silently
+   accumulates reducer-backed state~~ — **fixed, M-2/D-20.** This entry
+   said "Not addressed by any Tier; no P2-xx item currently scoped to
+   it" long after `assembly.py::reject_if_thread_in_use` shipped and
+   both interfaces adopted it: the CLI refuses with exit code 3 and the
+   API returns `409`, each naming the prior run's query. Found by an
+   external review reading this list against the code.
+   **What is genuinely still open is narrower**, and worth stating in
+   its place: the guard refuses a *new query* on a thread that already
+   holds a run, which is the accidental case. It cannot refuse a
+   deliberate re-invoke of a thread whose run finished, because that is
+   also how `/resume` legitimately reaches a paused one — the
+   checkpointer cannot distinguish the two intents. So the accumulation
+   described in the Postgres section above is still the underlying
+   behaviour; it is now merely unreachable by accident.
 5. Contradiction detection remains marker-only — `E2` has never fired in a
    real run (`P2-12`, Tier 3, depends on P2-01 which is done). Wiring the
    detector to something more than explicit markers is the only remaining

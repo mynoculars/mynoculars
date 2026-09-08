@@ -123,3 +123,46 @@ def test_a_clean_gate_says_so_unambiguously():
 
     assert "PASSED. Every step ran." in text
     assert "FAILED" not in text
+
+
+def test_the_offline_run_is_pinned_away_from_every_live_service():
+    """N1. The gate promised "it does NOT touch a store" while LLM_MODE
+    =stub gated only the model -- assembly.py builds a real QdrantStore
+    regardless, so on a machine with Qdrant up the step read memory,
+    retrieved from the corpus and WROTE six points back, every run.
+
+    Measured before the fix: evidence_items 4 -> 15, memory_writes 0 -> 6,
+    decided purely by what was listening on localhost. A gate whose
+    answer depends on the environment cannot say "a failure here is
+    always the code"."""
+    sanity = _load_sanity()
+    step = {s.name: s for s in sanity.build_steps()}["offline run"]
+    for key in ("QDRANT_URL", "OPENSEARCH_URL", "POSTGRES_DSN"):
+        assert "127.0.0.1:1" in step.env_overrides[key], (
+            f"{key} must point at a closed port so the step degrades "
+            f"instead of reaching a developer's live service")
+    assert step.env_overrides["LLM_MODE"] == "stub"
+    # Anything that would make a network call or block on a human.
+    for key in ("MCP_ENABLED", "WEB_SEARCH_ENABLED", "LANGFUSE_ENABLED",
+                "HITL_ENABLED"):
+        assert step.env_overrides[key] == "false"
+
+
+def test_scratch_store_names_so_a_reachable_store_is_still_not_yours():
+    """Belt and braces behind the closed ports: if a future change makes
+    a store reachable again, the names it would touch must not be ones
+    anybody's real data lives under."""
+    sanity = _load_sanity()
+    step = {s.name: s for s in sanity.build_steps()}["offline run"]
+    assert step.env_overrides["MEMORY_COLLECTION"].startswith("sanity_scratch")
+    assert step.env_overrides["CORPUS_INDEX"].startswith("sanity_scratch")
+
+
+def test_only_the_offline_run_carries_env_overrides():
+    """ruff and pytest must run against the repo as it is. pytest has its
+    own config isolation (conftest::_no_ambient_config) and ruff reads no
+    environment at all; overriding either would be pinning something that
+    is already pinned, in a second place that can drift."""
+    sanity = _load_sanity()
+    overridden = {s.name: bool(s.env_overrides) for s in sanity.build_steps()}
+    assert overridden == {"ruff": False, "tests": False, "offline run": True}

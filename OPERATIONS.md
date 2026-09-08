@@ -975,10 +975,15 @@ Two things about that number are worth internalising rather than copying:
 
 - **Unrelated text does not score near zero.** With this embedding model it
   clusters at **0.40–0.53**. Whatever "0.35 similarity" means in your head
-  from a different model, it does not mean that here — and `0.35`, the
-  shipped code default, sits *below the floor of pure noise*, which is why
-  it filters nothing. If you leave it there, every off-topic query still
-  returns three confident, irrelevant documents.
+  from a different model, it does not mean that here — `0.35` sits *below
+  the floor of pure noise* on this corpus, which is why it filters
+  nothing, and a run left there still returns three confident, irrelevant
+  documents for every off-topic query. **D-189 raised the CODE default
+  from that number to 0.60**, matching what `.env.example` has shipped for
+  some time: the two disagreed, so `pip install research-agent` with no
+  `.env` got the inert floor while anyone following the Quickstart got the
+  calibrated one, and `warn_on_inert_coverage_gate` only fires at `<= 0.0`
+  so nothing said so.
 - **Do not pick the midpoint.** The midpoint here is 0.632. `0.60` is
   better, because the two errors are not symmetric. Too low lets noise
   through — visible in the report, recoverable. Too high silently drops real
@@ -1458,6 +1463,39 @@ edited), stops at the first failure, and prints one summary block that
 cannot disagree with its own exit code. It never touches a store, a
 model, or the network; that question belongs to
 `scripts/check_services.py` above.
+
+> ⚠ **That last sentence was not true until D-188, and the failure is
+> worth knowing about because it is easy to reproduce.** `LLM_MODE=stub`
+> gates the MODEL only — `assembly.py` builds a real `QdrantStore`
+> regardless, and `config.py`'s defaults point at `localhost`. So on a
+> machine with Qdrant running (i.e. any machine set up for L2), the gate
+> read from semantic memory, retrieved from the corpus, and **wrote six
+> points back into `agent_semantic_memory` on every invocation**.
+> Measured on the same commit, two machines: `evidence_items` 4 → 15,
+> `memory_writes` 0 → 6.
+>
+> The offline run is now launched with every store URL pinned to a closed
+> local port and the collection names pinned to scratch names, so it
+> degrades in milliseconds and writes nothing. **If your recorded
+> `sanity.py` output shows `memory_writes` above 0, it predates this
+> fix** — and its numbers describe your laptop, not this repository. Side
+> effect: the step dropped from ~40s to ~7s, because the Postgres pool no
+> longer spends five of them retrying a database that is not there.
+
+**Then package what just passed (D-190):**
+```bash
+python scripts/package.py --dry-run   # what would travel
+python scripts/package.py             # -> ../research-agent.zip, verified
+```
+`sanity.py` proves the working tree is demoable. This proves the ARCHIVE
+matches that tree -- it builds from an explicit exclude list, scans the
+files that are about to travel for credential-shaped values, and re-opens
+the written zip to confirm no forbidden path is in it. Nonzero exit and no
+file if anything is wrong.
+
+Run them in that order and the two questions a reviewer's copy raises --
+"does it work" and "is this the thing that worked" -- both have an answer
+you did not have to remember to check.
 
 **This does not replace `.github/workflows/tests.yml`** — that runs the
 suite on every push and answers *"did that commit break anything"*. This

@@ -61,6 +61,48 @@ def llm_metrics(c: Dict[str, float]) -> Dict[str, Any]:
             if key.startswith("llm_context_skipped_") and value
         },
         "llm_disabled_skips": int(c.get("llm_disabled_skips", 0)),
+        # D-191: the pacing counters, which the router has been
+        # accumulating and this function has never emitted.
+        #
+        # THE THIRD PLACE D-183 WAS MISSING. That decision shipped in
+        # three parts -- the router's retry loop, the client's parser,
+        # and these fields -- and only the first was ever written. D-185
+        # supplied the client half; the counters still stopped at
+        # `state.counters`, so a run that DID wait out a 429 reported
+        # nothing about it in the telemetry block, the agent_runs row's
+        # telemetry JSONB, or `analyze_runs.py`. README's own telemetry
+        # table documents all three of the retry_after fields as
+        # telemetry, and reading them back returned `null`.
+        #
+        # It stayed invisible because it only shows once a provider
+        # actually 429s or a hop delay is configured -- so a run that
+        # never hit either is indistinguishable from a run whose
+        # reporting was missing, which is the same shape of silence
+        # D-185 itself had.
+        #
+        # `llm_retry_after_seconds_total` and `llm_hop_delay_seconds_total`
+        # are DURATIONS, and state.py::merge_counters' standing rule is
+        # "monotonic countables only, never durations". They are legal
+        # here for the reason that rule gives: the objection is to
+        # merging two PARALLEL nodes' elapsed times into a number that
+        # measures nothing. These are seconds this process deliberately
+        # SLEPT, which is monotonic and additive -- two threads that each
+        # waited 30s did spend 60 seconds of provider cooldown between
+        # them. Rounded to 3dp because a float sum of sleeps otherwise
+        # reports 35.360000000000004.
+        "llm_retry_after_sleeps": int(c.get("llm_retry_after_sleeps", 0)),
+        "llm_retry_after_seconds_total": round(
+            float(c.get("llm_retry_after_seconds_total", 0.0)), 3),
+        "llm_retry_after_skipped_too_long": int(
+            c.get("llm_retry_after_skipped_too_long", 0)),
+        # D-184's pair, absent for the same reason and fixed in the same
+        # pass. A fixed hop delay is opt-in (LLM_HOP_DELAY_SECONDS
+        # defaults to 0), so on a default deployment both stay 0 -- which
+        # is the point: 0 now means "no pause happened", where before it
+        # meant "this run cannot tell you".
+        "llm_hop_delay_sleeps": int(c.get("llm_hop_delay_sleeps", 0)),
+        "llm_hop_delay_seconds_total": round(
+            float(c.get("llm_hop_delay_seconds_total", 0.0)), 3),
     }
 
 
@@ -94,6 +136,20 @@ def retrieval_metrics(c: Dict[str, float]) -> Dict[str, Any]:
             if key.startswith("chain_answered_") and value
         },
         "chain_tier_failures": int(c.get("chain_tier_failed", 0)),
+        # Tasks that reached the TERMINAL model tier and got something
+        # back that cleared neither the coverage floor nor the topical
+        # gate. Deliberately not folded into tier_answers above: the
+        # ladder returned that evidence (it is real context for the
+        # compiler, and evidence_by_source still counts it), but nothing
+        # ANSWERED, and rounding the two together is what made the
+        # offline L1 demo report tier_answers {"model": 2} while its own
+        # confidence verdict read UNRELIABLE.
+        #
+        # A nonzero value here beside an empty tier_answers is the
+        # honest shape of "every tier was tried and none of them
+        # sufficed" -- distinguishable, now, from a run that never
+        # reached tier 5 at all.
+        "chain_model_insufficient": int(c.get("chain_model_insufficient", 0)),
         "chain_exhausted": int(c.get("chain_exhausted", 0)),
     }
 

@@ -388,7 +388,24 @@ class Settings(BaseSettings):
     # (retrieval/hybrid.py), before a hit ever becomes Evidence — without
     # it a dense index still returns its k nearest neighbours regardless
     # of relevance, and min_evidence_score alone was the only gate.
-    min_similarity: float = Field(0.35, ge=0.0, le=1.0)
+    #
+    # 0.60, NOT the 0.35 this shipped as. That number was P2-01's first
+    # guess, and .env.example has since said in its own words that it is
+    # "BELOW the measured noise floor for the shipped sample corpus
+    # (unrelated text scores 0.40-0.53 with this embedding model) and
+    # cannot filter anything against it" -- so the CODE default was a
+    # value this repo's own documentation calls useless, and
+    # warn_on_inert_coverage_gate only fires at <= 0.0, which meant it
+    # said nothing. Anyone following the Quickstart copies .env.example
+    # and gets 0.60 already; only `pip install research-agent` with no
+    # .env got the inert one, silently. The two now agree.
+    #
+    # STILL RE-DERIVE IT for your own corpus -- OPERATIONS.md Step 3 is
+    # the procedure, and 0.60 is a measurement of THIS corpus with THIS
+    # embedding model, not a constant. Changing this default changes
+    # retrieval behaviour for a defaults-only install, so it is a MINOR
+    # bump under pyproject.toml's stated policy.
+    min_similarity: float = Field(0.60, ge=0.0, le=1.0)
     retrieval_floor_warn_ratio: float = Field(0.8, ge=0.0, le=1.0)  # D-48
     quality_judge_warn_ratio: float = Field(0.5, ge=0.0, le=1.0)  # D-53
     max_revisions: int = Field(2, ge=0)       # D-22: critique-loop bound

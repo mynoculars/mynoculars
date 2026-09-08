@@ -2048,7 +2048,14 @@ def test_llm_metrics_reads_only_counters_and_defaults_everything():
         "llm_completion_tokens", "llm_total_tokens", "llm_context_skips",
         # D-153: which provider was skipped, not just how many times.
         "context_skips_by_provider",
-        "llm_disabled_skips"}
+        "llm_disabled_skips",
+        # D-191: the pacing counters. The router bumped all five and this
+        # builder emitted none of them, so a run that waited out a 429
+        # reported `null` for the three fields README's telemetry table
+        # documents by name.
+        "llm_retry_after_sleeps", "llm_retry_after_seconds_total",
+        "llm_retry_after_skipped_too_long",
+        "llm_hop_delay_sleeps", "llm_hop_delay_seconds_total"}
 
 
 def test_llm_total_tokens_is_the_sum_of_the_two_halves():
@@ -2058,6 +2065,86 @@ def test_llm_total_tokens_is_the_sum_of_the_two_halves():
                         "llm_completion_tokens": 5164})
 
     assert out["llm_total_tokens"] == 24601, "p205.280-check's own figures"
+
+
+def test_every_counter_the_router_bumps_reaches_telemetry():
+    """D-191, and the generalisation rather than five hardcoded names.
+
+    FallbackRouter accumulates counters into state.counters, and
+    llm_metrics is what turns them into the run's telemetry. Nothing
+    connected the two lists, so five counters -- D-183's three
+    retry_after fields and D-184's two hop-delay fields -- were bumped
+    for the life of both decisions and emitted by nothing, while
+    README's telemetry table documented three of them by name and
+    reading them back returned `null`.
+
+    Read from the router's SOURCE rather than from a literal list, so a
+    counter added later is covered the day it is added instead of the
+    day someone remembers this test exists."""
+    import pathlib
+    import re
+
+    from research_agent.reporting.telemetry import llm_metrics
+
+    source = pathlib.Path(
+        "src/research_agent/llm/router.py").read_text(encoding="utf-8")
+    bumped = set(re.findall(r'_bump\("(llm_[a-z_]+)"', source))
+    assert bumped, "the scrape found nothing -- has _bump been renamed?"
+
+    emitted = set(llm_metrics({}))
+    # Two counters are INPUTS to a derived field rather than fields of
+    # their own: compilation.py::telemetry_node divides the score sum by
+    # the judged count to publish llm_quality_score_mean, and publishing
+    # the raw sum as well would invite it being read as a score.
+    derived_inputs = {"llm_quality_score_sum", "llm_quality_scores_judged"}
+
+    missing = bumped - emitted - derived_inputs
+    assert not missing, (
+        f"the router bumps {sorted(missing)} and llm_metrics emits "
+        f"none of them -- the counter reaches state.counters and stops "
+        f"there, so telemetry, the agent_runs row and analyze_runs.py "
+        f"all report nothing for it")
+
+
+def test_a_waited_out_429_is_reported_rather_than_silently_absent():
+    """The shape a real D-183 retry produces. Before this, all three came
+    back `null` no matter what the router had actually done."""
+    from research_agent.reporting.telemetry import llm_metrics
+
+    out = llm_metrics({"llm_retry_after_sleeps": 2,
+                       "llm_retry_after_seconds_total": 44.34,
+                       "llm_retry_after_skipped_too_long": 1})
+
+    assert out["llm_retry_after_sleeps"] == 2
+    assert out["llm_retry_after_seconds_total"] == 44.34
+    assert out["llm_retry_after_skipped_too_long"] == 1
+
+
+def test_summed_sleep_seconds_do_not_report_float_noise():
+    """merge_counters adds floats, and 0.059 + 35.36 + 8.98 lands at
+    44.399000000000004 -- three live Gemini cooldowns from one session.
+    A duration reported to twelve decimal places claims precision the
+    measurement does not have."""
+    from research_agent.reporting.telemetry import llm_metrics
+
+    out = llm_metrics(
+        {"llm_retry_after_seconds_total": 0.059 + 35.36 + 8.98})
+
+    assert out["llm_retry_after_seconds_total"] == 44.399
+
+
+def test_hop_delay_zero_means_no_pause_not_no_answer():
+    """LLM_HOP_DELAY_SECONDS ships at 0, so both fields are 0 on a normal
+    run -- which is the point of emitting them at all: 0 now means "no
+    pause happened", where an absent key meant "this run cannot tell
+    you"."""
+    from research_agent.reporting.telemetry import llm_metrics
+
+    assert llm_metrics({})["llm_hop_delay_sleeps"] == 0
+    assert llm_metrics({})["llm_hop_delay_seconds_total"] == 0.0
+    paced = llm_metrics({"llm_hop_delay_sleeps": 3,
+                         "llm_hop_delay_seconds_total": 3.0})
+    assert paced["llm_hop_delay_sleeps"] == 3
 
 
 def test_retrieval_metrics_derives_tier_answers_from_the_chain_counters():

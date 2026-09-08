@@ -262,10 +262,31 @@ def make_retrieval_chain(corpus: ToolFn, min_evidence_score: float,
         if model is not None:
             found = _try("model", model, task)
             collected.extend(found)
-            _bump_tier("chain_answered_model")
+            # The model tier is TERMINAL -- there is no tier 6 to escalate
+            # to -- so it returns whatever it got either way. But
+            # "returned" and "ANSWERED" are not the same claim, and
+            # telemetry publishes this counter under a field README
+            # describes as "WHICH tier of the D-38 ladder actually
+            # answered". Bumping it unconditionally made a run where the
+            # model tier cleared neither the coverage floor nor the
+            # topical gate report `tier_answers {"model": N}` -- the same
+            # shape as a run it genuinely answered.
+            #
+            # Live: the offline L1 demo does exactly this. Every stub
+            # recollection logs `sufficient: false`, and the run still
+            # reported the model tier as the answering one while its own
+            # confidence verdict said UNRELIABLE. The fact was already in
+            # the log line below; only telemetry was rounding it up.
+            #
+            # A separate counter rather than silence, so the tier's WORK
+            # stays visible: a run that reached tier 5 twice and cleared
+            # nothing is a different finding from one that never got
+            # there, and `tier_answers {}` alone cannot tell them apart.
+            answered = _sufficient(found, task.query)
+            _bump_tier("chain_answered_model" if answered
+                       else "chain_model_insufficient")
             log_event(logger, "chain.answered", tier="model", task=task.key,
-                      items=len(found),
-                      sufficient=_sufficient(found, task.query))
+                      items=len(found), sufficient=answered)
             return collected
 
         _bump_tier("chain_exhausted")

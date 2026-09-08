@@ -29,6 +29,14 @@ WHAT IT DELIBERATELY DOES NOT DO:
       environment. Live-service verification is a different question with
       a different tool: scripts/check_services.py, which this script
       points at rather than absorbing.
+
+      THIS IS ENFORCED, NOT ASSUMED, and it did not used to be. The
+      offline run is launched with OFFLINE_ENV (below) pointing every
+      store at a closed port, because LLM_MODE=stub gates only the MODEL
+      -- a developer with Qdrant running on localhost was getting a
+      DIFFERENT result from this gate than a developer without it, and
+      it wrote six points into their semantic memory each time. See
+      OFFLINE_ENV for the measurement.
     - It does NOT grade an answer. scripts/eval_suite.py is the golden-set
       harness and it needs a live deployment; a gate that silently skips
       the interesting half is worse than one that says what it covers.
@@ -69,6 +77,58 @@ SRC = REPO_ROOT / "src" if REPO_ROOT is not None else None
 # rather than wondering whether this script runs something else.
 DEMO_QUERY = "Compare Redis and Memcached for session caching"
 
+# The offline run's store endpoints, pointed at a port nothing listens on.
+#
+# WHY THIS EXISTS: this script's own docstring promised "it does NOT
+# touch a store, a model, or the network ... so a failure here is always
+# the code and never the environment", and that was FALSE. LLM_MODE=stub
+# gates the MODEL; it says nothing about the stores, and
+# assembly.py::build_app_and_settings builds a real QdrantStore
+# regardless. On a developer machine with Qdrant up, the gate therefore
+# read from semantic memory, retrieved from the corpus, and WROTE six
+# points back into agent_semantic_memory on every invocation.
+#
+# Measured, on one such machine versus a machine with nothing running:
+#
+#     evidence_items      4  ->  15
+#     evidence_by_source  model 4  ->  memory 5 / corpus 6 / model 4
+#     memory_writes       0  ->  6
+#
+# Same command, same commit, different answer -- decided entirely by
+# what happened to be listening on localhost. That is precisely the
+# thing the docstring said could not happen, and a pre-demo CHECK that
+# mutates a store is the wrong shape regardless.
+#
+# Port 1 rather than an unroutable address: a closed local port refuses
+# immediately (ECONNREFUSED), so each store degrades in milliseconds via
+# the graceful-degradation path every storage module already has. An
+# unroutable IP would hang until a connect timeout and make the gate slow
+# for no extra guarantee.
+#
+# This makes the step assert exactly what README's Quickstart advertises
+# -- "No services, no API keys, no model download" -- rather than
+# whatever the developer's laptop is running.
+_CLOSED_PORT = "http://127.0.0.1:1"
+OFFLINE_ENV = {
+    "LLM_MODE": "stub",
+    "QDRANT_URL": _CLOSED_PORT,
+    "OPENSEARCH_URL": _CLOSED_PORT,
+    "POSTGRES_DSN": "postgresql://sanity:sanity@127.0.0.1:1/sanity",
+    # Belt and braces. If a future change makes a store reachable again
+    # despite the URLs above, it must not be one anybody's real data
+    # lives in -- so the names are scratch names too.
+    "MEMORY_COLLECTION": "sanity_scratch_memory",
+    "CORPUS_INDEX": "sanity_scratch_corpus",
+    # Off regardless of .env: both reach a standalone server this gate
+    # has no business requiring (scripts/check_services.py is the tool
+    # for that question), and both would make real network calls.
+    "MCP_ENABLED": "false",
+    "WEB_SEARCH_ENABLED": "false",
+    "LANGFUSE_ENABLED": "false",
+    # A gate must never block on stdin waiting for a human.
+    "HITL_ENABLED": "false",
+}
+
 
 class Step:
     """One check: a name, a command, and whether a miss is fatal.
@@ -80,7 +140,7 @@ class Step:
     """
 
     def __init__(self, name: str, argv: list, why: str, optional_tool: str = "",
-                 isolated: bool = False):
+                 isolated: bool = False, env_overrides: dict = None):
         self.name = name
         self.argv = argv
         self.why = why
@@ -89,6 +149,10 @@ class Step:
         # repo root. Exactly one step needs it, and the reason is not
         # tidiness -- see build_steps' note on the offline run.
         self.isolated = isolated
+        # Extra environment for THIS step's child process only. Same
+        # posture as `isolated` above: a per-step override, never an edit
+        # to anyone's .env. See build_steps' note on OFFLINE_ENV.
+        self.env_overrides = dict(env_overrides or {})
 
 
 def build_steps(quick: bool = False, lint: bool = True) -> list:
@@ -133,7 +197,13 @@ def build_steps(quick: bool = False, lint: bool = True) -> list:
         # forgetting one puts the leak back silently. No file is read from
         # the CWD other than .env, and the run writes only logs/, which
         # belongs in the scratch directory too.
-        isolated=True))
+        isolated=True,
+        # The scratch CWD stops a developer's .env being READ. It does
+        # nothing about services that happen to be listening on
+        # localhost, which the defaults in config.py point straight at --
+        # so the step still reached a running Qdrant and wrote to it. See
+        # OFFLINE_ENV for the measurement and the fix.
+        env_overrides=OFFLINE_ENV))
     return steps
 
 
@@ -167,11 +237,15 @@ def run(step: Step, env: dict) -> tuple:
     print(f"\n--- {step.name}: {' '.join(step.argv)}")
     print(f"    ({step.why})")
     started = time.monotonic()
+    # Per-step overrides on top of the shared environment, applied to the
+    # CHILD only -- nobody's .env is edited to achieve a deterministic
+    # gate. See OFFLINE_ENV.
+    step_env = {**env, **step.env_overrides}
     if step.isolated:
         with tempfile.TemporaryDirectory(prefix="sanity-") as scratch:
-            completed = subprocess.run(step.argv, cwd=scratch, env=env)
+            completed = subprocess.run(step.argv, cwd=scratch, env=step_env)
     else:
-        completed = subprocess.run(step.argv, cwd=REPO_ROOT, env=env)
+        completed = subprocess.run(step.argv, cwd=REPO_ROOT, env=step_env)
     elapsed = time.monotonic() - started
     return ("PASS" if completed.returncode == 0 else "FAIL"), elapsed
 

@@ -35,9 +35,14 @@ mcp>=1.9,<2
 # mcp.server.fastmcp, which BREAKS scripts/mcp_corpus_server.py,
 # tests/fixtures/mcp_echo_server.py and 9 tests outright on a fresh
 # install. Reproduced directly: `pip install "mcp>=1.9"` resolves to 2.x
-# today and the suite goes 348 -> 339 with ModuleNotFoundError. Raise this
+# today and the suite loses those 9 to ModuleNotFoundError. Raise this
 # ceiling only after porting both servers to the 2.x layout and re-running
 # the full suite.
+#
+# (The literal pass/fail counts this paragraph used to quote went stale
+# exactly as README's own D-158 rule predicts -- three files in this
+# repo carried three different numbers. The DELTA is the durable fact;
+# run the suite for the total.)
 
 # Phase 4: web search (research_agent/websearch/) is NOT installed by this
 # file. Its one extra dependency lives in requirements-websearch.txt:
@@ -62,10 +67,10 @@ langfuse>=4.0
 pytest>=8.0
 # P8-2 (D-141): pytest.ini sets `addopts = -n auto --dist loadfile`, so the
 # suite does not run without this. Adopted only after verifying the suite
-# is actually parallel-safe -- 1019/1019 at -n0, -n4 and -n8, no flakes --
-# which is not free for a suite with subprocess MCP fixtures and a
-# threading.local retrieval counter. Remove the addopts line, not this
-# package, if you want serial runs back.
+# is actually parallel-safe -- a full green run at -n0, -n4 and -n8, no
+# flakes and no ordering dependency -- which is not free for a suite with
+# subprocess MCP fixtures and a threading.local retrieval counter. Remove
+# the addopts line, not this package, if you want serial runs back.
 pytest-xdist>=3.5
 
 # Windows API bindings for Python

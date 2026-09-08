@@ -312,3 +312,71 @@ def test_a_run_with_no_tier_data_keeps_the_original_wording():
 
     assert "real evidence may be being discarded" in " ".join(result["reasons"])
 
+
+
+# ---------------------------------------------------------------------------
+# D-190: a blind figure audit must not read as HIGH.
+#
+# The exact telemetry run p205.325-check emitted, transcribed from its
+# narrative log. Every research signal on this run is good -- recall 1.0,
+# corpus_recall 1.0, critique PASSED on the first pass, quality judge 0.85
+# -- and the report stated THIRTEEN figures, none of which the audit could
+# reach, because the compiler cited on paragraphs rather than sentences.
+# report_metrics.py fired report.figure_audit_saw_nothing at WARNING; this
+# function scored it HIGH (98%) anyway, because it read only
+# cited_figures_unsupported and that was legitimately 0.
+# ---------------------------------------------------------------------------
+
+P205_325 = {
+    "evidence_items": 18, "evidence_cited": 4, "citations_attached": 0,
+    "grounding_ratio": 1.0, "recall": 1.0, "corpus_recall": 1.0,
+    "grounded_score": 1.0, "retrieval_floor_drop_ratio": 0.0,
+    "llm_quality_score_mean": 0.85, "critique_passed": True,
+    "cited_figures_checked": 0, "cited_figures_unsupported": 0,
+    "figures_outside_citation_scope": 13,
+    "goals_without_evidence": [], "escalations": [],
+    "web_sources_listed": 0, "web_sourced_items": 0,
+}
+
+
+def test_a_blind_figure_audit_cannot_score_high():
+    """p205.325-check, verbatim. 13 figures stated, 0 reachable by the
+    audit, and this returned HIGH (98%) -- the top band -- while the same
+    run's log carried a warning saying the check could not run."""
+    result = score_report(P205_325)
+    assert result["band"] == "MODERATE"
+    assert result["score"] == 60
+    assert any("outside citation scope" in reason
+               for reason in result["reasons"])
+
+
+def test_the_same_run_scores_high_once_its_figures_are_reachable():
+    """The cap is about REACHABILITY, not about the research. Nothing else
+    on this run is weak, so fixing the citation placement -- a prompt
+    change, not a prose one -- restores the top band."""
+    audited = dict(P205_325, figures_outside_citation_scope=0,
+                   cited_figures_checked=13)
+    assert score_report(audited)["band"] == "HIGH"
+
+
+def test_figures_outside_scope_do_not_cap_a_run_that_audited_something():
+    """`figures_outside_citation_scope` alone is not a finding: a report
+    can legitimately state a figure in an uncited aside while its cited
+    claims audit fine. The cap applies only when NOTHING was checked --
+    that is what separates a partial view from a blind one."""
+    partial = dict(P205_325, figures_outside_citation_scope=3,
+                   cited_figures_checked=10)
+    assert score_report(partial)["band"] == "HIGH"
+
+
+def test_a_blind_audit_and_unsupported_figures_are_different_findings():
+    """Opposite remedies, so they must not collapse into one cap: the
+    audit looked and found something wrong (40, LOW) versus the audit
+    could not look (60, MODERATE). The lowest applicable cap still wins
+    if a run somehow reports both."""
+    from research_agent.reporting.confidence import (
+        CAP_FIGURE_AUDIT_BLIND, CAP_UNSUPPORTED_FIGURES)
+    assert CAP_UNSUPPORTED_FIGURES < CAP_FIGURE_AUDIT_BLIND
+    both = dict(P205_325, cited_figures_checked=5,
+                cited_figures_unsupported=2)
+    assert score_report(both)["band"] == "LOW"

@@ -57,7 +57,7 @@ import hmac
 import logging
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from langgraph.types import Command
@@ -538,7 +538,27 @@ class ResumeRequest(BaseModel):
     """
 
     thread_id: str
-    action: str            # approve | redirect | abort
+    # A LITERAL, not a bare str, and this is a correctness fix rather
+    # than tidying. agents/escalation.py reads
+    # `str(answer.get("action", "abort")).lower()` and then tests for
+    # "redirect" and "abort" explicitly -- so ANY other string, a typo
+    # ("aprove") very much included, falls through both tests onto the
+    # approve path. An unreviewed report would ship as human-approved,
+    # and `escalation_history` would record the typo as the action a
+    # person took.
+    #
+    # The CLI never had this exposure: _prompt_for_decision loops until
+    # the reviewer types one of the three, and tells them so. This makes
+    # the HTTP surface refuse the same input instead of guessing at it --
+    # pydantic returns 422 naming the field and the permitted values,
+    # before the request reaches the graph.
+    #
+    # ⚠ PUBLIC API SURFACE (D-37). This narrows an accepted request
+    # shape, so it is a MAJOR-bump-eligible change under
+    # pyproject.toml's stated policy -- a caller sending anything else
+    # was, however, getting a silently wrong outcome rather than a
+    # working one.
+    action: Literal["approve", "redirect", "abort"]
     guidance: str = ""
 
 
