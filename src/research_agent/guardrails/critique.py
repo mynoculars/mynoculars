@@ -202,6 +202,17 @@ def resolve_verdict(passed: bool, notes: List[str],
     value means the deterministic check AGREES something is unsupported,
     and the verdict stands however the notes read -- the two checks are
     only in conflict when one of them is clean.
+
+    D-193: UNSUPPORTED ONLY, and the caller is where that is enforced --
+    see agents/compilation.py, which passes `len(flagged)`. The audit
+    reports three kinds now and only this one is agreement with a failing
+    critic. A MISATTRIBUTED figure (D-179) is true and retrieved, and the
+    note this system writes for one ends "Do NOT remove the figure"; a
+    RECALLED figure (D-192) came out of the compile prompt. Neither says
+    the report asserted something its evidence does not hold, so neither
+    can stand in for the agreement this veto is checking for. Passing
+    "everything the audit had to say" instead disabled the guard on one
+    misfiled citation marker, live, in p205.334-check.
     """
     if passed or not notes or unsupported_figures:
         return passed, notes, {}

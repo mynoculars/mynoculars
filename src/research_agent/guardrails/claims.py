@@ -520,6 +520,66 @@ def _strip_markers(sentence: str) -> str:
     return _CITATION_MARKER_RE.sub(" ", sentence)
 
 
+# D-192(a): the P2-02 namespace, read here for the same reason
+# guardrails/attribution.py reads it -- recalled evidence must never be
+# able to make a sentence look supported by THIS run's retrieval. See
+# the block comment inside audit_cited_figures for why stripping the
+# prefix (the obvious "fix") would be a regression rather than one.
+_MEMORY_NS = "memory::"
+
+# D-192(b): a sentence that ASSERTS THE ABSENCE of support. Auditing it
+# for support is backwards -- the sentence and the audit agree, and the
+# audit reports a defect anyway.
+#
+# Live, twice (p205.330-check and p205.333-check): the report wrote
+# "However, no document specifies whether current spending (~4% of GDP)
+# is explicitly cited", and separately listed the same figure in its own
+# "could not find" section. Both sentences carry `[gN]` from their
+# heading scope, both state a figure, neither claims it. Each run was
+# capped at LOW(40) by CAP_UNSUPPORTED_FIGURES for saying the honest
+# thing -- the exact behaviour D-51's hedging asks the compiler for.
+#
+# Deliberately narrow. It matches an explicit statement about documents,
+# sources, evidence or confirmation, NOT the word "not" -- "the fleet is
+# not 300 ships" is a claim about the world and stays audited. Every
+# figure it excludes is counted (figures_in_disclaimed_sentences), on
+# D-174's principle: an exclusion nothing can see is a loophole, not a
+# fix.
+#
+# D-194: `figure` joined that noun list, and the omission is worth
+# recording rather than quietly correcting. Live (p205.336-check) the
+# compiler wrote "NSDC and PMKVY aim to certify millions in vocational
+# skills, though NO VERIFIED FIGURE (e.g., 1.3 crore) IS SUPPORTED BY
+# THE CORPUS [g5]" -- a sentence whose whole content is the denial this
+# pattern exists to recognise -- and 1.3 was audited as an assertion,
+# reported as the run's only unsupported figure, and capped the run at
+# LOW(40) via CAP_UNSUPPORTED_FIGURES. The noun list guarding the FIGURE
+# audit did not contain the word "figure".
+#
+# ONLY `figure` was added. "statistic", "number" and "estimate" are
+# plausible next omissions and are deliberately absent until a run
+# actually produces one: D-54's rule -- do not build against a failure
+# mode nothing has measured -- applies to a regex's vocabulary exactly
+# as it applies to a guardrail, and every addition widens what this
+# check declines to audit.
+_DISCLAIMER_RE = re.compile(
+    r"\b(?:"
+    r"n(?:o|one|either)\s+(?:\w+\s+){0,3}?"
+    # D-194: `figure` was missing from a noun list guarding the FIGURE
+    # audit. See the block comment above the pattern.
+    r"(?:document|source|evidence|record|report|dataset|data|figure|"
+    r"citation|corroborat\w*|confirmation)s?\b"
+    r"|(?:could|can|do(?:es)?|was|were|is|are)\s*n(?:o|')t\s+"
+    r"(?:be\s+|explicitly\s+|directly\s+|independently\s+){0,2}"
+    r"(?:confirm\w*|verif\w*|corroborat\w*|substantiat\w*|specif\w*|"
+    r"state\w*|cite\w*|support\w*|locate\w*|find|found|establish\w*)"
+    r"|(?:remains?|is|are)\s+(?:unconfirmed|unverified|unsupported|"
+    r"uncorroborated|unsubstantiated)\b"
+    r"|without\s+(?:direct\s+|explicit\s+){0,1}"
+    r"(?:evidence|support|corroboration|confirmation)\b"
+    r")", re.IGNORECASE)
+
+
 def audit_cited_figures(report: str, goals: List[Goal],
                         evidence: List[Evidence]
                         ) -> Tuple[List[Dict[str, object]], Dict[str, float]]:
@@ -546,14 +606,52 @@ def audit_cited_figures(report: str, goals: List[Goal],
     """
     counters = {"cited_figures_checked": 0.0, "cited_figures_unsupported": 0.0,
                 "cited_figures_misattributed": 0.0,
-                "figures_outside_citation_scope": 0.0}
+                "cited_figures_recalled": 0.0,
+                "figures_outside_citation_scope": 0.0,
+                "figures_in_disclaimed_sentences": 0.0}
     if not report or not evidence:
         return [], counters
 
     known_goal_ids = {g.goal_id for g in goals}
     figures_by_goal: Dict[str, Set[str]] = {}
     values_by_goal: Dict[str, Set[float]] = {}
+    # D-192(a): recalled evidence, kept OUT of the per-goal index and in
+    # a bucket of its own.
+    #
+    # P2-02 files memory hits under "memory::<the goal id of whichever
+    # EARLIER run stored them>". That id is not this run's g3; it is a
+    # different run's g3, and the namespace exists precisely so the two
+    # can never collide. Stripping the prefix here -- the obvious
+    # reading of "a figure cited [g3] and supported by memory::g3 is
+    # fine" -- would rebuild the exact collision P2-02 removed, and let
+    # an unrelated run's number silently vouch for this one's claim.
+    # guardrails/attribution.py excludes the same evidence for the same
+    # reason; this is that rule, applied one pass later.
+    #
+    # But leaving it in the general index was also wrong, and that is
+    # what shipped. A memory bucket can never be `checkable` (cited ids
+    # are bare `gN`), so it only ever reached the `elsewhere` scan --
+    # where it produced kind="misattributed", supported_by=
+    # ["memory::g3"]. Live (p205.333-check) three of four findings had
+    # that shape. "Misattributed" tells the operator to cite the goal
+    # that carries the figure, and there is no such goal to cite: the
+    # finding is unactionable by construction.
+    #
+    # Neither existing kind is true of it, so it gets its own. A figure
+    # the compiler read out of RECALLED evidence is not invented (the
+    # text was in its prompt -- prompts/budget.py budgets memory items
+    # in) and is not misfiled (nothing citable holds it). It is a claim
+    # resting on an earlier run, which the honesty rail says does not
+    # ground. Naming that is the whole finding; it deliberately does not
+    # feed cited_figures_unsupported, so it cannot trip
+    # CAP_UNSUPPORTED_FIGURES for a number the run really did hold.
+    recalled_figures: Set[str] = set()
+    recalled_values: Set[float] = set()
     for item in evidence:
+        if item.goal_id.startswith(_MEMORY_NS):
+            recalled_figures |= figures_in(item.content)
+            recalled_values |= scaled_values(item.content)
+            continue
         if item.goal_id not in figures_by_goal:
             figures_by_goal[item.goal_id] = set()
             values_by_goal[item.goal_id] = set()
@@ -608,6 +706,17 @@ def audit_cited_figures(report: str, goals: List[Goal],
         stated = figures_in(prose)
         if not stated:
             continue
+        if _DISCLAIMER_RE.search(prose):
+            # D-192(b): the sentence says the support is not there. It
+            # is not asserting the figure; it is reporting that nothing
+            # backs it -- so "this figure appears in no cited evidence"
+            # is not a finding, it is agreement. Counted, never
+            # silently dropped: a nonzero value beside
+            # cited_figures_checked: 0 is a report that hedged every
+            # number it stated, which an operator should see.
+            counters["figures_in_disclaimed_sentences"] += float(
+                len(stated))
+            continue
         counters["cited_figures_checked"] += float(len(stated))
         # Exact string match first -- fast, and precise by construction.
         # Only what it could not settle goes to the scale comparison,
@@ -633,11 +742,22 @@ def audit_cited_figures(report: str, goals: List[Goal],
                 and (figure in figures_by_goal[g]
                      or _confirmed_by_scale(figure, spans,
                                             values_by_goal[g])))
+            if elsewhere:
+                kind = "misattributed"
+            elif (figure in recalled_figures
+                    or _confirmed_by_scale(figure, spans, recalled_values)):
+                # D-192(a): retrieved, but by an EARLIER run. Third kind,
+                # third remedy -- neither "delete it" nor "cite the goal
+                # that holds it", but "this rests on memory, which does
+                # not ground".
+                kind = "recalled"
+            else:
+                kind = "unsupported"
             finding: Dict[str, object] = {
                 "figure": figure,
                 "goals": sorted(checkable),
                 "sentence": " ".join(sentence.split())[:200],
-                "kind": "misattributed" if elsewhere else "unsupported",
+                "kind": kind,
             }
             if elsewhere:
                 finding["supported_by"] = elsewhere
@@ -652,4 +772,6 @@ def audit_cited_figures(report: str, goals: List[Goal],
         {f["figure"] for f in findings if f["kind"] == "unsupported"}))
     counters["cited_figures_misattributed"] = float(len(
         {f["figure"] for f in findings if f["kind"] == "misattributed"}))
+    counters["cited_figures_recalled"] = float(len(
+        {f["figure"] for f in findings if f["kind"] == "recalled"}))
     return findings, counters

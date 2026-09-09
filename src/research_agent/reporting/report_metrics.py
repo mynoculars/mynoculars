@@ -169,17 +169,66 @@ def _audit_figures(state: ResearchState, settings: Settings) -> tuple:
                          "does not cite; the citation is wrong, not "
                          "the figure",
                   examples=misattributed[:5])
-    findings = [f for f in findings if f.get("kind") != "misattributed"]
-    if findings:
+    # D-192(a): recalled figures, reported apart from both. The remedy
+    # is neither the report's ("delete an invented number") nor the
+    # citation's ("cite the goal that holds it") -- the figure came out
+    # of an EARLIER run's memory, which nothing in this run can cite and
+    # which the honesty rail does not treat as grounding. Like
+    # misattributed above it does not feed cited_figures_unsupported, so
+    # it cannot trip CAP_UNSUPPORTED_FIGURES.
+    recalled = [f for f in findings if f.get("kind") == "recalled"]
+    if recalled:
+        log_event(logger, "report.recalled_cited_figures",
+                  level=logging.WARNING,
+                  recalled=int(counters.get("cited_figures_recalled", 0)),
+                  checked=int(counters.get("cited_figures_checked", 0)),
+                  effect="the figures come from recalled memory, not "
+                         "from evidence this run retrieved; memory "
+                         "does not ground a claim and cannot be cited",
+                  examples=recalled[:5])
+    # D-192(b): figures inside sentences that assert the absence of
+    # support. Not a defect and not a warning -- the compiler hedged,
+    # which is what D-51 asks of it. Recorded so the exclusion is
+    # visible in the run log as well as in telemetry (D-174's rule: an
+    # exclusion nothing can see is a loophole).
+    disclaimed = int(counters.get("figures_in_disclaimed_sentences", 0))
+    if disclaimed:
+        log_event(logger, "report.figures_in_disclaimed_sentences",
+                  figures=disclaimed,
+                  effect="stated inside sentences denying that support "
+                         "exists; excluded from the audit rather than "
+                         "reported as unsupported")
+    # D-193: filtered for THIS LOG LINE, not for the return value. The
+    # rebinding used to be `findings = [...]`, and the filtered list is
+    # what this function returned -- so telemetry_node's
+    # `_distinct_figures(figure_findings, "misattributed")` searched a
+    # list every misattributed entry had already been removed from.
+    # `misattributed_figures` has therefore been `[]` on every run since
+    # D-179 shipped, while `cited_figures_misattributed` reported a
+    # nonzero count beside it, and README documents the field as "a
+    # capped sample naming WHICH, so the number is actionable without
+    # re-running anything". D-192's `recalled_figures` inherited the
+    # same defect the day it was added (p205.334-check: counts 1 and 3,
+    # both samples empty).
+    #
+    # Same failure shape as D-185 and D-191: a documented field that
+    # cannot carry a value, invisible because the count beside it looks
+    # right. tests/unit/test_reporting_report_metrics.py asserts the
+    # general property -- a nonzero cited_figures_* count implies a
+    # non-empty sample of that kind -- rather than the three names,
+    # so a fourth kind is covered the day it is added.
+    unsupported = [f for f in findings
+                   if f.get("kind") not in ("misattributed", "recalled")]
+    if unsupported:
         log_event(logger, "report.unsupported_cited_figures",
                   level=logging.WARNING,
-                  unsupported=len(findings),
+                  unsupported=len(unsupported),
                   checked=int(counters.get("cited_figures_checked", 0)),
                   # Capped: a report can state many figures, and one log
                   # line should stay readable. The full count is the field
                   # above; telemetry carries the same capped sample for the
                   # run record.
-                  examples=findings[:5])
+                  examples=unsupported[:5])
     return findings, counters
 
 

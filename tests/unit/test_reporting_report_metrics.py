@@ -160,3 +160,80 @@ def test_grounding_notice_is_read_from_the_shipped_report(report, expected):
     additively."""
     m = shipped_report_metrics(_state(report=report), _live_settings(), {})
     assert m["grounding_notice_shipped"] is expected
+
+
+# --------------------------------------------------------------------------
+# D-193: a nonzero count must come with a sample. The samples were empty.
+# --------------------------------------------------------------------------
+
+
+_THREE_KINDS_REPORT = (
+    "# R\n\n"
+    # 2.1 is under g1, cited to g2 -> misattributed.
+    "China fields 2.1 million active personnel [g2].\n"
+    # 45.7 exists only in recalled memory -> recalled.
+    "Spending reached 45.7 billion dollars [g1].\n"
+    # 999.9 exists nowhere -> unsupported.
+    "The fleet numbers 999.9 thousand hulls [g1].\n")
+
+
+def _three_kinds_evidence():
+    return [
+        _ev("g1", content="China's armed forces have over 2.1 million "
+                          "active personnel."),
+        _ev("g2", content="The PLA is a large organisation."),
+        _ev("memory::g1", source="memory",
+            content="Spending reached 45.7 billion dollars."),
+    ]
+
+
+def _three_kinds_state():
+    return _state([Goal(goal_id="g1", description="size"),
+                   Goal(goal_id="g2", description="structure")],
+                  _three_kinds_evidence(), _THREE_KINDS_REPORT)
+
+
+def test_every_kind_the_audit_counts_survives_into_the_returned_findings():
+    """The defect, stated as the property that catches it.
+
+    `_audit_figures` filtered its findings list to build the
+    unsupported-only WARNING and then returned the FILTERED list, so
+    telemetry_node's `_distinct_figures(figure_findings, "misattributed")`
+    searched a list every misattributed entry had already been removed
+    from. `misattributed_figures` was therefore `[]` on every run since
+    D-179 shipped -- beside a nonzero `cited_figures_misattributed` -- and
+    D-192's `recalled_figures` inherited it on day one (p205.334-check:
+    counts 1 and 3, both samples empty).
+
+    Asserted as "every counted kind is present", not as three names, so a
+    fourth kind is covered the day it is added.
+    """
+    m = shipped_report_metrics(_three_kinds_state(), _live_settings(),
+                               {"corpus": 2})
+    counters, findings = m["figure_counters"], m["figure_findings"]
+
+    counted = {kind for kind in ("unsupported", "misattributed", "recalled")
+               if counters.get(f"cited_figures_{kind}")}
+    assert counted == {"unsupported", "misattributed", "recalled"}, \
+        "the fixture must exercise all three or it proves nothing"
+    for kind in counted:
+        assert [f for f in findings if f.get("kind") == kind], \
+            f"cited_figures_{kind} is nonzero but no finding carries it"
+
+
+def test_a_nonzero_count_always_reaches_the_telemetry_sample():
+    """The property one step further out, through the function telemetry
+    actually calls. This is the assertion that would have failed on
+    p205.334-check."""
+    from research_agent.agents.compilation import _distinct_figures
+
+    m = shipped_report_metrics(_three_kinds_state(), _live_settings(),
+                               {"corpus": 2})
+    counters, findings = m["figure_counters"], m["figure_findings"]
+
+    for kind in ("unsupported", "misattributed", "recalled"):
+        count = counters.get(f"cited_figures_{kind}", 0)
+        sample = _distinct_figures(findings, kind)
+        assert bool(count) == bool(sample), (
+            f"{kind}: count={count} sample={sample} -- a count and its "
+            f"sample must agree about whether anything was found")

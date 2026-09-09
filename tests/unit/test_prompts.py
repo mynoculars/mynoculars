@@ -415,3 +415,80 @@ def test_within_one_source_the_higher_score_comes_first():
 
     assert body.index("HIGHSCORE") < body.index("LOWSCORE")
 
+
+
+# ---------------------------------------------------------------------------
+# D-193 -- a note the writer cannot act on guarantees a second failure
+# ---------------------------------------------------------------------------
+
+
+def _critique_body():
+    from research_agent.prompts.templates import critique
+    from research_agent.state import Goal
+    return critique("q", "r", [Goal(goal_id="g1", description="d")],
+                    [])[-1]["content"]
+
+
+def test_critique_forbids_a_note_about_a_claim_the_report_does_not_make():
+    """p205.334-check. "The most popular fields are Arts (24.2%), followed
+    by Science and Commerce ... The percentage for Commerce is not
+    supported by any evidence item." The report states NO percentage for
+    Commerce, so there is nothing in the draft to change and the rewrite
+    reproduced the sentence unaltered. D-181 stopped the critic recording
+    that a claim IS supported; nothing stopped it objecting to a claim
+    that is absent."""
+    body = _critique_body()
+    assert "EVERY ENTRY MUST BE FIXABLE BY EDITING THIS DRAFT" in body
+    assert "do not write a note about a claim the report does not make" in body
+    assert "find it IN THE REPORT above" in body
+    assert "the absence of a figure you expected is not a violation" in body
+
+
+def test_critique_forbids_asking_for_something_the_report_already_did():
+    """The other half, and the one that actually cost six runs. Two of
+    p205.334-check's five surviving notes asked for claims to be
+    "explicitly attributed as general knowledge" -- under the report's own
+    heading "General knowledge (not from retrieved documents) suggests:".
+    A note whose remedy is already applied cannot be satisfied by
+    rewriting, and guardrails/critique.py cannot dismiss it either: it
+    names no figure, so falsified_by_evidence can never refute it."""
+    body = _critique_body()
+    assert "do not ask for something the report has already done" in body
+    assert "IS the attribution" in body
+    assert "an instruction the writer cannot carry out" in body
+
+
+def test_the_changed_prompt_declares_a_new_version_and_the_other_does_not():
+    """The maintenance contract in PROMPT_VERSIONS' own comment: bump when
+    the prompt TEXT changes in a way that could affect behaviour.
+
+    `critic` changed and is v3. `compiler` must stay v2 -- D-193(c)'s
+    compile-side rule was withdrawn before any run served it, so the text
+    at v2 is byte-identical to what it always was, and a version burnt on
+    a round trip nothing observed would make the Langfuse UI imply a
+    behaviour change that never happened."""
+    from research_agent.prompts.templates import PROMPT_VERSIONS
+
+    assert PROMPT_VERSIONS["critic"] == ("critique", "v3")
+    assert PROMPT_VERSIONS["compiler"] == ("compile_report", "v2")
+
+
+def test_compile_report_does_not_ban_attributed_general_knowledge():
+    """D-193(c), withdrawn. The rule banned a general-knowledge section
+    whenever no evidence item was tagged `model` -- and p205.335-check
+    showed why that was aimed at the wrong side of the loop: with
+    `model_sourced_items: 0` the compiler produced four passages, every
+    one of them marked in place ("Nothing was retrieved regarding the RTE
+    Act 2009, though from general knowledge, ..."). That is the honest
+    writing the ATTRIBUTION RULE asks for; a compiler that OBEYED the new
+    rule would have deleted all four and told the reader less. The
+    critic's inability to see the marking is the critic's defect to fix.
+    """
+    from research_agent.prompts.templates import compile_report
+    from research_agent.state import Goal
+
+    body = compile_report("q", [Goal(goal_id="g1", description="d")],
+                          [], [])[-1]["content"]
+    assert "Do NOT add a general-knowledge" not in body
+    assert "must be marked in the prose as drawn from general knowledge" \
+        in body, "the ATTRIBUTION RULE itself must survive the withdrawal"

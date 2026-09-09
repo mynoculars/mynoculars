@@ -84,8 +84,20 @@ PROMPT_VERSIONS = {
     # score, instead of retrieval order). No instruction text changed, but
     # what the model reads first did -- and that is exactly the kind of
     # structural change this table exists to mark.
+    # D-193 bumped `critic` to v3 for the actionability contract (no note
+    # about a claim the report does not make; no note asking for
+    # something the report already did) -- an instruction-text change
+    # aimed squarely at critique_passed, which is the rate this table
+    # exists to let anyone compare across revisions.
+    #
+    # `compiler` is BACK AT v2, and stayed there rather than advancing to
+    # v4: D-193's compile-side rule was withdrawn before any run served
+    # it, so no generation was ever tagged compile_report/v3 and the
+    # prompt text at v2 is byte-identical to what it always was. Burning
+    # a version on a round trip nothing observed would make the UI imply
+    # a behaviour change that never happened. See D-193(c).
     "compiler":         ("compile_report", "v2"),
-    "critic":           ("critique", "v2"),
+    "critic":           ("critique", "v3"),
     # detect_contradictions runs inside the "merger" node but is called
     # conditionally, not on every merger execution -- so merger's
     # generations are a MIX of that prompt and none at all. Deliberately
@@ -640,6 +652,48 @@ def critique(query: str, report: str, goals: List[Goal],
             f"everything you list. If a claim is fine, say nothing about "
             f"it. An empty list is the correct answer for a report with "
             f"nothing wrong. "
+            # D-193: D-181 stopped the critic recording that a claim IS
+            # supported. Two shapes it did not stop are the ones that
+            # actually cost this system its runs, because BOTH survive a
+            # rewrite unchanged and therefore guarantee a second failure
+            # and an E4 -- the same defect D-139 fixed once for machine
+            # annotations ("a revision was spent on an instruction no
+            # rewrite can satisfy"), arriving through the notes instead.
+            #
+            # Live, p205.334-check, both in the five notes that reached
+            # the human:
+            #   (a) "The most popular fields are Arts (24.2%), followed
+            #       by Science and Commerce ... The percentage for
+            #       Commerce is not supported by any evidence item." The
+            #       report states NO percentage for Commerce. There is
+            #       nothing in the draft to remove.
+            #   (b) "...marked as general knowledge but ... should either
+            #       be supported by evidence OR explicitly attributed as
+            #       general knowledge." The text sits under the report's
+            #       own heading "General knowledge (not from retrieved
+            #       documents) suggests:". The remedy the note asks for
+            #       is the one the report already applied.
+            # Neither is dismissable by guardrails/critique.py either:
+            # resolve_verdict can only refute a note that NAMES a figure
+            # the evidence holds, and (a) and (b) name none, so they
+            # survive every counterweight this system has. They are the
+            # single reason six consecutive runs shipped LOW.
+            f"EVERY ENTRY MUST BE FIXABLE BY EDITING THIS DRAFT. Two "
+            f"kinds of entry never are, and both are forbidden. FIRST: "
+            f"do not write a note about a claim the report does not "
+            f"make. Before naming a figure, statistic, entity or date as "
+            f"unsupported, find it IN THE REPORT above; the absence of a "
+            f"figure you expected is not a violation, and neither is a "
+            f"comparison the report declined to quantify. SECOND: do not "
+            f"ask for something the report has already done. If your "
+            f"note would read \"X should be attributed as general "
+            f"knowledge\" or \"X should be marked as unsupported\" and "
+            f"the report ALREADY says so -- in that sentence, its "
+            f"bullet, or the heading above it -- then the report is "
+            f"correct and you must say nothing about it. An explicit "
+            f"statement that a claim is not from the retrieved documents "
+            f"IS the attribution; asking for it a second time is an "
+            f"instruction the writer cannot carry out. "
             'JSON schema: {"passed": <bool>, "score": <0..1>, '
             '"violations": ["..."]}'}]
 

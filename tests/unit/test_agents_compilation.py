@@ -2518,3 +2518,96 @@ def test_citations_attached_still_reports_a_real_rescue():
     telemetry = node(state)["telemetry"]
 
     assert telemetry["citations_attached"] == 1
+
+
+# --------------------------------------------------------------------------
+# D-193: only an UNSUPPORTED figure vetoes D-155's counterweight.
+# --------------------------------------------------------------------------
+
+
+_MISATTRIBUTED_NOTES = [
+    "Unfaithful: the report claims the PLAGF deploys 975,000 troops. No "
+    "evidence item supports the figure 975,000.",
+]
+
+
+def test_a_misattributed_figure_does_not_veto_the_counterweight():
+    """p205.334-check, replayed.
+
+    `audit_flagged` was `len(flagged) + len(misattributed)` and was passed
+    to `resolve_verdict`'s `unsupported_figures`, whose docstring reads "a
+    nonzero value means the deterministic check AGREES something is
+    unsupported". A misattribution is the opposite finding -- D-179 says
+    the figure is true and retrieved, and the note this node writes for
+    one ends "Do NOT remove the figure". Live, ONE misfiled citation
+    marker (figure 50, cited [g2], held by g1) against
+    `cited_figures_unsupported: 0` made the parameter truthy, so
+    resolve_verdict returned at its first line and D-178's guard -- which
+    that decision went to some trouble to make non-vacuous -- never ran.
+
+    Here the sole note disputes 975,000, which the evidence DOES contain
+    (under g3), and the audit reports zero unsupported figures. Nothing
+    corroborates the failure, so the counterweight must act.
+    """
+    from research_agent.agents.compilation import build_critic_node
+
+    router = _VerdictRouter(_MISATTRIBUTED_NOTES)
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(_misattributed_state())
+
+    assert result["critique_passed"] is True
+    assert result["counters"]["critique_notes_dismissed"] == 1.0
+
+
+def test_an_unsupported_figure_still_vetoes_the_counterweight():
+    """The half that must not move. When the deterministic audit agrees
+    something is unsupported, the two checks are not in conflict and the
+    critic's failure stands however the notes read."""
+    from research_agent.agents.compilation import build_critic_node
+
+    state = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1")],
+        evidence=[_e("g1", "The PLA is estimated at approximately 2 "
+                           "million to 2.1 million active personnel.")],
+        # 987654 appears in no evidence under any goal -> unsupported.
+        final_report=("# R\n\nThe PLA fields approximately 2 million "
+                      "personnel [g1] across 987654 units [g1].\n"))
+    # The note itself is refutable -- it disputes a figure the evidence
+    # holds -- so ONLY the veto can keep this verdict failing.
+    router = _VerdictRouter([
+        "Unfaithful: the report claims 'approximately 2 million "
+        "personnel'. The evidence states 2 million to 2.1 million."])
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(state)
+
+    assert result["critique_passed"] is False
+    assert "critique_notes_dismissed" not in result["counters"]
+
+
+def test_a_recalled_figure_does_not_veto_the_counterweight():
+    """D-192's kind, decided rather than inherited. A recalled figure came
+    out of the compile prompt (prompts/budget.py budgets memory items in),
+    so nothing about it says the report asserted something its evidence
+    does not hold. It was silently excluded from the old sum; it is
+    excluded on purpose now, and this test is what says so."""
+    from research_agent.agents.compilation import build_critic_node
+
+    state = ResearchState(
+        raw_query="Compare Armies of China and India",
+        goals=[_g("g1")],
+        evidence=[
+            _e("g1", "The PLA is estimated at approximately 2 million to "
+                     "2.1 million active personnel."),
+            _e("memory::g1", "Spending reached 296.4 billion dollars.",
+               source="memory")],
+        final_report=("# R\n\nThe PLA fields approximately 2 million "
+                      "personnel [g1] on 296.4 billion dollars [g1].\n"))
+    router = _VerdictRouter([
+        "Unfaithful: the report claims 'approximately 2 million "
+        "personnel'. The evidence states 2 million to 2.1 million."])
+    result = build_critic_node(router, _settings(
+        claim_verification_enabled=False))(state)
+
+    assert result["critique_passed"] is True, \
+        "a recalled figure is not the audit agreeing a claim is unsupported"

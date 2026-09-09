@@ -213,7 +213,9 @@ def test_no_evidence_at_all_is_a_clean_no_op():
     assert counters == {"cited_figures_checked": 0.0,
                         "cited_figures_unsupported": 0.0,
                         "cited_figures_misattributed": 0.0,
-                        "figures_outside_citation_scope": 0.0}
+                        "cited_figures_recalled": 0.0,
+                        "figures_outside_citation_scope": 0.0,
+                        "figures_in_disclaimed_sentences": 0.0}
 
 
 def test_findings_name_the_figure_the_goals_and_a_bounded_sentence():
@@ -661,3 +663,218 @@ def test_one_figure_in_three_sentences_is_one_unsupported_figure():
 
     assert len(findings) == 3, "one finding per sentence stays -- each is a fix"
     assert counters["cited_figures_unsupported"] == 1.0
+
+
+# --------------------------------------------------------------------------
+# D-192(a): recalled evidence is a third kind, not a misattribution and
+# not an invention.
+# --------------------------------------------------------------------------
+
+
+def test_a_figure_from_memory_is_recalled_not_misattributed_to_a_namespace():
+    """p205.333-check, replayed.
+
+    Three of that run's four findings read kind="misattributed",
+    supported_by=["memory::g3"]. "Misattributed" instructs the operator
+    to cite the goal that carries the figure -- and "memory::g3" is not
+    a goal any sentence can cite, so the finding named a remedy that
+    does not exist.
+    """
+    ev = [_ev("The PLA is large.", "g1"),
+          _ev("China fields 2.1 million active personnel.",
+              "memory::g3", source="memory")]
+    report = "# R\n\nChina fields 2.1 million active personnel [g1].\n"
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["kind"] for f in findings] == ["recalled"]
+    assert "supported_by" not in findings[0], \
+        "nothing citable holds it, so naming a supporter would be false"
+    assert counters["cited_figures_recalled"] == 1.0
+    assert counters["cited_figures_unsupported"] == 0.0, \
+        "the text was in the compile prompt; it was not invented"
+    assert counters["cited_figures_misattributed"] == 0.0
+
+
+def test_memory_evidence_can_never_support_a_bare_goal_id():
+    """The regression the obvious fix would have caused.
+
+    P2-02's prefix carries an EARLIER run's goal id, not this run's, so
+    stripping it to let `memory::g3` satisfy `[g3]` would rebuild the
+    exact string collision the namespace exists to prevent -- an
+    unrelated run's number vouching for this run's claim. The figure
+    must still be reported; only its KIND changes.
+    """
+    ev = [_ev("Unrelated: the cache holds 4,096 keys.",
+              "memory::g3", source="memory")]
+    report = "# R\n\nThe fleet numbers 4,096 hulls [g3].\n"
+
+    findings, counters = audit_cited_figures(report, _goals3(), ev)
+
+    assert findings == [], \
+        "g3 retrieved nothing this run, so there is nothing to check"
+    assert counters["cited_figures_checked"] == 0.0
+
+
+def test_a_real_goal_still_outranks_memory_holding_the_same_figure():
+    """When both a citable goal and memory carry the figure, the
+    actionable finding wins: cite g3."""
+    ev = [_ev("The PLA is large.", "g1"),
+          _ev("A deployed force of 975,000 troops.", "g3"),
+          _ev("A deployed force of 975,000 troops.",
+              "memory::g2", source="memory")]
+    report = "# R\n\nThe PLAGF deploys 975,000 troops [g1].\n"
+
+    findings, counters = audit_cited_figures(report, _goals3(), ev)
+
+    assert [f["kind"] for f in findings] == ["misattributed"]
+    assert findings[0]["supported_by"] == ["g3"]
+    assert counters["cited_figures_recalled"] == 0.0
+
+
+def test_memory_bucket_never_appears_in_a_supported_by_list():
+    """The generalisation. Whatever else changes, no finding may ever
+    tell a reader to cite a namespace."""
+    ev = [_ev("The PLA is large.", "g1"),
+          _ev("China fields 2.1 million active personnel.",
+              "memory::g3", source="memory"),
+          _ev("Spending reached 296.4 billion.",
+              "memory::g1", source="memory")]
+    report = ("# R\n\nChina fields 2.1 million active personnel [g1]. "
+              "Spending reached 296.4 billion [g1].\n")
+
+    findings, _ = audit_cited_figures(report, [_goal()], ev)
+
+    assert findings, "the sentences must still be examined"
+    for finding in findings:
+        for supporter in finding.get("supported_by", []):
+            assert not supporter.startswith("memory::")
+
+
+# --------------------------------------------------------------------------
+# D-192(b): a sentence that denies its own support is not audited for it.
+# --------------------------------------------------------------------------
+
+
+def test_a_sentence_denying_support_is_not_reported_as_unsupported():
+    """p205.330-check and p205.333-check, replayed. Both were capped at
+    LOW(40) by CAP_UNSUPPORTED_FIGURES for writing the honest sentence
+    D-51's hedging asks the compiler for."""
+    ev = [_ev("China's defence budget rose in 2024.", "g1")]
+    report = ("# R\n\nHowever, no document specifies whether current "
+              "spending (~4% of GDP) is explicitly cited [g1].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert findings == []
+    assert counters["cited_figures_unsupported"] == 0.0
+    assert counters["figures_in_disclaimed_sentences"] == 1.0
+    assert counters["cited_figures_checked"] == 0.0, \
+        "the sentence was excluded, not examined and passed"
+
+
+def test_the_exclusion_is_counted_so_it_cannot_be_a_silent_loophole():
+    """D-174's rule. A figure this check declines to judge must still be
+    visible in telemetry, or the exclusion is indistinguishable from a
+    clean report."""
+    ev = [_ev("China's defence budget rose in 2024.", "g1")]
+    report = ("# R\n\nThe figure of 4.5% could not be confirmed in any "
+              "retrieved source [g1]. Spending is 296.4 billion [g1].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["figure"] for f in findings] == ["296.4"], \
+        "only the sentence that ASSERTS is audited"
+    assert counters["figures_in_disclaimed_sentences"] == 1.0
+    assert counters["cited_figures_checked"] == 1.0
+
+
+def test_a_negated_claim_about_the_world_is_still_audited():
+    """The line the regex must not cross. "not 300 ships" is a claim
+    about reality, not a statement about the evidence, and a report that
+    states a number it never retrieved does not get to keep it by
+    phrasing it negatively."""
+    ev = [_ev("The PLAN operates a large surface fleet.", "g1")]
+    report = "# R\n\nThe PLAN does not field 300 major surface combatants [g1].\n"
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["figure"] for f in findings] == ["300"]
+    assert counters["figures_in_disclaimed_sentences"] == 0.0
+
+
+def test_the_disclaimer_forms_the_compiler_actually_writes_are_recognised():
+    """One assertion per phrasing, so a regression names the shape it
+    broke rather than "the disclaimer test"."""
+    ev = [_ev("China's defence budget rose in 2024.", "g1")]
+    shapes = [
+        "No retrieved evidence supports the 4% of GDP figure [g1].",
+        "This 4% of GDP share is not confirmed by any source [g1].",
+        "The 4% of GDP share could not be verified [g1].",
+        "The 4% of GDP share remains unconfirmed [g1].",
+        "None of the documents state the 4% of GDP share [g1].",
+        "The 4% of GDP share is cited without direct evidence [g1].",
+    ]
+    for sentence in shapes:
+        findings, counters = audit_cited_figures(
+            f"# R\n\n{sentence}\n", [_goal()], ev)
+        assert findings == [], f"still audited: {sentence}"
+        assert counters["figures_in_disclaimed_sentences"] == 1.0, sentence
+
+
+# --------------------------------------------------------------------------
+# D-194: the noun list guarding the FIGURE audit did not contain "figure".
+# --------------------------------------------------------------------------
+
+
+def test_a_sentence_denying_a_figure_has_support_is_disclaimed():
+    """p205.336-check, replayed, and the reason it cost 5 confidence points.
+
+    The compiler wrote the denial in the vocabulary of the thing being
+    denied -- "no verified FIGURE ... is supported by the corpus" -- and
+    _DISCLAIMER_RE's noun list, which already carried document, source,
+    evidence, record, report, dataset, data, citation, corroboration and
+    confirmation, did not carry `figure`. So 1.3 was audited as an
+    assertion, became the run's only unsupported figure, and capped it at
+    LOW(40) through CAP_UNSUPPORTED_FIGURES -- on a sentence that says
+    outright the number is not supported.
+    """
+    ev = [_ev("NSDC and PMKVY run vocational certification schemes.", "g5")]
+    report = ("# R\n\nNSDC and PMKVY aim to certify millions in vocational "
+              "skills, though no verified figure (e.g., 1.3 crore) is "
+              "supported by the corpus [g5].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal("g5", "skills")],
+                                             ev)
+
+    assert findings == []
+    assert counters["cited_figures_unsupported"] == 0.0
+    assert counters["figures_in_disclaimed_sentences"] == 1.0
+
+
+def test_the_plural_form_is_recognised_too():
+    """The same run's other occurrence, one section earlier."""
+    ev = [_ev("NSDC and PMKVY run vocational certification schemes.", "g5")]
+    report = ("# R\n\nNSDC and PMKVY aim to bridge skill gaps, though no "
+              "specific certification figures (e.g., 1.3 crore candidates) "
+              "are cited [g5].\n")
+
+    _, counters = audit_cited_figures(report, [_goal("g5", "skills")], ev)
+
+    assert counters["figures_in_disclaimed_sentences"] == 1.0
+    assert counters["cited_figures_unsupported"] == 0.0
+
+
+def test_adding_figure_did_not_widen_the_pattern_to_ordinary_claims():
+    """The line D-192(b) drew, re-checked after touching the vocabulary.
+    A negated claim about the WORLD is not a statement about the evidence,
+    and a report does not get to keep an unretrieved number by phrasing it
+    negatively."""
+    ev = [_ev("The PLAN operates a large surface fleet.", "g1")]
+    report = ("# R\n\nThe PLAN does not field 300 major surface "
+              "combatants [g1].\n")
+
+    findings, counters = audit_cited_figures(report, [_goal()], ev)
+
+    assert [f["figure"] for f in findings] == ["300"]
+    assert counters["figures_in_disclaimed_sentences"] == 0.0

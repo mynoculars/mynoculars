@@ -404,8 +404,9 @@ step 5 caused by step 2.
 | 2 | **Qdrant** | 6333 | Dense (meaning) retrieval + semantic memory | **T2** — own window |
 | 3 | **OpenSearch** | 9200 | Keyword (BM25) retrieval | **T3** — own window |
 | 4 | **llama-server** | 8080 | L3 only — the local LLM | **T4** — own window |
-| 5 | **MCP corpus server** | *(none)* | Optional alternative corpus tool | **None — do not start it yourself** |
-| 6 | **uvicorn** | 8000 | Optional — the HTTP API | **T5** — own window |
+| 5 | **MCP corpus server** | 8765 | Optional — routes corpus search over MCP instead of in-process | **T7** — own window, **you start it yourself** (D-76) |
+| 6 | **MCP web-search server** | 8766 | Optional — Phase 4 web tier | **T8** — own window, **you start it yourself** (D-76) |
+| 7 | **uvicorn** | 8000 | Optional — the HTTP API. **Not needed by anything above** | **T5** — own window |
 
 **Every one of these is optional and degrades gracefully.** The agent never
 crashes because a store is down; it logs `qdrant.unavailable` /
@@ -413,6 +414,48 @@ crashes because a store is down; it logs `qdrant.unavailable` /
 (L1 proves it), and it is also the trap: *a run with everything down still
 succeeds*, it just finds nothing. Which is why you verify each service rather
 than assuming.
+
+**Which of these do I actually need?** The table above is a parts list, not a
+stack: rows 5–7 are three independent options, and starting one never obliges
+you to start another. The distinction that matters is which way each one
+faces.
+
+```text
+                    ENTRY POINTS                        TOOLS THE AGENT CALLS OUT TO
+                    (pick exactly one)                  (optional, add either or both)
+
+   you ──►  python -m research_agent.cli   ─┐        ┌─►  MCP corpus server      :8765  (T7)
+                                            ├─► graph ┤
+   you ──►  uvicorn ... api.server:app     ─┘        └─►  MCP web-search server  :8766  (T8)
+            POST /research, /resume  :8000 (T5)
+```
+
+- **The MCP servers are downstream of the agent.** The agent is their
+  *client* — it dials `MCP_SERVER_URL` / `WEB_MCP_SERVER_URL` during
+  retrieval (tier 3 of the D-38 ladder). They serve search results and
+  nothing else; they never call the agent, and they have no idea whether
+  the run reaching them came from the CLI or from the API.
+- **uvicorn is upstream of it.** It is the HTTP *entry point* — the
+  alternative to typing `python -m research_agent.cli`, over the same
+  `build_app_and_settings` bundle. `api/server.py` adds zero new wiring;
+  it puts HTTP verbs on the same `_graph.invoke()` calls `cli.py` makes.
+
+**So: running both MCP servers does not mean you need uvicorn.** CLI + the
+two MCP servers is a complete, correct setup, and the API adds nothing to
+retrieval. Start uvicorn only when you want one of the three things the CLI
+cannot do:
+
+| Want | Why the CLI can't | Endpoint |
+|---|---|---|
+| Resolve an E1–E4 pause from a UI or another service | `cli.py` blocks on `input()` in a loop; an HTTP request cannot block that way | `POST /research` returns `{"status": "interrupted", "thread_id": ...}`, then `POST /resume` |
+| Inspect a paused or finished run without re-running it | no such command | `GET /state/{thread_id}` |
+| Demo the agent as a service rather than as a script | — | `POST /research` |
+
+**If you do run both**, note that uvicorn's `_lifespan` builds its own bundle
+at startup and owns its own `MCPBridge` shutdown. A CLI run and a uvicorn
+process are therefore two independent *clients* of the same MCP servers, not
+one shared pipeline — they share nothing except the Postgres checkpoints and
+the `agent_runs` history.
 
 #### The one command that checks everything
 
@@ -698,8 +741,10 @@ See **[Running the MCP servers standalone](#running-the-mcp-servers-standalone-d
 
 #### 6. uvicorn — the HTTP API (optional)
 
-Not needed for the CLI at all. Full setup, including the separate-terminal
-requirement, is in **Running the HTTP API** in Part 2.
+**Not needed for the CLI at all, and not needed by the MCP servers either** —
+it faces the opposite direction from them (see *Which of these do I actually
+need?* under the service table above). Full setup, including the
+separate-terminal requirement, is in **Running the HTTP API** in Part 2.
 
 ---
 
@@ -1542,6 +1587,16 @@ The CLI will PAUSE and print a review payload, then prompt:
 stop with an explicit aborted-report. This is the interrupt/resume machinery
 running live.
 
+**On an E4 payload, read `critique_notes_hidden` before you decide.**
+`critique_notes` accumulates across revisions, and the payload shows the
+**five most recent** — the ones describing the draft in front of you; the
+older ones describe drafts that have already been rewritten. When any were
+cut, `critique_notes_hidden` gives the number and `critique_notes_note`
+says how many notes over how many revisions. Before D-193 the cut was
+silent: a reviewer could approve a report having seen 5 of 13 notes with
+nothing indicating the rest existed. To read them all, the run record's
+`critique_notes` carries the full history.
+
 **If you type anything other than those three words** — including typing your redirect guidance directly at this prompt, which the payload's own `hint` field can make look natural — the CLI now prints `'<input>' is not one of the three actions. Type 'redirect' first -- you will be asked for your guidance text on the NEXT line.` and re-prompts, rather than silently re-prompting with no explanation. Type `redirect`, press enter, and you'll be asked for the guidance text on the following line.
 
 **If it converges instead of escalating**, check `recall` in the printed
@@ -1599,6 +1654,18 @@ codebase ALSO ships a FastAPI app (`api/server.py`) with `/health`,
 `/research`, `/resume` and `/state/{thread_id}` — a genuinely separate, optional way to run
 this codebase, not required for L1/L2/L3 or for anything else in this
 manual. Skip this section entirely if you only ever use the CLI.
+
+**It is not part of the MCP setup, and the MCP servers do not need it.**
+This is the question the layout of Part 1's service table used to invite,
+so it is worth stating plainly here too: the MCP servers sit
+**downstream** of the agent — it is their client, dialling them during
+retrieval — while this API sits **upstream**, as an alternative to typing
+the CLI command. Running `mcp_corpus_server.py` and
+`mcp_web_search_server.py` therefore obliges you to run nothing here.
+`python -m research_agent.cli` with both MCP servers up is a complete
+setup, and `uvicorn` would add nothing to what that run retrieves. See
+*Which of these do I actually need?* under Part 1's service table for the
+picture.
 
 > If `uvicorn` raises `ValueError: too many values to unpack` at startup,
 > your checkout predates `AppBundle`'s current shape (`api/server.py` is
@@ -2321,11 +2388,17 @@ critic.failure_not_corroborated   dismissed=4  notes=[...]
 | `0` on most runs, occasional `1` | the counterweight doing its job on an outlier | nothing |
 | a persistent nonzero count | the CRITIC is systematically wrong about faithfulness, and this is masking it | read the dismissed notes and revisit `templates.critique` — **do not widen the check** |
 | `0` but E4 escalations on figure notes | notes this cannot adjudicate, or a figure genuinely absent | read them; the critic may well be right |
+| `0` on a run whose only audit finding is `cited_figures_misattributed` or `cited_figures_recalled` | **before D-193, the counterweight was switched off by that finding and never ran.** One misfiled citation marker was enough | fixed — only `cited_figures_unsupported` vetoes now. On an older run record, read `critique_notes_dismissed: 0` as "not asked", not as "asked and declined" |
 
 The counterweight is deliberately narrow and will not fire on:
 
 - a note naming **no** figure (*"the report never addresses goal g3"*) —
   a coverage or semantic finding, which is what the LLM critic is for;
+  **This is also the shape of an unactionable note** — one asking for a
+  change the report has already made. Such a note names no figure, so
+  nothing here can refute it and no rewrite can satisfy it; it fails the
+  report every cycle until the budget runs out. D-193 forbids it in
+  `templates.critique` rather than trying to dismiss it here;
 - a note naming a figure genuinely **absent** from the evidence;
 - a note quoting **both** figures (*"the report says 1.4 where the
   evidence says 1.23"*) — 1.4 is absent precisely because the report

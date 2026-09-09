@@ -362,3 +362,48 @@ def test_the_run_clock_survives_a_pause_and_resume(off_memory, stub_router,
     result = graph.invoke(_resume("approve"), config=cfg)
     assert result["run_started_at"] == stamped, (
         "a resumed run continues its original budget, it does not restart it")
+
+
+# --------------------------------------------------------------------------
+# D-193: the last human checkpoint does not get to imply it showed
+# everything.
+# --------------------------------------------------------------------------
+
+
+def _e4_state(note_count):
+    from research_agent.state import ResearchState
+    return ResearchState(
+        raw_query="Tell me about education in India",
+        escalation_trigger="E4",
+        critique_notes=[f"note {i}" for i in range(note_count)],
+        revision_count=2,
+        final_report="# R\n\nBody.\n")
+
+
+def test_the_e4_payload_says_when_it_is_showing_only_the_newest_notes():
+    """p205.334-check: a reviewer chose "approve" shown 5 of 13
+    accumulated notes, with nothing in the payload saying so.
+    `critique_notes` accumulates across revisions (state.py's operator.add
+    reducer), so the tail slice is the right five -- but a silent cut at
+    the one point a human decides whether to ship is the wrong kind of
+    quiet."""
+    from research_agent.agents.escalation import _payload_for
+
+    payload = _payload_for(_e4_state(13))
+
+    assert len(payload["critique_notes"]) == 5
+    assert payload["critique_notes_hidden"] == 8
+    assert "13" in payload["critique_notes_note"]
+    assert "2 revision" in payload["critique_notes_note"]
+
+
+def test_a_payload_that_shows_everything_says_nothing_extra():
+    """The no-op path. Nothing was cut, so nothing is claimed about
+    cutting -- a reviewer must never see "showing 3 of 3"."""
+    from research_agent.agents.escalation import _payload_for
+
+    payload = _payload_for(_e4_state(3))
+
+    assert len(payload["critique_notes"]) == 3
+    assert "critique_notes_hidden" not in payload
+    assert "critique_notes_note" not in payload

@@ -178,7 +178,24 @@ def _payload_for(state: ResearchState) -> Dict[str, Any]:
         base["hint"] = "redirect: guidance is passed to gap generation."
     elif trigger == "E4":
         base["reason"] = "Critique budget exhausted; report still failing."
+        # D-193: the tail slice stays -- five notes is the right amount
+        # to read at a decision prompt, and critique_notes accumulates
+        # across revisions (state.py's operator.add reducer), so the
+        # NEWEST are the ones describing the draft in front of the
+        # reviewer. What was wrong is that the cut was silent: live
+        # (p205.334-check) a reviewer chose "approve" shown 5 of 13
+        # accumulated notes with nothing saying so. This is the last
+        # human checkpoint in the run; it does not get to imply it is
+        # showing everything.
         base["critique_notes"] = state.critique_notes[-5:]
+        hidden = len(state.critique_notes) - len(base["critique_notes"])
+        if hidden:
+            base["critique_notes_hidden"] = hidden
+            base["critique_notes_note"] = (
+                f"showing the {len(base['critique_notes'])} most recent "
+                f"of {len(state.critique_notes)} note(s) accumulated "
+                f"across {state.revision_count} revision(s); the older "
+                f"{hidden} describe drafts already rewritten")
         base["report_preview"] = state.final_report[:600]
         base["hint"] = "redirect: guidance is added to the critic's notes."
     return base

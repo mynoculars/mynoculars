@@ -463,9 +463,33 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
             flagged = [f for f in audited if f["kind"] == "unsupported"]
             misattributed = [f for f in audited
                              if f["kind"] == "misattributed"]
-        # Both kinds count for D-155/D-178: either is the deterministic
-        # check having something to say about this report.
-        audit_flagged = len(flagged) + len(misattributed)
+        # D-193: what vetoes D-155's counterweight is UNSUPPORTED figures,
+        # and only those. This line read
+        # `len(flagged) + len(misattributed)` and was passed to a
+        # parameter named `unsupported_figures`, whose docstring says "a
+        # nonzero value means the deterministic check AGREES something is
+        # unsupported". A misattributed figure is the opposite of that
+        # finding: D-179 exists in this file to say the figure is TRUE
+        # and RETRIEVED and the citation is what is wrong, and the note
+        # this node writes for one says "Do NOT remove the figure".
+        #
+        # Live (p205.334-check): ONE misattribution -- figure 50, cited
+        # [g2], held by g1 -- against cited_figures_unsupported: 0. That
+        # single citation-marker error made `unsupported_figures` truthy,
+        # so resolve_verdict returned at its first line and the
+        # counterweight never examined a critique whose notes included
+        # two that the report already satisfied. A guard that D-178 went
+        # to some trouble to make non-vacuous was switched off by the
+        # smallest fault the audit can report.
+        #
+        # `recalled` (D-192) does not veto either, for the same reason
+        # one step further out: the figure was in the compile prompt, so
+        # nothing about it says the report invented anything. Naming all
+        # three kinds here rather than summing "everything the audit
+        # said" is the point -- the audit now reports three verdicts with
+        # three different meanings, and only one of them is agreement
+        # that a claim is unsupported.
+        unsupported_flagged = len(flagged)
         if settings.claim_verification_enabled and flagged:
             # D-175: the JUDGE is shown deduplicated evidence, the AUDIT
             # above is not, and the asymmetry is deliberate.
@@ -582,7 +606,7 @@ def build_critic_node(router: FallbackRouter, settings: Settings, debug: bool = 
         # note it cannot adjudicate (coverage, semantics) survives, and a
         # single survivor leaves the verdict exactly as the critic set it.
         passed, notes, verdict_counters = resolve_verdict(
-            passed, notes, prompt_evidence, audit_flagged)
+            passed, notes, prompt_evidence, unsupported_flagged)
         revision = state.revision_count + 1
         update: Dict[str, Any] = {
             "critique_passed": passed,
@@ -664,7 +688,8 @@ def _distinct_figures(findings: List[Dict[str, object]],
                       kind: str, limit: int = 5) -> List[Dict[str, object]]:
     """Up to `limit` DISTINCT figures of one kind, first mention wins.
 
-    CALLED BY   telemetry_node, for both figure samples (D-180).
+    CALLED BY   telemetry_node, for all three figure samples (D-180;
+                D-192 added the recalled one).
     WHY         audit_cited_figures reports one finding per SENTENCE, so
                 a figure the report states three times is three findings.
                 That is right for the findings list -- each one names a
@@ -1009,6 +1034,34 @@ def build_telemetry_node(settings: Settings, debug: bool = False):
                 figure_counters.get("cited_figures_misattributed", 0)),
             "misattributed_figures": _distinct_figures(
                 figure_findings, "misattributed"),
+            # D-192(a): a figure the compiler took from RECALLED
+            # evidence. P2-02 files memory under "memory::<an earlier
+            # run's goal id>", which is deliberately uncitable, so this
+            # is neither an invented number nor a misfiled citation --
+            # it is a claim resting on a previous run, which the honesty
+            # rail does not treat as grounding. Like misattributed, it
+            # is excluded from cited_figures_unsupported and therefore
+            # from CAP_UNSUPPORTED_FIGURES: the text WAS in the compile
+            # prompt (prompts/budget.py budgets memory items in), so
+            # "delete it, you made it up" is the wrong instruction.
+            # Before this it was reported as misattributed to
+            # "memory::g3" -- a goal no sentence can cite, i.e. a
+            # finding with no available remedy (p205.333-check: three
+            # of four).
+            "cited_figures_recalled": int(
+                figure_counters.get("cited_figures_recalled", 0)),
+            "recalled_figures": _distinct_figures(
+                figure_findings, "recalled"),
+            # D-192(b): figures stated inside sentences that assert the
+            # ABSENCE of support ("no document specifies whether current
+            # spending (~4% of GDP) is explicitly cited"). Excluded from
+            # cited_figures_checked because the sentence claims nothing
+            # to falsify -- and counted here rather than dropped, on
+            # D-174's rule that an exclusion nothing can see is a
+            # loophole. Two runs (p205.330-check, p205.333-check) were
+            # capped at LOW(40) for hedging exactly as D-51 asks.
+            "figures_in_disclaimed_sentences": int(
+                figure_counters.get("figures_in_disclaimed_sentences", 0)),
             # D-174: figures the audit could not reach, because their
             # sentence carries no citation and sits under no cited
             # heading. Read it beside cited_figures_checked: 0 and 0 is
